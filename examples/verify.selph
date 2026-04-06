@@ -1,0 +1,323 @@
+; ============================================================================
+; Verification as a SELPH program
+; ============================================================================
+;
+; Expresses the 4-level verification hierarchy (from verify.py) in SELPH
+; itself, so that synthesis can learn and improve verification strategies.
+;
+; The verification pipeline has four hard gates (type, shape, constraint,
+; goal) and a reward computation. This file implements each stage using
+; SELPH builtins: namespaces hold structured results, higher-order
+; functions run checks, and arithmetic computes rewards.
+;
+; Key insight: by expressing verification in the language being synthesized,
+; the meta-synthesis loop can eventually improve these verifiers too.
+; ============================================================================
+
+
+; ----------------------------------------------------------------------------
+; Helper: count how many items in a list satisfy a predicate
+; Returns the count as a number.
+;
+; Synthesis could improve this by discovering a built-in count-if or
+; by fusing the filter and length into a single reduce.
+; ----------------------------------------------------------------------------
+(define count-passing
+  (lambda (pred items)
+    (length (filter pred items))))
+
+
+; ----------------------------------------------------------------------------
+; check-examples: Level 0 verification
+; ----------------------------------------------------------------------------
+; Given a function and a list of (input expected) pairs (each pair is a
+; 2-element list), apply fn to each input and compare to expected.
+;
+; Returns a namespace with:
+;   "total"   - number of examples
+;   "passed"  - number that matched
+;   "score"   - passed / total (0.0 to 1.0)
+;   "ok"      - true if all examples pass
+;
+; How synthesis could improve this:
+;   - Discover partial-credit scoring (edit distance for strings)
+;   - Learn to weight examples by difficulty
+;   - Generate additional test cases from existing ones
+; ----------------------------------------------------------------------------
+(define check-examples
+  (lambda (fn examples)
+    (let ((total (length examples))
+          (results (map (lambda (pair)
+                          (let ((input    (nth pair 0))
+                                (expected (nth pair 1))
+                                (actual   (fn input)))
+                            (= actual expected)))
+                        examples))
+          (passed (count-passing (lambda (x) x) results))
+          (score  (if (= total 0) 1.0 (divide passed total))))
+      (ns-put (ns-put (ns-put (ns-put (ns-empty) "total" total)
+                               "passed" passed)
+                       "score" score)
+              "ok" (= passed total)))))
+
+
+; ----------------------------------------------------------------------------
+; check-type: verify a value's runtime type matches expected
+; ----------------------------------------------------------------------------
+; Takes a value and an expected type name (string), returns a namespace:
+;   "match" - true if the type matches
+;   "actual" - the actual type name string
+;   "expected" - the expected type name string
+;
+; Supported type names: "number", "string", "bool", "list", "nil", "function"
+;
+; How synthesis could improve this:
+;   - Learn richer type predicates (e.g., "list-of-numbers")
+;   - Discover union types ("number-or-string")
+;   - Infer types from example data
+;
+; NOTE: full type introspection would benefit from a builtin (type-of x)
+; that returns a string. For now we check each type predicate manually.
+; ----------------------------------------------------------------------------
+(define check-type
+  (lambda (value expected-type)
+    (let ((actual-type
+            (if (number? value)   "number"
+            (if (string? value)   "string"
+            (if (bool? value)     "bool"
+            (if (list? value)     "list"
+            (if (nil? value)      "nil"
+            (if (callable? value) "function"
+                                  "unknown")))))))
+          (match (= actual-type expected-type)))
+      (ns-put (ns-put (ns-put (ns-empty) "match" match)
+                       "actual" actual-type)
+              "expected" expected-type))))
+
+
+; ----------------------------------------------------------------------------
+; check-shape: verify that a list has the expected length
+; ----------------------------------------------------------------------------
+; Takes a value and an expected length (number). Returns a namespace:
+;   "match" - true if shape matches
+;   "actual" - actual length (or -1 for non-lists)
+;   "expected" - expected length
+;
+; How synthesis could improve this:
+;   - Extend to multi-dimensional shape checking (nested lists)
+;   - Learn symbolic dimension constraints (e.g., "same length as input")
+;   - Discover shape algebra (output is input-length + 1)
+;
+; NOTE: for full multi-dimensional shapes, a builtin (shape-of x) returning
+; a list of dimensions would be needed.
+; ----------------------------------------------------------------------------
+(define check-shape
+  (lambda (value expected-len)
+    (let ((actual-len (if (list? value) (length value) -1))
+          (match      (= actual-len expected-len)))
+      (ns-put (ns-put (ns-put (ns-empty) "match" match)
+                       "actual" actual-len)
+              "expected" expected-len))))
+
+
+; ----------------------------------------------------------------------------
+; check-constraint: verify a predicate constraint holds on a value
+; ----------------------------------------------------------------------------
+; Takes a value and a predicate function. Returns a namespace:
+;   "match" - true if predicate returns truthy
+;
+; How synthesis could improve this:
+;   - Compose multiple constraints with short-circuit evaluation
+;   - Learn constraint relaxation strategies for partial credit
+;   - Discover implied constraints from examples
+; ----------------------------------------------------------------------------
+(define check-constraint
+  (lambda (value predicate)
+    (let ((result (predicate value)))
+      (ns-put (ns-empty) "match" (if result true false)))))
+
+
+; ----------------------------------------------------------------------------
+; check-constraints: verify a list of predicate constraints
+; ----------------------------------------------------------------------------
+; Takes a value and a list of predicate functions. Returns a namespace:
+;   "all-match" - true if every constraint passes
+;   "total"     - number of constraints
+;   "passed"    - number that passed
+;
+; How synthesis could improve this:
+;   - Return per-constraint diagnostics for the critic loop
+;   - Learn to order constraints from cheapest to most expensive
+;   - Weight constraints by importance
+; ----------------------------------------------------------------------------
+(define check-constraints
+  (lambda (value predicates)
+    (let ((total   (length predicates))
+          (results (map (lambda (pred) (pred value)) predicates))
+          (passed  (count-passing (lambda (x) x) results)))
+      (ns-put (ns-put (ns-put (ns-empty) "all-match" (= passed total))
+                       "total" total)
+              "passed" passed))))
+
+
+; ----------------------------------------------------------------------------
+; compute-reward: scalar reward from verification gates
+; ----------------------------------------------------------------------------
+; Implements the reward formula from verify.py section 6.2:
+;   reward = hard_gate * (w_goal * goal_score)
+;
+; Hard gate: if ANY of type-ok, shape-ok, constraint-ok is false, reward = 0.
+; Otherwise: reward = w_goal * goal_score.
+;
+; Arguments:
+;   type-ok        - boolean: did the type check pass?
+;   shape-ok       - boolean: did the shape check pass?
+;   constraint-ok  - boolean: did all constraints pass?
+;   goal-score     - number 0.0 to 1.0: fraction of goal satisfied
+;
+; Returns: a number (the reward signal).
+;
+; How synthesis could improve this:
+;   - Learn different weight schedules (e.g., early training vs. late)
+;   - Discover partial credit for type mismatches (e.g., number vs string)
+;   - Add parent-success and global-outcome terms (w2, w3 from the paper)
+; ----------------------------------------------------------------------------
+(define compute-reward
+  (lambda (type-ok shape-ok constraint-ok goal-score)
+    (if (and type-ok (and shape-ok constraint-ok))
+      (multiply 0.7 goal-score)
+      0)))
+
+
+; ----------------------------------------------------------------------------
+; compute-reward-full: extended reward with parent and global signals
+; ----------------------------------------------------------------------------
+; Implements the full 3-term reward from verify.py:
+;   reward = hard_gate * (0.7*goal + 0.2*parent + 0.1*global)
+;
+; How synthesis could improve this:
+;   - Learn adaptive weights based on training stage
+;   - Discover that certain tasks need higher parent-success weight
+; ----------------------------------------------------------------------------
+(define compute-reward-full
+  (lambda (type-ok shape-ok constraint-ok goal-score parent-score global-score)
+    (if (and type-ok (and shape-ok constraint-ok))
+      (add (multiply 0.7 goal-score)
+           (add (multiply 0.2 parent-score)
+                (multiply 0.1 global-score)))
+      0)))
+
+
+; ----------------------------------------------------------------------------
+; verify-program: full verification pipeline
+; ----------------------------------------------------------------------------
+; Given a program (function) and a spec (namespace), run all verification
+; levels and return a structured result.
+;
+; The spec namespace should contain:
+;   "examples"     - list of (input expected) pairs (for Level 0)
+;   "type"         - expected output type name string (optional)
+;   "shape"        - expected output length (optional, for lists)
+;   "constraints"  - list of predicate functions (optional)
+;
+; Returns a namespace with:
+;   "type-ok"        - boolean
+;   "shape-ok"       - boolean
+;   "constraint-ok"  - boolean
+;   "goal-score"     - number 0.0 to 1.0
+;   "reward"         - scalar reward signal
+;   "passed"         - boolean: full pass (reward > 0 and goal-score = 1.0)
+;
+; How synthesis could improve this:
+;   - Learn to skip expensive checks when cheap ones already fail
+;   - Discover check ordering that maximizes early termination
+;   - Add Level 1 (pattern) and Level 2 (satisfy) goal checking
+;
+; NOTE: this currently supports Level 0 goals (examples). Levels 1-3 would
+; need additional builtins:
+;   - (pattern-match value pattern) for Level 1
+;   - (try-catch expr handler) for safe predicate evaluation in Level 2
+;   - model-as-judge integration for Level 3
+; ----------------------------------------------------------------------------
+(define verify-program
+  (lambda (program spec)
+    (let (
+      ; --- Level 0: run examples ---
+      (examples   (ns-get spec "examples"))
+      (example-result (check-examples program examples))
+      (goal-score (ns-get example-result "score"))
+
+      ; --- Type check (if spec provides "type") ---
+      ; Use the first example to get a sample output for type checking
+      (first-pair   (nth examples 0))
+      (first-input  (nth first-pair 0))
+      (sample-output (program first-input))
+      (has-type-spec (contains (ns-keys spec) "type"))
+      (type-result   (if has-type-spec
+                       (check-type sample-output (ns-get spec "type"))
+                       (ns-put (ns-empty) "match" true)))
+      (type-ok       (ns-get type-result "match"))
+
+      ; --- Shape check (if spec provides "shape") ---
+      (has-shape-spec (contains (ns-keys spec) "shape"))
+      (shape-result   (if has-shape-spec
+                        (check-shape sample-output (ns-get spec "shape"))
+                        (ns-put (ns-empty) "match" true)))
+      (shape-ok       (ns-get shape-result "match"))
+
+      ; --- Constraint check (if spec provides "constraints") ---
+      (has-constraints (contains (ns-keys spec) "constraints"))
+      (constraint-result (if has-constraints
+                           (check-constraints sample-output
+                                              (ns-get spec "constraints"))
+                           (ns-put (ns-empty) "all-match" true)))
+      (constraint-ok (ns-get constraint-result "all-match"))
+
+      ; --- Reward ---
+      (reward (compute-reward type-ok shape-ok constraint-ok goal-score))
+      (passed (and (> reward 0) (= goal-score 1.0)))
+    )
+    ; Build the result namespace
+    (ns-put (ns-put (ns-put (ns-put (ns-put (ns-put (ns-empty)
+      "type-ok" type-ok)
+      "shape-ok" shape-ok)
+      "constraint-ok" constraint-ok)
+      "goal-score" goal-score)
+      "reward" reward)
+      "passed" passed))))
+
+
+; ============================================================================
+; Demo: verify a simple squaring function
+; ============================================================================
+
+(define my-square (lambda (x) (multiply x x)))
+
+; Build a spec namespace with examples and type
+(define my-spec
+  (ns-put (ns-put (ns-empty)
+    "examples" (list (list 2 4) (list 3 9) (list 5 25)))
+    "type" "number"))
+
+; Run verification
+(define result (verify-program my-square my-spec))
+
+; Print results
+(print (concat "Verification passed: " (to-string (ns-get result "passed"))))
+(print (concat "Goal score: " (to-string (ns-get result "goal-score"))))
+(print (concat "Reward: " (to-string (ns-get result "reward"))))
+(print (concat "Type OK: " (to-string (ns-get result "type-ok"))))
+
+
+; ============================================================================
+; Demo: verify a failing function
+; ============================================================================
+
+(define bad-square (lambda (x) (add x x)))
+
+(define bad-result (verify-program bad-square my-spec))
+
+(print "")
+(print (concat "Bad function passed: " (to-string (ns-get bad-result "passed"))))
+(print (concat "Bad function goal score: " (to-string (ns-get bad-result "goal-score"))))
+(print (concat "Bad function reward: " (to-string (ns-get bad-result "reward"))))

@@ -1,0 +1,230 @@
+; ============================================================================
+; Search heuristics expressed as SELPH programs
+; ============================================================================
+;
+; These are priority functions for the synthesis search: given a context
+; namespace describing a candidate component, they return a numeric priority
+; score. Higher scores mean the component should be explored first.
+;
+; By expressing heuristics as SELPH programs, the meta-synthesis loop can:
+;   1. Start with simple hand-coded heuristics (below)
+;   2. Synthesize improved heuristics using past search data
+;   3. Verify new heuristics by comparing search efficiency
+;   4. Gradually replace human-written heuristics with learned ones
+;
+; Each heuristic takes a context namespace (ctx) with keys like:
+;   "priority"    - base priority from the component library (number)
+;   "ret-type"    - return type of the component (string)
+;   "target-type" - desired output type from the spec (string)
+;   "usage-count" - how many previous solutions used this component (number)
+;   "depth"       - current search depth (number)
+;   "max-depth"   - maximum allowed search depth (number)
+;   "arity"       - number of arguments the component takes (number)
+;   "name"        - component name (string)
+;
+; NOTE: the ctx namespace is built by the synthesizer before calling
+; the heuristic. Additional keys can be added as the system learns
+; which features are predictive.
+; ============================================================================
+
+
+; ----------------------------------------------------------------------------
+; default-heuristic: just use the component's base priority
+; ----------------------------------------------------------------------------
+; The simplest possible heuristic -- ignores all context and returns
+; the static priority assigned when the component was registered.
+;
+; This is the baseline that synthesis should improve upon.
+;
+; How synthesis could improve this:
+;   - Any heuristic that considers context will beat this
+;   - Even a small type-match bonus significantly prunes the search
+; ----------------------------------------------------------------------------
+(define default-heuristic
+  (lambda (ctx)
+    (ns-get ctx "priority")))
+
+
+; ----------------------------------------------------------------------------
+; type-match-heuristic: boost components whose output type matches target
+; ----------------------------------------------------------------------------
+; If the component's return type matches the spec's target type, add a
+; large bonus (+100) to its priority. Otherwise, keep the base priority.
+;
+; Rationale: in bottom-up enumeration, preferring type-compatible
+; components dramatically reduces the number of candidates explored.
+;
+; How synthesis could improve this:
+;   - Learn the right bonus magnitude from search statistics
+;   - Discover partial type compatibility (e.g., number is close to bool)
+;   - Use type distance instead of exact match
+; ----------------------------------------------------------------------------
+(define type-match-heuristic
+  (lambda (ctx)
+    (let ((base    (ns-get ctx "priority"))
+          (ret     (ns-get ctx "ret-type"))
+          (target  (ns-get ctx "target-type")))
+      (if (= ret target)
+        (add base 100)
+        base))))
+
+
+; ----------------------------------------------------------------------------
+; frequency-heuristic: boost components used in previous solutions
+; ----------------------------------------------------------------------------
+; Components that appeared in successful synthesis results are likely
+; useful for similar future tasks. Scale the bonus by usage count.
+;
+; How synthesis could improve this:
+;   - Learn a non-linear scaling (diminishing returns for very common ops)
+;   - Discount usage count by task similarity
+;   - Combine with recency weighting (recent solutions matter more)
+; ----------------------------------------------------------------------------
+(define frequency-heuristic
+  (lambda (ctx)
+    (let ((base  (ns-get ctx "priority"))
+          (usage (ns-get ctx "usage-count")))
+      (add base (multiply 50 usage)))))
+
+
+; ----------------------------------------------------------------------------
+; depth-aware-heuristic: penalize candidates at deeper search levels
+; ----------------------------------------------------------------------------
+; As search depth increases, the likelihood of finding a correct program
+; decreases exponentially. This heuristic applies a penalty proportional
+; to the current depth, encouraging shallower (simpler) solutions.
+;
+; Penalty: base_priority - 20 * depth
+;
+; How synthesis could improve this:
+;   - Learn the optimal penalty coefficient from training data
+;   - Discover that some tasks genuinely need deep compositions
+;   - Use depth/max-depth ratio instead of absolute depth
+; ----------------------------------------------------------------------------
+(define depth-aware-heuristic
+  (lambda (ctx)
+    (let ((base  (ns-get ctx "priority"))
+          (depth (ns-get ctx "depth")))
+      (subtract base (multiply 20 depth)))))
+
+
+; ----------------------------------------------------------------------------
+; arity-preference-heuristic: prefer lower-arity components
+; ----------------------------------------------------------------------------
+; Components with fewer arguments are easier to fill (fewer sub-expressions
+; to synthesize), so they should be tried first. This is a simple but
+; effective pruning strategy for bottom-up search.
+;
+; Score: base_priority - 30 * (arity - 1)
+;   (unary functions get no penalty, binary lose 30, ternary lose 60, etc.)
+;
+; How synthesis could improve this:
+;   - Learn that some high-arity components (e.g., if) are essential
+;   - Discover task-specific arity preferences
+;   - Combine with type information (high-arity is OK if types constrain args)
+; ----------------------------------------------------------------------------
+(define arity-preference-heuristic
+  (lambda (ctx)
+    (let ((base  (ns-get ctx "priority"))
+          (arity (ns-get ctx "arity")))
+      (subtract base (multiply 30 (subtract arity 1))))))
+
+
+; ----------------------------------------------------------------------------
+; combined-heuristic: weighted sum of multiple signals
+; ----------------------------------------------------------------------------
+; Combines type matching, frequency, depth, and arity into a single score.
+; This is closer to what a learned heuristic would look like -- a linear
+; combination of features with hand-tuned weights.
+;
+; How synthesis could improve this:
+;   - Learn the weights from search performance data
+;   - Discover non-linear feature interactions
+;   - Add new features (e.g., syntactic similarity to partial solution)
+;
+; NOTE: a more complete version would use a builtin for safe ns-get with
+; a default value, e.g., (ns-get-or ctx "usage-count" 0). For now, the
+; caller must ensure all keys are present.
+; ----------------------------------------------------------------------------
+(define combined-heuristic
+  (lambda (ctx)
+    (let ((base    (ns-get ctx "priority"))
+          (ret     (ns-get ctx "ret-type"))
+          (target  (ns-get ctx "target-type"))
+          (usage   (ns-get ctx "usage-count"))
+          (depth   (ns-get ctx "depth"))
+          (arity   (ns-get ctx "arity"))
+
+          ; Feature: type match bonus
+          (type-bonus (if (= ret target) 100 0))
+
+          ; Feature: frequency bonus (capped at 200)
+          (freq-bonus (min 200 (multiply 50 usage)))
+
+          ; Feature: depth penalty
+          (depth-penalty (multiply 20 depth))
+
+          ; Feature: arity penalty
+          (arity-penalty (multiply 30 (max 0 (subtract arity 1)))))
+
+      (subtract (add base (add type-bonus freq-bonus))
+                (add depth-penalty arity-penalty)))))
+
+
+; ============================================================================
+; Heuristic evaluator: run a heuristic on a context and return the score
+; ============================================================================
+; This utility makes it easy to test and compare heuristics.
+;
+; How synthesis could use this:
+;   - Evaluate candidate heuristics on a suite of benchmark contexts
+;   - Compare search efficiency (candidates explored) across heuristics
+;   - Select the heuristic with best average performance
+; ----------------------------------------------------------------------------
+(define eval-heuristic
+  (lambda (heuristic ctx)
+    (heuristic ctx)))
+
+
+; ============================================================================
+; Demo: evaluate all heuristics on a sample context
+; ============================================================================
+
+; Build a sample component context
+(define sample-ctx
+  (ns-put (ns-put (ns-put (ns-put (ns-put (ns-put (ns-put (ns-empty)
+    "priority" 50)
+    "ret-type" "number")
+    "target-type" "number")
+    "usage-count" 3)
+    "depth" 1)
+    "arity" 2)
+    "name" "add"))
+
+(print "=== Heuristic scores for 'add' (ret=number, target=number, usage=3, depth=1, arity=2) ===")
+(print (concat "  default:          " (to-string (eval-heuristic default-heuristic sample-ctx))))
+(print (concat "  type-match:       " (to-string (eval-heuristic type-match-heuristic sample-ctx))))
+(print (concat "  frequency:        " (to-string (eval-heuristic frequency-heuristic sample-ctx))))
+(print (concat "  depth-aware:      " (to-string (eval-heuristic depth-aware-heuristic sample-ctx))))
+(print (concat "  arity-preference: " (to-string (eval-heuristic arity-preference-heuristic sample-ctx))))
+(print (concat "  combined:         " (to-string (eval-heuristic combined-heuristic sample-ctx))))
+
+; Build a mismatched context (ret-type != target-type)
+(define mismatch-ctx
+  (ns-put (ns-put (ns-put (ns-put (ns-put (ns-put (ns-put (ns-empty)
+    "priority" 50)
+    "ret-type" "string")
+    "target-type" "number")
+    "usage-count" 0)
+    "depth" 2)
+    "arity" 1)
+    "name" "to-string"))
+
+(print "")
+(print "=== Heuristic scores for 'to-string' (ret=string, target=number, usage=0, depth=2, arity=1) ===")
+(print (concat "  default:          " (to-string (eval-heuristic default-heuristic mismatch-ctx))))
+(print (concat "  type-match:       " (to-string (eval-heuristic type-match-heuristic mismatch-ctx))))
+(print (concat "  frequency:        " (to-string (eval-heuristic frequency-heuristic mismatch-ctx))))
+(print (concat "  depth-aware:      " (to-string (eval-heuristic depth-aware-heuristic mismatch-ctx))))
+(print (concat "  arity-preference: " (to-string (eval-heuristic arity-preference-heuristic mismatch-ctx))))
+(print (concat "  combined:         " (to-string (eval-heuristic combined-heuristic mismatch-ctx))))

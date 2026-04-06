@@ -1,0 +1,40 @@
+; SELPH depth filter — controls which components are tried at each depth
+;
+; This is a SELPH program that the synthesizer calls once per (component, depth)
+; to decide whether to include it.  By expressing pruning as a SELPH program,
+; the meta-curriculum can synthesize better filters.
+;
+; Input: namespace with keys:
+;   "name"     — component name (string)
+;   "priority" — priority score from interleaved learning (number)
+;   "arity"    — number of parameters (number)
+;   "ret-type" — return type tag: 0=num, 1=str, 2=bool (number)
+;   "depth"    — current synthesis depth level (number)
+;
+; Output: boolean (true = try this component, false = skip it)
+
+; Priority-based depth filter:
+; At depth 1, try everything (we need the full pool).
+; At depth 2+, only try components with priority above a threshold.
+; This prevents low-priority components from exploding the search space
+; at higher depths where combinations grow quadratically.
+;
+; The threshold increases with depth:
+;   depth 1: all components (threshold = -1, everything passes)
+;   depth 2: priority >= 10 (skip never-used builtins)
+;   depth 3: priority >= 25 (only well-established components)
+;
+; Components with arity 0 (constants) are always included — they're cheap.
+; The "x" variable (priority 100) always passes.
+
+(lambda (ctx)
+  (let ((depth (ns-get ctx "depth"))
+        (priority (ns-get ctx "priority"))
+        (arity (ns-get ctx "arity")))
+    (if (= arity 0)
+      true                                    ; constants always included
+      (if (= depth 1)
+        true                                  ; depth 1: try everything
+        (if (= depth 2)
+          (> priority 10)                     ; depth 2: skip low-priority
+          (> priority 25))))))                ; depth 3+: only high-priority

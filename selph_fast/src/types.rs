@@ -1,6 +1,8 @@
 //! Core types for the SELPH runtime.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// AST node.
 #[derive(Clone, Debug)]
@@ -23,8 +25,10 @@ pub enum Value {
     Bool(bool),
     List(Vec<Value>),
     Nil,
-    /// Closure: (params, body_index, captured_env, captured_nodes)
-    Closure(Vec<String>, usize, Env, Vec<Node>),
+    /// Closure: (params, body_index, captured_env, captured_nodes, letrec_scope)
+    /// The optional letrec_scope is a shared mutable scope that enables
+    /// self-referential and mutually-recursive let bindings.
+    Closure(Vec<String>, usize, Env, Vec<Node>, Option<SharedScope>),
     Builtin(String),
     RustMacro(Vec<String>, Vec<Node>, usize),
     Namespace(HashMap<String, Value>),
@@ -32,6 +36,9 @@ pub enum Value {
 
 /// Lexical environment: stack of scopes.
 pub type Env = Vec<HashMap<String, Value>>;
+
+/// Shared mutable scope for letrec bindings, enabling self/mutual recursion.
+pub type SharedScope = Rc<RefCell<HashMap<String, Value>>>;
 
 pub fn env_lookup(env: &Env, name: &str) -> Option<Value> {
     for scope in env.iter().rev() {

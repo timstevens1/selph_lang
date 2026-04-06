@@ -2,7 +2,30 @@
 
 use crate::types::*;
 
+// Maximum eval recursion depth to prevent stack overflow from
+// deeply nested or self-referential macros.
+const MAX_EVAL_DEPTH: usize = 256;
+
+thread_local! {
+    static EVAL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn eval(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String> {
+    let depth = EVAL_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    if depth >= MAX_EVAL_DEPTH {
+        EVAL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        return Err("eval: max recursion depth exceeded".into());
+    }
+    let result = eval_inner(nodes, idx, env);
+    EVAL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    result
+}
+
+fn eval_inner(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String> {
     match &nodes[idx] {
         Node::Num(n) => Ok(Value::Num(*n)),
         Node::Str(s) => Ok(Value::Str(s.clone())),
@@ -11,7 +34,7 @@ pub fn eval(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String> 
             env_lookup(env, name).ok_or_else(|| format!("unbound: {}", name))
         }
         Node::Lambda(params, body) => {
-            Ok(Value::Closure(params.clone(), *body, env.clone(), nodes.to_vec()))
+            Ok(Value::Closure(params.clone(), *body, env.clone(), nodes.to_vec(), None))
         }
         Node::If(cond, then_br, else_br) => {
             let cond_val = eval(nodes, *cond, env)?;
@@ -22,11 +45,55 @@ pub fn eval(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String> 
             }
         }
         Node::Let(bindings, body) => {
+            // letrec semantics: all bindings share a single child env so that
+            // closures can refer to names defined in the same let block
+            // (enables self-recursion and mutual recursion).
+            //
+            // We use a SharedScope (Rc<RefCell<HashMap>>) so all closures
+            // created in this let block share the same mutable scope.
+            // After all bindings are evaluated, we populate the shared scope
+            // with the final values (including patched closures), and every
+            // closure that references it will see the complete set of bindings.
             env.push(std::collections::HashMap::new());
+
+            let shared_scope: SharedScope = std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            ));
+
+            // Track which binding names got closure values
+            let mut closure_names: Vec<String> = Vec::new();
+
             for (name, val_idx) in bindings {
                 let val = eval(nodes, *val_idx, env)?;
+                if matches!(&val, Value::Closure(..)) {
+                    closure_names.push(name.clone());
+                }
                 env_define(env, name.clone(), val);
             }
+
+            // Patch closures: give them the shared scope so recursive
+            // references resolve through it at call time.
+            if !closure_names.is_empty() {
+                if let Some(scope) = env.last_mut() {
+                    for cname in &closure_names {
+                        if let Some(Value::Closure(params, body_idx, captured_env, nodes_vec, _)) = scope.get(cname).cloned() {
+                            scope.insert(cname.clone(), Value::Closure(
+                                params, body_idx, captured_env, nodes_vec,
+                                Some(shared_scope.clone()),
+                            ));
+                        }
+                    }
+                }
+                // Now populate the shared scope with all let bindings
+                // (including the patched closures).
+                if let Some(scope) = env.last() {
+                    let mut shared = shared_scope.borrow_mut();
+                    for (k, v) in scope.iter() {
+                        shared.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+
             let result = eval(nodes, *body, env);
             env.pop();
             result
@@ -102,6 +169,33 @@ pub fn eval(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String> 
                         }
                         return Ok(Value::Namespace(entries));
                     }
+                    // try: evaluate expr, on error return fallback
+                    // (try expr fallback)
+                    "try" if children.len() == 3 => {
+                        match eval(nodes, children[1], env) {
+                            Ok(v) => return Ok(v),
+                            Err(_) => return eval(nodes, children[2], env),
+                        }
+                    }
+                    // eval-in: evaluate a source string in the current env
+                    // (eval-in "(add x 1)") — x must be bound in current scope
+                    "eval-in" if children.len() == 2 => {
+                        let src_val = eval(nodes, children[1], env)?;
+                        let src = match &src_val {
+                            Value::Str(s) => s.clone(),
+                            _ => return Err("eval-in: expected string".into()),
+                        };
+                        let (new_nodes, roots) = crate::parser::parse_file(&src)
+                            .map_err(|e| format!("eval-in: parse error: {}", e))?;
+                        if roots.is_empty() {
+                            return Ok(Value::Nil);
+                        }
+                        let mut last = Value::Nil;
+                        for &r in &roots {
+                            last = eval(&new_nodes, r, env)?;
+                        }
+                        return Ok(last);
+                    }
                     _ => {}
                 }
             }
@@ -118,8 +212,13 @@ pub fn eval(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String> 
 
 pub fn apply(fn_val: &Value, args: &[Value], nodes: &[Node], env: &mut Env) -> Result<Value, String> {
     match fn_val {
-        Value::Closure(params, body, closed_env, closure_nodes) => {
+        Value::Closure(params, body, closed_env, closure_nodes, letrec_scope) => {
             let mut new_env = closed_env.clone();
+            // If this closure was created in a letrec, push the shared scope
+            // so recursive/mutual references resolve correctly.
+            if let Some(shared) = letrec_scope {
+                new_env.push(shared.borrow().clone());
+            }
             let mut scope = std::collections::HashMap::new();
             for (i, param) in params.iter().enumerate() {
                 if i < args.len() {
@@ -243,6 +342,85 @@ pub fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
             }
             Ok(Value::List(results))
         }
+        "nth" => {
+            let l = list(&args[0])?;
+            let i = num(&args[1])? as usize;
+            l.get(i).cloned().ok_or(format!("nth: index {} out of bounds (len {})", i, l.len()))
+        }
+        "slice" => {
+            let l = list(&args[0])?;
+            let start = num(&args[1])? as usize;
+            let end = if args.len() > 2 { num(&args[2])? as usize } else { l.len() };
+            let end = end.min(l.len());
+            let start = start.min(end);
+            Ok(Value::List(l[start..end].to_vec()))
+        }
+        "sort" => {
+            let mut l = list(&args[0])?;
+            l.sort_by(|a, b| {
+                match (a, b) {
+                    (Value::Num(x), Value::Num(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+                    (Value::Str(x), Value::Str(y)) => x.cmp(y),
+                    _ => std::cmp::Ordering::Equal,
+                }
+            });
+            Ok(Value::List(l))
+        }
+        "reverse" => {
+            let mut l = list(&args[0])?;
+            l.reverse();
+            Ok(Value::List(l))
+        }
+        "append" => {
+            let mut l1 = list(&args[0])?;
+            let l2 = list(&args[1])?;
+            l1.extend(l2);
+            Ok(Value::List(l1))
+        }
+        "range" => {
+            let n = num(&args[0])? as i64;
+            let start = if args.len() > 1 { num(&args[1])? as i64 } else { 0 };
+            let (from, to) = if args.len() > 1 { (start, n) } else { (0, n) };
+            Ok(Value::List((from..to).map(|i| Value::Num(i as f64)).collect()))
+        }
+        "contains" => {
+            let l = list(&args[0])?;
+            let target = &args[1];
+            let found = l.iter().any(|v| match (v, target) {
+                (Value::Num(a), Value::Num(b)) => (a - b).abs() < f64::EPSILON,
+                (Value::Str(a), Value::Str(b)) => a == b,
+                (Value::Bool(a), Value::Bool(b)) => a == b,
+                _ => false,
+            });
+            Ok(Value::Bool(found))
+        }
+        "zip" => {
+            let l1 = list(&args[0])?;
+            let l2 = list(&args[1])?;
+            Ok(Value::List(l1.into_iter().zip(l2).map(|(a, b)| Value::List(vec![a, b])).collect()))
+        }
+        "enumerate" => {
+            let l = list(&args[0])?;
+            Ok(Value::List(l.into_iter().enumerate().map(|(i, v)| Value::List(vec![Value::Num(i as f64), v])).collect()))
+        }
+        "round" => Ok(Value::Num(num(&args[0])?.round())),
+        "pow" => num2(args, |a, b| a.powf(b)),
+        "sqrt" => Ok(Value::Num(num(&args[0])?.sqrt())),
+        "log" => Ok(Value::Num(num(&args[0])?.ln())),
+        "string-nth" => {
+            let s = string(&args[0])?;
+            let i = num(&args[1])? as usize;
+            s.chars().nth(i).map(|c| Value::Str(c.to_string())).ok_or(format!("string-nth: index {} out of bounds", i))
+        }
+        "string-slice" => {
+            let s = string(&args[0])?;
+            let start = num(&args[1])? as usize;
+            let end = if args.len() > 2 { num(&args[2])? as usize } else { s.len() };
+            let chars: Vec<char> = s.chars().collect();
+            let end = end.min(chars.len());
+            let start = start.min(end);
+            Ok(Value::Str(chars[start..end].iter().collect()))
+        }
         "identity" => Ok(args[0].clone()),
         "print" => {
             for a in args { print!("{}", value_to_string(a)); }
@@ -280,6 +458,262 @@ pub fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         "ns?" => Ok(Value::Bool(matches!(&args[0], Value::Namespace(_)))),
         "ns-empty" => Ok(Value::Namespace(std::collections::HashMap::new())),
+        "synthesize" => {
+            if args.len() != 1 {
+                return Err("synthesize: expected 1 argument (namespace)".into());
+            }
+            let ns = match &args[0] {
+                Value::Namespace(m) => m,
+                _ => return Err("synthesize: argument must be a namespace".into()),
+            };
+            // Extract spec: list of [input, output] pairs
+            let spec_val = ns.get("spec").ok_or("synthesize: namespace must have \"spec\" field")?;
+            let pairs = match spec_val {
+                Value::List(l) => l,
+                _ => return Err("synthesize: \"spec\" must be a list of example pairs".into()),
+            };
+            let mut inputs = Vec::new();
+            let mut expected = Vec::new();
+            for pair in pairs {
+                match pair {
+                    Value::List(p) if p.len() == 2 => {
+                        inputs.push(p[0].clone());
+                        expected.push(p[1].clone());
+                    }
+                    _ => return Err("synthesize: each spec entry must be a list of [input, output]".into()),
+                }
+            }
+            let max_depth = ns.get("max-depth")
+                .and_then(|v| if let Value::Num(n) = v { Some(*n as usize) } else { None })
+                .unwrap_or(2);
+            let max_candidates = ns.get("max-candidates")
+                .and_then(|v| if let Value::Num(n) = v { Some(*n as usize) } else { None })
+                .unwrap_or(10000);
+            let macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = Vec::new();
+
+            // Extract optional trees
+            let trees = extract_trees_from_ns(ns);
+            let (components, extra_bindings) = crate::synth::default_synth_components_with_trees(&macros, &trees);
+            let sr = crate::synth::synthesize_with_validation(
+                &components, &inputs, &expected, &macros,
+                max_depth, max_candidates, true, None, &extra_bindings,
+            );
+            let source = if sr.found {
+                node_to_source(sr.nodes.as_ref().unwrap(), sr.root.unwrap())
+            } else {
+                String::new()
+            };
+            let mut result = std::collections::HashMap::new();
+            result.insert("found".to_string(), Value::Bool(sr.found));
+            result.insert("candidates".to_string(), Value::Num(sr.candidates_explored as f64));
+            result.insert("source".to_string(), Value::Str(source));
+            Ok(Value::Namespace(result))
+        }
+        "synthesize-optimize" => {
+            if args.len() != 1 {
+                return Err("synthesize-optimize: expected 1 argument (namespace)".into());
+            }
+            let ns = match &args[0] {
+                Value::Namespace(m) => m,
+                _ => return Err("synthesize-optimize: argument must be a namespace".into()),
+            };
+
+            // Determine direction
+            let direction = if ns.contains_key("minimize") {
+                crate::synth::OptDirection::Minimize
+            } else if ns.contains_key("maximize") {
+                crate::synth::OptDirection::Maximize
+            } else {
+                return Err("synthesize-optimize: namespace must have \"minimize\" or \"maximize\" field".into());
+            };
+
+            // Get the fitness function source
+            let fitness_key = if direction == crate::synth::OptDirection::Minimize { "minimize" } else { "maximize" };
+            let fitness_src = match ns.get(fitness_key) {
+                Some(Value::Str(s)) => s.clone(),
+                _ => return Err(format!("synthesize-optimize: \"{}\" field must be a string (source code)", fitness_key)),
+            };
+
+            let (fitness_nodes, fitness_root) = match crate::parser::parse_source(&fitness_src) {
+                Ok(r) => r,
+                Err(e) => return Err(format!("synthesize-optimize: error parsing fitness function: {}", e)),
+            };
+
+            // Optional base examples (constraints)
+            let mut base_inputs = Vec::new();
+            let mut base_expected = Vec::new();
+            if let Some(Value::List(pairs)) = ns.get("spec") {
+                for pair in pairs {
+                    if let Value::List(p) = pair {
+                        if p.len() == 2 {
+                            base_inputs.push(p[0].clone());
+                            base_expected.push(p[1].clone());
+                        }
+                    }
+                }
+            }
+
+            let max_depth = ns.get("max-depth")
+                .and_then(|v| if let Value::Num(n) = v { Some(*n as usize) } else { None })
+                .unwrap_or(2);
+            let max_candidates = ns.get("max-candidates")
+                .and_then(|v| if let Value::Num(n) = v { Some(*n as usize) } else { None })
+                .unwrap_or(10000);
+
+            let macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = Vec::new();
+
+            // Extract optional trees
+            let trees = extract_trees_from_ns(ns);
+            let (components, extra_bindings) = crate::synth::default_synth_components_with_trees(&macros, &trees);
+            let osr = crate::synth::synthesize_optimize(
+                &components,
+                direction,
+                &fitness_nodes,
+                fitness_root,
+                &base_inputs,
+                &base_expected,
+                &macros,
+                max_depth,
+                max_candidates,
+                &extra_bindings,
+            );
+            let source = if osr.found {
+                node_to_source(osr.nodes.as_ref().unwrap(), osr.root.unwrap())
+            } else {
+                String::new()
+            };
+            let mut result = std::collections::HashMap::new();
+            result.insert("found".to_string(), Value::Bool(osr.found));
+            result.insert("candidates".to_string(), Value::Num(osr.candidates_explored as f64));
+            result.insert("source".to_string(), Value::Str(source));
+            if let Some(score) = osr.fitness_score {
+                result.insert("fitness".to_string(), Value::Num(score));
+            }
+            Ok(Value::Namespace(result))
+        }
+        // ── Self-hosting builtins ────────────────────────────────────
+        // These enable SELPH programs to express their own infrastructure:
+        // curriculum loops, dynamic macro creation, error handling, etc.
+
+        // eval-source: parse and evaluate a SELPH source string
+        // (eval-source "(add 1 2)") => 3
+        // Enables: dynamic code generation, promoting synthesized programs
+        "eval-source" => {
+            let src = string(&args[0])?;
+            let (nodes, roots) = crate::parser::parse_file(&src)
+                .map_err(|e| format!("eval-source: parse error: {}", e))?;
+            if roots.is_empty() {
+                return Ok(Value::Nil);
+            }
+            let mut env = make_default_env();
+            let mut last = Value::Nil;
+            for &r in &roots {
+                last = eval(&nodes, r, &mut env)?;
+            }
+            Ok(last)
+        }
+
+        // eval-in: evaluate a source string in the CURRENT environment
+        // (let ((x 5)) (eval-in "(add x 1)")) => 6
+        // This version is handled specially in the eval loop (see below),
+        // but we provide a fallback here for when called via apply_builtin
+        "eval-in" => {
+            let src = string(&args[0])?;
+            let (nodes, roots) = crate::parser::parse_file(&src)
+                .map_err(|e| format!("eval-in: parse error: {}", e))?;
+            if roots.is_empty() {
+                return Ok(Value::Nil);
+            }
+            let mut env = make_default_env();
+            let mut last = Value::Nil;
+            for &r in &roots {
+                last = eval(&nodes, r, &mut env)?;
+            }
+            Ok(last)
+        }
+
+        // define: create a new binding in the current scope
+        // Handled as special form in the eval loop, not here.
+        // This is the fallback for when it's called through apply.
+        "define" => Err("define: must be used as a special form, not called".into()),
+
+        // ns-get-or: namespace get with default value
+        // (ns-get-or ns "key" default-value) => value or default
+        // Avoids errors on missing keys — essential for robust SELPH programs
+        "ns-get-or" => {
+            if args.len() != 3 { return Err("ns-get-or: need namespace, key, default".into()); }
+            let key = match &args[1] { Value::Str(s) => s.clone(), _ => return Err("ns-get-or: key must be string".into()) };
+            match crate::namespace::ns_get(&args[0], &key) {
+                Ok(v) => Ok(v),
+                Err(_) => Ok(args[2].clone()),
+            }
+        }
+
+        // ns-has: check if a namespace has a key
+        // (ns-has ns "key") => true/false
+        "ns-has" => {
+            if args.len() != 2 { return Err("ns-has: need namespace and key".into()); }
+            let key = match &args[1] { Value::Str(s) => s.clone(), _ => return Err("ns-has: key must be string".into()) };
+            Ok(Value::Bool(crate::namespace::ns_get(&args[0], &key).is_ok()))
+        }
+
+        // try: evaluate first arg; if it errors, return second arg
+        // (try (divide 1 0) "error") => "error"
+        // Enables: robust curriculum loops, graceful synthesis failure handling
+        "try" => {
+            // try is handled as a special form in eval for full env access.
+            // This fallback works for pre-evaluated args.
+            // The first arg has already been evaluated by the time we get here,
+            // so it either succeeded (return it) or we'd never reach here.
+            Ok(args[0].clone())
+        }
+
+        // type-of: return the type name of a value as a string
+        // (type-of 42) => "number"
+        // (type-of "hello") => "string"
+        // Enables: type-based dispatch in SELPH programs, scoping predicates
+        "type-of" => {
+            let type_name = match &args[0] {
+                Value::Num(_) => "number",
+                Value::Str(_) => "string",
+                Value::Bool(_) => "bool",
+                Value::List(_) => "list",
+                Value::Namespace(_) => "namespace",
+                Value::Nil => "nil",
+                Value::Closure(..) => "function",
+                Value::Builtin(_) => "function",
+                Value::RustMacro(..) => "function",
+            };
+            Ok(Value::Str(type_name.to_string()))
+        }
+
+        // number?: type predicate
+        "number?" => Ok(Value::Bool(matches!(&args[0], Value::Num(_)))),
+        // string?: type predicate
+        "string?" => Ok(Value::Bool(matches!(&args[0], Value::Str(_)))),
+        // bool?: type predicate
+        "bool?" => Ok(Value::Bool(matches!(&args[0], Value::Bool(_)))),
+        // list?: type predicate
+        "list?" => Ok(Value::Bool(matches!(&args[0], Value::List(_)))),
+        // nil?: type predicate
+        "nil?" => Ok(Value::Bool(matches!(&args[0], Value::Nil))),
+        // function?: type predicate
+        "function?" => Ok(Value::Bool(matches!(&args[0], Value::Closure(..) | Value::Builtin(_) | Value::RustMacro(..)))),
+
+        // apply: call a function with a list of arguments
+        // (apply add (list 1 2)) => 3
+        "apply" => {
+            let func = &args[0];
+            let arg_list = list(&args[1])?;
+            let empty: Vec<Node> = Vec::new();
+            let mut env = make_default_env();
+            apply(func, &arg_list, &empty, &mut env)
+        }
+
+        // error: raise an error with a message
+        // (error "something went wrong")
+        "error" => Err(value_to_string(&args[0])),
+
         _ => Err(format!("unknown builtin: {}", name)),
     }
 }
@@ -318,13 +752,39 @@ pub fn value_to_string(v: &Value) -> String {
             format!("({})", parts.join(" "))
         }
         Value::Nil => "nil".to_string(),
-        Value::Closure(params, _, _, _) => format!("<lambda ({})>", params.join(" ")),
+        Value::Closure(params, _, _, _, _) => format!("<lambda ({})>", params.join(" ")),
         Value::Builtin(name) => format!("<builtin {}>", name),
         Value::RustMacro(params, _, _) => format!("<macro ({})>", params.join(" ")),
         Value::Namespace(map) => {
             let keys: Vec<&String> = map.keys().collect();
             format!("<namespace {:?}>", keys)
         }
+    }
+}
+
+/// Extract trees from a namespace's optional "trees" field.
+///
+/// The "trees" field should be a namespace where each key is a tree name
+/// and each value is the tree's namespace value.
+fn extract_trees_from_ns(ns: &std::collections::HashMap<String, Value>) -> Vec<(String, Value)> {
+    match ns.get("trees") {
+        Some(Value::Namespace(tree_map)) => {
+            tree_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        }
+        Some(Value::List(tree_list)) => {
+            // Also support a list of (name, namespace) pairs
+            tree_list.iter().filter_map(|item| {
+                if let Value::List(pair) = item {
+                    if pair.len() == 2 {
+                        if let Value::Str(name) = &pair[0] {
+                            return Some((name.clone(), pair[1].clone()));
+                        }
+                    }
+                }
+                None
+            }).collect()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -337,14 +797,103 @@ pub fn make_default_env() -> Env {
         "string-length", "string-contains", "string-split", "string-join",
         "concat", "to-string", "to-number",
         "list", "head", "tail", "length", "cons",
+        "nth", "slice", "sort", "reverse", "append",
+        "range", "contains", "zip", "enumerate",
+        "round", "pow", "sqrt", "log",
+        "string-nth", "string-slice",
         "map", "reduce", "filter", "identity", "print",
         "ns-get", "ns-put", "ns-keys", "ns-values", "ns-merge",
         "ns-size", "ns-flatten", "ns?", "ns-empty",
+        "ns-get-or", "ns-has",
+        "synthesize", "synthesize-optimize",
+        "eval-source", "eval-in", "type-of",
+        "number?", "string?", "bool?", "list?", "nil?", "function?",
+        "apply", "error",
     ];
     let mut scope = std::collections::HashMap::new();
     for name in builtins {
         scope.insert(name.to_string(), Value::Builtin(name.to_string()));
     }
     scope.insert("nil".to_string(), Value::Nil);
+
+    // __builtins__: introspectable namespace of all builtins with metadata.
+    // Lets SELPH programs reason about the component library.
+    let mut builtins_ns = std::collections::HashMap::new();
+    let bi = |name: &str, arity: usize, params: &[&str], ret: &str| {
+        let mut m = std::collections::HashMap::new();
+        m.insert("name".to_string(), Value::Str(name.to_string()));
+        m.insert("arity".to_string(), Value::Num(arity as f64));
+        m.insert("params".to_string(), Value::List(
+            params.iter().map(|p| Value::Str(p.to_string())).collect()));
+        m.insert("returns".to_string(), Value::Str(ret.to_string()));
+        (name.to_string(), Value::Namespace(m))
+    };
+    // Arithmetic
+    for (n, a, p, r) in [
+        ("add", 2, vec!["number", "number"], "number"),
+        ("subtract", 2, vec!["number", "number"], "number"),
+        ("multiply", 2, vec!["number", "number"], "number"),
+        ("divide", 2, vec!["number", "number"], "number"),
+        ("modulo", 2, vec!["number", "number"], "number"),
+        ("abs", 1, vec!["number"], "number"),
+        ("negate", 1, vec!["number"], "number"),
+        ("min", 2, vec!["number", "number"], "number"),
+        ("max", 2, vec!["number", "number"], "number"),
+        ("floor", 1, vec!["number"], "number"),
+        ("ceil", 1, vec!["number"], "number"),
+        ("round", 1, vec!["number"], "number"),
+        ("pow", 2, vec!["number", "number"], "number"),
+        ("sqrt", 1, vec!["number"], "number"),
+        ("log", 1, vec!["number"], "number"),
+    ] { let (k, v) = bi(n, a, &p, r); builtins_ns.insert(k, v); }
+    // Comparison
+    for (n, a, p, r) in [
+        ("<", 2, vec!["number", "number"], "bool"),
+        (">", 2, vec!["number", "number"], "bool"),
+        ("<=", 2, vec!["number", "number"], "bool"),
+        (">=", 2, vec!["number", "number"], "bool"),
+        ("=", 2, vec!["any", "any"], "bool"),
+        ("not", 1, vec!["bool"], "bool"),
+        ("even", 1, vec!["number"], "bool"),
+        ("odd", 1, vec!["number"], "bool"),
+    ] { let (k, v) = bi(n, a, &p, r); builtins_ns.insert(k, v); }
+    // String
+    for (n, a, p, r) in [
+        ("string-upper", 1, vec!["string"], "string"),
+        ("string-lower", 1, vec!["string"], "string"),
+        ("string-reverse", 1, vec!["string"], "string"),
+        ("string-trim", 1, vec!["string"], "string"),
+        ("string-length", 1, vec!["string"], "number"),
+        ("string-contains", 2, vec!["string", "string"], "bool"),
+        ("string-split", 2, vec!["string", "string"], "list"),
+        ("string-join", 2, vec!["list", "string"], "string"),
+        ("concat", 2, vec!["any", "any"], "string"),
+        ("to-string", 1, vec!["any"], "string"),
+        ("to-number", 1, vec!["string"], "number"),
+        ("string-nth", 2, vec!["string", "number"], "string"),
+        ("string-slice", 3, vec!["string", "number", "number"], "string"),
+    ] { let (k, v) = bi(n, a, &p, r); builtins_ns.insert(k, v); }
+    // List
+    for (n, a, p, r) in [
+        ("list", 0, vec![], "list"),
+        ("head", 1, vec!["list"], "any"),
+        ("tail", 1, vec!["list"], "list"),
+        ("length", 1, vec!["list"], "number"),
+        ("cons", 2, vec!["any", "list"], "list"),
+        ("nth", 2, vec!["list", "number"], "any"),
+        ("slice", 3, vec!["list", "number", "number"], "list"),
+        ("sort", 1, vec!["list"], "list"),
+        ("reverse", 1, vec!["list"], "list"),
+        ("append", 2, vec!["list", "list"], "list"),
+        ("range", 1, vec!["number"], "list"),
+        ("contains", 2, vec!["list", "any"], "bool"),
+        ("zip", 2, vec!["list", "list"], "list"),
+        ("enumerate", 1, vec!["list"], "list"),
+        ("map", 2, vec!["function", "list"], "list"),
+        ("reduce", 2, vec!["function", "list"], "any"),
+        ("filter", 2, vec!["function", "list"], "list"),
+    ] { let (k, v) = bi(n, a, &p, r); builtins_ns.insert(k, v); }
+
+    scope.insert("__builtins__".to_string(), Value::Namespace(builtins_ns));
     vec![scope]
 }

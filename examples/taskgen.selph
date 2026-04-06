@@ -1,0 +1,228 @@
+; ============================================================================
+; taskgen.selph — Task generation as a SELPH program
+; ============================================================================
+;
+; The system can synthesize better task generators! By expressing task
+; creation as SELPH programs, the curriculum itself becomes improvable.
+;
+; Task format matches what curriculum.selph expects:
+;   { "name": string, "depth": number, "spec": list of [input, output] }
+;
+; The spec format matches what the `synthesize` builtin expects:
+;   Each entry is (list input-string expected-number)
+; ============================================================================
+
+
+; --- Sequence prediction helpers ---
+(defmacro idx (s)
+  (to-number (head (string-split s " "))))
+(defmacro v3 (s)
+  (to-number (head (tail (tail (tail (tail (string-split s " "))))))))
+
+
+; ============================================================================
+; Part 1: Task construction helpers
+; ============================================================================
+
+; make-task: construct a task namespace from name, depth, and example list
+(defmacro make-task (name depth examples)
+  (ns-put (ns-put (ns-put (ns-empty)
+                           "name" name)
+                   "depth" depth)
+           "spec" examples))
+
+; make-example: construct a single (input, output) pair
+(defmacro make-example (input output)
+  (list input output))
+
+; make-seq-input: build the "idx v0 v1 v2 v3" input string
+; from an index and four context values
+(defmacro make-seq-input (i a b c d)
+  (concat (to-string i) " "
+    (concat (to-string a) " "
+      (concat (to-string b) " "
+        (concat (to-string c) " "
+          (to-string d))))))
+
+
+; ============================================================================
+; Part 2: Constant task generator
+; ============================================================================
+; Generate a task where the answer is always the same constant value.
+; These are the simplest tasks — solvable at depth 1.
+
+(defmacro constant-task (name value)
+  (make-task name 2
+    (list
+      (make-example (make-seq-input 4 value value value value) value)
+      (make-example (make-seq-input 5 value value value value) value)
+      (make-example (make-seq-input 6 value value value value) value))))
+
+
+; ============================================================================
+; Part 3: Linear sequence task generator
+; ============================================================================
+; Generate a task where the sequence follows: f(i) = start + i * step
+; The answer at position i is (start + i * step).
+
+(defmacro linear-task (name start step)
+  (make-task name 2
+    (list
+      (make-example
+        (make-seq-input 4
+          (add start (multiply 0 step))
+          (add start (multiply 1 step))
+          (add start (multiply 2 step))
+          (add start (multiply 3 step)))
+        (add start (multiply 4 step)))
+      (make-example
+        (make-seq-input 5
+          (add start (multiply 1 step))
+          (add start (multiply 2 step))
+          (add start (multiply 3 step))
+          (add start (multiply 4 step)))
+        (add start (multiply 5 step)))
+      (make-example
+        (make-seq-input 6
+          (add start (multiply 2 step))
+          (add start (multiply 3 step))
+          (add start (multiply 4 step))
+          (add start (multiply 5 step)))
+        (add start (multiply 6 step)))
+      (make-example
+        (make-seq-input 7
+          (add start (multiply 3 step))
+          (add start (multiply 4 step))
+          (add start (multiply 5 step))
+          (add start (multiply 6 step)))
+        (add start (multiply 7 step))))))
+
+
+; ============================================================================
+; Part 4: "Last element plus offset" task generator
+; ============================================================================
+; Generate a task where the answer is always (last element + offset).
+; This tests the pattern f(s) = v3(s) + k.
+
+(defmacro last-plus-k-task (name offset)
+  (make-task name 2
+    (list
+      (make-example (make-seq-input 4 10 (add 10 offset) (add 10 (multiply 2 offset)) (add 10 (multiply 3 offset)))
+                    (add 10 (multiply 4 offset)))
+      (make-example (make-seq-input 5 20 (add 20 offset) (add 20 (multiply 2 offset)) (add 20 (multiply 3 offset)))
+                    (add 20 (multiply 4 offset)))
+      (make-example (make-seq-input 6 0 offset (multiply 2 offset) (multiply 3 offset))
+                    (multiply 4 offset))
+      (make-example (make-seq-input 7 5 (add 5 offset) (add 5 (multiply 2 offset)) (add 5 (multiply 3 offset)))
+                    (add 5 (multiply 4 offset))))))
+
+
+; ============================================================================
+; Part 5: Recurrence task generator
+; ============================================================================
+; Generate a task where f(i) = v2 + v3 (Fibonacci-like recurrence).
+; Parameterized by seed values.
+
+(defmacro recurrence-add-task (name a0 a1 a2 a3)
+  (make-task name 3
+    (list
+      (make-example (make-seq-input 4 a0 a1 a2 a3)
+                    (add a2 a3))
+      (make-example (make-seq-input 5 a1 a2 a3 (add a2 a3))
+                    (add a3 (add a2 a3)))
+      (make-example (make-seq-input 6 a2 a3 (add a2 a3) (add a3 (add a2 a3)))
+                    (add (add a2 a3) (add a3 (add a2 a3))))
+      (make-example (make-seq-input 7 a3 (add a2 a3) (add a3 (add a2 a3)) (add (add a2 a3) (add a3 (add a2 a3))))
+                    (add (add a3 (add a2 a3)) (add (add a2 a3) (add a3 (add a2 a3))))))))
+
+
+; ============================================================================
+; Part 6: Generate a curriculum of tasks
+; ============================================================================
+
+(print "=== SELPH Task Generator ===")
+(print "")
+
+; Generate constant tasks for several values
+(define const-tasks (list
+  (constant-task "gen_const_0" 0)
+  (constant-task "gen_const_3" 3)
+  (constant-task "gen_const_7" 7)))
+
+; Generate linear tasks with different slopes
+(define linear-tasks (list
+  (linear-task "gen_identity"  0 1)
+  (linear-task "gen_double"    0 2)
+  (linear-task "gen_triple"    0 3)
+  (linear-task "gen_offset_10" 10 1)))
+
+; Generate last+k tasks
+(define lastk-tasks (list
+  (last-plus-k-task "gen_last_plus_1" 1)
+  (last-plus-k-task "gen_last_plus_2" 2)
+  (last-plus-k-task "gen_last_minus_1" -1)))
+
+; Generate recurrence tasks
+(define recurrence-tasks (list
+  (recurrence-add-task "gen_fib_classic" 1 1 2 3)
+  (recurrence-add-task "gen_fib_lucas"   2 1 3 4)))
+
+; Combine into full curriculum
+(define generated-curriculum
+  (reduce (lambda (acc tasks)
+            (reduce (lambda (a t) (cons t a)) acc tasks))
+          (list)
+          (list const-tasks linear-tasks lastk-tasks recurrence-tasks)))
+
+(print (concat "Generated " (to-string (length generated-curriculum)) " tasks:"))
+(map (lambda (task)
+       (print (concat "  " (ns-get task "name")
+                      " (depth=" (to-string (ns-get task "depth"))
+                      ", examples=" (to-string (length (ns-get task "spec"))) ")")))
+     generated-curriculum)
+
+
+; ============================================================================
+; Part 7: Validate generated tasks by test-solving them
+; ============================================================================
+
+(print "")
+(print "--- Validating generated tasks (solving each with synthesis) ---")
+(print "")
+
+; Pick a few simple tasks to validate (full curriculum would take too long)
+(define validation-tasks (list
+  (constant-task "validate_const_3" 3)
+  (linear-task "validate_identity" 0 1)))
+
+(map (lambda (task)
+       (define name (ns-get task "name"))
+       (define result (synthesize
+                        (ns-put (ns-put (ns-put (ns-empty)
+                                                 "spec" (ns-get task "spec"))
+                                         "max-depth" (ns-get task "depth"))
+                                 "max-candidates" 10000)))
+       (if (ns-get result "found")
+         (print (concat "  OK: " name " -> " (ns-get result "source")))
+         (print (concat "  FAIL: " name " (not solvable within budget)"))))
+     validation-tasks)
+
+
+; ============================================================================
+; Future: synthesizable task generators
+; ============================================================================
+;
+; Because task generators are SELPH programs, they are synthesis targets.
+; A meta-level synthesizer could search for task generators that:
+;   - Produce tasks the current library cannot solve (novelty)
+;   - Produce tasks just beyond the current frontier (zone of proximal dev.)
+;   - Cover diverse categories to prevent overfitting
+;
+; The fitness function for a task generator g would be:
+;   score(g) = count(tasks where: solvable(t) AND NOT already-in-library(t))
+;
+; This closes the loop: the system generates its own training data.
+; ============================================================================
+
+(print "")
+(print "Done. Task generators are SELPH programs that synthesis can improve.")

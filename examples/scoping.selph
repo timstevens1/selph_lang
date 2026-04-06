@@ -1,0 +1,175 @@
+; ============================================================================
+; scoping.selph — Component scoping as a SELPH program
+; ============================================================================
+;
+; Instead of hardcoded Rust logic, express which synthesis components are
+; relevant for a given task as SELPH predicates. This means the scoping
+; strategy itself can be improved by synthesis.
+;
+; A "component" is represented as a namespace with:
+;   "name"        — the component name (e.g., "add", "v3", "idx")
+;   "return-type" — what type it produces ("number", "string", "bool")
+;   "input-types" — list of types it consumes
+;   "category"    — grouping ("arithmetic", "accessor", "string-op", "logic")
+;   "depth-cost"  — how much AST depth this component uses
+;
+; Currently these are conceptual — the actual synthesis engine uses Rust
+; structs for components. The goal is to eventually have synthesis read
+; component descriptions from SELPH data, making the component set itself
+; a program that synthesis can modify.
+;
+; Builtins needed for full integration:
+;   set-components  — replace the active component set for synthesis
+;   get-components  — retrieve the current component set as SELPH data
+;   component-stats — get usage statistics from recent synthesis runs
+; ============================================================================
+
+
+; ============================================================================
+; Part 1: Define components as SELPH data
+; ============================================================================
+
+(defmacro make-component (name return-type input-types category depth-cost)
+  (ns-put (ns-put (ns-put (ns-put (ns-put (ns-empty)
+    "name" name)
+    "return-type" return-type)
+    "input-types" input-types)
+    "category" category)
+    "depth-cost" depth-cost))
+
+; Arithmetic components
+(define comp-add     (make-component "add"      "number" (list "number" "number") "arithmetic" 1))
+(define comp-sub     (make-component "subtract" "number" (list "number" "number") "arithmetic" 1))
+(define comp-mul     (make-component "multiply" "number" (list "number" "number") "arithmetic" 1))
+(define comp-negate  (make-component "negate"   "number" (list "number")          "arithmetic" 1))
+(define comp-abs     (make-component "abs"      "number" (list "number")          "arithmetic" 1))
+
+; Accessor components (extract fields from sequence input strings)
+(define comp-idx  (make-component "idx" "number" (list "string") "accessor" 1))
+(define comp-v0   (make-component "v0"  "number" (list "string") "accessor" 1))
+(define comp-v1   (make-component "v1"  "number" (list "string") "accessor" 1))
+(define comp-v2   (make-component "v2"  "number" (list "string") "accessor" 1))
+(define comp-v3   (make-component "v3"  "number" (list "string") "accessor" 1))
+
+; String components
+(define comp-concat  (make-component "concat"        "string" (list "string" "string") "string-op" 1))
+(define comp-strlen  (make-component "string-length" "number" (list "string")          "string-op" 1))
+
+; All available components
+(define all-components (list
+  comp-add comp-sub comp-mul comp-negate comp-abs
+  comp-idx comp-v0 comp-v1 comp-v2 comp-v3
+  comp-concat comp-strlen))
+
+
+; ============================================================================
+; Part 2: Type-based scoping predicates
+; ============================================================================
+
+; A component is type-relevant if its return type matches the target type
+(defmacro returns-type (comp target-type)
+  (= (ns-get comp "return-type") target-type))
+
+; A component is an input bridge if it consumes the input type
+(defmacro consumes-type (comp input-type)
+  (> (length (filter (lambda (t) (= t input-type))
+                     (ns-get comp "input-types")))
+     0))
+
+; Core scoping decision: should a component be included for a task?
+; A component is relevant if:
+;   1. It returns the target output type, OR
+;   2. It bridges from the input type to another useful type, OR
+;   3. It is in the same category as another relevant component
+(defmacro scope-for-type (comp target-type)
+  (or (returns-type comp target-type)
+      (consumes-type comp target-type)))
+
+
+; ============================================================================
+; Part 3: Full scoping predicate
+; ============================================================================
+
+; Full scoping decision combining type relevance and category
+(defmacro should-include (comp target-type input-type)
+  (or
+    ; Direct type match — component returns what we need
+    (returns-type comp target-type)
+    ; Input bridge — component can process the input type
+    (consumes-type comp input-type)
+    ; Arithmetic is always useful for number targets
+    (and (= target-type "number")
+         (= (ns-get comp "category") "arithmetic"))))
+
+
+; ============================================================================
+; Part 4: Apply scoping to filter the component set
+; ============================================================================
+
+; scope-components: given a target type and input type, return only
+; the components that are relevant for this synthesis task
+(defmacro scope-components (components target-type input-type)
+  (filter (lambda (c) (should-include c target-type input-type))
+          components))
+
+
+; ============================================================================
+; Part 5: Demo — scope for a typical sequence prediction task
+; ============================================================================
+; Sequence tasks: input is a string, output is a number
+
+(print "=== Component Scoping Demo ===")
+(print "")
+(print (concat "Total components: " (to-string (length all-components))))
+
+(define scoped (scope-components all-components "number" "string"))
+(print (concat "Scoped for (string -> number): " (to-string (length scoped))))
+(print "Included:")
+(map (lambda (c) (print (concat "  " (ns-get c "name")
+                                " : " (ns-get c "category"))))
+     scoped)
+
+; Show what gets excluded for a pure string task
+(define string-scoped (scope-components all-components "string" "string"))
+(print "")
+(print (concat "Scoped for (string -> string): " (to-string (length string-scoped))))
+(print "Included:")
+(map (lambda (c) (print (concat "  " (ns-get c "name")
+                                " : " (ns-get c "category"))))
+     string-scoped)
+
+
+; ============================================================================
+; Part 6: Depth-aware budget estimation
+; ============================================================================
+;
+; Given a scoped component set and a max depth, estimate the search space size.
+; This helps the curriculum decide how much budget to allocate per task.
+
+(defmacro estimate-search-space (components max-depth)
+  (define n (length components))
+  ; Rough estimate: branching factor ^ depth
+  ; Each depth level multiplies candidates by ~n (number of components)
+  (reduce (lambda (acc _unused) (multiply acc n))
+          1
+          components))
+
+(print "")
+(define est (estimate-search-space scoped 2))
+(print (concat "Estimated search space at depth 2: ~" (to-string est) " candidates"))
+
+; ============================================================================
+; Future: synthesizable scoping
+; ============================================================================
+;
+; Because should-include is a SELPH program, we can treat it as a synthesis
+; target. The fitness function would be:
+;   - Maximize: tasks solved with the scoped component set
+;   - Minimize: search space size (fewer irrelevant components)
+;
+; This would let the system learn better scoping strategies from experience,
+; rather than relying on hand-written type-matching rules.
+; ============================================================================
+
+(print "")
+(print "Done. Scoping predicates are SELPH programs that synthesis can improve.")

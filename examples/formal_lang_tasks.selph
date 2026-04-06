@@ -39,16 +39,40 @@
   ("8 2 3 4 5" 2) ("9 3 4 5 0" 3)
   ("10 4 5 0 1" 4) ("11 5 0 1 2" 5) ("12 0 1 2 3" 0))
 
+; === Stage 5.5: ASCII base constants (scaffolding for character cycles) ===
+; Teach the system that 'a' = 97 as a constant offset from idx
+; This gives the synthesizer the building block it needs to compose
+; character cycles as: ascii_base + (idx mod period)
+
+; ascii_a: the constant 97 (ASCII 'a')
+; Context window has DIFFERENT values so the synthesizer can't cheat with v0.
+; Must discover 97 = multiply(idx, 0) + 97, or via arithmetic on known constants.
+; With pow available: 97 = subtract(pow(10,2), 3) or add(multiply(10,10), negate(3))
+; The synthesizer should find this at depth 2.
+(task "ascii_a" 2
+  ("0 50 60 70 80" 97) ("1 51 61 71 81" 97)
+  ("2 52 62 72 82" 97) ("3 53 63 73 83" 97)
+  ("4 54 64 74 84" 97) ("5 55 65 75 85" 97)
+  ("6 56 66 76 86" 97) ("7 57 67 77 87" 97))
+
+; offset_from_a: given an ASCII char, return its offset from 'a'
+; v3 contains the char code. offset = v3 - 97 = v3 - ascii_a
+(task "offset_from_a" 2
+  ("0 0 0 0 97" 0) ("1 0 0 0 98" 1)
+  ("2 0 0 0 99" 2) ("3 0 0 0 100" 3)
+  ("4 0 0 0 101" 4) ("5 0 0 0 102" 5)
+  ("6 0 0 0 103" 6) ("7 0 0 0 104" 7))
+
 ; === Stage 6: Character cycles using mod ===
-; abcde cycle (period 5): char = 97 + (idx mod 5)
-; This should compose idx_mod5 + 97
-(task "cycle_abcde" 2
+; abcde cycle (period 5): char = ascii_a + (idx mod 5)
+; With ascii_a promoted, this is (add (ascii_a x) (idx_mod5 x))
+(task "cycle_abcde" 3
   ("5 97 98 99 100" 101) ("6 98 99 100 101" 97)
   ("7 99 100 101 97" 98) ("8 100 101 97 98" 99)
   ("9 101 97 98 99" 100) ("10 97 98 99 100" 101))
 
-; abcdef cycle (period 6): char = 97 + (idx mod 6)
-(task "cycle_abcdef" 2
+; abcdef cycle (period 6): char = ascii_a + (idx mod 6)
+(task "cycle_abcdef" 3
   ("6 97 98 99 100" 101) ("7 98 99 100 101" 102)
   ("8 99 100 101 102" 97) ("9 100 101 102 97" 98)
   ("10 101 102 97 98" 99) ("11 102 97 98 99" 100) ("12 97 98 99 100" 101))
