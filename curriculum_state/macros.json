@@ -1,0 +1,163 @@
+[
+  {
+    "name": "seq_const_0",
+    "params": [
+      "s"
+    ],
+    "body_source": "0"
+  },
+  {
+    "name": "seq_const_1",
+    "params": [
+      "s"
+    ],
+    "body_source": "1"
+  },
+  {
+    "name": "seq_const_5",
+    "params": [
+      "s"
+    ],
+    "body_source": "5"
+  },
+  {
+    "name": "seq_const_neg1",
+    "params": [
+      "s"
+    ],
+    "body_source": "-1"
+  },
+  {
+    "name": "seq_inc_1",
+    "params": [
+      "s"
+    ],
+    "body_source": "(idx x)"
+  },
+  {
+    "name": "seq_inc_2",
+    "params": [
+      "s"
+    ],
+    "body_source": "(add (idx x) (idx x))"
+  },
+  {
+    "name": "seq_inc_3",
+    "params": [
+      "s"
+    ],
+    "body_source": "(add (idx x) (seq_inc_2 x))"
+  },
+  {
+    "name": "seq_dec_1",
+    "params": [
+      "s"
+    ],
+    "body_source": "(add (last x) (seq_const_neg1 x))"
+  },
+  {
+    "name": "seq_inc_5",
+    "params": [
+      "s"
+    ],
+    "body_source": "(add (last x) (seq_const_5 x))"
+  },
+  {
+    "name": "seq_identity",
+    "params": [
+      "s"
+    ],
+    "body_source": "(idx x)"
+  },
+  {
+    "name": "seq_idx_plus1",
+    "params": [
+      "s"
+    ],
+    "body_source": "(add (idx x) (seq_const_1 x))"
+  },
+  {
+    "name": "seq_idx_times2",
+    "params": [
+      "s"
+    ],
+    "body_source": "(seq_inc_2 x)"
+  },
+  {
+    "name": "seq_idx_times3",
+    "params": [
+      "s"
+    ],
+    "body_source": "(seq_inc_3 x)"
+  },
+  {
+    "name": "seq_squares",
+    "params": [
+      "s"
+    ],
+    "body_source": "(add (seq_inc_2 x) (seq_dec_1 x))"
+  },
+  {
+    "name": "seq_triangular",
+    "params": [
+      "s"
+    ],
+    "body_source": "(add (idx x) (last x))"
+  },
+  {
+    "name": "seq_idx_sq_plus1",
+    "params": [
+      "s"
+    ],
+    "body_source": "(seq_squares x)"
+  },
+  {
+    "name": "seq_double_idx",
+    "params": [
+      "s"
+    ],
+    "body_source": "(add (idx x) (seq_idx_plus1 x))"
+  },
+  {
+    "name": "seq_mod2",
+    "params": [
+      "s"
+    ],
+    "body_source": "(v0 x)"
+  },
+  {
+    "name": "seq_mod3",
+    "params": [
+      "s"
+    ],
+    "body_source": "(v1 x)"
+  },
+  {
+    "name": "seq_fib",
+    "params": [
+      "s"
+    ],
+    "body_source": "(add (last x) (v2 x))"
+  },
+  {
+    "name": "seq_sum_prev2",
+    "params": [
+      "s"
+    ],
+    "body_source": "(seq_fib x)"
+  },
+  {
+    "name": "seq_double_prev",
+    "params": [
+      "s"
+    ],
+    "body_source": "(add (last x) (last x))"
+  },
+  {
+    "name": "seq_sq_mod3",
+    "params": [
+      "s"
+    ],
+    "body_source": "(v1 x)"
+  }
+]

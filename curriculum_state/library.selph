@@ -1,0 +1,72 @@
+; SELPH library — auto-generated
+; 23 abstractions
+
+; seq_const_0: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_const_0 (s) 0)
+
+; seq_const_1: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_const_1 (s) 1)
+
+; seq_const_5: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_const_5 (s) 5)
+
+; seq_const_neg1: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_const_neg1 (s) -1)
+
+; seq_inc_1: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_inc_1 (s) (idx x))
+
+; seq_inc_2: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_inc_2 (s) (add (idx x) (idx x)))
+
+; seq_inc_3: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_inc_3 (s) (add (idx x) (seq_inc_2 x)))
+
+; seq_dec_1: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_dec_1 (s) (add (last x) (seq_const_neg1 x)))
+
+; seq_inc_5: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_inc_5 (s) (add (last x) (seq_const_5 x)))
+
+; seq_identity: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_identity (s) (idx x))
+
+; seq_idx_plus1: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_idx_plus1 (s) (add (idx x) (seq_const_1 x)))
+
+; seq_idx_times2: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_idx_times2 (s) (seq_inc_2 x))
+
+; seq_idx_times3: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_idx_times3 (s) (seq_inc_3 x))
+
+; seq_squares: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_squares (s) (add (seq_inc_2 x) (seq_dec_1 x)))
+
+; seq_triangular: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_triangular (s) (add (idx x) (last x)))
+
+; seq_idx_sq_plus1: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_idx_sq_plus1 (s) (seq_squares x))
+
+; seq_double_idx: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_double_idx (s) (add (idx x) (seq_idx_plus1 x)))
+
+; seq_mod2: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_mod2 (s) (v0 x))
+
+; seq_mod3: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_mod3 (s) (v1 x))
+
+; seq_fib: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_fib (s) (add (last x) (v2 x)))
+
+; seq_sum_prev2: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_sum_prev2 (s) (seq_fib x))
+
+; seq_double_prev: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_double_prev (s) (add (last x) (last x)))
+
+; seq_sq_mod3: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro seq_sq_mod3 (s) (v1 x))
+

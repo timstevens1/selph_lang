@@ -1,0 +1,100 @@
+[
+  {
+    "name": "lang_repeat_a",
+    "params": [
+      "s"
+    ],
+    "body_source": "97"
+  },
+  {
+    "name": "lang_repeat_b",
+    "params": [
+      "s"
+    ],
+    "body_source": "98"
+  },
+  {
+    "name": "lang_repeat_x",
+    "params": [
+      "s"
+    ],
+    "body_source": "(last x)"
+  },
+  {
+    "name": "lang_alt_ab",
+    "params": [
+      "s"
+    ],
+    "body_source": "(v0 x)"
+  },
+  {
+    "name": "lang_alt_cd",
+    "params": [
+      "s"
+    ],
+    "body_source": "(v0 x)"
+  },
+  {
+    "name": "lang_cycle_abc",
+    "params": [
+      "s"
+    ],
+    "body_source": "(v1 x)"
+  },
+  {
+    "name": "lang_cycle_abcd",
+    "params": [
+      "s"
+    ],
+    "body_source": "(v0 x)"
+  },
+  {
+    "name": "lang_ascending_a",
+    "params": [
+      "s"
+    ],
+    "body_source": "(add (idx x) (lang_repeat_a x))"
+  },
+  {
+    "name": "lang_ascending_d",
+    "params": [
+      "s"
+    ],
+    "body_source": "(add (idx x) 100)"
+  },
+  {
+    "name": "lang_descending_j",
+    "params": [
+      "s"
+    ],
+    "body_source": "(add (last x) -1)"
+  },
+  {
+    "name": "lang_step2_a",
+    "params": [
+      "s"
+    ],
+    "body_source": "(add (idx x) (lang_ascending_a x))"
+  },
+  {
+    "name": "lang_each2_ab",
+    "params": [
+      "s"
+    ],
+    "body_source": "(v0 x)"
+  },
+  {
+    "name": "lang_mirror_ab",
+    "params": [
+      "s"
+    ],
+    "body_source": "(v1 x)"
+  },
+  {
+    "name": "lang_depth2",
+    "params": [
+      "s"
+    ],
+    "body_source": "(v0 x)"
+  }
+]

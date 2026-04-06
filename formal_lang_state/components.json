@@ -1,0 +1,142 @@
+[
+  {
+    "name": "lang_repeat_a",
+    "builtin": "lang_repeat_a",
+    "arity": 1,
+    "ret_type": 0,
+    "param_types": [
+      1
+    ],
+    "priority": 30.0
+  },
+  {
+    "name": "lang_repeat_b",
+    "builtin": "lang_repeat_b",
+    "arity": 1,
+    "ret_type": 0,
+    "param_types": [
+      1
+    ],
+    "priority": 30.0
+  },
+  {
+    "name": "lang_repeat_x",
+    "builtin": "lang_repeat_x",
+    "arity": 1,
+    "ret_type": 0,
+    "param_types": [
+      1
+    ],
+    "priority": 30.0
+  },
+  {
+    "name": "lang_alt_ab",
+    "builtin": "lang_alt_ab",
+    "arity": 1,
+    "ret_type": 0,
+    "param_types": [
+      1
+    ],
+    "priority": 30.0
+  },
+  {
+    "name": "lang_alt_cd",
+    "builtin": "lang_alt_cd",
+    "arity": 1,
+    "ret_type": 0,
+    "param_types": [
+      1
+    ],
+    "priority": 30.0
+  },
+  {
+    "name": "lang_cycle_abc",
+    "builtin": "lang_cycle_abc",
+    "arity": 1,
+    "ret_type": 0,
+    "param_types": [
+      1
+    ],
+    "priority": 30.0
+  },
+  {
+    "name": "lang_cycle_abcd",
+    "builtin": "lang_cycle_abcd",
+    "arity": 1,
+    "ret_type": 0,
+    "param_types": [
+      1
+    ],
+    "priority": 30.0
+  },
+  {
+    "name": "lang_ascending_a",
+    "builtin": "lang_ascending_a",
+    "arity": 1,
+    "ret_type": 0,
+    "param_types": [
+      1
+    ],
+    "priority": 30.0
+  },
+  {
+    "name": "lang_ascending_d",
+    "builtin": "lang_ascending_d",
+    "arity": 1,
+    "ret_type": 0,
+    "param_types": [
+      1
+    ],
+    "priority": 30.0
+  },
+  {
+    "name": "lang_descending_j",
+    "builtin": "lang_descending_j",
+    "arity": 1,
+    "ret_type": 0,
+    "param_types": [
+      1
+    ],
+    "priority": 30.0
+  },
+  {
+    "name": "lang_step2_a",
+    "builtin": "lang_step2_a",
+    "arity": 1,
+    "ret_type": 0,
+    "param_types": [
+      1
+    ],
+    "priority": 30.0
+  },
+  {
+    "name": "lang_each2_ab",
+    "builtin": "lang_each2_ab",
+    "arity": 1,
+    "ret_type": 0,
+    "param_types": [
+      1
+    ],
+    "priority": 30.0
+  },
+  {
+    "name": "lang_mirror_ab",
+    "builtin": "lang_mirror_ab",
+    "arity": 1,
+    "ret_type": 0,
+    "param_types": [
+      1
+    ],
+    "priority": 30.0
+  },
+  {
+    "name": "lang_depth2",
+    "builtin": "lang_depth2",
+    "arity": 1,
+    "ret_type": 0,
+    "param_types": [
+      1
+    ],
+    "priority": 30.0
+  }
+]

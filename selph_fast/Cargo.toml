@@ -1,0 +1,19 @@
+[package]
+name = "selph_fast"
+version = "0.2.0"
+edition = "2024"
+
+[lib]
+name = "selph_fast"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "selph"
+path = "src/main.rs"
+
+[dependencies]
+pyo3 = { version = "0.27.0", optional = true }
+
+[features]
+default = ["python"]
+python = ["pyo3"]

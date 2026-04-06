@@ -1,0 +1,17 @@
+; SELPH hello world
+
+(define greeting "Hello from SELPH!")
+(print greeting)
+
+; Define and use a function
+(define square (lambda (x) (multiply x x)))
+(print (concat "5 squared = " (to-string (square 5))))
+
+; Higher-order programming
+(define nums (list 1 2 3 4 5))
+(define squares (map square nums))
+(print (concat "Squares: " (string-join (map to-string squares) ", ")))
+
+; Library-style abstraction
+(defmacro double (x) (add x x))
+(print (concat "Double 21 = " (to-string (double 21))))

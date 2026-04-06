@@ -1,0 +1,21 @@
+; Sequence prediction helpers
+; Input format: "idx v0 v1 v2 v3" (space-separated numbers)
+; idx = position, v0-v3 = context window (v3 = most recent)
+
+(defmacro idx (s)
+  (to-number (head (string-split s " "))))
+
+(defmacro v0 (s)
+  (to-number (head (tail (string-split s " ")))))
+
+(defmacro v1 (s)
+  (to-number (head (tail (tail (string-split s " "))))))
+
+(defmacro v2 (s)
+  (to-number (head (tail (tail (tail (string-split s " ")))))))
+
+(defmacro v3 (s)
+  (to-number (head (tail (tail (tail (tail (string-split s " "))))))))
+
+(defmacro last (s)
+  (to-number (head (tail (tail (tail (tail (string-split s " "))))))))

@@ -1,0 +1,9 @@
+; Sequence prediction test: f(i) = i (identity/counting)
+; Input: "idx v0 v1 v2 v3", Output: idx value
+
+; Examples as (input output) pairs
+("4 0 1 2 3" 4)
+("5 1 2 3 4" 5)
+("6 2 3 4 5" 6)
+("7 3 4 5 6" 7)
+("8 4 5 6 7" 8)

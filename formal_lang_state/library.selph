@@ -1,0 +1,45 @@
+; SELPH library — auto-generated
+; 14 abstractions
+
+; lang_repeat_a: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro lang_repeat_a (s) 97)
+
+; lang_repeat_b: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro lang_repeat_b (s) 98)
+
+; lang_repeat_x: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro lang_repeat_x (s) (last x))
+
+; lang_alt_ab: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro lang_alt_ab (s) (v0 x))
+
+; lang_alt_cd: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro lang_alt_cd (s) (v0 x))
+
+; lang_cycle_abc: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro lang_cycle_abc (s) (v1 x))
+
+; lang_cycle_abcd: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro lang_cycle_abcd (s) (v0 x))
+
+; lang_ascending_a: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro lang_ascending_a (s) (add (idx x) (lang_repeat_a x)))
+
+; lang_ascending_d: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro lang_ascending_d (s) (add (idx x) 100))
+
+; lang_descending_j: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro lang_descending_j (s) (add (last x) -1))
+
+; lang_step2_a: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro lang_step2_a (s) (add (idx x) (lang_ascending_a x)))
+
+; lang_each2_ab: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro lang_each2_ab (s) (v0 x))
+
+; lang_mirror_ab: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro lang_mirror_ab (s) (v1 x))
+
+; lang_depth2: (?t0) -> ?t0  freq=1 comp=0.0
+(defmacro lang_depth2 (s) (v0 x))
+
