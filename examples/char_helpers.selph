@@ -1,0 +1,20 @@
+; Character sequence helpers
+; Input format: "idx c0 c1 c2 c3" (space-separated: index then 4 context chars)
+; The index is numeric, characters are single-char strings.
+
+; Extract index (position in sequence)
+(defmacro idx (s)
+  (to-number (head (string-split s " "))))
+
+; Extract context characters (c0=oldest, c3=most recent)
+(defmacro c0 (s) (head (tail (string-split s " "))))
+(defmacro c1 (s) (head (tail (tail (string-split s " ")))))
+(defmacro c2 (s) (head (tail (tail (tail (string-split s " "))))))
+(defmacro c3 (s) (head (tail (tail (tail (tail (string-split s " ")))))))
+(defmacro last (s) (head (tail (tail (tail (tail (string-split s " ")))))))
+
+; Character arithmetic helpers
+; next-char: advance a character by 1 (a->b, b->c, etc.)
+(defmacro next-char (c) (code-char (add (char-code c) 1)))
+; prev-char: go back by 1 (b->a, c->b, etc.)
+(defmacro prev-char (c) (code-char (subtract (char-code c) 1)))

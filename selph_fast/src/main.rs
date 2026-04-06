@@ -375,8 +375,14 @@ fn node_to_value(nodes: &[Node], idx: usize) -> Option<Value> {
         Node::Str(s) => Some(Value::Str(s.clone())),
         Node::Bool(b) => Some(Value::Bool(*b)),
         Node::Symbol(s) => {
-            // Try parsing as number
-            if let Ok(n) = s.parse::<f64>() {
+            // Try parsing as bool, then number, then fall back to string
+            if s == "true" {
+                Some(Value::Bool(true))
+            } else if s == "false" {
+                Some(Value::Bool(false))
+            } else if s == "nil" {
+                Some(Value::Nil)
+            } else if let Ok(n) = s.parse::<f64>() {
                 Some(Value::Num(n))
             } else {
                 Some(Value::Str(s.clone()))

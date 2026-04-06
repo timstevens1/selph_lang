@@ -421,6 +421,50 @@ pub fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
             let start = start.min(end);
             Ok(Value::Str(chars[start..end].iter().collect()))
         }
+        // String analysis builtins — enable context-free language tasks
+        "count-char" => {
+            // (count-char "aabba" "a") => 3
+            let s = string(&args[0])?;
+            let c = string(&args[1])?;
+            Ok(Value::Num(s.matches(&c as &str).count() as f64))
+        }
+        "string-replace" => {
+            // (string-replace "hello" "l" "r") => "herro"
+            let s = string(&args[0])?;
+            let from = string(&args[1])?;
+            let to = string(&args[2])?;
+            Ok(Value::Str(s.replace(&from as &str, &to as &str)))
+        }
+        "string-chars" => {
+            // (string-chars "abc") => ("a" "b" "c")
+            let s = string(&args[0])?;
+            Ok(Value::List(s.chars().map(|c| Value::Str(c.to_string())).collect()))
+        }
+        "string-starts-with" => {
+            let s = string(&args[0])?;
+            let prefix = string(&args[1])?;
+            Ok(Value::Bool(s.starts_with(&prefix as &str)))
+        }
+        "string-ends-with" => {
+            let s = string(&args[0])?;
+            let suffix = string(&args[1])?;
+            Ok(Value::Bool(s.ends_with(&suffix as &str)))
+        }
+        // Character ↔ number conversion
+        "char-code" => {
+            // (char-code "a") => 97
+            let s = string(&args[0])?;
+            s.chars().next()
+                .map(|c| Value::Num(c as u32 as f64))
+                .ok_or("char-code: empty string".into())
+        }
+        "code-char" => {
+            // (code-char 97) => "a"
+            let n = num(&args[0])? as u32;
+            char::from_u32(n)
+                .map(|c| Value::Str(c.to_string()))
+                .ok_or(format!("code-char: invalid code point {}", n))
+        }
         "identity" => Ok(args[0].clone()),
         "print" => {
             for a in args { print!("{}", value_to_string(a)); }
@@ -800,7 +844,9 @@ pub fn make_default_env() -> Env {
         "nth", "slice", "sort", "reverse", "append",
         "range", "contains", "zip", "enumerate",
         "round", "pow", "sqrt", "log",
-        "string-nth", "string-slice",
+        "string-nth", "string-slice", "char-code", "code-char",
+        "count-char", "string-replace", "string-chars",
+        "string-starts-with", "string-ends-with",
         "map", "reduce", "filter", "identity", "print",
         "ns-get", "ns-put", "ns-keys", "ns-values", "ns-merge",
         "ns-size", "ns-flatten", "ns?", "ns-empty",
@@ -872,6 +918,13 @@ pub fn make_default_env() -> Env {
         ("to-number", 1, vec!["string"], "number"),
         ("string-nth", 2, vec!["string", "number"], "string"),
         ("string-slice", 3, vec!["string", "number", "number"], "string"),
+        ("char-code", 1, vec!["string"], "number"),
+        ("code-char", 1, vec!["number"], "string"),
+        ("count-char", 2, vec!["string", "string"], "number"),
+        ("string-replace", 3, vec!["string", "string", "string"], "string"),
+        ("string-chars", 1, vec!["string"], "list"),
+        ("string-starts-with", 2, vec!["string", "string"], "bool"),
+        ("string-ends-with", 2, vec!["string", "string"], "bool"),
     ] { let (k, v) = bi(n, a, &p, r); builtins_ns.insert(k, v); }
     // List
     for (n, a, p, r) in [

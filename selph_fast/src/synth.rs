@@ -638,6 +638,41 @@ pub fn synthesize_full(
         scoped
     };
 
+    // ── Probe-and-filter: remove macros that error on actual inputs ──
+    // Library macros from previous curricula may expect different input
+    // formats (e.g. space-separated vs raw strings). Test each unary
+    // macro against the first input — if it errors, exclude it.
+    let scoped_components: Vec<&SynthComponent> = if !inputs.is_empty() {
+        let test_input = &inputs[0];
+        scoped_components.into_iter().filter(|comp| {
+            // Only probe macros (arity 1, have a builtin name that matches a macro)
+            if comp.arity != 1 { return true; }
+            let bn = match &comp.builtin {
+                Some(n) => n,
+                None => return true,
+            };
+            // Check if this is a library macro (not a builtin)
+            let is_macro = macros.iter().any(|(mn, _, _, _)| mn == bn);
+            if !is_macro { return true; }
+            // Probe: try calling the macro with the first input
+            let macro_data = macros.iter().find(|(mn, _, _, _)| mn == bn);
+            if let Some((_, params, mnodes, mroot)) = macro_data {
+                let val = Value::RustMacro(params.clone(), mnodes.clone(), *mroot);
+                let empty: Vec<Node> = Vec::new();
+                let mut env = eval::make_default_env();
+                for (nm, ps, mn, mr) in &macro_env {
+                    env_define(&mut env, nm.clone(),
+                        Value::RustMacro(ps.clone(), mn.clone(), *mr));
+                }
+                eval::apply(&val, &[test_input.clone()], &empty, &mut env).is_ok()
+            } else {
+                true
+            }
+        }).collect()
+    } else {
+        scoped_components
+    };
+
     // Use scoped components for the rest of synthesis.
     let components = &scoped_components;
 
@@ -734,6 +769,87 @@ pub fn synthesize_full(
             ret_type: actual_ret_type,
             priority: comp.priority,
         });
+    }
+
+    // ── Auto-extract constants from examples ──────────────────────
+    // Extract unique characters and numbers from examples, scored by
+    // frequency. Constants that appear more often across examples get
+    // higher priority — the interleaved search will try them first.
+    //
+    // This replaces hard-coded string constants like "a", "b", "(", ")"
+    // and makes the synthesizer adapt to any domain automatically.
+    {
+        let mut seen_str_constants: HashSet<String> = HashSet::new();
+        let mut seen_num_constants: HashSet<i64> = HashSet::new();
+        let mut str_freq: HashMap<String, usize> = HashMap::new();
+
+        // Collect existing constants already in the pool
+        for p in &pool {
+            if let Node::Str(s) = &p.nodes[p.root] {
+                seen_str_constants.insert(s.clone());
+            }
+            if let Node::Num(n) = &p.nodes[p.root] {
+                seen_num_constants.insert(*n as i64);
+            }
+        }
+
+        // Count character frequency across ALL examples
+        let n_examples = inputs.len().max(1);
+        for val in inputs.iter().chain(expected.iter()) {
+            if let Value::Str(s) = val {
+                // Count unique chars per example (not total occurrences)
+                let mut seen_in_example: HashSet<char> = HashSet::new();
+                for ch in s.chars() {
+                    if seen_in_example.insert(ch) {
+                        *str_freq.entry(ch.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        // Add string constants with frequency-based priority
+        // Priority = (frequency / n_examples) * 20
+        // A char in every example gets priority 20+, rare chars get ~1
+        for (cs, freq) in &str_freq {
+            if !seen_str_constants.contains(cs) {
+                seen_str_constants.insert(cs.clone());
+                let priority = (*freq as f64 / n_examples as f64) * 20.0;
+                pool.push(SynthPool {
+                    nodes: vec![Node::Str(cs.clone())],
+                    root: 0,
+                    ret_type: TYPE_STR,
+                    priority,
+                });
+            }
+        }
+
+        // Extract small numeric outputs as constants
+        for val in expected.iter() {
+            if let Value::Num(n) = val {
+                let ni = *n as i64;
+                if ni.abs() <= 100 && !seen_num_constants.contains(&ni) {
+                    seen_num_constants.insert(ni);
+                    pool.push(SynthPool {
+                        nodes: vec![Node::Num(*n)],
+                        root: 0,
+                        ret_type: TYPE_NUM,
+                        priority: 0.0,
+                    });
+                }
+            }
+        }
+
+        // Add empty string if any string values are present
+        let has_strings = inputs.iter().chain(expected.iter())
+            .any(|v| matches!(v, Value::Str(_)));
+        if has_strings && !seen_str_constants.contains("") {
+            pool.push(SynthPool {
+                nodes: vec![Node::Str(String::new())],
+                root: 0,
+                ret_type: TYPE_STR,
+                priority: 0.0,
+            });
+        }
     }
 
     // Test atoms
@@ -1318,6 +1434,11 @@ pub fn default_synth_components(
         SynthComponent { name: "7".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
         SynthComponent { name: "10".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
         SynthComponent { name: "-1".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
+        // String constants — common characters for formal language tasks
+        SynthComponent { name: "a".into(), builtin: None, arity: 0, ret_type: 1, param_types: vec![], priority: 0.0 },
+        SynthComponent { name: "b".into(), builtin: None, arity: 0, ret_type: 1, param_types: vec![], priority: 0.0 },
+        SynthComponent { name: "(".into(), builtin: None, arity: 0, ret_type: 1, param_types: vec![], priority: 0.0 },
+        SynthComponent { name: ")".into(), builtin: None, arity: 0, ret_type: 1, param_types: vec![], priority: 0.0 },
     ];
 
     // Unary num->num
@@ -1348,6 +1469,48 @@ pub fn default_synth_components(
     comps.push(SynthComponent {
         name: "string-length".into(), builtin: Some("string-length".into()),
         arity: 1, ret_type: 0, param_types: vec![1], priority: 0.0,
+    });
+
+    // string-nth: (str, num) -> str (get character at index)
+    comps.push(SynthComponent {
+        name: "string-nth".into(), builtin: Some("string-nth".into()),
+        arity: 2, ret_type: 1, param_types: vec![1, 0], priority: 0.0,
+    });
+
+    // char-code: str -> num (character to ASCII code)
+    comps.push(SynthComponent {
+        name: "char-code".into(), builtin: Some("char-code".into()),
+        arity: 1, ret_type: 0, param_types: vec![1], priority: 0.0,
+    });
+
+    // code-char: num -> str (ASCII code to character)
+    comps.push(SynthComponent {
+        name: "code-char".into(), builtin: Some("code-char".into()),
+        arity: 1, ret_type: 1, param_types: vec![0], priority: 0.0,
+    });
+
+    // count-char: (str, str) -> num (count occurrences)
+    comps.push(SynthComponent {
+        name: "count-char".into(), builtin: Some("count-char".into()),
+        arity: 2, ret_type: 0, param_types: vec![1, 1], priority: 0.0,
+    });
+
+    // string-replace: (str, str, str) -> str
+    comps.push(SynthComponent {
+        name: "string-replace".into(), builtin: Some("string-replace".into()),
+        arity: 3, ret_type: 1, param_types: vec![1, 1, 1], priority: 0.0,
+    });
+
+    // string-starts-with: (str, str) -> bool
+    comps.push(SynthComponent {
+        name: "string-starts-with".into(), builtin: Some("string-starts-with".into()),
+        arity: 2, ret_type: 2, param_types: vec![1, 1], priority: 0.0,
+    });
+
+    // string-ends-with: (str, str) -> bool
+    comps.push(SynthComponent {
+        name: "string-ends-with".into(), builtin: Some("string-ends-with".into()),
+        arity: 2, ret_type: 2, param_types: vec![1, 1], priority: 0.0,
     });
 
     // Comparison operators: num->num->bool (for if-expression conditions)

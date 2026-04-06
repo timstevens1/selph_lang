@@ -1,0 +1,11 @@
+; Context-free language helpers
+; Provides string constants and predicates for formal language tasks
+
+; Character constants — these become zero-cost atoms in the synthesis pool
+(defmacro char_a (s) "a")
+(defmacro char_b (s) "b")
+(defmacro char_c (s) "c")
+(defmacro char_d (s) "d")
+(defmacro char_open (s) "(")
+(defmacro char_close (s) ")")
+(defmacro char_empty (s) "")
