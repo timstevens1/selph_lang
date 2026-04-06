@@ -2,9 +2,9 @@
 
 ## From Enumerative Solver to Self-Building Architecture
 
-**Version 0.2 — April 2026**
+**Version 0.3 — April 6, 2026**
 
-Based on implementation experience with the v0.1 Architecture Spec. Supersedes §13 (Self-Hosting) and §14 (MVP) with a concrete, incremental path.
+Based on implementation experience with the v0.1 Architecture Spec and the Rust-native migration. Supersedes v0.2 with validated results from the standalone Rust binary.
 
 ---
 
@@ -16,51 +16,128 @@ The architecture IS the curriculum. Change the curriculum, change the architectu
 
 ---
 
-## 2. What Exists (April 2026)
+## 2. What Exists (April 6, 2026)
 
-### 2.1 Language and Evaluator
+### 2.1 Standalone Rust Binary
+The system now runs as a single Rust binary (`selph`) with zero runtime dependencies. The Python/PyO3 implementation remains for reference but is no longer the primary execution path.
+
 - S-expression parser with full EBNF from v0.1 spec
-- Tree-walking evaluator (Python + Rust) with ~60 builtins
+- Tree-walking evaluator with 55+ builtins
 - First-class namespaces: functions, data, and cache in the same tree
-- Hindley-Milner type inference with shape tracking
-- Macro system (defmacro) in both Python and Rust evaluators
+- Hindley-Milner type inference (as second-pass pruning over u8 type tags)
+- Macro system (defmacro) with letrec semantics (Rc<RefCell> shared scope)
+- Eval depth limit (256) prevents stack overflow from deep macro chains
 
-### 2.2 Spec and Verification
-- Specs as first-class values with typed goals (Levels 0-2 mechanical)
-- `(:examples ...)` — input/output pairs (Level 0)
-- `(:pattern ...)` — structural constraints (Level 1)
-- `(:satisfy ...)` — predicate functions (Level 2)
-- `(:minimize ...)` / `(:maximize ...)` — optimization objectives
-- Reward computation: `hard_gate × (w_goal + w_parent + w_global)`
-- Held-out validation for generalization
+### 2.2 Builtins (55 total)
+- **Arithmetic:** add, subtract, multiply, divide, modulo, abs, negate, min, max, floor, ceil, round, pow, sqrt, log
+- **Comparison:** <, >, <=, >=, =, not, even, odd
+- **String:** upper, lower, reverse, trim, length, contains, split, join, concat, nth, slice, starts-with, ends-with, replace, chars
+- **Character:** char-code, code-char (char/number conversion)
+- **String analysis:** count-char (occurrence counting)
+- **List:** list, head, tail, length, cons, nth, slice, sort, reverse, append, range, contains, zip, enumerate
+- **Higher-order:** map, reduce, filter, apply, identity
+- **Type:** type-of, number?, string?, bool?, list?, nil?, function?
+- **Namespace:** get, put, keys, values, merge, size, flatten, has, get-or, empty, ns?
+- **Meta/self-hosting:** synthesize, synthesize-optimize, eval-source, eval-in, try, define, error
+- **Introspection:** `__builtins__` namespace with type metadata for all builtins
 
-### 2.3 Synthesis
-- Bottom-up enumerative search with type-directed pruning
+### 2.3 Spec and Verification (Rust-native)
+- Specs as first-class values with typed goals (Levels 0-3)
+- verify.rs: VerificationResult with type/shape/constraint gates + goal scoring
+- Reward computation: `hard_gate * (w_goal + w_parent + w_global)`
+- Held-out validation for generalization (`--validate` flag)
+- Optimization synthesis: `--minimize`/`--maximize` for objective-driven search
+
+### 2.4 Synthesis
+- **Priority-weighted interleaved search:** candidates sorted by combined priority of component + arguments. High-value compositions tried first regardless of which component they use.
+- Bottom-up enumerative search with HM type-directed pruning
 - If-expression synthesis with expected-output matching
 - Divide-and-conquer for multi-way classification
 - Failure-driven induction (intermediate value decomposition)
 - Observational equivalence deduplication
-- Rust accelerated inner loop (18,700x fewer candidates on pair-min)
+- **Auto-constant extraction:** unique characters and numbers from examples added to pool, scored by frequency
+- **Probe-and-filter:** macros that error on actual inputs automatically excluded
+- **Trivial promotion skip:** prevents self-referential macros (e.g., `(defmacro f (x) (f x))`)
 
-### 2.4 Library System
-- Promotion: solved programs become single-step primitives
-- Extraction: anti-unification + compression scoring
+### 2.5 Library System
+- Promotion: solved programs become single-step primitives (immediate, within the curriculum loop)
+- Extraction: anti-unification + compression scoring (abstraction.rs)
 - Pruning: observational + builtin equivalence + usage tracking
-- Persistence: save/load as SELPH source files
-- Immediate promotion within stages (not just at transitions)
+- **Trained model = library file:** the .selph output IS the model. Contains solutions, extracted abstractions, and learned heuristic. Loading it restores the full learned state.
+- Trivial wrapper detection prevents re-promoting existing macros on reload
 
-### 2.5 Search Strategy
-- Programmable heuristics as SELPH functions
-- Component priorities with type-aware + recency ordering
-- Interleaved online learning: priorities update after each solve
-- Multi-tree synthesis across arbitrary namespaces
-- `synthesize` exposed as a SELPH builtin
+### 2.6 Search Strategy
+- **Interleaved priority learning:** component priorities update after every solve (learn_rate boost). No explicit meta-synthesis needed — the priority weights capture the signal.
+- Programmable heuristics via `make_selph_scorer` / `make_selph_depth_filter`
+- First-class namespace trees: `--tree` flag on synth and grow commands
+- `synthesize` exposed as a SELPH builtin for self-improvement loops
+- Meta-heuristic synthesis available via `--meta` flag (failure-triggered, not periodic)
 
-### 2.6 Validated Results
-- 6-stage curriculum: 61/62 tasks (98%), Stages 0-4 at 100%
-- Library bootstrapping: 0/4 → 4/4 at Stage 2, 98% search reduction
-- Sorting: pair-min in 5 candidates (Rust) vs 93,429 (Python)
-- Stochastic process benchmarks with Bayes-optimal baselines
+### 2.7 CLI Commands (10 total)
+```
+selph eval       Evaluate SELPH files or expressions
+selph parse      Parse and print AST
+selph synth      Synthesize from examples (--tree, --minimize, --maximize, --validate)
+selph grow       Run curriculum (--meta, --extract, --validate, --filter, --tree)
+selph bench      Run stochastic benchmark suite
+selph generate   Generate a curriculum in .selph format
+selph verify     Verify a program against a spec
+selph multi-synth Synthesize across namespace trees
+selph repl       Interactive REPL
+selph help       Show usage
+```
+
+### 2.8 Rust Modules (15 source files)
+types.rs, parser.rs, eval.rs, synth.rs, hm.rs, library.rs, namespace.rs, induce.rs, divide.rs, verify.rs, abstraction.rs, multitree.rs, stochastic.rs, meta.rs, taskgen.rs
+
+208 tests, all passing.
+
+### 2.9 Validated Results
+
+**Sequence curriculum (13 tasks): 13/13 (100%) in 25 seconds**
+
+| Task | Candidates | Solution |
+|------|-----------|----------|
+| const_1 | 3 | `1` |
+| const_5 | 7 | `5` |
+| identity | 12 | `(idx x)` |
+| double_idx | 1,261 | `(add (idx x) (idx x))` |
+| triple_idx | 1,281 | `(add (idx x) (double_idx x))` |
+| last_plus_1 | 1,563 | `(add (v3 x) (const_1 x))` |
+| last_minus_1 | 1,861 | `(subtract (v3 x) (const_1 x))` |
+| **squares** | **1,301** | **`(multiply (idx x) (idx x))`** |
+| triangular | 1,267 | `(add (idx x) (v3 x))` |
+| fibonacci | 1,341 | `(add (v3 x) (v2 x))` |
+| double_prev | 1,271 | `(add (v3 x) (v3 x))` |
+| **cubes** | **1,690** | **`(multiply (idx x) (squares x))`** |
+| idx_plus_last | 25 | `(triangular x)` |
+
+Key results:
+- `cubes = (multiply (idx x) (squares x))` — compositional: uses promoted `squares` macro
+- `idx_plus_last = (triangular x)` — library cascade: trivially reuses promoted macro (25 candidates)
+- Priority-weighted interleaving was the breakthrough: tries high-value compositions first
+
+**Character-native formal language (12 tasks): 10/12 (83%)**
+- ascending: `(next-char (c3 x))` — character arithmetic
+- step2: `(next-char (next-char (c3 x)))` — double composition
+
+**Context-free language (17 tasks): 8/17 solved so far**
+- `(count-char x "a")` — 21 candidates with auto-extracted constants
+- `(= (count-char x "a") (count-char x "b"))` — a^n b^n prerequisite
+- `(string-starts-with x "a")` — 47 candidates
+- `(= x (string-reverse x))` — palindrome (pending, needs depth 2)
+
+### 2.10 Self-Hosting Infrastructure
+SELPH programs can now express their own infrastructure:
+
+```lisp
+; The self-improvement loop works end-to-end:
+(do (define result (synthesize spec))
+    (define learned (eval-source (ns-get result "source")))
+    (learned 7))  ; => 14
+```
+
+Example SELPH programs in `examples/`: curriculum.selph, scoping.selph, taskgen.selph, verify.selph, heuristics.selph, filter.selph
 
 ---
 
@@ -339,15 +416,44 @@ This is itself an optimization problem — and it could eventually be solved by 
 
 ---
 
-## 8. Immediate Next Steps
+## 8. Immediate Next Steps (updated April 6, 2026)
 
-1. **Logging infrastructure:** Record all synthesis runs as (spec, solution, candidates, components_used, decomposition_strategy) tuples. This is the training data factory.
+### 8.1 Performance: Interleaved search memory optimization
+The priority-weighted interleaved search clones full node vectors into the pending list for sorting. With large component pools (50+ components × many pool entries), this allocates gigabytes. **Fix: sort indices/references, not cloned node trees.** This is the blocker for running context-free tasks with a loaded library.
 
-2. **Meta-1 curriculum:** Design tasks for learning search heuristics. Start with "predict output type from examples" (the simplest meta-task).
+### 8.2 Heuristic optimization via solution ranking
+Key insight: once you HAVE solutions from a curriculum run, evaluating a candidate heuristic doesn't require full synthesis. You just check: "what rank would the known solution have under this heuristic's ordering?" This is O(pool_size) comparison, not O(budget) evaluation.
 
-3. **Constrained decoding prototype:** Hook the type system into a small model's token mask. This is needed before Phase 4 but can be developed in parallel.
+The loop:
+1. Solve curriculum → get solutions + pool snapshots
+2. For each candidate heuristic: score = avg(rank of known solution in heuristic-ordered pool)
+3. `synthesize_optimize --minimize` → find the heuristic that minimizes average rank
 
-4. **Curriculum optimizer:** Given a task suite and a compute budget, find the ordering and difficulty gradient that minimizes total candidates. This is a meta-meta-task that the system could eventually learn.
+This makes meta-heuristic synthesis cheap enough to run after every curriculum, and the result is directly useful for the next run.
+
+### 8.3 Context-free language curriculum
+The curriculum exists (`examples/context_free_tasks.selph`) and the string analysis builtins work. First results: `(count-char x "a")` found in 21 candidates, `(= (count-char x "a") (count-char x "b"))` for a^n b^n equality in 2,987 candidates. Blocked on 8.1 (memory) for running with a loaded library.
+
+Remaining CF tasks need scaffolding:
+- String replacement tasks (remove_a, remove_b) to teach `string-replace`
+- Ordering tasks (no_b_before_a) that compose replacement + counting
+- Palindrome: `(= x (string-reverse x))` — should be findable at depth 1
+- Bracket matching: needs nesting depth tracking, likely needs reduce/fold
+
+### 8.4 Chained curriculum execution
+The train→save→reload loop works. Next: build a standard multi-stage pipeline:
+```
+selph grow sequence_tasks.selph --library seq_helpers.selph -o model.selph
+selph grow formal_lang_tasks.selph --library model.selph -o model.selph
+selph grow context_free_tasks.selph --library model.selph -o model.selph
+```
+Each stage grows the shared library. The probe-and-filter ensures macros from incompatible input formats are automatically excluded.
+
+### 8.5 Curriculum design principles (learned from this session)
+- **Every builtin needs a teaching task:** The synthesizer can't discover a 3-arg function with specific constants unless it's been taught simpler uses first (e.g., teach `count-char` before composing `(= (count-char x "a") (count-char x "b"))`)
+- **Auto-constant extraction helps but needs frequency scoring:** Characters that appear in every example get high priority; rare characters get low priority
+- **The curriculum is the only tuning knob:** All "architecture" improvements should flow from curriculum design, not from hardcoded Rust logic
+- **Trivial solutions should be detected, not promoted:** When a task is already solved by an existing macro, skip promotion to avoid self-referential macros
 
 ---
 
