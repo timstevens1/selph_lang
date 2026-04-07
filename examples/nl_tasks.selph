@@ -1,0 +1,149 @@
+; Natural language curriculum
+; Builds from word operations → vocabulary → sentence patterns.
+; Requires: nl_helpers.selph (first_word, second_word, last_word, word_count)
+
+; === Stage 0: Word-level compositions ===
+; These teach the system to compose word-access helpers
+
+; first_char: first character of input
+(task "first_char" 2
+  ("cat" "c") ("dog" "d") ("apple" "a") ("zebra" "z")
+  ("run" "r") ("sit" "s") ("the" "t") ("big" "b"))
+
+; last_char: last character of input
+(task "last_char" 2
+  ("cat" "t") ("dog" "g") ("apple" "e") ("zebra" "a")
+  ("run" "n") ("sit" "t") ("the" "e") ("big" "g"))
+
+; first_of_sentence: first word of a multi-word input
+(task "first_of_sentence" 2
+  ("the cat" "the") ("a dog" "a") ("big apple" "big")
+  ("my car" "my") ("the book" "the") ("a hat" "a"))
+
+; last_of_sentence: last word of a multi-word input
+(task "last_of_sentence" 2
+  ("the cat" "cat") ("a dog" "dog") ("big apple" "apple")
+  ("my car" "car") ("the book" "book") ("a hat" "hat"))
+
+; count_words: number of words
+(task "count_words" 2
+  ("the cat" 2) ("a big dog" 3) ("hello" 1) ("one two three" 3)
+  ("the" 1) ("the big cat" 3) ("i see" 2) ("a b c d" 4))
+
+; === Stage 1: Vocabulary as predicates ===
+; These are associative (no string pattern) — the system will memorize them.
+
+; is_article: is the word an article?
+(task "is_article" 2
+  ("the" true) ("a" true) ("an" true)
+  ("cat" false) ("dog" false) ("big" false) ("run" false) ("to" false))
+
+; is_noun: is the word a noun?
+(task "is_noun" 2
+  ("cat" true) ("dog" true) ("book" true) ("hat" true) ("car" true) ("apple" true)
+  ("big" false) ("run" false) ("the" false) ("a" false) ("to" false) ("is" false))
+
+; is_verb: is the word a verb?
+(task "is_verb" 2
+  ("run" true) ("sit" true) ("see" true) ("is" true)
+  ("cat" false) ("dog" false) ("the" false) ("a" false) ("big" false) ("hat" false))
+
+; is_adjective: is the word an adjective?
+(task "is_adj" 2
+  ("big" true) ("small" true) ("red" true) ("old" true)
+  ("cat" false) ("run" false) ("the" false) ("a" false) ("dog" false) ("sit" false))
+
+; === Stage 1b: Morphological rules ===
+; These are computable from string features.
+
+; is_plural: does the word end with "s"?
+(task "is_plural" 2
+  ("cats" true) ("dogs" true) ("books" true) ("hats" true)
+  ("cat" false) ("dog" false) ("book" false) ("hat" false))
+
+; is_gerund: does the word end with "ing"?
+(task "is_gerund" 2
+  ("running" true) ("sitting" true) ("seeing" true) ("going" true)
+  ("run" false) ("sit" false) ("see" false) ("go" false))
+
+; === Stage 2: Sentence pattern recognition ===
+; Composes word extraction (Stage 0) with vocabulary (Stage 1).
+; BD pre-check should find these as (and P Q) / (not P) compositions.
+
+; starts_with_article: does the sentence start with an article?
+(task "starts_with_article" 2
+  ("the cat" true) ("a dog" true) ("an apple" true)
+  ("big cat" false) ("cat sits" false) ("run fast" false)
+  ("the book" true) ("old hat" false))
+
+; starts_with_adj: does the sentence start with an adjective?
+(task "starts_with_adj" 2
+  ("big cat" true) ("small dog" true) ("red hat" true) ("old book" true)
+  ("the cat" false) ("a dog" false) ("cat sits" false) ("run fast" false))
+
+; ends_with_noun: does the sentence end with a noun?
+(task "ends_with_noun" 2
+  ("the cat" true) ("a dog" true) ("big apple" true) ("old hat" true)
+  ("cat run" false) ("dog sit" false) ("the big" false) ("a old" false))
+
+; ends_with_verb: does the sentence end with a verb?
+(task "ends_with_verb" 2
+  ("cat run" true) ("dog sit" true) ("the see" true) ("a is" true)
+  ("the cat" false) ("a dog" false) ("big apple" false) ("old hat" false))
+
+; article_noun: article followed by noun (the simplest sentence pattern)
+(task "article_noun" 2
+  ("the cat" true) ("a dog" true) ("the book" true) ("a hat" true)
+  ("big cat" false) ("cat the" false) ("run fast" false) ("the big" false))
+
+; === Stage 3: POS tagging (word → tag string) ===
+; Maps individual words to their part-of-speech tag as a string.
+; This is associative knowledge — will be memorized.
+
+(task "pos_tag" 2
+  ("cat" "noun") ("dog" "noun") ("book" "noun") ("hat" "noun")
+  ("run" "verb") ("sit" "verb") ("see" "verb") ("is" "verb")
+  ("big" "adj") ("small" "adj") ("red" "adj") ("old" "adj")
+  ("the" "art") ("a" "art") ("an" "art")
+  ("i" "pron") ("you" "pron"))
+
+; === Stage 4: Per-position tagging (sentence → tag of word N) ===
+; Composes pos_tag with word extraction helpers.
+; Early depth extension should find these as (pos_tag (first_word x)) etc.
+
+; tag_first: POS tag of first word
+(task "tag_first" 2
+  ("the cat" "art") ("a dog" "art") ("big apple" "adj") ("old hat" "adj")
+  ("cat run" "noun") ("i see" "pron") ("run dog" "verb") ("you sit" "pron"))
+
+; tag_second: POS tag of second word
+(task "tag_second" 2
+  ("the cat" "noun") ("a dog" "noun") ("big apple" "noun") ("old hat" "noun")
+  ("cat run" "verb") ("i see" "verb") ("the big" "adj") ("a old" "adj"))
+
+; tag_last: POS tag of last word
+(task "tag_last" 2
+  ("the cat" "noun") ("a dog" "noun") ("big apple" "noun") ("old hat" "noun")
+  ("cat run" "verb") ("dog sit" "verb") ("the big" "adj") ("a old" "adj"))
+
+; === Stage 5: Structure assembly (sentence → grammatical structure) ===
+; Composes per-position tag helpers with concat to build structure strings.
+; For 2-word sentences: concat(tag_first(x), concat(" ", tag_last(x)))
+
+; structure of 2-word sentences
+(task "structure_2w" 2
+  ("the cat" "art noun") ("a dog" "art noun") ("big apple" "adj noun")
+  ("old hat" "adj noun") ("cat run" "noun verb") ("i see" "pron verb")
+  ("dog sit" "noun verb") ("you sit" "pron verb"))
+
+; === Stage 6: 3-word sentence structures ===
+; Extends structure classification to 3-word sentences.
+; D&C should find a decision tree using first/second word predicates.
+
+; structure of 3-word sentences
+(task "structure_3w" 3
+  ("the big cat" "art adj noun") ("a red hat" "art adj noun")
+  ("the old dog" "art adj noun") ("an old book" "art adj noun")
+  ("the cat run" "art noun verb") ("a dog sit" "art noun verb")
+  ("big cat run" "adj noun verb") ("old dog sit" "adj noun verb")
+  ("i see cat" "pron verb noun") ("you see dog" "pron verb noun"))

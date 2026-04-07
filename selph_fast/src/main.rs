@@ -74,15 +74,15 @@ fn print_usage() {
     println!("  selph parse -e \"(add 1 2)\"    Parse and print AST");
     println!("  selph synth <spec.selph>      Synthesize from a spec file");
     println!("  selph synth -e '1->2 3->6'    Synthesize from inline examples");
-    println!("    --tree <ns.selph>           Add namespace tree (repeatable)");
+    println!("    --library <lib.selph>       Add library (repeatable)");
     println!("  selph grow <tasks.selph>      Run curriculum: solve, promote, save");
     println!("    --meta                      Enable meta-heuristic learning");
     println!("    --extract                   Enable abstraction extraction");
-    println!("    --tree <ns.selph>           Add namespace tree (repeatable)");
+    println!("    --library <lib.selph>       Add library (repeatable)");
     println!("  selph bench                   Run stochastic benchmark suite");
     println!("  selph generate                Generate a curriculum in .selph format");
     println!("  selph verify <prog> <spec>    Verify a program against a spec");
-    println!("  selph multi-synth <spec>      Synthesize across multiple namespace trees");
+    println!("  selph multi-synth <spec>      Synthesize with multiple libraries");
     println!("  selph repl                    Interactive REPL");
     println!("  selph help                    Show this message");
 }
@@ -213,16 +213,15 @@ fn cmd_repl() {
 
 fn cmd_synth(args: &[String]) {
     if args.is_empty() {
-        eprintln!("Usage: selph synth -e '1->2 3->6' [--depth N] [--budget N] [--library file.selph] [--tree ns.selph]");
+        eprintln!("Usage: selph synth -e '1->2 3->6' [--depth N] [--budget N] [--library file.selph]");
         eprintln!("       selph synth spec.selph");
         return;
     }
 
     let mut max_depth: usize = 2;
     let mut max_candidates: usize = 100000;
-    let mut library_path: Option<String> = None;
+    let mut library_paths: Vec<String> = Vec::new();
     let mut source: Option<String> = None;
-    let mut tree_paths: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -230,9 +229,8 @@ fn cmd_synth(args: &[String]) {
             "-e" => { source = Some(args.get(i + 1).cloned().unwrap_or_default()); i += 2; }
             "--depth" => { max_depth = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(2); i += 2; }
             "--budget" => { max_candidates = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(100000); i += 2; }
-            "--library" => { library_path = args.get(i + 1).cloned(); i += 2; }
-            "--tree" => {
-                if let Some(p) = args.get(i + 1) { tree_paths.push(p.clone()); }
+            "--library" | "--tree" => {
+                if let Some(p) = args.get(i + 1) { library_paths.push(p.clone()); }
                 i += 2;
             }
             other => {
@@ -249,37 +247,30 @@ fn cmd_synth(args: &[String]) {
         None => { eprintln!("No examples provided"); return; }
     };
 
-    // Parse examples: "1->2 3->6 5->10" or from a spec file
     let (inputs, expected) = parse_examples(&examples_str);
     if inputs.is_empty() {
         eprintln!("No valid examples found");
         return;
     }
 
-    // Load library macros if specified
+    // Load libraries
     let mut macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = Vec::new();
-    if let Some(lib_path) = &library_path {
+    for lib_path in &library_paths {
         match fs::read_to_string(lib_path) {
             Ok(lib_source) => {
-                macros = load_library_macros(&lib_source);
-                eprintln!("Loaded {} macros from {}", macros.len(), lib_path);
+                let lib_macros = load_library(&lib_source);
+                eprintln!("Loaded {} macros from {}", lib_macros.len(), lib_path);
+                macros.extend(lib_macros);
             }
-            Err(e) => eprintln!("Warning: couldn't load library: {}", e),
+            Err(e) => eprintln!("Warning: couldn't load library {}: {}", lib_path, e),
         }
-    }
-
-    // Load namespace trees
-    let trees = load_namespace_trees(&tree_paths);
-    if !trees.is_empty() {
-        eprintln!("Loaded {} namespace trees", trees.len());
     }
 
     // Detect input type
     let input_is_string = matches!(&inputs[0], Value::Str(_));
-    let _output_is_string = matches!(&expected[0], Value::Str(_));
 
-    // Build components using synth module (includes comparisons for if-expressions)
-    let (mut synth_comps, extra_bindings) = synth::default_synth_components_with_trees(&macros, &trees);
+    // Build components
+    let mut synth_comps = synth::default_synth_components(&macros);
     if input_is_string {
         for comp in &mut synth_comps {
             if comp.name == "x" { comp.ret_type = 1; }
@@ -294,28 +285,16 @@ fn cmd_synth(args: &[String]) {
     eprintln!("Synthesizing from {} examples, depth={}, budget={}, components={}",
               inputs.len(), max_depth, max_candidates, synth_comps.len());
 
-    // Run synthesis with if-expression support and tree bindings
     let start = std::time::Instant::now();
     let sr = synth::synthesize_with_validation(
         &synth_comps, &inputs, &expected, &macros,
-        max_depth, max_candidates, true, None, &extra_bindings);
+        max_depth, max_candidates, true, None, &[]);
     let elapsed = start.elapsed();
 
     if sr.found {
         let source = node_to_source(sr.nodes.as_ref().unwrap(), sr.root.unwrap());
         println!("{}", source);
         eprintln!("Found in {} candidates ({:.3}s)", sr.candidates_explored, elapsed.as_secs_f64());
-
-        // Trace which trees contributed
-        if !trees.is_empty() {
-            let tree_names: Vec<String> = trees.iter().map(|(n, _)| n.clone()).collect();
-            let used = multitree::trace_solution(
-                sr.nodes.as_ref().unwrap(), sr.root.unwrap(), &tree_names,
-            );
-            if !used.is_empty() {
-                eprintln!("Trees used: {}", used.join(", "));
-            }
-        }
     } else {
         eprintln!("Not found ({} candidates explored, {:.3}s)", sr.candidates_explored, elapsed.as_secs_f64());
         std::process::exit(1);
@@ -399,30 +378,66 @@ fn node_to_value(nodes: &[Node], idx: usize) -> Option<Value> {
     }
 }
 
-fn load_library_macros(source: &str) -> Vec<(String, Vec<String>, Vec<Node>, usize)> {
-    let mut macros = Vec::new();
-
-    let (nodes, roots) = match parse_file(source) {
+/// Load a library file, returning macros as (name, params, nodes, body_root) tuples.
+///
+/// A library file is evaluated. If the last expression produces a Namespace,
+/// its RustMacro entries are extracted. Otherwise, defmacro forms are parsed
+/// structurally (legacy fallback).
+///
+/// This is the single entry point for loading reusable components — there is
+/// no separate "tree" concept. A library IS a namespace.
+fn load_library(source: &str) -> Vec<(String, Vec<String>, Vec<Node>, usize)> {
+    let (nodes_vec, roots) = match parse_file(source) {
         Ok(r) => r,
-        Err(_) => return macros,
+        Err(_) => return Vec::new(),
     };
 
+    // Evaluate the file to get the last value
+    let nodes_rc: Rc<[Node]> = nodes_vec.clone().into();
+    let mut env = make_default_env();
+    let mut last_val = Value::Nil;
+    for &r in &roots {
+        match eval(&nodes_rc, r, &mut env) {
+            Ok(v) => last_val = v,
+            Err(_) => {}
+        }
+    }
+
+    // If the last value is a namespace, extract RustMacro entries from it
+    if let Value::Namespace(ref map) = last_val {
+        let mut macros = Vec::new();
+        for (key, val) in map {
+            if let Value::RustMacro(params, macro_nodes, body_root) = val {
+                macros.push((
+                    key.clone(),
+                    params.iter().map(|s| resolve(*s)).collect(),
+                    macro_nodes.as_ref().to_vec(),
+                    *body_root,
+                ));
+            }
+        }
+        if !macros.is_empty() {
+            return macros;
+        }
+    }
+
+    // Fallback: parse defmacro forms structurally (legacy files without ns export)
+    let mut macros = Vec::new();
     for &root in &roots {
-        if let Node::App(children) = &nodes[root] {
+        if let Node::App(children) = &nodes_vec[root] {
             if children.len() == 4 {
-                if let Node::Symbol(s) = &nodes[children[0]] {
+                if let Node::Symbol(s) = &nodes_vec[children[0]] {
                     if *s == intern("defmacro") {
-                        if let Node::Symbol(name) = &nodes[children[1]] {
-                            if let Node::App(param_indices) = &nodes[children[2]] {
+                        if let Node::Symbol(name) = &nodes_vec[children[1]] {
+                            if let Node::App(param_indices) = &nodes_vec[children[2]] {
                                 let params: Vec<String> = param_indices.iter()
                                     .filter_map(|&i| {
-                                        if let Node::Symbol(s) = &nodes[i] { Some(resolve(*s)) }
+                                        if let Node::Symbol(s) = &nodes_vec[i] { Some(resolve(*s)) }
                                         else { None }
                                     }).collect();
-                                // Clone the body subtree
                                 macros.push((
                                     resolve(*name), params,
-                                    nodes.clone(), children[3],
+                                    nodes_vec.clone(), children[3],
                                 ));
                             }
                         }
@@ -433,38 +448,6 @@ fn load_library_macros(source: &str) -> Vec<(String, Vec<String>, Vec<Node>, usi
     }
 
     macros
-}
-
-/// Load namespace trees from file paths.
-///
-/// Each file is evaluated; the last expression becomes the tree's value.
-/// The tree name is derived from the file stem (e.g., "ops.selph" -> "ops").
-fn load_namespace_trees(paths: &[String]) -> Vec<(String, Value)> {
-    let mut trees = Vec::new();
-    for (idx, path) in paths.iter().enumerate() {
-        if let Ok(src) = fs::read_to_string(path) {
-            if let Ok((nodes_vec, roots)) = parse_file(&src) {
-                let nodes: Rc<[Node]> = nodes_vec.into();
-                let mut env = make_default_env();
-                let mut last_val = Value::Nil;
-                for &r in &roots {
-                    match eval(&nodes, r, &mut env) {
-                        Ok(v) => last_val = v,
-                        Err(e) => { eprintln!("Error evaluating {}: {}", path, e); }
-                    }
-                }
-                let tree_name = std::path::Path::new(path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(&format!("tree{}", idx))
-                    .to_string();
-                trees.push((tree_name, last_val));
-            }
-        } else {
-            eprintln!("Warning: couldn't read tree file: {}", path);
-        }
-    }
-    trees
 }
 
 // ── Synthesis Engine ────────────────────────────────────────────────
@@ -715,7 +698,7 @@ fn vals_equal(a: &Value, b: &Value) -> bool {
 
 fn cmd_curriculum(args: &[String]) {
     if args.is_empty() {
-        eprintln!("Usage: selph grow <tasks.selph> [--library base.selph] [--output grown.selph] [--tree ns.selph]");
+        eprintln!("Usage: selph grow <tasks.selph> [--library base.selph] [--output grown.selph]");
         eprintln!("       selph grow <tasks.selph> --budget 200000 --depth 3");
         eprintln!("       selph grow <tasks.selph> --meta --extract");
         eprintln!();
@@ -727,7 +710,7 @@ fn cmd_curriculum(args: &[String]) {
     }
 
     let mut task_file = String::new();
-    let mut library_path: Option<String> = None;
+    let mut library_paths: Vec<String> = Vec::new();
     let mut output_path = String::from("grown_library.selph");
     let mut default_budget: usize = 200000;
     let mut default_depth: usize = 2;
@@ -735,12 +718,14 @@ fn cmd_curriculum(args: &[String]) {
     let mut enable_extract = false;
     let mut enable_validate = false;
     let mut filter_path: Option<String> = None;
-    let mut tree_paths: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--library" => { library_path = args.get(i + 1).cloned(); i += 2; }
+            "--library" | "--tree" => {
+                if let Some(p) = args.get(i + 1) { library_paths.push(p.clone()); }
+                i += 2;
+            }
             "--output" | "-o" => { output_path = args.get(i + 1).cloned().unwrap_or(output_path); i += 2; }
             "--budget" => { default_budget = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(default_budget); i += 2; }
             "--depth" => { default_depth = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(default_depth); i += 2; }
@@ -748,10 +733,6 @@ fn cmd_curriculum(args: &[String]) {
             "--extract" => { enable_extract = true; i += 1; }
             "--validate" => { enable_validate = true; i += 1; }
             "--filter" => { filter_path = args.get(i + 1).cloned(); i += 2; }
-            "--tree" => {
-                if let Some(p) = args.get(i + 1) { tree_paths.push(p.clone()); }
-                i += 2;
-            }
             other => { task_file = other.to_string(); i += 1; }
         }
     }
@@ -767,25 +748,22 @@ fn cmd_curriculum(args: &[String]) {
         Err(e) => { eprintln!("Error reading {}: {}", task_file, e); return; }
     };
 
-    // Load base library
+    // Load libraries
     let mut all_macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = Vec::new();
     let mut library_source = String::new();
 
-    if let Some(lib_path) = &library_path {
+    for lib_path in &library_paths {
         match fs::read_to_string(lib_path) {
             Ok(s) => {
-                library_source = s.clone();
-                all_macros = load_library_macros(&s);
-                eprintln!("Loaded {} macros from {}", all_macros.len(), lib_path);
+                if library_source.is_empty() {
+                    library_source = s.clone();
+                }
+                let lib_macros = load_library(&s);
+                eprintln!("Loaded {} macros from {}", lib_macros.len(), lib_path);
+                all_macros.extend(lib_macros);
             }
-            Err(e) => eprintln!("Warning: couldn't load library: {}", e),
+            Err(e) => eprintln!("Warning: couldn't load library {}: {}", lib_path, e),
         }
-    }
-
-    // Load namespace trees (persist across all tasks)
-    let trees = load_namespace_trees(&tree_paths);
-    if !trees.is_empty() {
-        eprintln!("Loaded {} namespace trees", trees.len());
     }
 
     // Parse tasks
@@ -799,7 +777,6 @@ fn cmd_curriculum(args: &[String]) {
     eprintln!("SELPH Curriculum: {} tasks", tasks.len());
     eprintln!("  Budget: {}, Default depth: {}", default_budget, default_depth);
     eprintln!("  Library: {} macros", all_macros.len());
-    if !trees.is_empty() { eprintln!("  Trees: {}", trees.len()); }
     if enable_meta { eprintln!("  Meta-heuristic learning: enabled"); }
     if enable_extract { eprintln!("  Abstraction extraction: enabled"); }
     if enable_validate { eprintln!("  Validation: enabled (20% held out when >= 5 examples)"); }
@@ -874,7 +851,8 @@ fn cmd_curriculum(args: &[String]) {
         // for tasks that don't specify a depth in the curriculum file.
         let depth = *task_depth;
         let input_is_string = matches!(&inputs[0], Value::Str(_));
-        let (mut synth_comps, extra_bindings) = synth::default_synth_components_with_trees(&all_macros, &trees);
+        let mut synth_comps = synth::default_synth_components(&all_macros);
+        let extra_bindings: Vec<(String, Value)> = Vec::new();
         if input_is_string {
             for comp in &mut synth_comps {
                 if comp.name == "x" { comp.ret_type = 1; }
@@ -1124,9 +1102,44 @@ fn cmd_curriculum(args: &[String]) {
                         solved_programs.push((dr.nodes.clone(), dr.root));
                     }
                 } else {
-                    let explored = sr.candidates_explored;
-                    eprintln!("  --  {:30}  {:6} cand  {:.3}s",
-                             name, explored, elapsed.as_secs_f64());
+                    // Fallback 3: Memorization — namespace lookup table
+                    if let Some((mem_nodes, mem_root)) = memorize_from_examples(inputs, expected) {
+                        let source = node_to_source(&mem_nodes, mem_root);
+                        solved += 1;
+                        eprintln!("  ME  {:30}  {:6} memo  {:.3}s  {}",
+                                 name, inputs.len(), elapsed.as_secs_f64(), source);
+
+                        let body_source = extract_lambda_body(&source);
+                        let macro_line = format!("(defmacro {} (s) {})", name, body_source);
+                        if let Ok((mnodes, mroots)) = parse_file(&macro_line) {
+                            if !mroots.is_empty() {
+                                if let Node::App(children) = &mnodes[mroots[0]] {
+                                    if children.len() == 4 {
+                                        if let Node::Symbol(mname) = &mnodes[children[1]] {
+                                            if let Node::App(param_indices) = &mnodes[children[2]] {
+                                                let params: Vec<String> = param_indices.iter()
+                                                    .filter_map(|&i| {
+                                                        if let Node::Symbol(s) = &mnodes[i] { Some(resolve(*s)) }
+                                                        else { None }
+                                                    }).collect();
+                                                all_macros.push((
+                                                    resolve(*mname).to_string(), params,
+                                                    mnodes.clone(), children[3],
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        promoted_source.push_str(&format!(
+                            "\n; {} (memorized: {} entries)\n{}\n",
+                            name, inputs.len(), macro_line));
+                    } else {
+                        let explored = sr.candidates_explored;
+                        eprintln!("  --  {:30}  {:6} cand  {:.3}s",
+                                 name, explored, elapsed.as_secs_f64());
+                    }
                 }
             }
         } // end bool_decompose else
@@ -1437,6 +1450,96 @@ fn extract_lambda_body(source: &str) -> String {
     source.to_string()
 }
 
+/// Build a namespace-backed lookup macro from examples.
+///
+/// Given string inputs and any-typed outputs, constructs:
+///   (lambda (x) (ns-get-or (ns ("key1" val1) ("key2" val2) ...) x default))
+///
+/// Returns Some((nodes, root)) or None if inputs aren't all strings.
+fn memorize_from_examples(inputs: &[Value], expected: &[Value]) -> Option<(Vec<Node>, usize)> {
+    // All inputs must be strings (namespace keys)
+    if inputs.is_empty() || !inputs.iter().all(|v| matches!(v, Value::Str(_))) {
+        return None;
+    }
+
+    // Deduplicate: same input must map to same output
+    let mut map: std::collections::HashMap<String, &Value> = std::collections::HashMap::new();
+    for (inp, exp) in inputs.iter().zip(expected.iter()) {
+        if let Value::Str(key) = inp {
+            if let Some(existing) = map.get(key.as_str()) {
+                if format!("{:?}", existing) != format!("{:?}", exp) {
+                    return None; // conflicting outputs for same input
+                }
+            }
+            map.insert(key.clone(), exp);
+        }
+    }
+
+    // Infer default value from output type
+    let default_val = match &expected[0] {
+        Value::Bool(_) => Value::Bool(false),
+        Value::Num(_) => Value::Num(0.0),
+        Value::Str(_) => Value::Str(String::new()),
+        _ => Value::Nil,
+    };
+
+    // Build AST: (lambda (x) (ns-get-or (ns ("k1" v1) ...) x default))
+    let mut nodes: Vec<Node> = Vec::new();
+
+    // Build namespace entries as (key value) App pairs
+    let mut ns_children: Vec<usize> = Vec::new();
+    // First child: the "ns" symbol
+    let ns_sym_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("ns")));
+    ns_children.push(ns_sym_idx);
+
+    for (key, val) in &map {
+        let key_idx = nodes.len();
+        nodes.push(Node::Str(key.clone()));
+        let val_idx = nodes.len();
+        match val {
+            Value::Num(n) => nodes.push(Node::Num(*n)),
+            Value::Bool(b) => nodes.push(Node::Bool(*b)),
+            Value::Str(s) => nodes.push(Node::Str(s.clone())),
+            _ => nodes.push(Node::Bool(false)),
+        }
+        let pair_idx = nodes.len();
+        nodes.push(Node::App(vec![key_idx, val_idx]));
+        ns_children.push(pair_idx);
+    }
+
+    // (ns ...) application
+    let ns_app_idx = nodes.len();
+    nodes.push(Node::App(ns_children));
+
+    // "x" symbol (parameter)
+    let x_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("x")));
+
+    // default value
+    let default_idx = nodes.len();
+    match &default_val {
+        Value::Num(n) => nodes.push(Node::Num(*n)),
+        Value::Bool(b) => nodes.push(Node::Bool(*b)),
+        Value::Str(s) => nodes.push(Node::Str(s.clone())),
+        _ => nodes.push(Node::Bool(false)),
+    }
+
+    // "ns-get-or" symbol
+    let ngo_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("ns-get-or")));
+
+    // (ns-get-or (ns ...) x default)
+    let body_idx = nodes.len();
+    nodes.push(Node::App(vec![ngo_idx, ns_app_idx, x_idx, default_idx]));
+
+    // (lambda (x) body)
+    let lambda_idx = nodes.len();
+    nodes.push(Node::Lambda(vec![intern("x")], body_idx));
+
+    Some((nodes, lambda_idx))
+}
+
 fn parens_balanced(s: &str) -> bool {
     let mut depth = 0i32;
     let mut in_string = false;
@@ -1647,10 +1750,9 @@ fn cmd_verify(args: &[String]) {
 // ── Multi-synth command ─────────────────────────────────────────────
 
 fn cmd_multi_synth(args: &[String]) {
-    // Usage: selph multi-synth -e "1->2 3->6" --tree ops.selph [--tree data.selph] [--library lib.selph]
+    // Usage: selph multi-synth -e "1->2 3->6" --library ops.selph [--library data.selph]
     let mut examples_str: Option<String> = None;
-    let mut tree_paths: Vec<String> = Vec::new();
-    let mut library_path: Option<String> = None;
+    let mut library_paths: Vec<String> = Vec::new();
     let mut max_depth: usize = 3;
     let mut max_budget: usize = 200_000;
 
@@ -1658,11 +1760,10 @@ fn cmd_multi_synth(args: &[String]) {
     while i < args.len() {
         match args[i].as_str() {
             "-e" => { examples_str = args.get(i + 1).cloned(); i += 2; }
-            "--tree" => {
-                if let Some(p) = args.get(i + 1) { tree_paths.push(p.clone()); }
+            "--library" | "--tree" => {
+                if let Some(p) = args.get(i + 1) { library_paths.push(p.clone()); }
                 i += 2;
             }
-            "--library" => { library_path = args.get(i + 1).cloned(); i += 2; }
             "--depth" => { max_depth = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(3); i += 2; }
             "--budget" => { max_budget = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(200_000); i += 2; }
             _ => { i += 1; }
@@ -1671,7 +1772,7 @@ fn cmd_multi_synth(args: &[String]) {
 
     let ex_str = match examples_str {
         Some(s) => s,
-        None => { eprintln!("Usage: selph multi-synth -e \"1->2 3->6\" --tree ops.selph"); return; }
+        None => { eprintln!("Usage: selph multi-synth -e \"1->2 3->6\" --library ops.selph"); return; }
     };
 
     // Parse examples
@@ -1699,52 +1800,32 @@ fn cmd_multi_synth(args: &[String]) {
         return;
     }
 
-    // Load library macros
+    // Load libraries
     let mut macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = Vec::new();
-    if let Some(lib_path) = &library_path {
-        if let Ok(lib_src) = fs::read_to_string(lib_path) {
-            if let Ok((ln_vec, lr)) = parse_file(&lib_src) {
-                let ln: Rc<[Node]> = ln_vec.into();
-                let mut lib_env = make_default_env();
-                for &r in &lr {
-                    let _ = eval(&ln, r, &mut lib_env);
-                }
-                // Extract macros via load_library
+    for lib_path in &library_paths {
+        match fs::read_to_string(lib_path) {
+            Ok(lib_source) => {
+                let lib_macros = load_library(&lib_source);
+                eprintln!("Loaded {} macros from {}", lib_macros.len(), lib_path);
+                macros.extend(lib_macros);
             }
-            if let Ok(m) = library::load_library(lib_path) {
-                macros = m;
-            }
+            Err(e) => eprintln!("Warning: couldn't load library {}: {}", lib_path, e),
         }
     }
 
-    // Load namespace trees using the shared helper
-    let trees = load_namespace_trees(&tree_paths);
+    eprintln!("Multi-synth: {} examples, {} macros, depth {}, budget {}",
+        inputs.len(), macros.len(), max_depth, max_budget);
 
-    eprintln!("Multi-tree synthesis: {} examples, {} trees, depth {}, budget {}",
-        inputs.len(), trees.len(), max_depth, max_budget);
-
-    // Use the core synthesizer with tree bindings injected
-    let (synth_comps, extra_bindings) = synth::default_synth_components_with_trees(&macros, &trees);
+    let synth_comps = synth::default_synth_components(&macros);
     let sr = synth::synthesize_with_validation(
         &synth_comps, &inputs, &expected, &macros,
-        max_depth, max_budget, true, None, &extra_bindings,
+        max_depth, max_budget, true, None, &[],
     );
 
     if sr.found {
         let source = node_to_source(sr.nodes.as_ref().unwrap(), sr.root.unwrap());
         println!("{}", source);
         eprintln!("Found in {} candidates", sr.candidates_explored);
-
-        // Trace which trees contributed
-        if !trees.is_empty() {
-            let tree_names: Vec<String> = trees.iter().map(|(n, _)| n.clone()).collect();
-            let used = multitree::trace_solution(
-                sr.nodes.as_ref().unwrap(), sr.root.unwrap(), &tree_names,
-            );
-            if !used.is_empty() {
-                eprintln!("Trees used: {}", used.join(", "));
-            }
-        }
     } else {
         eprintln!("No solution found ({} candidates explored)", sr.candidates_explored);
     }

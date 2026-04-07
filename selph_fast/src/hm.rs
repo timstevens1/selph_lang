@@ -129,7 +129,7 @@ pub fn unify(t1: &Type, t2: &Type, subst: &mut Subst) -> Result<(), String> {
 
 // ── Conversion from u8 type tags ────────────────────────────────────
 
-use crate::synth::{TYPE_NUM, TYPE_STR, TYPE_BOOL, TYPE_ANY};
+use crate::synth::{TYPE_NUM, TYPE_STR, TYPE_BOOL, TYPE_LIST, TYPE_ANY};
 
 /// Convert a u8 type tag to an HM Type.
 ///
@@ -140,6 +140,7 @@ pub fn type_from_tag(tag: u8, counter: &mut u32) -> Type {
         TYPE_NUM => Type::TNum,
         TYPE_STR => Type::TStr,
         TYPE_BOOL => Type::TBool,
+        TYPE_LIST => Type::TList(Box::new(fresh_var(counter))),
         TYPE_ANY => fresh_var(counter),
         _ => fresh_var(counter), // unknown tags become variables
     }
@@ -154,6 +155,7 @@ pub fn type_to_tag(ty: &Type, subst: &Subst) -> u8 {
         Type::TNum => TYPE_NUM,
         Type::TStr => TYPE_STR,
         Type::TBool => TYPE_BOOL,
+        Type::TList(_) => TYPE_LIST,
         _ => TYPE_ANY,
     }
 }

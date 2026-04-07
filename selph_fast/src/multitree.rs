@@ -88,7 +88,7 @@ fn extract_recursive(
                     depth + 1, max_depth,
                 );
             }
-            Value::Closure(..) | Value::Builtin(_) => {
+            Value::Closure(..) | Value::Builtin(_) | Value::RustMacro(..) => {
                 if let Some((param_types, ret_type)) = infer_callable_type(val, env) {
                     // Register the callable in the env so the synthesizer can
                     // invoke it by its qualified name.
@@ -168,6 +168,7 @@ pub fn infer_callable_type(
 ) -> Option<(Vec<u8>, u8)> {
     let arity = match val {
         Value::Closure(params, _, _, _, _) => params.len(),
+        Value::RustMacro(params, _, _) => params.len(),
         Value::Builtin(_) => probe_arity(val, env)?,
         _ => return None,
     };

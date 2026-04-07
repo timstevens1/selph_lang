@@ -1,0 +1,27 @@
+; Natural language helpers
+; Word-level access primitives for sentence processing.
+; Input: a string (word or sentence). Output varies by operation.
+
+; Word extraction
+(defmacro first_word (s)
+  (head (string-split s " ")))
+
+(defmacro second_word (s)
+  (head (tail (string-split s " "))))
+
+(defmacro last_word (s)
+  (head (reverse (string-split s " "))))
+
+(defmacro third_word (s)
+  (head (tail (tail (string-split s " ")))))
+
+; Word counting
+(defmacro word_count (s)
+  (length (string-split s " ")))
+
+; Export as namespace for --tree loading
+(ns ("first_word" first_word)
+    ("second_word" second_word)
+    ("last_word" last_word)
+    ("third_word" third_word)
+    ("word_count" word_count))

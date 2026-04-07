@@ -2,9 +2,9 @@
 
 ## From Enumerative Solver to Self-Building Architecture
 
-**Version 0.4 — April 6, 2026**
+**Version 0.8 — April 7, 2026**
 
-Based on implementation experience with the v0.1 Architecture Spec and the Rust-native migration. Supersedes v0.2 with validated results from the standalone Rust binary.
+Based on implementation experience with the v0.1 Architecture Spec, the Rust-native migration, the April 6-7 session (decomposition via synthesis, tracing, 7.2x search optimization, namespace literals, memorization), the April 7 session that added: bytecode VM (22.9x eval speedup), `synthesize` builtin `:library`/`:priorities` support, early depth extension for compositional search, optimization curriculum with meta-optimization, NL curriculum, and chained curriculum execution, and the April 7 evening session that added: unified library/tree/namespace loading, TYPE_LIST in the type system, higher-order synthesis via fused map components, 3-word sentence structures, and variable-length sentence tagging via `(string-join (map pos_tag (string-split x " ")) " ")`.
 
 ---
 
@@ -24,7 +24,7 @@ The system now runs as a single Rust binary (`selph`) with zero runtime dependen
 - S-expression parser with full EBNF from v0.1 spec
 - Tree-walking evaluator with 55+ builtins
 - First-class namespaces: functions, data, and cache in the same tree
-- Hindley-Milner type inference (as second-pass pruning over u8 type tags)
+- Hindley-Milner type inference (as second-pass pruning over u8 type tags: NUM=0, STR=1, BOOL=2, LIST=3, ANY=255)
 - Macro system (defmacro) with letrec semantics (Rc<RefCell> shared scope)
 - Eval depth limit (256) prevents stack overflow from deep macro chains
 
@@ -60,6 +60,8 @@ The system now runs as a single Rust binary (`selph`) with zero runtime dependen
 - Divide-and-conquer for multi-way classification
 - Failure-driven induction (intermediate value decomposition)
 - Observational equivalence deduplication
+- **Bytecode VM fast path:** candidates compiled to bytecodes for evaluation (22.9x speedup). Macros with unsupported constructs (e.g., `ns` special form) automatically fall back to tree-walker.
+- **Early depth extension:** after each depth-1 candidate, immediately try composing it with arity-1 components whose return type matches the target. Finds `(is_noun (last_word x))` in 8 candidates instead of exhausting 200K. Key enabler for compositional NL tasks.
 - **Auto-constant extraction:** unique characters and numbers from examples added to pool, scored by frequency
 - **Probe-and-filter:** macros that error on actual inputs automatically excluded
 - **Trivial promotion skip:** prevents self-referential macros (e.g., `(defmacro f (x) (f x))`)
@@ -75,7 +77,7 @@ The system now runs as a single Rust binary (`selph`) with zero runtime dependen
 - **Interleaved priority learning:** component priorities update after every solve (learn_rate boost). No explicit meta-synthesis needed — the priority weights capture the signal.
 - Programmable heuristics via `make_selph_scorer` / `make_selph_depth_filter`
 - First-class namespace trees: `--tree` flag on synth and grow commands
-- `synthesize` exposed as a SELPH builtin for self-improvement loops
+- `synthesize` exposed as a SELPH builtin for self-improvement loops; accepts `:library` (namespace of macros) and `:priorities` (namespace of component name → priority boost)
 - Meta-heuristic synthesis available via `--meta` flag (failure-triggered, not periodic)
 
 ### 2.7 CLI Commands (10 total)
@@ -92,10 +94,10 @@ selph repl       Interactive REPL
 selph help       Show usage
 ```
 
-### 2.8 Rust Modules (15 source files)
-types.rs, parser.rs, eval.rs, synth.rs, hm.rs, library.rs, namespace.rs, induce.rs, divide.rs, verify.rs, abstraction.rs, multitree.rs, stochastic.rs, meta.rs, taskgen.rs
+### 2.8 Rust Modules (17 source files)
+types.rs, parser.rs, eval.rs, synth.rs, hm.rs, library.rs, namespace.rs, induce.rs, divide.rs, verify.rs, abstraction.rs, multitree.rs, stochastic.rs, meta.rs, taskgen.rs, intern.rs, vm.rs
 
-215 tests, all passing.
+222 tests, all passing.
 
 ### 2.9 Validated Results
 
@@ -117,7 +119,7 @@ types.rs, parser.rs, eval.rs, synth.rs, hm.rs, library.rs, namespace.rs, induce.
 | **cubes** | **9,794** | **`(multiply (idx x) (squares x))`** |
 | idx_plus_last | 59 | `(triangular x)` |
 
-**Context-free language curriculum (20 tasks): 20/20 (100%) in 293 seconds**
+**Context-free language curriculum (20 tasks): 20/20 (100%) in 15.7 seconds** (was 293s before optimizations; 96s after search opts; 15.7s after bytecode VM)
 
 | Task | Candidates | Solution |
 |------|-----------|----------|
@@ -165,6 +167,49 @@ SELPH programs can now express their own infrastructure:
 ```
 
 Example SELPH programs in `examples/`: curriculum.selph, scoping.selph, taskgen.selph, verify.selph, heuristics.selph, filter.selph
+
+### 2.11 Bytecode VM (22.9x eval speedup)
+Candidates compiled to bytecodes via `vm.rs`. String interning (`intern.rs`) replaces string comparisons with integer lookups. Rc-wrapped node pools eliminate cloning. Combined effect: CF curriculum 96s → 15.7s (6.1x on top of the 7.2x search optimization = **18.6x total** from baseline 293s).
+
+VM supports: builtins, pre-compiled macro calls, if-expressions, constants. Unsupported constructs (e.g., `ns` special form in memorized macros) fall back to tree-walker automatically.
+
+### 2.12 Chained Curriculum
+Validated: sequence (13 tasks) → CF (20 tasks) = 33/33 (100%). Library grows from 6 helpers → 17 after sequence → 37 after CF. Cross-domain macro filtering via `scope_library_for_task` ensures sequence macros don't pollute CF search space.
+
+### 2.13 Optimization Curriculum & Meta-Optimization
+`(opt-task ...)` form in curriculum runner dispatches to `synthesize_optimize`. Validated on 5 tasks including constant optimization, constrained optimization, and **meta-optimization** — a fitness function that calls `synthesize` internally to measure candidate count, enabling the system to optimize its own search strategy.
+
+First self-improvement loop: `meta_count_char_boost` synthesized a priority boost by running synthesis inside the fitness function (0.7s, 1754 candidates).
+
+### 2.14 Natural Language Curriculum
+**22/22 solved (100%).** `examples/nl_tasks.selph` with `nl_helpers.selph` (loaded as `--library`). 6 stages:
+
+- **Stage 0 (word ops):** 5/5 — `first_char`, `last_char` synthesized; word extraction composed from library helpers (`first_word`, `last_word`)
+- **Stage 1 (vocabulary):** `is_noun`, `is_verb`, `is_adj` memorized as namespace lookups (11-12 entries each). `is_article` found computable pattern `(or (starts-with "a") (ends-with "e"))`
+- **Stage 1b (morphology):** `is_plural` → `(string-ends-with x "s")`, `is_gerund` → `(string-ends-with x "g")`
+- **Stage 2 (sentence patterns):** compositions found via flat synthesis + BD:
+  - `starts_with_article` → `(is_article (first_word x))` (12.7K cand)
+  - `ends_with_noun` → `(is_noun (last_word x))` (10.9K cand)
+  - `article_noun` → `(and (starts_with_article x) (ends_with_noun x))` (BD, instant)
+- **Stage 3 (POS tagging):** D&C found a **decision tree** for POS tagging:
+  `(if (is_noun x) "noun" (if (is_verb x) "verb" (if (is_adj x) "adj" (if (is_article x) "art" "pron"))))`
+- **Stage 4 (per-position tagging):** `tag_first`, `tag_second`, `tag_last` — D&C if-expression cascades composing vocabulary predicates with word extractors
+- **Stage 5 (structure assembly):** `structure_2w` — full grammatical structure classifier via D&C:
+  `(if (is_article (first_word x)) "art noun" (if (is_noun (last_word x)) "adj noun" ...))`
+- **Stage 6 (3-word structures):** `structure_3w` — D&C decision tree for 3-word sentences:
+  `(if (is_adj (second_word x)) "art adj noun" (if (is_article (first_word x)) "art noun verb" ...))`
+
+**Key insight:** D&C discovers decision trees for fixed-length structure classification. For variable-length sentences, the system uses a different strategy: `(string-join (map pos_tag (string-split x " ")) " ")` — higher-order synthesis via fused map components. Both approaches compose library primitives, but one enumerates output patterns while the other generalizes.
+
+### 2.15 Unified Library Loading
+Libraries, trees, and namespaces are unified into a single concept. A library file is evaluated; if it produces a `Value::Namespace`, its `RustMacro` entries are extracted as synthesis components. Falls back to structural `defmacro` parsing for legacy files. `--library` replaces `--tree` (kept as alias for backward compatibility).
+
+### 2.16 TYPE_LIST and Higher-Order Synthesis
+`TYPE_LIST = 3` added to the type system alongside NUM, STR, BOOL. List operations (`string-split`, `string-join`, `head`, `tail`) registered as synthesis components with proper type annotations. Higher-order synthesis via **fused map components**: for each unary macro `m`, the synthesizer auto-generates `map_m(list) → list` that materializes as `(map m list)` during candidate construction. **Chained early depth extension** follows intermediate types — when a depth-1 composition returns LIST (not the target STR), it immediately probes arity-2 compositions like `string-join` to reach the target in one step.
+
+Validated: `(string-join (map pos_tag (string-split x " ")) " ")` found in 230 candidates (0.054s). Works for 2-word, 3-word, and any-length sentences.
+
+The `synthesize` builtin accepts `:library` (namespace of macros) for SELPH-level library control, and `:priorities` for search tuning.
 
 ---
 
@@ -317,9 +362,13 @@ Phase 1: Enumerative solver (DONE)
   - Generates training data for all meta-levels
   - Establishes the curriculum framework
 
-Phase 2: Learned heuristics (STARTED)
+Phase 2: Learned heuristics (VALIDATED)
   - Meta-1 replaces hardcoded search ordering
-  - Training data: synthesis logs from Phase 1
+  - First loop validated: meta_count_char_boost synthesized a priority
+    boost by running synthesis inside the fitness function (0.7s)
+  - The synthesize builtin accepts :priorities and :library for
+    SELPH-level control of search strategy
+  - Training data: synthesis logs from Phase 1 + chained curriculum (33 tasks)
   - Validation: does learned heuristic match domain-specific hand-written ones?
 
 Phase 3: Learned decomposition
@@ -470,52 +519,82 @@ When flat synthesis fails on bool-target tasks, tries all `(and P Q)`, `(or P Q)
 
 ## 9. Immediate Next Steps
 
-### 9.1 Chained curriculum execution
-The train→save→reload loop works. Next: build a standard multi-stage pipeline:
-```
-selph grow sequence_tasks.selph --library seq_helpers.selph -o model.selph
-selph grow formal_lang_tasks.selph --library model.selph -o model.selph
-selph grow context_free_tasks.selph --library model.selph -o model.selph
-```
-Each stage grows the shared library. The probe-and-filter ensures macros from incompatible input formats are automatically excluded. Validate that RL coefficients transfer across domains.
+### ~~9.1 Chained curriculum execution~~ ✓
+Validated: sequence (13 tasks) → CF (20 tasks) = 33/33 (100%). Library grows from 6 helpers → 17 after sequence → 37 after CF. Cross-domain macro filtering ensures sequence macros don't pollute CF search space. RL coefficients transfer across domains.
 
-### 9.2 Reduce search space for hard tasks
-`equal_ab` (9,373 candidates) and `matched_parens` (35,933) are still expensive. Opportunities:
-- **Partial match pruning between depths:** If a depth-1 candidate matches 0 examples AND returns the target type, skip it as an argument for depth-2 compositions entirely (not just deprioritize).
-- **Component-level type scoping per depth:** At the final depth, only generate candidates whose return type matches the target. At intermediate depths, allow all useful types.
-- **Early termination on partial match:** If a depth-1 candidate matches >50% of examples, immediately try composing it with comparisons/logic before exhausting the full depth-1 pool.
-
-### 9.3 Generalize boolean decomposition to N-ary
-Current decomposition tries pairs. Extend to:
-- Chains: `(and P (and Q R))` for 3+ predicates
-- Mixed: `(and P (or Q R))` for disjunctive sub-conditions
-- Numeric: `(and (= (f x) (g x)) (> (h x) 0))` for non-macro compositions
-This would handle more complex classification tasks without exhaustive depth-3 search.
+### ~~9.2 Early depth extension~~ ✓
+Implemented as targeted composition probe: after each depth-1 candidate, immediately try composing it with arity-1 components whose return type matches the target. Finds `(is_noun (last_word x))` in 8 candidates instead of exhausting 200K. Combined with bytecode VM, the CF curriculum runs in 15.7s (was 293s baseline).
 
 ### 9.4 Curriculum-driven RL coefficient specialization
-Currently one (cold, warm) pair for all tasks. Different task types may benefit from different coefficients:
-- Numeric tasks: strong cold penalty (many string candidates to prune)
-- Boolean tasks: weaker cold penalty (intermediates cross types frequently)
-- String tasks: strong warm bonus (partial string matches are informative)
-Store per-domain coefficients in the library, select based on inferred task type.
+Currently one (cold, warm) pair for all tasks. Different task types may benefit from different coefficients. Per-domain coefficients could be stored as namespace metadata and selected based on inferred task type. The `:priorities` field in the `synthesize` builtin partially addresses this.
 
-### 9.5 Meta-2: Learn decomposition as SELPH programs
-The boolean decomposition fallback is hardcoded Rust. Reframe it as a synthesis target: given a failed spec + a library of bool macros, find a SELPH program that combines them. Training data: the `(and (equal_ab x) (no_b_before_a x))` solution for `anbn`, etc. This moves decomposition from infrastructure to learned capability.
+### ~~9.5 Meta-2: Learn decomposition as SELPH programs~~ ✓
+The `synthesize` builtin accepts `:library` — a SELPH program can restrict the component set and call synthesis on sub-problems. Decomposition IS parameterized synthesis, expressible end-to-end from SELPH.
 
 ### 9.6 Deeper curriculum: context-sensitive languages
 With a^n b^n solved, the next frontier is context-sensitive patterns:
 - a^n b^n c^n (equal counts of three symbols)
 - Copy language: ww (string repeated twice)
 - Reversal: w^R (string followed by its reverse)
-These likely need `reduce`/`fold` over characters or recursive decomposition, pushing the system toward Meta-2 capabilities.
+These likely need `reduce`/`fold` over characters or recursive decomposition.
 
-### 9.7 Curriculum design principles (updated)
+### ~~9.7 Optimization curriculum~~ ✓ (Stage 0-2)
+`(opt-task ...)` form in curriculum runner. Stage 0-1 validated (constant + constrained optimization). Stage 2 (meta-optimization) validated — fitness function calls `synthesize` internally to optimize search priorities. First self-improvement loop: `meta_count_char_boost` found in 0.7s.
+
+Remaining: Stage 3 (multi-task meta-optimization across full task suite), Stage 4 (learned component filtering).
+
+### 9.8 Vector/tensor builtins
+Prerequisite for optimization curriculum Stage 4+ (weight vector learning, linear models). Not yet started.
+
+### ~~9.10 Natural language curriculum~~ ✓ (Stage 0-6)
+22/22 tasks solved. Full pipeline: word ops → vocabulary memorization → morphological rules → sentence pattern recognition → POS tagging → per-position tagging → structure classification (2-word and 3-word via D&C).
+
+### ~~9.12 3-word sentence structures~~ ✓
+`structure_3w` solved via D&C decision tree composing `is_adj`, `is_article`, `is_noun` with `second_word`, `first_word`. Required unified library loading so `nl_helpers.selph` word extractors were available as synthesis components.
+
+### ~~9.14 `map` + `string-join` as synthesis components~~ ✓
+TYPE_LIST (u8=3) added to the type system. `string-split`, `string-join`, `head`, `tail` registered as components. Fused map components (`map_<macro>`) auto-generated for each unary macro. Chained early depth extension probes intermediate types. Variable-length sentence tagging solved: `(string-join (map pos_tag (string-split x " ")) " ")` in 230 candidates.
+
+**Remaining NL directions:**
+- **Richer grammar:** Subject-verb agreement, determiner-noun agreement. Combines morphological rules with exception tables: `(or (is_regular_plural x) (ns-get-or irregular_plurals x false))`.
+- **Multi-word expressions:** Recognize phrases like "ice cream", "New York" — requires lookahead beyond single-word POS tagging.
+- **Parse trees:** Beyond flat structure strings, produce hierarchical representations: `(np (art "the") (noun "cat"))`. Requires namespace-valued outputs.
+- **`reduce`/`fold` as synthesis components:** For context-sensitive patterns (a^n b^n c^n) and accumulator-based processing.
+
+### 9.11 Curriculum design principles (updated)
 - **Every builtin needs a teaching task:** `and`/`or`/`not` needed scaffolding tasks before `anbn` could compose them
 - **Arity-3 requires depth-aware caps:** cubic enumeration at deeper depths is infeasible; cap by type-matching pool size
 - **Macro promotion must preserve semantics:** the `x→s` variable substitution must be word-boundary-aware; broken macros silently poison the library
 - **Type filtering is multiplicative:** combining useful-type reachability with return-type gating compounds the savings
-- **RL coefficients converge slowly:** most tasks are easy (low difficulty), so coefficient updates are small; learning requires enough hard tasks in the curriculum
-- **Static heuristic templates are harmful:** hand-coded "match-output-type" heuristics crush intermediate-type components; learned RL rewards are safer because they adjust pool entries, not component ordering
+- **Early depth extension finds compositions that exhaustive search misses:** For NL tasks, `(is_noun (last_word x))` is a depth-2 composition found in 8 candidates via targeted probe, vs 200K+ via exhaustive enumeration
+- **VM fallback is essential for correctness:** Macros with `ns` (namespace) constructs can't be VM-compiled. Candidates calling these macros must fall through to the tree-walker, not fail silently
+- **Two kinds of knowledge:** Computable (rules) and associative (facts). Both become macros. The memorization fallback handles facts; synthesis handles rules. Compositions bridge them: `(or (rule x) (has exceptions x))`
+- **Spurious correlations in examples:** The synthesizer finds any pattern that fits training data. NL examples must include adversarial cases that break surface-level string patterns (e.g., "apple" is not an article even though it starts with "a")
+- **D&C is the key to multi-output classification:** When the output has multiple distinct values (e.g., "noun", "verb", "adj", "art", "pron"), divide-and-conquer finds if-expression decision trees that compose library predicates. This is more powerful than flat synthesis — it composes across output categories, not just within a single expression.
+- **The system discovers classifiers, not string manipulators:** For `structure_2w`, instead of `concat(tag_first(x), " ", tag_last(x))`, D&C found `(if (is_article (first_word x)) "art noun" ...)` — a decision tree. The curriculum doesn't need `concat` in the component set; D&C with if-expressions handles classification naturally.
+- **Libraries, trees, and namespaces are the same thing:** A library IS a namespace. Loading a file evaluates it and extracts `RustMacro` entries from the resulting namespace. No separate `--tree` concept — everything goes through `--library`. Homoiconicity demands it: data must be expressible as code, and code must be loadable as data.
+- **Fused components bridge higher-order and first-order synthesis:** Instead of teaching the synthesizer about function-typed pool entries, generate `map_<macro>` components that materialize as `(map macro list)`. The synthesizer treats them as regular arity-1 list→list operations. This is decomposition: higher-order synthesis becomes first-order + naming.
+- **Chained early depth extension catches multi-step type conversions:** The original probe only tried compositions whose return type matched the target. With TYPE_LIST, the answer requires LIST as an intermediate: `string-split → map → string-join`. The chained probe follows intermediate useful types, testing arity-2 compositions on the result.
+
+### 9.13 Next priorities (updated April 7, 2026)
+
+With 3-word structures, unified loading, TYPE_LIST, and `map` synthesis all complete, the priority shifts toward scaling and meta-learning:
+
+**Highest-value next steps:**
+
+1. **Full chained curriculum: sequence → CF → NL.** Chain all three domains into one pipeline: 13 + 20 + 22 = 55 tasks, ~40+ macros. This is the training set for real meta-optimization. Tests cross-domain library scaling.
+
+2. **Meta-optimization Stage 3: multi-task heuristic learning.** With 55 tasks and traces, synthesize a priority function that minimizes total candidates across the full suite. Uses the `:priorities` field in the `synthesize` builtin.
+
+3. **Types as a SELPH program.** The type vocabulary (NUM, STR, BOOL, LIST) is currently hardcoded. Making type inference a curriculum target lets the system learn to expand its own type vocabulary. A type inference stage teaches "if `string-split` produces it, and `head` consumes it, they share a type."
+
+4. **`reduce`/`fold` as synthesis components.** Extends higher-order synthesis beyond `map`. Needed for context-sensitive languages (a^n b^n c^n) and accumulator-based processing. Same fused-component approach: `reduce_<macro>` auto-generated for each binary macro.
+
+**Lower priority (infrastructure):**
+- Fix the `synthesize` builtin's `:library` extraction for defmacro-captured macros
+- 9.6 context-sensitive languages (a^n b^n c^n) — needs `reduce`/`fold`
+- 9.8 vector/tensor builtins — prerequisite for linear models
+- VM compilation of `ns` in the candidate path
 
 ---
 
