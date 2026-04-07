@@ -262,66 +262,251 @@ pub fn apply(fn_val: &Value, args: &[Value], _nodes: &Rc<[Node]>, env: &mut Env)
     }
 }
 
+// ── Builtin dispatch table ───────────────────────────────────────────
+// Maps Sym → fn pointer for O(1) dispatch. Covers all builtins except
+// those that call back into eval/apply (map, reduce, filter, apply,
+// eval-source, eval-in, synthesize, synthesize-optimize).
+
+type BuiltinFn = fn(&[Value]) -> Result<Value, String>;
+
+fn build_dispatch_table() -> std::collections::HashMap<Sym, BuiltinFn> {
+    let mut m: std::collections::HashMap<Sym, BuiltinFn> = std::collections::HashMap::new();
+    // Arithmetic
+    m.insert(intern("add"), |args| num2(args, |a, b| a + b));
+    m.insert(intern("+"), |args| num2(args, |a, b| a + b));
+    m.insert(intern("subtract"), |args| num2(args, |a, b| a - b));
+    m.insert(intern("-"), |args| num2(args, |a, b| a - b));
+    m.insert(intern("multiply"), |args| num2(args, |a, b| a * b));
+    m.insert(intern("*"), |args| num2(args, |a, b| a * b));
+    m.insert(intern("divide"), |args| { let (a, b) = nums(args)?; if b == 0.0 { Err("division by zero".into()) } else { Ok(Value::Num(a / b)) } });
+    m.insert(intern("/"), |args| { let (a, b) = nums(args)?; if b == 0.0 { Err("division by zero".into()) } else { Ok(Value::Num(a / b)) } });
+    m.insert(intern("modulo"), |args| num2(args, |a, b| a % b));
+    m.insert(intern("%"), |args| num2(args, |a, b| a % b));
+    m.insert(intern("abs"), |args| Ok(Value::Num(num(&args[0])?.abs())));
+    m.insert(intern("negate"), |args| Ok(Value::Num(-num(&args[0])?)));
+    m.insert(intern("min"), |args| num2(args, |a, b| a.min(b)));
+    m.insert(intern("max"), |args| num2(args, |a, b| a.max(b)));
+    m.insert(intern("floor"), |args| Ok(Value::Num(num(&args[0])?.floor())));
+    m.insert(intern("ceil"), |args| Ok(Value::Num(num(&args[0])?.ceil())));
+    m.insert(intern("round"), |args| Ok(Value::Num(num(&args[0])?.round())));
+    m.insert(intern("pow"), |args| num2(args, |a, b| a.powf(b)));
+    m.insert(intern("sqrt"), |args| Ok(Value::Num(num(&args[0])?.sqrt())));
+    m.insert(intern("log"), |args| Ok(Value::Num(num(&args[0])?.ln())));
+    // Comparison
+    m.insert(intern("<"), |args| { let (a, b) = nums(args)?; Ok(Value::Bool(a < b)) });
+    m.insert(intern(">"), |args| { let (a, b) = nums(args)?; Ok(Value::Bool(a > b)) });
+    m.insert(intern("<="), |args| { let (a, b) = nums(args)?; Ok(Value::Bool(a <= b)) });
+    m.insert(intern(">="), |args| { let (a, b) = nums(args)?; Ok(Value::Bool(a >= b)) });
+    m.insert(intern("="), |args| match (&args[0], &args[1]) {
+        (Value::Num(a), Value::Num(b)) => Ok(Value::Bool(a == b)),
+        (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a == b)),
+        _ => Ok(Value::Bool(false)),
+    });
+    m.insert(intern("not"), |args| match &args[0] { Value::Bool(b) => Ok(Value::Bool(!*b)), _ => Err("not: expected bool".into()) });
+    m.insert(intern("even"), |args| Ok(Value::Bool(num(&args[0])? % 2.0 == 0.0)));
+    m.insert(intern("odd"), |args| Ok(Value::Bool(num(&args[0])? % 2.0 != 0.0)));
+    // String operations
+    m.insert(intern("string-upper"), |args| Ok(Value::Str(string(&args[0])?.to_uppercase())));
+    m.insert(intern("string-lower"), |args| Ok(Value::Str(string(&args[0])?.to_lowercase())));
+    m.insert(intern("string-reverse"), |args| Ok(Value::Str(string(&args[0])?.chars().rev().collect())));
+    m.insert(intern("string-trim"), |args| Ok(Value::Str(string(&args[0])?.trim().to_string())));
+    m.insert(intern("string-length"), |args| Ok(Value::Num(string(&args[0])?.len() as f64)));
+    m.insert(intern("string-contains"), |args| Ok(Value::Bool(string(&args[0])?.contains(&string(&args[1])?))));
+    m.insert(intern("string-split"), |args| {
+        let s = string(&args[0])?; let sep = string(&args[1])?;
+        Ok(Value::List(s.split(&sep).map(|p| Value::Str(p.to_string())).collect()))
+    });
+    m.insert(intern("string-join"), |args| {
+        let lst = list(&args[0])?; let sep = string(&args[1])?;
+        let strs: Vec<String> = lst.iter().map(|v| value_to_string(v)).collect();
+        Ok(Value::Str(strs.join(&sep)))
+    });
+    m.insert(intern("concat"), |args| {
+        let mut r = String::new();
+        for a in args { r.push_str(&value_to_string(a)); }
+        Ok(Value::Str(r))
+    });
+    m.insert(intern("to-string"), |args| Ok(Value::Str(value_to_string(&args[0]))));
+    m.insert(intern("to-number"), |args| match &args[0] {
+        Value::Str(s) => s.parse::<f64>().map(Value::Num).map_err(|e| format!("to-number: {}", e)),
+        Value::Num(n) => Ok(Value::Num(*n)),
+        _ => Err("to-number: expected string".into()),
+    });
+    m.insert(intern("string-nth"), |args| {
+        let s = string(&args[0])?; let i = num(&args[1])? as usize;
+        s.chars().nth(i).map(|c| Value::Str(c.to_string())).ok_or(format!("string-nth: index {} out of bounds", i))
+    });
+    m.insert(intern("string-slice"), |args| {
+        let s = string(&args[0])?; let start = num(&args[1])? as usize;
+        let end = if args.len() > 2 { num(&args[2])? as usize } else { s.len() };
+        let chars: Vec<char> = s.chars().collect();
+        let end = end.min(chars.len()); let start = start.min(end);
+        Ok(Value::Str(chars[start..end].iter().collect()))
+    });
+    m.insert(intern("count-char"), |args| {
+        let s = string(&args[0])?; let c = string(&args[1])?;
+        Ok(Value::Num(s.matches(&c as &str).count() as f64))
+    });
+    m.insert(intern("string-replace"), |args| {
+        let s = string(&args[0])?; let from = string(&args[1])?; let to = string(&args[2])?;
+        Ok(Value::Str(s.replace(&from as &str, &to as &str)))
+    });
+    m.insert(intern("string-chars"), |args| {
+        let s = string(&args[0])?;
+        Ok(Value::List(s.chars().map(|c| Value::Str(c.to_string())).collect()))
+    });
+    m.insert(intern("string-starts-with"), |args| {
+        let s = string(&args[0])?; let prefix = string(&args[1])?;
+        Ok(Value::Bool(s.starts_with(&prefix as &str)))
+    });
+    m.insert(intern("string-ends-with"), |args| {
+        let s = string(&args[0])?; let suffix = string(&args[1])?;
+        Ok(Value::Bool(s.ends_with(&suffix as &str)))
+    });
+    m.insert(intern("char-code"), |args| {
+        let s = string(&args[0])?;
+        s.chars().next().map(|c| Value::Num(c as u32 as f64)).ok_or("char-code: empty string".into())
+    });
+    m.insert(intern("code-char"), |args| {
+        let n = num(&args[0])? as u32;
+        char::from_u32(n).map(|c| Value::Str(c.to_string())).ok_or(format!("code-char: invalid code point {}", n))
+    });
+    // List operations
+    m.insert(intern("list"), |args| Ok(Value::List(args.to_vec())));
+    m.insert(intern("head"), |args| { let l = list(&args[0])?; l.first().cloned().ok_or("head: empty".into()) });
+    m.insert(intern("tail"), |args| { let l = list(&args[0])?; if l.is_empty() { Err("tail: empty".into()) } else { Ok(Value::List(l[1..].to_vec())) } });
+    m.insert(intern("length"), |args| Ok(Value::Num(list(&args[0])?.len() as f64)));
+    m.insert(intern("cons"), |args| { let mut l = list(&args[1])?; l.insert(0, args[0].clone()); Ok(Value::List(l)) });
+    m.insert(intern("nth"), |args| {
+        let l = list(&args[0])?; let i = num(&args[1])? as usize;
+        l.get(i).cloned().ok_or(format!("nth: index {} out of bounds (len {})", i, l.len()))
+    });
+    m.insert(intern("slice"), |args| {
+        let l = list(&args[0])?; let start = num(&args[1])? as usize;
+        let end = if args.len() > 2 { num(&args[2])? as usize } else { l.len() };
+        let end = end.min(l.len()); let start = start.min(end);
+        Ok(Value::List(l[start..end].to_vec()))
+    });
+    m.insert(intern("sort"), |args| {
+        let mut l = list(&args[0])?;
+        l.sort_by(|a, b| match (a, b) {
+            (Value::Num(x), Value::Num(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+            (Value::Str(x), Value::Str(y)) => x.cmp(y),
+            _ => std::cmp::Ordering::Equal,
+        });
+        Ok(Value::List(l))
+    });
+    m.insert(intern("reverse"), |args| { let mut l = list(&args[0])?; l.reverse(); Ok(Value::List(l)) });
+    m.insert(intern("append"), |args| { let mut l1 = list(&args[0])?; let l2 = list(&args[1])?; l1.extend(l2); Ok(Value::List(l1)) });
+    m.insert(intern("range"), |args| {
+        let n = num(&args[0])? as i64;
+        let start = if args.len() > 1 { num(&args[1])? as i64 } else { 0 };
+        let (from, to) = if args.len() > 1 { (start, n) } else { (0, n) };
+        Ok(Value::List((from..to).map(|i| Value::Num(i as f64)).collect()))
+    });
+    m.insert(intern("contains"), |args| {
+        let l = list(&args[0])?; let target = &args[1];
+        let found = l.iter().any(|v| match (v, target) {
+            (Value::Num(a), Value::Num(b)) => (a - b).abs() < f64::EPSILON,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            _ => false,
+        });
+        Ok(Value::Bool(found))
+    });
+    m.insert(intern("zip"), |args| {
+        let l1 = list(&args[0])?; let l2 = list(&args[1])?;
+        Ok(Value::List(l1.into_iter().zip(l2).map(|(a, b)| Value::List(vec![a, b])).collect()))
+    });
+    m.insert(intern("enumerate"), |args| {
+        let l = list(&args[0])?;
+        Ok(Value::List(l.into_iter().enumerate().map(|(i, v)| Value::List(vec![Value::Num(i as f64), v])).collect()))
+    });
+    // Misc
+    m.insert(intern("identity"), |args| Ok(args[0].clone()));
+    m.insert(intern("print"), |args| {
+        for a in args { print!("{}", value_to_string(a)); }
+        println!();
+        Ok(Value::Nil)
+    });
+    // Namespace operations
+    m.insert(intern("ns-get"), |args| {
+        if args.len() < 2 { return Err("ns-get: need namespace and key".into()); }
+        let mut result = args[0].clone();
+        for arg in &args[1..] {
+            let key = match arg { Value::Str(s) => s.clone(), _ => return Err("ns-get: key must be string".into()) };
+            result = crate::namespace::ns_get(&result, &key)?;
+        }
+        Ok(result)
+    });
+    m.insert(intern("ns-put"), |args| {
+        if args.len() != 3 { return Err("ns-put: need namespace, key, value".into()); }
+        let key = match &args[1] { Value::Str(s) => s.clone(), _ => return Err("ns-put: key must be string".into()) };
+        crate::namespace::ns_put(&args[0], &key, args[2].clone())
+    });
+    m.insert(intern("ns-keys"), |args| crate::namespace::ns_keys(&args[0]).map(|ks| Value::List(ks.into_iter().map(Value::Str).collect())));
+    m.insert(intern("ns-values"), |args| crate::namespace::ns_values(&args[0]).map(Value::List));
+    m.insert(intern("ns-merge"), |args| {
+        if args.len() != 2 { return Err("ns-merge: need two namespaces".into()); }
+        crate::namespace::ns_merge(&args[0], &args[1])
+    });
+    m.insert(intern("ns-size"), |args| crate::namespace::ns_size(&args[0]).map(|n| Value::Num(n as f64)));
+    m.insert(intern("ns-flatten"), |args| {
+        crate::namespace::ns_flatten(&args[0]).map(|m| {
+            let mut entries = std::collections::HashMap::new();
+            for (k, v) in m { entries.insert(k, v); }
+            Value::Namespace(entries)
+        })
+    });
+    m.insert(intern("ns?"), |args| Ok(Value::Bool(matches!(&args[0], Value::Namespace(_)))));
+    m.insert(intern("ns-empty"), |_args| Ok(Value::Namespace(std::collections::HashMap::new())));
+    m.insert(intern("ns-get-or"), |args| {
+        if args.len() != 3 { return Err("ns-get-or: need namespace, key, default".into()); }
+        let key = match &args[1] { Value::Str(s) => s.clone(), _ => return Err("ns-get-or: key must be string".into()) };
+        match crate::namespace::ns_get(&args[0], &key) { Ok(v) => Ok(v), Err(_) => Ok(args[2].clone()) }
+    });
+    m.insert(intern("ns-has"), |args| {
+        if args.len() != 2 { return Err("ns-has: need namespace and key".into()); }
+        let key = match &args[1] { Value::Str(s) => s.clone(), _ => return Err("ns-has: key must be string".into()) };
+        Ok(Value::Bool(crate::namespace::ns_get(&args[0], &key).is_ok()))
+    });
+    // Type predicates
+    m.insert(intern("type-of"), |args| {
+        let type_name = match &args[0] {
+            Value::Num(_) => "number", Value::Str(_) => "string", Value::Bool(_) => "bool",
+            Value::List(_) => "list", Value::Namespace(_) => "namespace", Value::Nil => "nil",
+            Value::Closure(..) | Value::Builtin(_) | Value::RustMacro(..) => "function",
+        };
+        Ok(Value::Str(type_name.to_string()))
+    });
+    m.insert(intern("number?"), |args| Ok(Value::Bool(matches!(&args[0], Value::Num(_)))));
+    m.insert(intern("string?"), |args| Ok(Value::Bool(matches!(&args[0], Value::Str(_)))));
+    m.insert(intern("bool?"), |args| Ok(Value::Bool(matches!(&args[0], Value::Bool(_)))));
+    m.insert(intern("list?"), |args| Ok(Value::Bool(matches!(&args[0], Value::List(_)))));
+    m.insert(intern("nil?"), |args| Ok(Value::Bool(matches!(&args[0], Value::Nil))));
+    m.insert(intern("function?"), |args| Ok(Value::Bool(matches!(&args[0], Value::Closure(..) | Value::Builtin(_) | Value::RustMacro(..)))));
+    m.insert(intern("try"), |args| Ok(args[0].clone()));
+    m.insert(intern("define"), |_args| Err("define: must be used as a special form, not called".into()));
+    m.insert(intern("error"), |args| Err(value_to_string(&args[0])));
+    m
+}
+
+thread_local! {
+    static BUILTIN_DISPATCH: std::collections::HashMap<Sym, BuiltinFn> = build_dispatch_table();
+}
+
 pub fn apply_builtin(name: Sym, args: &[Value]) -> Result<Value, String> {
-    // Minimal builtins for the CLI. Add more as needed.
+    // Fast path: direct fn pointer dispatch (O(1) hash lookup, no string allocation)
+    if let Some(result) = BUILTIN_DISPATCH.with(|d| d.get(&name).map(|f| f(args))) {
+        return result;
+    }
+    // Slow path: builtins that call back into eval/apply
+    apply_builtin_slow(name, args)
+}
+
+fn apply_builtin_slow(name: Sym, args: &[Value]) -> Result<Value, String> {
     let name_str = resolve(name);
     match name_str.as_str() {
-        "add" | "+" => num2(args, |a, b| a + b),
-        "subtract" | "-" => num2(args, |a, b| a - b),
-        "multiply" | "*" => num2(args, |a, b| a * b),
-        "divide" | "/" => { let (a, b) = nums(args)?; if b == 0.0 { Err("division by zero".into()) } else { Ok(Value::Num(a / b)) } },
-        "modulo" | "%" => num2(args, |a, b| a % b),
-        "abs" => Ok(Value::Num(num(&args[0])?.abs())),
-        "negate" => Ok(Value::Num(-num(&args[0])?)),
-        "min" => num2(args, |a, b| a.min(b)),
-        "max" => num2(args, |a, b| a.max(b)),
-        "floor" => Ok(Value::Num(num(&args[0])?.floor())),
-        "ceil" => Ok(Value::Num(num(&args[0])?.ceil())),
-        "<" => Ok(Value::Bool(nums(args)?.0 < nums(args)?.1)),
-        ">" => Ok(Value::Bool(nums(args)?.0 > nums(args)?.1)),
-        "<=" => Ok(Value::Bool(nums(args)?.0 <= nums(args)?.1)),
-        ">=" => Ok(Value::Bool(nums(args)?.0 >= nums(args)?.1)),
-        "=" => match (&args[0], &args[1]) {
-            (Value::Num(a), Value::Num(b)) => Ok(Value::Bool(a == b)),
-            (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a == b)),
-            _ => Ok(Value::Bool(false)),
-        },
-        "not" => match &args[0] { Value::Bool(b) => Ok(Value::Bool(!*b)), _ => Err("not: expected bool".into()) },
-        "even" => Ok(Value::Bool(num(&args[0])? % 2.0 == 0.0)),
-        "odd" => Ok(Value::Bool(num(&args[0])? % 2.0 != 0.0)),
-        "string-upper" => Ok(Value::Str(string(&args[0])?.to_uppercase())),
-        "string-lower" => Ok(Value::Str(string(&args[0])?.to_lowercase())),
-        "string-reverse" => Ok(Value::Str(string(&args[0])?.chars().rev().collect())),
-        "string-trim" => Ok(Value::Str(string(&args[0])?.trim().to_string())),
-        "string-length" => Ok(Value::Num(string(&args[0])?.len() as f64)),
-        "string-contains" => Ok(Value::Bool(string(&args[0])?.contains(&string(&args[1])?))),
-        "string-split" => {
-            let s = string(&args[0])?;
-            let sep = string(&args[1])?;
-            Ok(Value::List(s.split(&sep).map(|p| Value::Str(p.to_string())).collect()))
-        }
-        "string-join" => {
-            let lst = list(&args[0])?;
-            let sep = string(&args[1])?;
-            let strs: Vec<String> = lst.iter().map(|v| value_to_string(v)).collect();
-            Ok(Value::Str(strs.join(&sep)))
-        }
-        "concat" => {
-            let mut r = String::new();
-            for a in args { r.push_str(&value_to_string(a)); }
-            Ok(Value::Str(r))
-        }
-        "to-string" => Ok(Value::Str(value_to_string(&args[0]))),
-        "to-number" => match &args[0] {
-            Value::Str(s) => s.parse::<f64>().map(Value::Num).map_err(|e| format!("to-number: {}", e)),
-            Value::Num(n) => Ok(Value::Num(*n)),
-            _ => Err("to-number: expected string".into()),
-        },
-        "list" => Ok(Value::List(args.to_vec())),
-        "head" => { let l = list(&args[0])?; l.first().cloned().ok_or("head: empty".into()) },
-        "tail" => { let l = list(&args[0])?; if l.is_empty() { Err("tail: empty".into()) } else { Ok(Value::List(l[1..].to_vec())) } },
-        "length" => Ok(Value::Num(list(&args[0])?.len() as f64)),
-        "cons" => { let mut l = list(&args[1])?; l.insert(0, args[0].clone()); Ok(Value::List(l)) },
         "map" => {
             let l = list(&args[1])?;
             let empty = empty_nodes();
@@ -355,166 +540,35 @@ pub fn apply_builtin(name: Sym, args: &[Value]) -> Result<Value, String> {
             }
             Ok(Value::List(results))
         }
-        "nth" => {
-            let l = list(&args[0])?;
-            let i = num(&args[1])? as usize;
-            l.get(i).cloned().ok_or(format!("nth: index {} out of bounds (len {})", i, l.len()))
+        "apply" => {
+            let func = &args[0];
+            let arg_list = list(&args[1])?;
+            let empty = empty_nodes();
+            let mut env = make_default_env();
+            apply(func, &arg_list, &empty, &mut env)
         }
-        "slice" => {
-            let l = list(&args[0])?;
-            let start = num(&args[1])? as usize;
-            let end = if args.len() > 2 { num(&args[2])? as usize } else { l.len() };
-            let end = end.min(l.len());
-            let start = start.min(end);
-            Ok(Value::List(l[start..end].to_vec()))
+        "eval-source" => {
+            let src = string(&args[0])?;
+            let (nodes, roots) = crate::parser::parse_file(&src)
+                .map_err(|e| format!("eval-source: parse error: {}", e))?;
+            if roots.is_empty() { return Ok(Value::Nil); }
+            let nodes_rc: Rc<[Node]> = nodes.into();
+            let mut env = make_default_env();
+            let mut last = Value::Nil;
+            for &r in &roots { last = eval(&nodes_rc, r, &mut env)?; }
+            Ok(last)
         }
-        "sort" => {
-            let mut l = list(&args[0])?;
-            l.sort_by(|a, b| {
-                match (a, b) {
-                    (Value::Num(x), Value::Num(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
-                    (Value::Str(x), Value::Str(y)) => x.cmp(y),
-                    _ => std::cmp::Ordering::Equal,
-                }
-            });
-            Ok(Value::List(l))
+        "eval-in" => {
+            let src = string(&args[0])?;
+            let (nodes, roots) = crate::parser::parse_file(&src)
+                .map_err(|e| format!("eval-in: parse error: {}", e))?;
+            if roots.is_empty() { return Ok(Value::Nil); }
+            let nodes_rc: Rc<[Node]> = nodes.into();
+            let mut env = make_default_env();
+            let mut last = Value::Nil;
+            for &r in &roots { last = eval(&nodes_rc, r, &mut env)?; }
+            Ok(last)
         }
-        "reverse" => {
-            let mut l = list(&args[0])?;
-            l.reverse();
-            Ok(Value::List(l))
-        }
-        "append" => {
-            let mut l1 = list(&args[0])?;
-            let l2 = list(&args[1])?;
-            l1.extend(l2);
-            Ok(Value::List(l1))
-        }
-        "range" => {
-            let n = num(&args[0])? as i64;
-            let start = if args.len() > 1 { num(&args[1])? as i64 } else { 0 };
-            let (from, to) = if args.len() > 1 { (start, n) } else { (0, n) };
-            Ok(Value::List((from..to).map(|i| Value::Num(i as f64)).collect()))
-        }
-        "contains" => {
-            let l = list(&args[0])?;
-            let target = &args[1];
-            let found = l.iter().any(|v| match (v, target) {
-                (Value::Num(a), Value::Num(b)) => (a - b).abs() < f64::EPSILON,
-                (Value::Str(a), Value::Str(b)) => a == b,
-                (Value::Bool(a), Value::Bool(b)) => a == b,
-                _ => false,
-            });
-            Ok(Value::Bool(found))
-        }
-        "zip" => {
-            let l1 = list(&args[0])?;
-            let l2 = list(&args[1])?;
-            Ok(Value::List(l1.into_iter().zip(l2).map(|(a, b)| Value::List(vec![a, b])).collect()))
-        }
-        "enumerate" => {
-            let l = list(&args[0])?;
-            Ok(Value::List(l.into_iter().enumerate().map(|(i, v)| Value::List(vec![Value::Num(i as f64), v])).collect()))
-        }
-        "round" => Ok(Value::Num(num(&args[0])?.round())),
-        "pow" => num2(args, |a, b| a.powf(b)),
-        "sqrt" => Ok(Value::Num(num(&args[0])?.sqrt())),
-        "log" => Ok(Value::Num(num(&args[0])?.ln())),
-        "string-nth" => {
-            let s = string(&args[0])?;
-            let i = num(&args[1])? as usize;
-            s.chars().nth(i).map(|c| Value::Str(c.to_string())).ok_or(format!("string-nth: index {} out of bounds", i))
-        }
-        "string-slice" => {
-            let s = string(&args[0])?;
-            let start = num(&args[1])? as usize;
-            let end = if args.len() > 2 { num(&args[2])? as usize } else { s.len() };
-            let chars: Vec<char> = s.chars().collect();
-            let end = end.min(chars.len());
-            let start = start.min(end);
-            Ok(Value::Str(chars[start..end].iter().collect()))
-        }
-        // String analysis builtins — enable context-free language tasks
-        "count-char" => {
-            // (count-char "aabba" "a") => 3
-            let s = string(&args[0])?;
-            let c = string(&args[1])?;
-            Ok(Value::Num(s.matches(&c as &str).count() as f64))
-        }
-        "string-replace" => {
-            // (string-replace "hello" "l" "r") => "herro"
-            let s = string(&args[0])?;
-            let from = string(&args[1])?;
-            let to = string(&args[2])?;
-            Ok(Value::Str(s.replace(&from as &str, &to as &str)))
-        }
-        "string-chars" => {
-            // (string-chars "abc") => ("a" "b" "c")
-            let s = string(&args[0])?;
-            Ok(Value::List(s.chars().map(|c| Value::Str(c.to_string())).collect()))
-        }
-        "string-starts-with" => {
-            let s = string(&args[0])?;
-            let prefix = string(&args[1])?;
-            Ok(Value::Bool(s.starts_with(&prefix as &str)))
-        }
-        "string-ends-with" => {
-            let s = string(&args[0])?;
-            let suffix = string(&args[1])?;
-            Ok(Value::Bool(s.ends_with(&suffix as &str)))
-        }
-        // Character ↔ number conversion
-        "char-code" => {
-            // (char-code "a") => 97
-            let s = string(&args[0])?;
-            s.chars().next()
-                .map(|c| Value::Num(c as u32 as f64))
-                .ok_or("char-code: empty string".into())
-        }
-        "code-char" => {
-            // (code-char 97) => "a"
-            let n = num(&args[0])? as u32;
-            char::from_u32(n)
-                .map(|c| Value::Str(c.to_string()))
-                .ok_or(format!("code-char: invalid code point {}", n))
-        }
-        "identity" => Ok(args[0].clone()),
-        "print" => {
-            for a in args { print!("{}", value_to_string(a)); }
-            println!();
-            Ok(Value::Nil)
-        }
-        // Namespace operations
-        "ns-get" => {
-            if args.len() < 2 { return Err("ns-get: need namespace and key".into()); }
-            let mut result = args[0].clone();
-            for arg in &args[1..] {
-                let key = match arg { Value::Str(s) => s.clone(), _ => return Err("ns-get: key must be string".into()) };
-                result = crate::namespace::ns_get(&result, &key)?;
-            }
-            Ok(result)
-        }
-        "ns-put" => {
-            if args.len() != 3 { return Err("ns-put: need namespace, key, value".into()); }
-            let key = match &args[1] { Value::Str(s) => s.clone(), _ => return Err("ns-put: key must be string".into()) };
-            crate::namespace::ns_put(&args[0], &key, args[2].clone())
-        }
-        "ns-keys" => crate::namespace::ns_keys(&args[0]).map(|ks| Value::List(ks.into_iter().map(Value::Str).collect())),
-        "ns-values" => crate::namespace::ns_values(&args[0]).map(Value::List),
-        "ns-merge" => {
-            if args.len() != 2 { return Err("ns-merge: need two namespaces".into()); }
-            crate::namespace::ns_merge(&args[0], &args[1])
-        }
-        "ns-size" => crate::namespace::ns_size(&args[0]).map(|n| Value::Num(n as f64)),
-        "ns-flatten" => {
-            crate::namespace::ns_flatten(&args[0]).map(|m| {
-                let mut entries = std::collections::HashMap::new();
-                for (k, v) in m { entries.insert(k, v); }
-                Value::Namespace(entries)
-            })
-        }
-        "ns?" => Ok(Value::Bool(matches!(&args[0], Value::Namespace(_)))),
-        "ns-empty" => Ok(Value::Namespace(std::collections::HashMap::new())),
         "synthesize" => {
             if args.len() != 1 {
                 return Err("synthesize: expected 1 argument (namespace)".into());
@@ -648,131 +702,6 @@ pub fn apply_builtin(name: Sym, args: &[Value]) -> Result<Value, String> {
             }
             Ok(Value::Namespace(result))
         }
-        // ── Self-hosting builtins ────────────────────────────────────
-        // These enable SELPH programs to express their own infrastructure:
-        // curriculum loops, dynamic macro creation, error handling, etc.
-
-        // eval-source: parse and evaluate a SELPH source string
-        // (eval-source "(add 1 2)") => 3
-        // Enables: dynamic code generation, promoting synthesized programs
-        "eval-source" => {
-            let src = string(&args[0])?;
-            let (nodes, roots) = crate::parser::parse_file(&src)
-                .map_err(|e| format!("eval-source: parse error: {}", e))?;
-            if roots.is_empty() {
-                return Ok(Value::Nil);
-            }
-            let nodes_rc: Rc<[Node]> = nodes.into();
-            let mut env = make_default_env();
-            let mut last = Value::Nil;
-            for &r in &roots {
-                last = eval(&nodes_rc, r, &mut env)?;
-            }
-            Ok(last)
-        }
-
-        // eval-in: evaluate a source string in the CURRENT environment
-        // (let ((x 5)) (eval-in "(add x 1)")) => 6
-        // This version is handled specially in the eval loop (see below),
-        // but we provide a fallback here for when called via apply_builtin
-        "eval-in" => {
-            let src = string(&args[0])?;
-            let (nodes, roots) = crate::parser::parse_file(&src)
-                .map_err(|e| format!("eval-in: parse error: {}", e))?;
-            if roots.is_empty() {
-                return Ok(Value::Nil);
-            }
-            let nodes_rc: Rc<[Node]> = nodes.into();
-            let mut env = make_default_env();
-            let mut last = Value::Nil;
-            for &r in &roots {
-                last = eval(&nodes_rc, r, &mut env)?;
-            }
-            Ok(last)
-        }
-
-        // define: create a new binding in the current scope
-        // Handled as special form in the eval loop, not here.
-        // This is the fallback for when it's called through apply.
-        "define" => Err("define: must be used as a special form, not called".into()),
-
-        // ns-get-or: namespace get with default value
-        // (ns-get-or ns "key" default-value) => value or default
-        // Avoids errors on missing keys — essential for robust SELPH programs
-        "ns-get-or" => {
-            if args.len() != 3 { return Err("ns-get-or: need namespace, key, default".into()); }
-            let key = match &args[1] { Value::Str(s) => s.clone(), _ => return Err("ns-get-or: key must be string".into()) };
-            match crate::namespace::ns_get(&args[0], &key) {
-                Ok(v) => Ok(v),
-                Err(_) => Ok(args[2].clone()),
-            }
-        }
-
-        // ns-has: check if a namespace has a key
-        // (ns-has ns "key") => true/false
-        "ns-has" => {
-            if args.len() != 2 { return Err("ns-has: need namespace and key".into()); }
-            let key = match &args[1] { Value::Str(s) => s.clone(), _ => return Err("ns-has: key must be string".into()) };
-            Ok(Value::Bool(crate::namespace::ns_get(&args[0], &key).is_ok()))
-        }
-
-        // try: evaluate first arg; if it errors, return second arg
-        // (try (divide 1 0) "error") => "error"
-        // Enables: robust curriculum loops, graceful synthesis failure handling
-        "try" => {
-            // try is handled as a special form in eval for full env access.
-            // This fallback works for pre-evaluated args.
-            // The first arg has already been evaluated by the time we get here,
-            // so it either succeeded (return it) or we'd never reach here.
-            Ok(args[0].clone())
-        }
-
-        // type-of: return the type name of a value as a string
-        // (type-of 42) => "number"
-        // (type-of "hello") => "string"
-        // Enables: type-based dispatch in SELPH programs, scoping predicates
-        "type-of" => {
-            let type_name = match &args[0] {
-                Value::Num(_) => "number",
-                Value::Str(_) => "string",
-                Value::Bool(_) => "bool",
-                Value::List(_) => "list",
-                Value::Namespace(_) => "namespace",
-                Value::Nil => "nil",
-                Value::Closure(..) => "function",
-                Value::Builtin(_) => "function",
-                Value::RustMacro(..) => "function",
-            };
-            Ok(Value::Str(type_name.to_string()))
-        }
-
-        // number?: type predicate
-        "number?" => Ok(Value::Bool(matches!(&args[0], Value::Num(_)))),
-        // string?: type predicate
-        "string?" => Ok(Value::Bool(matches!(&args[0], Value::Str(_)))),
-        // bool?: type predicate
-        "bool?" => Ok(Value::Bool(matches!(&args[0], Value::Bool(_)))),
-        // list?: type predicate
-        "list?" => Ok(Value::Bool(matches!(&args[0], Value::List(_)))),
-        // nil?: type predicate
-        "nil?" => Ok(Value::Bool(matches!(&args[0], Value::Nil))),
-        // function?: type predicate
-        "function?" => Ok(Value::Bool(matches!(&args[0], Value::Closure(..) | Value::Builtin(_) | Value::RustMacro(..)))),
-
-        // apply: call a function with a list of arguments
-        // (apply add (list 1 2)) => 3
-        "apply" => {
-            let func = &args[0];
-            let arg_list = list(&args[1])?;
-            let empty = empty_nodes();
-            let mut env = make_default_env();
-            apply(func, &arg_list, &empty, &mut env)
-        }
-
-        // error: raise an error with a message
-        // (error "something went wrong")
-        "error" => Err(value_to_string(&args[0])),
-
         _ => Err(format!("unknown builtin: {}", name_str)),
     }
 }
