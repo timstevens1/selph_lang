@@ -256,12 +256,43 @@ pub struct SynthPool {
     pub priority: f64,
 }
 
+/// RL reward coefficients for partial-match-driven priority adjustment.
+/// These control how strongly partial match signals affect pool entry
+/// priorities during synthesis. Optimized by the meta loop.
+#[derive(Clone, Copy, Debug)]
+pub struct RlCoefficients {
+    /// Penalty applied to pool entries that match 0 examples when their
+    /// return type matches the target. Negative value (default: -50.0).
+    pub cold_penalty: f64,
+    /// Scale factor for partial match bonus. A candidate matching fraction
+    /// f of examples gets priority += f * warm_bonus. Default: 30.0.
+    pub warm_bonus: f64,
+}
+
+impl Default for RlCoefficients {
+    fn default() -> Self {
+        RlCoefficients { cold_penalty: -50.0, warm_bonus: 30.0 }
+    }
+}
+
 /// Result of a synthesis search.
 pub struct SynthResult {
     pub found: bool,
     pub nodes: Option<Vec<Node>>,
     pub root: Option<usize>,
     pub candidates_explored: usize,
+}
+
+/// Lightweight record of a candidate for heuristic re-ranking.
+///
+/// Captures only the component name and argument priority sum — enough
+/// to re-score under a different heuristic without re-enumerating.
+/// The heuristic controls component priority; arg_priority_sum is the
+/// fixed contribution from arguments (heuristic-independent).
+#[derive(Clone, Debug)]
+pub struct CandidateRecord {
+    pub comp_name: String,
+    pub arg_priority_sum: f64,
 }
 
 impl SynthResult {
@@ -551,7 +582,8 @@ pub fn synthesize_with_validation(
     extra_bindings: &[(String, Value)],
 ) -> SynthResult {
     synthesize_full(components, inputs, expected, macros, max_depth,
-        max_candidates, enable_if, validation_examples, extra_bindings, None)
+        max_candidates, enable_if, validation_examples, extra_bindings, None, None,
+        RlCoefficients::default())
 }
 
 /// Full synthesizer with optional SELPH-programmable depth filter.
@@ -570,11 +602,14 @@ pub fn synthesize_full(
     validation_examples: Option<&[(Value, Value)]>,
     extra_bindings: &[(String, Value)],
     depth_filter: Option<&dyn Fn(&SynthComponent, usize) -> bool>,
+    snapshot: Option<&mut Vec<CandidateRecord>>,
+    rl_coeffs: RlCoefficients,
 ) -> SynthResult {
     const MAX_POOL: usize = 100_000;
     let mut explored: usize = 0;
     let mut seen: HashSet<Vec<u64>> = HashSet::new();
     let macro_env = build_macro_env(macros);
+    let mut snapshot = snapshot;
 
     // ── Namespace-based scoping ─────────────────────────────────────
     // Infer the input/output types from examples, then filter out
@@ -590,6 +625,37 @@ pub fn synthesize_full(
     // input type so that type-based composition checks work correctly.
     let target_output_type = infer_uniform_type(expected);
     let input_type = infer_uniform_type(inputs);
+
+    // Compute which types are "useful" — can eventually produce the target
+    // output type through some chain of available components. A type t is
+    // useful if: (a) t == target, or (b) some component takes t as input
+    // and returns a useful type. This is a fixed-point computation.
+    // Pool entries whose type is not useful are dead weight.
+    let useful_types: HashSet<u8> = if let Some(target) = target_output_type {
+        let mut useful = HashSet::new();
+        useful.insert(target);
+        useful.insert(TYPE_ANY);
+        // Fixed-point: keep adding types that feed into useful types
+        loop {
+            let mut changed = false;
+            for comp in components.iter() {
+                if comp.arity == 0 { continue; }
+                // If this component returns a useful type, all its param types are useful
+                if useful.contains(&comp.ret_type) || comp.ret_type == TYPE_ANY {
+                    for &pt in &comp.param_types {
+                        if useful.insert(pt) { changed = true; }
+                    }
+                }
+            }
+            if !changed { break; }
+        }
+        useful
+    } else {
+        // No target type — all types are useful
+        let mut all = HashSet::new();
+        all.insert(TYPE_NUM); all.insert(TYPE_STR); all.insert(TYPE_BOOL); all.insert(TYPE_ANY);
+        all
+    };
 
     // Fix up `x` variable type: its ret_type should match the actual
     // input type, not always be TYPE_NUM.
@@ -678,14 +744,31 @@ pub fn synthesize_full(
 
     // Closure: evaluate a candidate, check against expected outputs,
     // and dedup via behavior hash.
+    //
+    // Returns (solution_or_none, match_fraction):
+    //   - match_fraction in [0.0, 1.0]: fraction of examples matched
+    //   - -1.0 if skipped (type gate, budget, dedup) — no eval happened
+    //
+    // The match_fraction enables RL-style reward propagation: partial
+    // matches signal that a component is "on the right track," and
+    // zero matches signal dead ends for Bayesian pruning.
     let test = |entry: &SynthPool,
                 seen: &mut HashSet<Vec<u64>>,
                 explored: &mut usize|
-        -> Option<(Vec<Node>, usize)>
+        -> (Option<(Vec<Node>, usize)>, f64)
     {
+        // Type gate: skip evaluation if the candidate's return type
+        // cannot match the expected output type. This avoids expensive
+        // eval calls for clearly wrong-typed candidates.
+        if let Some(target) = target_output_type {
+            if entry.ret_type != target && entry.ret_type != TYPE_ANY && target != TYPE_ANY {
+                return (None, -1.0);
+            }
+        }
+
         *explored += 1;
         if *explored > max_candidates {
-            return None;
+            return (None, -1.0);
         }
 
         // Wrap the body in (lambda (x) body)
@@ -694,7 +777,8 @@ pub fn synthesize_full(
         ln.push(Node::Lambda(vec!["x".into()], entry.root));
 
         let mut beh = Vec::new();
-        let mut ok = true;
+        let mut matches = 0usize;
+        let mut evaluated = 0usize;
         for (inp, exp) in inputs.iter().zip(expected.iter()) {
             let mut env = eval::make_default_env();
             for (nm, ps, mn, mr) in &macro_env {
@@ -709,34 +793,41 @@ pub fn synthesize_full(
             }
             let fv = match eval::eval(&ln, lr, &mut env) {
                 Ok(v) => v,
-                Err(_) => { ok = false; break; }
+                Err(_) => break,
             };
             match eval::apply(&fv, &[inp.clone()], &ln, &mut env) {
                 Ok(a) => {
                     beh.push(val_hash(&a));
-                    if !vals_equal(&a, exp) { ok = false; }
+                    evaluated += 1;
+                    if vals_equal(&a, exp) { matches += 1; }
                 }
-                Err(_) => { ok = false; break; }
+                Err(_) => break,
             }
         }
 
+        let match_frac = if evaluated > 0 {
+            matches as f64 / inputs.len() as f64
+        } else {
+            0.0
+        };
+
         // Observational equivalence dedup
         if !beh.is_empty() {
-            if seen.contains(&beh) { return None; }
+            if seen.contains(&beh) { return (None, -1.0); }
             seen.insert(beh);
         }
 
-        if ok && !inputs.is_empty() {
+        if matches == inputs.len() && !inputs.is_empty() {
             // Held-out validation: if validation examples provided,
             // check the candidate generalises beyond training data.
             if let Some(val_exs) = validation_examples {
                 if !validate_candidate(&ln, lr, val_exs, &macro_env, extra_bindings) {
-                    return None; // passes training but fails validation
+                    return (None, match_frac); // passes training but fails validation
                 }
             }
-            Some((ln, lr))
+            (Some((ln, lr)), match_frac)
         } else {
-            None
+            (None, match_frac)
         }
     };
 
@@ -852,17 +943,30 @@ pub fn synthesize_full(
         }
     }
 
+    // Track partial match scores per pool entry for RL reward propagation.
+    // Indexed parallel to pool: match_fraction in [0.0, 1.0], or -1.0 if
+    // not evaluated (type-gated or deduped).
+    let mut pool_scores: Vec<f64> = Vec::new();
+
     // Test atoms
     for e in &pool {
         if explored >= max_candidates {
             return SynthResult { found: false, nodes: None, root: None, candidates_explored: explored };
         }
-        if let Some((n, r)) = test(e, &mut seen, &mut explored) {
+        let (result, score) = test(e, &mut seen, &mut explored);
+        pool_scores.push(score);
+        if let Some((n, r)) = result {
             return SynthResult::success(n, r, explored);
         }
     }
 
     // ── Depth 1..max_depth: compose ─────────────────────────────────
+
+    // Per-component reward accumulator for RL-style priority updates.
+    // Between depths, components whose candidates got partial matches
+    // get priority boosts, while components with only zero-match
+    // candidates get deprioritized.
+    let mut comp_best_match: HashMap<usize, f64> = HashMap::new();
 
     // HM type variable counter for fresh variables during synthesis.
     let mut hm_counter: u32 = 0;
@@ -885,21 +989,29 @@ pub fn synthesize_full(
         //
         // The priority of a candidate = component.priority + sum(arg.priority)
         // This naturally prioritizes compositions of useful components.
+        //
+        // Memory optimization: we store lightweight descriptors (component
+        // index + pool indices + inferred type) instead of cloned node trees.
+        // Node trees are built on-demand during testing, so only one
+        // materialized candidate exists at a time.
 
-        struct PendingCandidate {
-            entry: SynthPool,
+        struct PendingDesc {
+            comp_idx: usize,    // index into components slice
+            arg1: usize,        // pool index of first argument
+            arg2: usize,        // pool index of second argument (unused for arity 1)
+            arg3: usize,        // pool index of third argument (unused for arity 1-2)
+            ret_type: u8,       // inferred return type
             score: f64,
         }
 
-        let mut pending: Vec<PendingCandidate> = Vec::new();
+        let mut pending: Vec<PendingDesc> = Vec::new();
 
-        for comp in components {
+        for (ci, comp) in components.iter().enumerate() {
             if comp.arity == 0 || comp.builtin.is_none() { continue; }
             // SELPH-programmable depth filter (optional hard cutoff)
             if let Some(ref filter) = depth_filter {
                 if !filter(comp, _depth) { continue; }
             }
-            let bn = comp.builtin.as_ref().unwrap();
 
             if comp.arity == 1 {
                 for pi in prev.clone() {
@@ -911,18 +1023,10 @@ pub fn synthesize_full(
                         continue;
                     }
                     let inferred_ret = hm_infer_ret_type(comp, &[p], &mut hm_counter);
-                    let mut n = p.nodes.clone();
-                    let fi = n.len();
-                    n.push(Node::Symbol(bn.clone()));
-                    let ai = n.len();
-                    n.push(Node::App(vec![fi, p.root]));
                     let score = comp.priority + p.priority;
-                    pending.push(PendingCandidate {
-                        entry: SynthPool {
-                            nodes: n, root: ai,
-                            ret_type: inferred_ret, priority: score,
-                        },
-                        score,
+                    pending.push(PendingDesc {
+                        comp_idx: ci, arg1: pi, arg2: 0, arg3: 0,
+                        ret_type: inferred_ret, score,
                     });
                 }
             } else if comp.arity == 2 {
@@ -941,22 +1045,10 @@ pub fn synthesize_full(
                             continue;
                         }
                         let inferred_ret = hm_infer_ret_type(comp, &[p1, p2], &mut hm_counter);
-                        let mut n = p1.nodes.clone();
-                        let off = n.len();
-                        for nd in &p2.nodes {
-                            n.push(remap_node(nd, off));
-                        }
-                        let fi = n.len();
-                        n.push(Node::Symbol(bn.clone()));
-                        let api = n.len();
-                        n.push(Node::App(vec![fi, p1.root, p2.root + off]));
                         let score = comp.priority + p1.priority + p2.priority;
-                        pending.push(PendingCandidate {
-                            entry: SynthPool {
-                                nodes: n, root: api,
-                                ret_type: inferred_ret, priority: score,
-                            },
-                            score,
+                        pending.push(PendingDesc {
+                            comp_idx: ci, arg1: pi, arg2: ai, arg3: 0,
+                            ret_type: inferred_ret, score,
                         });
                     }
                 }
@@ -975,44 +1067,189 @@ pub fn synthesize_full(
                             continue;
                         }
                         let inferred_ret = hm_infer_ret_type(comp, &[p1, p2], &mut hm_counter);
-                        let mut n = p1.nodes.clone();
-                        let off = n.len();
-                        for nd in &p2.nodes {
-                            n.push(remap_node(nd, off));
-                        }
-                        let fi = n.len();
-                        n.push(Node::Symbol(bn.clone()));
-                        let api = n.len();
-                        n.push(Node::App(vec![fi, p1.root, p2.root + off]));
                         let score = comp.priority + p1.priority + p2.priority;
-                        pending.push(PendingCandidate {
-                            entry: SynthPool {
-                                nodes: n, root: api,
-                                ret_type: inferred_ret, priority: score,
-                            },
-                            score,
+                        pending.push(PendingDesc {
+                            comp_idx: ci, arg1: ai, arg2: pi, arg3: 0,
+                            ret_type: inferred_ret, score,
                         });
+                    }
+                }
+            } else if comp.arity == 3 {
+                // Arity-3: at least one arg must be from prev (current depth).
+                // Guard: skip arity-3 when the pool is large enough that
+                // cubic enumeration would dominate the search budget.
+                // At depth 1 (small pool of atoms), arity-3 is cheap.
+                // At depth 2+ with many pool entries, skip it.
+                let max_per_arg: usize = 15;
+                let type_counts: Vec<usize> = comp.param_types.iter().map(|&pt| {
+                    (0..all_end).filter(|&i| pool[i].ret_type == pt || pt == 255).count()
+                }).collect();
+                if type_counts.iter().any(|&c| c > max_per_arg) {
+                    continue;
+                }
+                // Case 1: arg1 from prev, arg2+arg3 from all
+                for pi in prev.clone() {
+                    let p1 = &pool[pi];
+                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 { continue; }
+                    for a2 in 0..all_end {
+                        let p2 = &pool[a2];
+                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 { continue; }
+                        for a3 in 0..all_end {
+                            let p3 = &pool[a3];
+                            if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 { continue; }
+                            if !hm_check_application(comp, &[p1, p2, p3], &mut hm_counter) { continue; }
+                            let inferred_ret = hm_infer_ret_type(comp, &[p1, p2, p3], &mut hm_counter);
+                            let score = comp.priority + p1.priority + p2.priority + p3.priority;
+                            pending.push(PendingDesc {
+                                comp_idx: ci, arg1: pi, arg2: a2, arg3: a3,
+                                ret_type: inferred_ret, score,
+                            });
+                        }
+                    }
+                }
+                // Case 2: arg1 from old, arg2 from prev, arg3 from all
+                for a1 in 0..prev_start {
+                    let p1 = &pool[a1];
+                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 { continue; }
+                    for pi in prev.clone() {
+                        let p2 = &pool[pi];
+                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 { continue; }
+                        for a3 in 0..all_end {
+                            let p3 = &pool[a3];
+                            if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 { continue; }
+                            if !hm_check_application(comp, &[p1, p2, p3], &mut hm_counter) { continue; }
+                            let inferred_ret = hm_infer_ret_type(comp, &[p1, p2, p3], &mut hm_counter);
+                            let score = comp.priority + p1.priority + p2.priority + p3.priority;
+                            pending.push(PendingDesc {
+                                comp_idx: ci, arg1: a1, arg2: pi, arg3: a3,
+                                ret_type: inferred_ret, score,
+                            });
+                        }
+                    }
+                }
+                // Case 3: arg1+arg2 from old, arg3 from prev
+                for a1 in 0..prev_start {
+                    let p1 = &pool[a1];
+                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 { continue; }
+                    for a2 in 0..prev_start {
+                        let p2 = &pool[a2];
+                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 { continue; }
+                        for pi in prev.clone() {
+                            let p3 = &pool[pi];
+                            if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 { continue; }
+                            if !hm_check_application(comp, &[p1, p2, p3], &mut hm_counter) { continue; }
+                            let inferred_ret = hm_infer_ret_type(comp, &[p1, p2, p3], &mut hm_counter);
+                            let score = comp.priority + p1.priority + p2.priority + p3.priority;
+                            pending.push(PendingDesc {
+                                comp_idx: ci, arg1: a1, arg2: a2, arg3: pi,
+                                ret_type: inferred_ret, score,
+                            });
+                        }
                     }
                 }
             }
         }
 
-        // Sort by priority descending — high-value compositions tested first
+        // Sort descriptors by priority descending — high-value compositions tested first
         pending.sort_by(|a, b| b.score.partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal));
 
-        // Test in priority order
-        for cand in pending {
-            if let Some((sn, sr)) = test(&cand.entry, &mut seen, &mut explored) {
+        // Materialize and test in priority order — only one node tree alive at a time
+        for desc in &pending {
+            let comp = &components[desc.comp_idx];
+            let bn = comp.builtin.as_ref().unwrap();
+
+            let entry = if comp.arity == 1 {
+                let p = &pool[desc.arg1];
+                let mut n = p.nodes.clone();
+                let fi = n.len();
+                n.push(Node::Symbol(bn.clone()));
+                let ai = n.len();
+                n.push(Node::App(vec![fi, p.root]));
+                SynthPool { nodes: n, root: ai, ret_type: desc.ret_type, priority: desc.score }
+            } else if comp.arity == 2 {
+                let p1 = &pool[desc.arg1];
+                let p2 = &pool[desc.arg2];
+                let mut n = p1.nodes.clone();
+                let off = n.len();
+                for nd in &p2.nodes {
+                    n.push(remap_node(nd, off));
+                }
+                let fi = n.len();
+                n.push(Node::Symbol(bn.clone()));
+                let api = n.len();
+                n.push(Node::App(vec![fi, p1.root, p2.root + off]));
+                SynthPool { nodes: n, root: api, ret_type: desc.ret_type, priority: desc.score }
+            } else {
+                // Arity 3: merge three node trees
+                let p1 = &pool[desc.arg1];
+                let p2 = &pool[desc.arg2];
+                let p3 = &pool[desc.arg3];
+                let mut n = p1.nodes.clone();
+                let off2 = n.len();
+                for nd in &p2.nodes {
+                    n.push(remap_node(nd, off2));
+                }
+                let off3 = n.len();
+                for nd in &p3.nodes {
+                    n.push(remap_node(nd, off3));
+                }
+                let fi = n.len();
+                n.push(Node::Symbol(bn.clone()));
+                let api = n.len();
+                n.push(Node::App(vec![fi, p1.root, p2.root + off2, p3.root + off3]));
+                SynthPool { nodes: n, root: api, ret_type: desc.ret_type, priority: desc.score }
+            };
+
+            // Record candidate in snapshot before testing
+            if let Some(ref mut snap) = snapshot {
+                let arg_psum = desc.score - comp.priority;
+                snap.push(CandidateRecord {
+                    comp_name: bn.clone(),
+                    arg_priority_sum: arg_psum,
+                });
+            }
+
+            let (result, match_frac) = test(&entry, &mut seen, &mut explored);
+
+            // RL reward: track best partial match per component
+            if match_frac >= 0.0 {
+                let best = comp_best_match.entry(desc.comp_idx).or_insert(0.0);
+                if match_frac > *best { *best = match_frac; }
+            }
+
+            if let Some((sn, sr)) = result {
                 return SynthResult::success(sn, sr, explored);
             }
             if explored > max_candidates {
                 return SynthResult { found: false, nodes: None, root: None, candidates_explored: explored };
             }
-            if pool.len() + new_entries.len() < MAX_POOL {
-                new_entries.push(cand.entry);
+            if pool.len() + new_entries.len() < MAX_POOL
+                && useful_types.contains(&entry.ret_type)
+            {
+                // Bayesian pruning: deprioritize pool entries that matched
+                // 0 examples when their return type matches the target.
+                // These are unlikely to be useful building blocks.
+                let mut adjusted_entry = entry;
+                if match_frac == 0.0 {
+                    if let Some(target) = target_output_type {
+                        if adjusted_entry.ret_type == target {
+                            adjusted_entry.priority += rl_coeffs.cold_penalty;
+                        }
+                    }
+                } else if match_frac > 0.0 {
+                    adjusted_entry.priority += match_frac * rl_coeffs.warm_bonus;
+                }
+                new_entries.push(adjusted_entry);
             }
         }
+
+        // ── RL priority update: boost components with partial matches ──
+        // Components whose candidates got partial matches are "warm" —
+        // their depth-(N+1) compositions should be tried earlier.
+        // This is applied by adjusting pending descriptor scores at the
+        // next iteration via the pool entry priorities (which flow into
+        // arg_priority_sum in the score calculation).
 
         // ── If-expression generation (when enabled) ─────────────────
 
@@ -1022,7 +1259,8 @@ pub fn synthesize_full(
                 inputs, expected, &macro_env, extra_bindings,
             );
             for e in if_entries {
-                if let Some((sn, sr)) = test(&e, &mut seen, &mut explored) {
+                let (result, _) = test(&e, &mut seen, &mut explored);
+                if let Some((sn, sr)) = result {
                     return SynthResult::success(sn, sr, explored);
                 }
                 if explored > max_candidates {
@@ -1529,6 +1767,20 @@ pub fn default_synth_components(
         });
     }
 
+    // Boolean logic: bool->bool, (bool,bool)->bool
+    comps.push(SynthComponent {
+        name: "not".into(), builtin: Some("not".into()),
+        arity: 1, ret_type: 2, param_types: vec![2], priority: 0.0,
+    });
+    comps.push(SynthComponent {
+        name: "and".into(), builtin: Some("and".into()),
+        arity: 2, ret_type: 2, param_types: vec![2, 2], priority: 0.0,
+    });
+    comps.push(SynthComponent {
+        name: "or".into(), builtin: Some("or".into()),
+        arity: 2, ret_type: 2, param_types: vec![2, 2], priority: 0.0,
+    });
+
     // Add macro components — infer types by probing with sample inputs
     for (mname, params, mnodes, mroot) in macros {
         let (inferred_param, inferred_ret) = infer_macro_types(mname, params, mnodes, *mroot);
@@ -1963,6 +2215,89 @@ pub fn synthesize_optimize(
                             }
                         }
                         if explored > max_candidates { break; }
+                    }
+                }
+            } else if comp.arity == 3 {
+                // Case 1: arg1 from prev, arg2+arg3 from all
+                'a3c1: for pi in prev.clone() {
+                    let p1 = &pool[pi];
+                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 { continue; }
+                    for a2 in 0..all_end {
+                        let p2 = &pool[a2];
+                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 { continue; }
+                        for a3 in 0..all_end {
+                            let p3 = &pool[a3];
+                            if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 { continue; }
+                            let mut n = p1.nodes.clone();
+                            let off2 = n.len();
+                            for nd in &p2.nodes { n.push(remap_node(nd, off2)); }
+                            let off3 = n.len();
+                            for nd in &p3.nodes { n.push(remap_node(nd, off3)); }
+                            let fi = n.len();
+                            n.push(Node::Symbol(bn.clone()));
+                            let api = n.len();
+                            n.push(Node::App(vec![fi, p1.root, p2.root + off2, p3.root + off3]));
+                            let e = SynthPool { nodes: n, root: api, ret_type: comp.ret_type, priority: comp.priority };
+                            test_and_score(&e, &mut seen, &mut explored);
+                            if explored > max_candidates { break 'a3c1; }
+                            if pool.len() + new_entries.len() < MAX_POOL { new_entries.push(e); }
+                        }
+                    }
+                }
+                // Case 2: arg1 from old, arg2 from prev, arg3 from all
+                if explored <= max_candidates {
+                    'a3c2: for a1 in 0..prev_start {
+                        let p1 = &pool[a1];
+                        if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 { continue; }
+                        for pi in prev.clone() {
+                            let p2 = &pool[pi];
+                            if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 { continue; }
+                            for a3 in 0..all_end {
+                                let p3 = &pool[a3];
+                                if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 { continue; }
+                                let mut n = p1.nodes.clone();
+                                let off2 = n.len();
+                                for nd in &p2.nodes { n.push(remap_node(nd, off2)); }
+                                let off3 = n.len();
+                                for nd in &p3.nodes { n.push(remap_node(nd, off3)); }
+                                let fi = n.len();
+                                n.push(Node::Symbol(bn.clone()));
+                                let api = n.len();
+                                n.push(Node::App(vec![fi, p1.root, p2.root + off2, p3.root + off3]));
+                                let e = SynthPool { nodes: n, root: api, ret_type: comp.ret_type, priority: comp.priority };
+                                test_and_score(&e, &mut seen, &mut explored);
+                                if explored > max_candidates { break 'a3c2; }
+                                if pool.len() + new_entries.len() < MAX_POOL { new_entries.push(e); }
+                            }
+                        }
+                    }
+                }
+                // Case 3: arg1+arg2 from old, arg3 from prev
+                if explored <= max_candidates {
+                    'a3c3: for a1 in 0..prev_start {
+                        let p1 = &pool[a1];
+                        if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 { continue; }
+                        for a2 in 0..prev_start {
+                            let p2 = &pool[a2];
+                            if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 { continue; }
+                            for pi in prev.clone() {
+                                let p3 = &pool[pi];
+                                if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 { continue; }
+                                let mut n = p1.nodes.clone();
+                                let off2 = n.len();
+                                for nd in &p2.nodes { n.push(remap_node(nd, off2)); }
+                                let off3 = n.len();
+                                for nd in &p3.nodes { n.push(remap_node(nd, off3)); }
+                                let fi = n.len();
+                                n.push(Node::Symbol(bn.clone()));
+                                let api = n.len();
+                                n.push(Node::App(vec![fi, p1.root, p2.root + off2, p3.root + off3]));
+                                let e = SynthPool { nodes: n, root: api, ret_type: comp.ret_type, priority: comp.priority };
+                                test_and_score(&e, &mut seen, &mut explored);
+                                if explored > max_candidates { break 'a3c3; }
+                                if pool.len() + new_entries.len() < MAX_POOL { new_entries.push(e); }
+                            }
+                        }
                     }
                 }
             }

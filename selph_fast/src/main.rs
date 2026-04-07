@@ -719,7 +719,7 @@ fn cmd_curriculum(args: &[String]) {
     let mut library_path: Option<String> = None;
     let mut output_path = String::from("grown_library.selph");
     let mut default_budget: usize = 200000;
-    let mut default_depth: usize = 3;
+    let mut default_depth: usize = 2;
     let mut enable_meta = false;
     let mut enable_extract = false;
     let mut enable_validate = false;
@@ -831,31 +831,35 @@ fn cmd_curriculum(args: &[String]) {
     // Priority map: learned from solutions, persists across tasks
     let mut priorities: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
 
-    // Meta-heuristic state — check if library contains a learned heuristic
-    let mut current_heuristic: Option<meta::Heuristic> = None;
-    let mut meta_training_tasks: Vec<meta::TrainingTask> = Vec::new();
+    // RL reward coefficients — learned across curriculum runs
+    let mut current_rl_coeffs = synth::RlCoefficients::default();
 
-    // Load learned heuristic from library if present
+    // Load learned RL coefficients from library if present
     for (mname, _params, mnodes, mroot) in &all_macros {
-        if mname == "__selph_heuristic__" {
-            let source = node_to_source(mnodes, *mroot);
-            // Wrap back in lambda since defmacro strips it
-            let full_source = format!("(lambda (ctx) {})", source);
-            if let Some(h) = meta::Heuristic::from_source("loaded", &full_source) {
-                eprintln!("  Loaded learned heuristic from library");
-                current_heuristic = Some(h);
+        if mname == "__selph_rl_cold__" {
+            if let Ok(val) = eval::eval(mnodes, *mroot, &mut eval::make_default_env()) {
+                if let Value::Num(n) = val { current_rl_coeffs.cold_penalty = n; }
             }
-            break;
         }
+        if mname == "__selph_rl_warm__" {
+            if let Ok(val) = eval::eval(mnodes, *mroot, &mut eval::make_default_env()) {
+                if let Value::Num(n) = val { current_rl_coeffs.warm_bonus = n; }
+            }
+        }
+    }
+    if current_rl_coeffs.cold_penalty != -50.0 || current_rl_coeffs.warm_bonus != 30.0 {
+        eprintln!("  Loaded RL coefficients: cold={:.1}, warm={:.1}",
+            current_rl_coeffs.cold_penalty, current_rl_coeffs.warm_bonus);
     }
 
     // Abstraction extraction state
     let mut solved_programs: Vec<(Vec<Node>, usize)> = Vec::new();
 
+
     for (name, task_depth, inputs, expected) in &tasks {
-        // Use the greater of the task-specified depth and the CLI --depth,
-        // so that CLI --depth 3 can unlock tasks that hardcode depth 2.
-        let depth = std::cmp::max(*task_depth, default_depth);
+        // Use the task-specified depth. The CLI --depth is only a fallback
+        // for tasks that don't specify a depth in the curriculum file.
+        let depth = *task_depth;
         let input_is_string = matches!(&inputs[0], Value::Str(_));
         let (mut synth_comps, extra_bindings) = synth::default_synth_components_with_trees(&all_macros, &trees);
         if input_is_string {
@@ -880,18 +884,8 @@ fn cmd_curriculum(args: &[String]) {
         // The priority sort ensures high-value components seed the pool first,
         // and the interleaved candidate generation (in synth.rs) sorts
         // compositions by combined priority of component + arguments.
-        if enable_meta {
-            if let Some(ref h) = current_heuristic {
-                let task_ctx = meta::TaskContext::from_examples(inputs, expected);
-                synth_comps = meta::apply_heuristic(h, &synth_comps, &task_ctx);
-            } else {
-                synth_comps.sort_by(|a, b| b.priority.partial_cmp(&a.priority)
-                    .unwrap_or(std::cmp::Ordering::Equal));
-            }
-        } else {
-            synth_comps.sort_by(|a, b| b.priority.partial_cmp(&a.priority)
-                .unwrap_or(std::cmp::Ordering::Equal));
-        }
+        synth_comps.sort_by(|a, b| b.priority.partial_cmp(&a.priority)
+            .unwrap_or(std::cmp::Ordering::Equal));
 
         // Split examples into train/validation if --validate enabled
         let (train_inputs, train_expected, val_pairs) = if enable_validate && inputs.len() >= 5 {
@@ -909,10 +903,12 @@ fn cmd_curriculum(args: &[String]) {
         let start = std::time::Instant::now();
         let filter_ref: Option<&dyn Fn(&synth::SynthComponent, usize) -> bool> =
             depth_filter.as_ref().map(|f| f.as_ref());
+        let snap_ref: Option<&mut Vec<synth::CandidateRecord>> = None;
         let sr = synth::synthesize_full(
             &synth_comps, train_inputs, train_expected, &all_macros,
             depth, default_budget, true,
-            val_pairs.as_deref(), &extra_bindings, filter_ref);
+            val_pairs.as_deref(), &extra_bindings, filter_ref, snap_ref,
+            current_rl_coeffs);
         let elapsed = start.elapsed();
         total_candidates += sr.candidates_explored;
 
@@ -986,13 +982,13 @@ fn cmd_curriculum(args: &[String]) {
                         name, explored, macro_line));
                 }
 
-                // Collect data for meta-heuristic and abstraction extraction
+                // Capture pool snapshot for rank-based heuristic optimization.
+                // The snapshot records (comp_name, arg_priority_sum) for each
+                // composition candidate tested. The solution is the last entry.
+                // Online RL coefficient update: nudge toward finding this solution earlier
                 if enable_meta {
-                    meta_training_tasks.push(meta::TrainingTask {
-                        name: name.clone(),
-                        inputs: inputs.clone(),
-                        expected: expected.clone(),
-                    });
+                    meta::update_rl_coefficients(
+                        &mut current_rl_coeffs, sr.candidates_explored, default_budget);
                 }
                 if enable_extract {
                     if let (Some(nodes), Some(root)) = (&sr.nodes, sr.root) {
@@ -1000,6 +996,55 @@ fn cmd_curriculum(args: &[String]) {
                     }
                 }
         } else {
+            // Fallback 0: Boolean decomposition — try (and P Q), (or P Q)
+            // for all pairs of bool-returning macros. O(macros²), instant.
+            let bool_result = bool_decompose(inputs, expected, &all_macros);
+
+            if let Some((op, m1, m2, source)) = bool_result {
+                solved += 1;
+                eprintln!("  BD  {:30}         0.000s  {}",
+                         name, source);
+
+                let used_components = library::extract_components(&source);
+                for comp_name in &used_components {
+                    let entry = priorities.entry(comp_name.clone()).or_insert(0.0);
+                    *entry += learn_rate;
+                }
+
+                let body_source = extract_lambda_body(&source);
+                let macro_line = format!("(defmacro {} (s) {})", name, body_source);
+                if let Ok((mnodes, mroots)) = parse_file(&macro_line) {
+                    if !mroots.is_empty() {
+                        if let Node::App(children) = &mnodes[mroots[0]] {
+                            if children.len() == 4 {
+                                if let Node::Symbol(mname) = &mnodes[children[1]] {
+                                    if let Node::App(param_indices) = &mnodes[children[2]] {
+                                        let params: Vec<String> = param_indices.iter()
+                                            .filter_map(|&i| {
+                                                if let Node::Symbol(s) = &mnodes[i] { Some(s.clone()) }
+                                                else { None }
+                                            }).collect();
+                                        all_macros.push((
+                                            mname.clone(), params,
+                                            mnodes.clone(), children[3],
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                promoted_source.push_str(&format!(
+                    "\n; {} (bool decomp: {} {} {})\n{}\n",
+                    name, op, m1, m2, macro_line));
+
+                if enable_meta {
+                    meta::update_rl_coefficients(
+                        &mut current_rl_coeffs, 0, default_budget);
+                }
+            } else {
+
             // Fallback 1: Try induction
             let ir = induce::induce_from_failure(
                 &synth_comps, inputs, expected, &all_macros, depth, default_budget / 2);
@@ -1041,14 +1086,6 @@ fn cmd_curriculum(args: &[String]) {
                     "\n; {} (induced): found in {} candidates\n{}\n",
                     name, ir.candidates_explored, macro_line));
 
-                // Collect data for meta-heuristic and abstraction extraction
-                if enable_meta {
-                    meta_training_tasks.push(meta::TrainingTask {
-                        name: name.clone(),
-                        inputs: inputs.clone(),
-                        expected: expected.clone(),
-                    });
-                }
                 if enable_extract {
                     solved_programs.push((ir.nodes.clone(), ir.root));
                 }
@@ -1070,14 +1107,6 @@ fn cmd_curriculum(args: &[String]) {
                         "\n; {} (D&C): found in {} candidates\n{}\n",
                         name, dr.candidates_explored, macro_line));
 
-                    // Collect data for meta-heuristic and abstraction extraction
-                    if enable_meta {
-                        meta_training_tasks.push(meta::TrainingTask {
-                            name: name.clone(),
-                            inputs: inputs.clone(),
-                            expected: expected.clone(),
-                        });
-                    }
                     if enable_extract {
                         solved_programs.push((dr.nodes.clone(), dr.root));
                     }
@@ -1087,24 +1116,7 @@ fn cmd_curriculum(args: &[String]) {
                              name, explored, elapsed.as_secs_f64());
                 }
             }
-        }
-
-        // Meta-heuristic synthesis: trigger on FAILURE, not periodically.
-        // The priority learning (learn_rate boost) updates weights after every
-        // solve — that's the cheap, per-task signal.  Structural meta-synthesis
-        // (trying new heuristic templates) is expensive and only worth doing
-        // when the current strategy fails.
-        if enable_meta && !sr.found && !meta_training_tasks.is_empty() && meta_training_tasks.len() >= 3 {
-            let base_comps = synth::default_synth_components(&all_macros);
-            eprintln!("  [meta] Task failed — synthesizing heuristic from {} training tasks...", meta_training_tasks.len());
-            if let Some(h) = meta::synthesize_heuristic(
-                &meta_training_tasks, &base_comps, &all_macros, 8,
-            ) {
-                eprintln!("  [meta] Found heuristic: \"{}\" -- applying to subsequent tasks", h.name);
-                current_heuristic = Some(h);
-            } else {
-                eprintln!("  [meta] No improved heuristic found");
-            }
+        } // end bool_decompose else
         }
 
         // Periodic abstraction extraction: every 10 solved tasks
@@ -1150,21 +1162,10 @@ fn cmd_curriculum(args: &[String]) {
         }
     }
 
-    // End-of-run meta-heuristic synthesis — only if tasks failed AND
-    // we don't already have a heuristic. Skip entirely if all tasks solved.
-    let unsolved = tasks.len() - solved;
-    if enable_meta && current_heuristic.is_none() && unsolved > 0 && !meta_training_tasks.is_empty() {
-        let base_comps = synth::default_synth_components(&all_macros);
-        eprintln!("  [meta] Final heuristic synthesis from {} training tasks ({} unsolved)...",
-            meta_training_tasks.len(), unsolved);
-        if let Some(h) = meta::synthesize_heuristic(
-            &meta_training_tasks, &base_comps, &all_macros, 8,
-        ) {
-            eprintln!("  [meta] Found final heuristic: \"{}\"", h.name);
-            current_heuristic = Some(h);
-        } else {
-            eprintln!("  [meta] No improved heuristic found at end of run");
-        }
+    // Log final RL coefficients
+    if enable_meta {
+        eprintln!("  [rl] Final coefficients: cold={:.1}, warm={:.1}",
+            current_rl_coeffs.cold_penalty, current_rl_coeffs.warm_bonus);
     }
 
     // End-of-run abstraction extraction
@@ -1207,8 +1208,9 @@ fn cmd_curriculum(args: &[String]) {
     output.push_str("; SELPH library — trained model from curriculum runner\n");
     output.push_str(&format!("; {} macros ({} promoted from this run)\n",
                              all_macros.len(), solved));
-    if current_heuristic.is_some() {
-        output.push_str("; Includes learned search heuristic\n");
+    if enable_meta {
+        output.push_str(&format!("; Includes learned RL coefficients (cold={:.1}, warm={:.1})\n",
+            current_rl_coeffs.cold_penalty, current_rl_coeffs.warm_bonus));
     }
     output.push_str("\n");
 
@@ -1225,29 +1227,13 @@ fn cmd_curriculum(args: &[String]) {
         output.push_str(&promoted_source);
     }
 
-    // Save learned heuristic as a special macro.
-    // Convention: __selph_heuristic__ is the learned search strategy.
-    // When this library is loaded, the grow command detects it and uses it
-    // as the initial heuristic for the next run.
-    if let Some(ref h) = current_heuristic {
-        output.push_str("\n; --- Learned search heuristic ---\n");
-        output.push_str(&format!("; Heuristic: {} (learned during this curriculum run)\n", h.name));
-        output.push_str(&format!("; This macro is the trained search strategy.\n"));
-        output.push_str(&format!("; It scores components for priority-weighted interleaving.\n"));
-        // Save heuristic as a defmacro. The heuristic source is a lambda like
-        // (lambda (ctx) body). We need to extract the body for defmacro syntax.
-        // Use the AST to do this correctly: evaluate the source to get the node tree,
-        // then extract the lambda body.
-        let heuristic_body = if h.nodes.len() > 0 {
-            if let Node::Lambda(_, body_idx) = &h.nodes[h.root] {
-                node_to_source(&h.nodes, *body_idx)
-            } else {
-                node_to_source(&h.nodes, h.root)
-            }
-        } else {
-            h.source.clone()
-        };
-        output.push_str(&format!("(defmacro __selph_heuristic__ (ctx) {})\n", heuristic_body));
+
+
+    // Save learned RL coefficients
+    if enable_meta {
+        output.push_str("\n; --- Learned RL reward coefficients ---\n");
+        output.push_str(&format!("(defmacro __selph_rl_cold__ (_) {})\n", current_rl_coeffs.cold_penalty));
+        output.push_str(&format!("(defmacro __selph_rl_warm__ (_) {})\n", current_rl_coeffs.warm_bonus));
     }
 
     match fs::write(&output_path, &output) {
@@ -1311,6 +1297,93 @@ fn parse_curriculum_tasks(source: &str, default_depth: usize)
     tasks
 }
 
+/// Boolean decomposition: try (and P Q), (or P Q), (not P) for all
+/// bool-returning macros in the library. Returns (op, macro1, macro2, source)
+/// if a combination matches all examples. O(macros²), essentially instant.
+fn bool_decompose(
+    inputs: &[Value],
+    expected: &[Value],
+    macros: &[(String, Vec<String>, Vec<Node>, usize)],
+) -> Option<(String, String, String, String)> {
+    // Only applicable for boolean output tasks
+    if expected.is_empty() || !matches!(&expected[0], Value::Bool(_)) {
+        return None;
+    }
+
+    // Collect bool-returning unary macros and precompute their outputs
+    let mut bool_macros: Vec<(String, Vec<bool>)> = Vec::new();
+
+    for (mname, params, mnodes, mroot) in macros {
+        if params.len() != 1 { continue; }
+        let val = Value::RustMacro(params.clone(), mnodes.clone(), *mroot);
+
+        let mut outputs = Vec::new();
+        let mut all_bool = true;
+        for inp in inputs {
+            let mut env = eval::make_default_env();
+            // Also load other macros so compositions work
+            for (mn2, p2, n2, r2) in macros {
+                env_define(&mut env, mn2.clone(),
+                    Value::RustMacro(p2.clone(), n2.clone(), *r2));
+            }
+            match eval::apply(&val, &[inp.clone()], mnodes, &mut env) {
+                Ok(Value::Bool(b)) => outputs.push(b),
+                _ => { all_bool = false; break; }
+            }
+        }
+        if all_bool && outputs.len() == inputs.len() {
+            bool_macros.push((mname.clone(), outputs));
+        }
+    }
+
+    let expected_bools: Vec<bool> = expected.iter().filter_map(|v| {
+        if let Value::Bool(b) = v { Some(*b) } else { None }
+    }).collect();
+    if expected_bools.len() != expected.len() { return None; }
+
+    // Try (not P)
+    for (name, outputs) in &bool_macros {
+        let negated: Vec<bool> = outputs.iter().map(|b| !b).collect();
+        if negated == expected_bools {
+            let source = format!("(lambda (x) (not ({} x)))", name);
+            return Some(("not".into(), name.clone(), String::new(), source));
+        }
+    }
+
+    // Try (and P Q) and (or P Q)
+    for (i, (name1, out1)) in bool_macros.iter().enumerate() {
+        for (name2, out2) in bool_macros.iter().skip(i) {
+            // and
+            let and_result: Vec<bool> = out1.iter().zip(out2).map(|(a, b)| *a && *b).collect();
+            if and_result == expected_bools {
+                let source = format!("(lambda (x) (and ({} x) ({} x)))", name1, name2);
+                return Some(("and".into(), name1.clone(), name2.clone(), source));
+            }
+
+            // or
+            let or_result: Vec<bool> = out1.iter().zip(out2).map(|(a, b)| *a || *b).collect();
+            if or_result == expected_bools {
+                let source = format!("(lambda (x) (or ({} x) ({} x)))", name1, name2);
+                return Some(("or".into(), name1.clone(), name2.clone(), source));
+            }
+
+            // Also try with negations: (and P (not Q)), (and (not P) Q)
+            let and_not2: Vec<bool> = out1.iter().zip(out2).map(|(a, b)| *a && !*b).collect();
+            if and_not2 == expected_bools {
+                let source = format!("(lambda (x) (and ({} x) (not ({} x))))", name1, name2);
+                return Some(("and-not".into(), name1.clone(), name2.clone(), source));
+            }
+            let and_not1: Vec<bool> = out1.iter().zip(out2).map(|(a, b)| !*a && *b).collect();
+            if and_not1 == expected_bools {
+                let source = format!("(lambda (x) (and (not ({} x)) ({} x)))", name1, name2);
+                return Some(("not-and".into(), name1.clone(), name2.clone(), source));
+            }
+        }
+    }
+
+    None
+}
+
 fn extract_lambda_body(source: &str) -> String {
     // "(lambda (x) body)" -> "body" with x replaced by s
     if source.starts_with("(lambda (") {
@@ -1322,12 +1395,26 @@ fn extract_lambda_body(source: &str) -> String {
             if rest.len() > 1 {
                 // Strip the final closing paren of the lambda
                 let body = &rest[..rest.len() - 1];
-                // Replace the param name (x) with s for macro consistency
-                return body
-                    .replace("(x)", "(s)")
-                    .replace("(x ", "(s ")
-                    .replace(" x)", " s)")
-                    .replace(" x ", " s ");
+                // Replace the param name x with s for macro consistency.
+                // Use a proper word-boundary replacement to handle all positions.
+                let mut result = String::with_capacity(body.len());
+                let chars: Vec<char> = body.chars().collect();
+                let mut i = 0;
+                while i < chars.len() {
+                    if chars[i] == 'x' {
+                        let before_ok = i == 0 || !chars[i-1].is_alphanumeric() && chars[i-1] != '_' && chars[i-1] != '-';
+                        let after_ok = i + 1 >= chars.len() || !chars[i+1].is_alphanumeric() && chars[i+1] != '_' && chars[i+1] != '-';
+                        if before_ok && after_ok {
+                            result.push('s');
+                        } else {
+                            result.push('x');
+                        }
+                    } else {
+                        result.push(chars[i]);
+                    }
+                    i += 1;
+                }
+                return result;
             }
         }
     }

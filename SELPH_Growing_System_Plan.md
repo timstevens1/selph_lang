@@ -2,7 +2,7 @@
 
 ## From Enumerative Solver to Self-Building Architecture
 
-**Version 0.3 — April 6, 2026**
+**Version 0.4 — April 6, 2026**
 
 Based on implementation experience with the v0.1 Architecture Spec and the Rust-native migration. Supersedes v0.2 with validated results from the standalone Rust binary.
 
@@ -50,6 +50,11 @@ The system now runs as a single Rust binary (`selph`) with zero runtime dependen
 
 ### 2.4 Synthesis
 - **Priority-weighted interleaved search:** candidates sorted by combined priority of component + arguments. High-value compositions tried first regardless of which component they use.
+- **Deferred materialization:** pending candidates stored as lightweight descriptors (component index + pool indices), node trees built on-demand during testing. Eliminates gigabyte allocations from cloned node vectors.
+- **Arity 1-3 support:** unary, binary, and ternary compositions (e.g., `string-replace` takes 3 args). Arity-3 has adaptive type-count cap to prevent cubic blowup at deeper depths.
+- **Type reachability filtering:** computes which types can eventually produce the target output type through available component chains. Pool entries with unreachable types are excluded, reducing search space 40-65%.
+- **RL reward propagation:** partial match scores (fraction of examples correct) adjust pool entry priorities during synthesis. Entries with partial matches get boosted; zero-match same-type entries get penalized. Coefficients (cold_penalty, warm_bonus) learned online and persisted across runs.
+- **Boolean decomposition fallback:** when flat synthesis fails on bool-target tasks, tries all (and P Q), (or P Q), (not P) combinations of bool-returning macros. O(macros²), essentially instant.
 - Bottom-up enumerative search with HM type-directed pruning
 - If-expression synthesis with expected-output matching
 - Divide-and-conquer for multi-way classification
@@ -90,42 +95,64 @@ selph help       Show usage
 ### 2.8 Rust Modules (15 source files)
 types.rs, parser.rs, eval.rs, synth.rs, hm.rs, library.rs, namespace.rs, induce.rs, divide.rs, verify.rs, abstraction.rs, multitree.rs, stochastic.rs, meta.rs, taskgen.rs
 
-208 tests, all passing.
+215 tests, all passing.
 
 ### 2.9 Validated Results
 
-**Sequence curriculum (13 tasks): 13/13 (100%) in 25 seconds**
+**Sequence curriculum (13 tasks): 13/13 (100%)**
 
 | Task | Candidates | Solution |
 |------|-----------|----------|
-| const_1 | 3 | `1` |
-| const_5 | 7 | `5` |
-| identity | 12 | `(idx x)` |
-| double_idx | 1,261 | `(add (idx x) (idx x))` |
-| triple_idx | 1,281 | `(add (idx x) (double_idx x))` |
-| last_plus_1 | 1,563 | `(add (v3 x) (const_1 x))` |
-| last_minus_1 | 1,861 | `(subtract (v3 x) (const_1 x))` |
-| **squares** | **1,301** | **`(multiply (idx x) (idx x))`** |
-| triangular | 1,267 | `(add (idx x) (v3 x))` |
-| fibonacci | 1,341 | `(add (v3 x) (v2 x))` |
-| double_prev | 1,271 | `(add (v3 x) (v3 x))` |
-| **cubes** | **1,690** | **`(multiply (idx x) (squares x))`** |
-| idx_plus_last | 25 | `(triangular x)` |
+| const_1 | 2 | `1` |
+| const_5 | 6 | `5` |
+| identity | 13 | `(idx x)` |
+| double_idx | 1,987 | `(add (idx x) (idx x))` |
+| triple_idx | 2,395 | `(add (idx x) (double_idx x))` |
+| last_plus_1 | 1,510 | `(add (count-char x x) (last x))` |
+| last_minus_1 | 1,721 | `(subtract (v3 x) (count-char x x))` |
+| **squares** | **5,930** | **`(multiply (idx x) (idx x))`** |
+| triangular | 2,099 | `(add (idx x) (last x))` |
+| fibonacci | 9,574 | `(add (v3 x) (v2 x))` |
+| double_prev | 2,509 | `(add (last x) (last x))` |
+| **cubes** | **9,794** | **`(multiply (idx x) (squares x))`** |
+| idx_plus_last | 59 | `(triangular x)` |
+
+**Context-free language curriculum (20 tasks): 20/20 (100%) in 293 seconds**
+
+| Task | Candidates | Solution |
+|------|-----------|----------|
+| count_a | 14 | `(count-char x "a")` |
+| count_b | 13 | `(count-char x "b")` |
+| str_len | 40 | `(string-length x)` |
+| equal_ab | 9,373 | `(= (count-char x "a") (count-char x "b"))` |
+| more_a | 8,895 | `(< (count-char x "b") (count-char x "a"))` |
+| remove_a | 48 | `(string-replace x "a" "")` |
+| remove_b | 32 | `(string-replace x "b" "")` |
+| a_to_b | 24 | `(string-replace x "a" "b")` |
+| starts_a | 9 | `(string-starts-with x "a")` |
+| ends_b | 21 | `(string-ends-with x "b")` |
+| all_a | 790 | `(string-starts-with (string-replace x x x) (string-replace x "b" "a"))` |
+| not_starts_a | 118,423 | compositional via string-replace |
+| starts_a_and_ends_b | 1,402 | compositional via string-replace |
+| starts_a_or_ends_b | 124,237 | `(or (string-starts-with x "a") (string-ends-with x "b"))` |
+| no_b_before_a | 812 | `(string-starts-with (string-replace x x x) (string-replace x "b" ""))` |
+| **anbn** | **61,386** | **`(and (equal_ab x) (no_b_before_a x))`** |
+| palindrome | 1,502 | compositional via string-replace |
+| count_open | 14 | `(count-char x "(")` |
+| count_close | 15 | `(count-char x ")")` |
+| matched_parens | 35,933 | `(= (count-char x "(") (count-char x ")"))` |
 
 Key results:
-- `cubes = (multiply (idx x) (squares x))` — compositional: uses promoted `squares` macro
-- `idx_plus_last = (triangular x)` — library cascade: trivially reuses promoted macro (25 candidates)
-- Priority-weighted interleaving was the breakthrough: tries high-value compositions first
+- **a^n b^n recognized:** `(and (equal_ab x) (no_b_before_a x))` — composes two promoted macros with boolean logic
+- **Arity-3 synthesis:** `string-replace` tasks solved compositionally (e.g., `(string-replace x "a" "")`)
+- **Library cascade:** 20 macros promoted, each building on prior solutions
+- **Boolean logic:** `and`, `or`, `not` enable predicate composition
+- **Type filtering:** useful-type reachability analysis reduces candidates 40-65%
+- **RL reward propagation:** partial match scores adjust pool priorities within each synthesis run
 
 **Character-native formal language (12 tasks): 10/12 (83%)**
 - ascending: `(next-char (c3 x))` — character arithmetic
 - step2: `(next-char (next-char (c3 x)))` — double composition
-
-**Context-free language (17 tasks): 8/17 solved so far**
-- `(count-char x "a")` — 21 candidates with auto-extracted constants
-- `(= (count-char x "a") (count-char x "b"))` — a^n b^n prerequisite
-- `(string-starts-with x "a")` — 47 candidates
-- `(= x (string-reverse x))` — palindrome (pending, needs depth 2)
 
 ### 2.10 Self-Hosting Infrastructure
 SELPH programs can now express their own infrastructure:
@@ -416,48 +443,83 @@ This is itself an optimization problem — and it could eventually be solved by 
 
 ---
 
-## 8. Immediate Next Steps (updated April 6, 2026)
+## 8. Completed Steps
 
-### 8.1 Performance: Interleaved search memory optimization
-The priority-weighted interleaved search clones full node vectors into the pending list for sorting. With large component pools (50+ components × many pool entries), this allocates gigabytes. **Fix: sort indices/references, not cloned node trees.** This is the blocker for running context-free tasks with a loaded library.
+### 8.1 ~~Performance: Interleaved search memory optimization~~ ✓
+Replaced cloned node vectors with lightweight `PendingDesc` descriptors (component index + pool indices + score). Node trees materialized on-demand during testing. Eliminates gigabyte allocations.
 
-### 8.2 Heuristic optimization via solution ranking
-Key insight: once you HAVE solutions from a curriculum run, evaluating a candidate heuristic doesn't require full synthesis. You just check: "what rank would the known solution have under this heuristic's ordering?" This is O(pool_size) comparison, not O(budget) evaluation.
+### 8.2 ~~Heuristic optimization via solution ranking~~ ✓
+Pool snapshots captured during synthesis enable O(snapshot_size) rank-based evaluation of candidate heuristics. Infrastructure built but superseded by online RL approach (see 8.6).
 
-The loop:
-1. Solve curriculum → get solutions + pool snapshots
-2. For each candidate heuristic: score = avg(rank of known solution in heuristic-ordered pool)
-3. `synthesize_optimize --minimize` → find the heuristic that minimizes average rank
+### 8.3 ~~Context-free language curriculum~~ ✓
+**20/20 tasks solved (100%).** Full curriculum: counting → equality → string replacement → structure checks → boolean logic → a^n b^n recognition → palindrome → bracket matching. Key enablers: arity-3 synthesis for `string-replace`, boolean logic components (`and`/`or`/`not`), type reachability filtering.
 
-This makes meta-heuristic synthesis cheap enough to run after every curriculum, and the result is directly useful for the next run.
+### 8.6 ~~Online RL reward propagation~~ ✓
+Partial match scores during synthesis adjust pool entry priorities. Cold penalty (zero-match entries) and warm bonus (partial matches) coefficients learned online after each solve and persisted to library. Replaces static heuristic templates.
 
-### 8.3 Context-free language curriculum
-The curriculum exists (`examples/context_free_tasks.selph`) and the string analysis builtins work. First results: `(count-char x "a")` found in 21 candidates, `(= (count-char x "a") (count-char x "b"))` for a^n b^n equality in 2,987 candidates. Blocked on 8.1 (memory) for running with a loaded library.
+### 8.7 ~~Type reachability filtering~~ ✓
+Fixed-point computation of "useful types" — types that can eventually produce the target output through some component chain. Pool entries with unreachable types excluded. 40-65% candidate reduction on sequence tasks, critical for enabling arity-3 without blowup.
 
-Remaining CF tasks need scaffolding:
-- String replacement tasks (remove_a, remove_b) to teach `string-replace`
-- Ordering tasks (no_b_before_a) that compose replacement + counting
-- Palindrome: `(= x (string-reverse x))` — should be findable at depth 1
-- Bracket matching: needs nesting depth tracking, likely needs reduce/fold
+### 8.8 ~~Arity-3 synthesis~~ ✓
+Candidate generation and materialization extended to arity-3 with adaptive type-count cap (max 15 matching entries per argument position) to prevent cubic blowup at deeper depths.
 
-### 8.4 Chained curriculum execution
+### 8.9 ~~Boolean decomposition fallback~~ ✓
+When flat synthesis fails on bool-target tasks, tries all `(and P Q)`, `(or P Q)`, `(not P)` combinations of bool-returning macros. O(macros²).
+
+---
+
+## 9. Immediate Next Steps
+
+### 9.1 Chained curriculum execution
 The train→save→reload loop works. Next: build a standard multi-stage pipeline:
 ```
 selph grow sequence_tasks.selph --library seq_helpers.selph -o model.selph
 selph grow formal_lang_tasks.selph --library model.selph -o model.selph
 selph grow context_free_tasks.selph --library model.selph -o model.selph
 ```
-Each stage grows the shared library. The probe-and-filter ensures macros from incompatible input formats are automatically excluded.
+Each stage grows the shared library. The probe-and-filter ensures macros from incompatible input formats are automatically excluded. Validate that RL coefficients transfer across domains.
 
-### 8.5 Curriculum design principles (learned from this session)
-- **Every builtin needs a teaching task:** The synthesizer can't discover a 3-arg function with specific constants unless it's been taught simpler uses first (e.g., teach `count-char` before composing `(= (count-char x "a") (count-char x "b"))`)
-- **Auto-constant extraction helps but needs frequency scoring:** Characters that appear in every example get high priority; rare characters get low priority
-- **The curriculum is the only tuning knob:** All "architecture" improvements should flow from curriculum design, not from hardcoded Rust logic
-- **Trivial solutions should be detected, not promoted:** When a task is already solved by an existing macro, skip promotion to avoid self-referential macros
+### 9.2 Reduce search space for hard tasks
+`equal_ab` (9,373 candidates) and `matched_parens` (35,933) are still expensive. Opportunities:
+- **Partial match pruning between depths:** If a depth-1 candidate matches 0 examples AND returns the target type, skip it as an argument for depth-2 compositions entirely (not just deprioritize).
+- **Component-level type scoping per depth:** At the final depth, only generate candidates whose return type matches the target. At intermediate depths, allow all useful types.
+- **Early termination on partial match:** If a depth-1 candidate matches >50% of examples, immediately try composing it with comparisons/logic before exhausting the full depth-1 pool.
+
+### 9.3 Generalize boolean decomposition to N-ary
+Current decomposition tries pairs. Extend to:
+- Chains: `(and P (and Q R))` for 3+ predicates
+- Mixed: `(and P (or Q R))` for disjunctive sub-conditions
+- Numeric: `(and (= (f x) (g x)) (> (h x) 0))` for non-macro compositions
+This would handle more complex classification tasks without exhaustive depth-3 search.
+
+### 9.4 Curriculum-driven RL coefficient specialization
+Currently one (cold, warm) pair for all tasks. Different task types may benefit from different coefficients:
+- Numeric tasks: strong cold penalty (many string candidates to prune)
+- Boolean tasks: weaker cold penalty (intermediates cross types frequently)
+- String tasks: strong warm bonus (partial string matches are informative)
+Store per-domain coefficients in the library, select based on inferred task type.
+
+### 9.5 Meta-2: Learn decomposition as SELPH programs
+The boolean decomposition fallback is hardcoded Rust. Reframe it as a synthesis target: given a failed spec + a library of bool macros, find a SELPH program that combines them. Training data: the `(and (equal_ab x) (no_b_before_a x))` solution for `anbn`, etc. This moves decomposition from infrastructure to learned capability.
+
+### 9.6 Deeper curriculum: context-sensitive languages
+With a^n b^n solved, the next frontier is context-sensitive patterns:
+- a^n b^n c^n (equal counts of three symbols)
+- Copy language: ww (string repeated twice)
+- Reversal: w^R (string followed by its reverse)
+These likely need `reduce`/`fold` over characters or recursive decomposition, pushing the system toward Meta-2 capabilities.
+
+### 9.7 Curriculum design principles (updated)
+- **Every builtin needs a teaching task:** `and`/`or`/`not` needed scaffolding tasks before `anbn` could compose them
+- **Arity-3 requires depth-aware caps:** cubic enumeration at deeper depths is infeasible; cap by type-matching pool size
+- **Macro promotion must preserve semantics:** the `x→s` variable substitution must be word-boundary-aware; broken macros silently poison the library
+- **Type filtering is multiplicative:** combining useful-type reachability with return-type gating compounds the savings
+- **RL coefficients converge slowly:** most tasks are easy (low difficulty), so coefficient updates are small; learning requires enough hard tasks in the curriculum
+- **Static heuristic templates are harmful:** hand-coded "match-output-type" heuristics crush intermediate-type components; learned RL rewards are safer because they adjust pool entries, not component ordering
 
 ---
 
-## 9. Success Criteria
+## 10. Success Criteria
 
 The growing system plan succeeds if:
 

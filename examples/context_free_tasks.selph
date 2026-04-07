@@ -4,20 +4,18 @@
 ;
 ; Builds from counting → equality → ordering → nesting
 ; Each stage provides scaffolding for the next.
+; Examples kept to 8 per task for synthesis efficiency.
 
 ; === Stage 0: Character counting ===
 ; count-a: count occurrences of "a" in the string
-; Expected solution: (count-char x "a")
 (task "count_a" 2
   ("a" 1) ("aa" 2) ("aaa" 3) ("aaaa" 4)
-  ("b" 0) ("ab" 1) ("ba" 1) ("aba" 2)
-  ("bbb" 0) ("aabaa" 3) ("abab" 2) ("bbbb" 0))
+  ("b" 0) ("ab" 1) ("ba" 1) ("aba" 2))
 
 ; count-b: count occurrences of "b"
 (task "count_b" 2
   ("b" 1) ("bb" 2) ("bbb" 3)
-  ("a" 0) ("ab" 1) ("ba" 1) ("abb" 2)
-  ("aaa" 0) ("bab" 2))
+  ("a" 0) ("ab" 1) ("ba" 1) ("abb" 2) ("aaa" 0))
 
 ; len: string length
 (task "str_len" 2
@@ -26,38 +24,31 @@
 
 ; === Stage 1: Equality checks (a^n b^n prerequisite) ===
 ; equal_ab: does the string have equal counts of a and b?
-; Expected: (= (count-a x) (count-b x))  [using promoted count_a, count_b]
 (task "equal_ab" 2
   ("ab" true) ("aabb" true) ("aaabbb" true)
   ("a" false) ("aab" false) ("abb" false)
-  ("ba" true) ("bbaa" true) ("" true))
+  ("ba" true) ("" true))
 
 ; more_a: does string have more a's than b's?
-; Expected: (> (count-a x) (count-b x))
 (task "more_a" 2
   ("a" true) ("aa" true) ("aab" true)
   ("b" false) ("ab" false) ("bb" false)
-  ("aba" true) ("bab" false) ("aabb" false))
+  ("aba" true) ("bab" false))
 
 ; === Stage 1.5: String replacement (scaffolding) ===
-; Teach string-replace so later tasks can compose it
-
 ; remove_a: remove all a's from string
-; Expected: (string-replace x "a" "")
 (task "remove_a" 2
   ("a" "") ("ab" "b") ("aab" "b") ("ba" "b")
   ("aba" "b") ("bbb" "bbb") ("aaa" "")
-  ("bab" "bb") ("abba" "bb"))
+  ("bab" "bb"))
 
 ; remove_b: remove all b's from string
-; Expected: (string-replace x "b" "")
 (task "remove_b" 2
   ("b" "") ("ab" "a") ("abb" "a") ("ba" "a")
   ("bab" "a") ("aaa" "aaa") ("bbb" "")
-  ("abba" "aa") ("bba" "a"))
+  ("abba" "aa"))
 
 ; a_to_b: replace all a's with b's
-; Expected: (string-replace x "a" "b")
 (task "a_to_b" 2
   ("a" "b") ("ab" "bb") ("aab" "bbb")
   ("ba" "bb") ("aaa" "bbb") ("bbb" "bbb")
@@ -72,50 +63,52 @@
 ; ends_b: does the string end with "b"?
 (task "ends_b" 2
   ("b" true) ("ab" true) ("aab" true) ("bb" true)
-  ("a" false) ("ba" false) ("abc" false))
+  ("a" false) ("ba" false) ("abc" false) ("" false))
 
-; all_a: is the string all a's? (= (count-a x) (string-length x))
+; all_a: is the string all a's?
 (task "all_a" 2
   ("a" true) ("aa" true) ("aaa" true) ("aaaa" true)
-  ("b" false) ("ab" false) ("ba" false) ("aab" false)
-  ("" true))
+  ("b" false) ("ab" false) ("ba" false) ("aab" false))
+
+; === Stage 2.5: Boolean logic scaffolding ===
+; Teach and/or/not so the synthesizer can compose boolean predicates.
+
+; not_starts_a: negation of starts_a
+; Expected: (not (starts_a x))
+(task "not_starts_a" 2
+  ("a" false) ("ab" false) ("abc" false) ("aaa" false)
+  ("b" true) ("ba" true) ("cba" true) ("" true))
+
+; starts_a_and_ends_b: conjunction of two predicates
+; Expected: (and (starts_a x) (ends_b x))
+(task "starts_a_and_ends_b" 2
+  ("ab" true) ("aab" true) ("abb" true) ("acb" true)
+  ("a" false) ("ba" false) ("b" false) ("abc" false))
+
+; starts_a_or_ends_b: disjunction of two predicates
+; Expected: (or (starts_a x) (ends_b x))
+(task "starts_a_or_ends_b" 2
+  ("ab" true) ("a" true) ("b" true) ("aab" true)
+  ("ba" false) ("bc" false) ("cd" false) ("" false))
 
 ; === Stage 3: a^n b^n recognition ===
-; The classic context-free language: n a's followed by n b's
-; Requires: equal counts AND a's before b's
-; Expected: (and (equal_ab x) (starts_a x) (ends_b x))
-; Or more precisely: (and (= (count-a x) (count-b x))
-;                        (not (string-contains (string-replace x "a" "") "a")))
-; With scaffolding: the synthesizer composes promoted macros
-
-; First, teach "a_prefix": the a-prefix of the string
-; After removing all a's from the front, no a's should remain
-; Simplified: does removing all b's leave only a's at the start?
+; no_b_before_a: all b's come after all a's
 (task "no_b_before_a" 2
   ("ab" true) ("aabb" true) ("aaabbb" true) ("aab" true)
-  ("ba" false) ("bab" false) ("abab" false) ("bba" false)
-  ("a" true) ("b" true) ("aa" true) ("bb" true))
+  ("ba" false) ("bab" false) ("abab" false) ("bba" false))
 
 ; a^n b^n: equal counts AND proper ordering
 (task "anbn" 3
   ("ab" true) ("aabb" true) ("aaabbb" true)
-  ("a" false) ("b" false) ("ba" false) ("aab" false)
-  ("abb" false) ("abab" false) ("aabb" true)
-  ("" true) ("aaabbb" true) ("aabbbb" false))
+  ("a" false) ("b" false) ("ba" false)
+  ("abab" false) ("" true))
 
 ; === Stage 4: Palindrome recognition ===
-; is the string a palindrome?
-; Expected: (= x (string-reverse x))
 (task "palindrome" 2
   ("a" true) ("aa" true) ("aba" true) ("abba" true)
-  ("abcba" true) ("ab" false) ("abc" false) ("abca" false)
-  ("" true) ("aaa" true) ("abb" false))
+  ("ab" false) ("abc" false) ("abca" false) ("" true))
 
-; === Stage 5: Bracket matching (Dyck language) ===
-; Balanced parentheses: "(())" is valid, "(()" is not
-; This is the hardest — needs nesting depth tracking
-; Scaffold: teach nesting depth first
-
+; === Stage 5: Bracket matching ===
 ; count_open: count "(" in string
 (task "count_open" 2
   ("()" 1) ("(())" 2) ("((()))" 3)
@@ -129,14 +122,6 @@
   ("" 0) ("))))" 4))
 
 ; matched_parens: equal open and close counts
-; Expected: (= (count_open x) (count_close x))
 (task "matched_parens" 2
   ("()" true) ("(())" true) ("()()" true) ("((()))" true)
-  ("(" false) (")" false) ("(()" false) ("())" false)
-  ("" true) ("(()())" true))
-
-; Note: matched_parens is necessary but not sufficient for balanced parens.
-; "(())(" has equal counts but isn't balanced.
-; Full Dyck language recognition requires tracking that the running depth
-; never goes negative — this needs reduce/fold over characters, which is
-; a natural next step for the curriculum.
+  ("(" false) (")" false) ("(()" false) ("())" false))

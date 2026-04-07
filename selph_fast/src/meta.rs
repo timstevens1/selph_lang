@@ -17,7 +17,7 @@
 
 use crate::eval;
 use crate::parser;
-use crate::synth::{SynthComponent, synthesize, value_type_tag, TYPE_NUM, TYPE_STR};
+use crate::synth::{CandidateRecord, RlCoefficients, SynthComponent, synthesize, value_type_tag, TYPE_NUM, TYPE_STR};
 use crate::types::*;
 
 // ── Heuristic ───────────────────────────────────────────────────────
@@ -493,6 +493,212 @@ pub fn meta_curriculum_step(
     (solved_names, new_heuristic)
 }
 
+// ── Rank-based heuristic optimization ────────────────────────────────
+//
+// Key insight (plan §8.2): once you HAVE solutions from a curriculum run,
+// evaluating a candidate heuristic doesn't require full synthesis. You just
+// check: "what rank would the known solution have under this heuristic's
+// ordering?" This is O(pool_size) comparison, not O(budget) evaluation.
+
+/// Snapshot of the synthesis pool at the moment a solution was found.
+///
+/// Captured during curriculum solve. Used to cheaply evaluate candidate
+/// heuristics by re-ranking: apply heuristic scores to components,
+/// recompute candidate priorities, and find the solution's new rank.
+#[derive(Clone)]
+pub struct PoolSnapshot {
+    pub task_name: String,
+    pub task_context: TaskContext,
+    /// All candidates tested during synthesis (in original test order).
+    /// The solution (if found) is the last entry.
+    pub candidates: Vec<CandidateRecord>,
+    /// Number of depth-0 (atomic) candidates tested before compositions.
+    /// These are heuristic-independent and form a fixed rank offset.
+    pub depth0_count: usize,
+}
+
+/// Compute the rank a known solution would have under a given heuristic.
+///
+/// Re-scores each candidate using the heuristic's component priority,
+/// sorts by new score descending, and returns the 1-based rank of the
+/// solution (the last entry in the snapshot).
+///
+/// Returns `None` if the snapshot is empty.
+pub fn rank_solution(
+    snapshot: &PoolSnapshot,
+    heuristic: &Heuristic,
+    components: &[SynthComponent],
+) -> Option<usize> {
+    if snapshot.candidates.is_empty() {
+        return None;
+    }
+
+    // Build a lookup from component name to heuristic score
+    let comp_scores: std::collections::HashMap<String, f64> = components
+        .iter()
+        .map(|comp| {
+            let score = evaluate_heuristic(heuristic, comp, &snapshot.task_context);
+            (comp.name.clone(), score)
+        })
+        .collect();
+
+    // Also index by builtin name (components often have builtin != name)
+    let mut builtin_scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for comp in components {
+        if let Some(ref bn) = comp.builtin {
+            let score = evaluate_heuristic(heuristic, comp, &snapshot.task_context);
+            builtin_scores.insert(bn.clone(), score);
+        }
+    }
+
+    let solution_idx = snapshot.candidates.len() - 1;
+
+    // Re-score each candidate: heuristic_score(component) + arg_priority_sum
+    let mut scored: Vec<(usize, f64)> = snapshot
+        .candidates
+        .iter()
+        .enumerate()
+        .map(|(i, rec)| {
+            let heuristic_score = builtin_scores
+                .get(&rec.comp_name)
+                .or_else(|| comp_scores.get(&rec.comp_name))
+                .copied()
+                .unwrap_or(0.0);
+            (i, heuristic_score + rec.arg_priority_sum)
+        })
+        .collect();
+
+    // Sort descending by score (highest priority first).
+    // Use stable sort to preserve original order for equal scores.
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Find rank of the solution (1-based)
+    let rank = scored
+        .iter()
+        .position(|(i, _)| *i == solution_idx)
+        .map(|pos| pos + 1)?;
+
+    // Total rank includes depth-0 candidates (always tested first)
+    Some(snapshot.depth0_count + rank)
+}
+
+/// Evaluate a heuristic across all snapshots, returning the average rank.
+///
+/// Lower is better: a perfect heuristic puts every solution first.
+pub fn evaluate_heuristic_by_rank(
+    snapshots: &[PoolSnapshot],
+    heuristic: &Heuristic,
+    components: &[SynthComponent],
+) -> f64 {
+    if snapshots.is_empty() {
+        return f64::MAX;
+    }
+    let total_rank: usize = snapshots
+        .iter()
+        .filter_map(|s| rank_solution(s, heuristic, components))
+        .sum();
+    total_rank as f64 / snapshots.len() as f64
+}
+
+/// Optimize heuristic using rank-based evaluation on pool snapshots.
+///
+/// This is the cheap replacement for `synthesize_heuristic()`: instead of
+/// running full synthesis for each candidate heuristic × task, it re-ranks
+/// pre-captured snapshots. Each evaluation is O(snapshot_size) instead of
+/// O(synthesis_budget).
+///
+/// Returns the best heuristic found, or None if no candidate improves on
+/// the default.
+pub fn optimize_heuristic_by_rank(
+    snapshots: &[PoolSnapshot],
+    components: &[SynthComponent],
+) -> Option<Heuristic> {
+    if snapshots.is_empty() || components.is_empty() {
+        return None;
+    }
+
+    // Baseline: default heuristic (pass-through priority)
+    let default_h = Heuristic::default_heuristic();
+    let baseline_rank = evaluate_heuristic_by_rank(snapshots, &default_h, components);
+
+    let candidate_templates = build_candidate_heuristics();
+
+    let mut best_heuristic: Option<Heuristic> = None;
+    let mut best_rank = baseline_rank;
+
+    for candidate in &candidate_templates {
+        let avg_rank = evaluate_heuristic_by_rank(snapshots, candidate, components);
+
+        if avg_rank < best_rank {
+            best_rank = avg_rank;
+            best_heuristic = Some(candidate.clone());
+        }
+    }
+
+    if best_rank < baseline_rank {
+        if let Some(ref h) = best_heuristic {
+            eprintln!(
+                "  [rank-opt] Best heuristic: \"{}\" (avg rank {:.1} vs baseline {:.1}, {:.1}x speedup)",
+                h.name,
+                best_rank,
+                baseline_rank,
+                baseline_rank / best_rank,
+            );
+        }
+        best_heuristic
+    } else {
+        eprintln!(
+            "  [rank-opt] No improvement over baseline (avg rank {:.1})",
+            baseline_rank,
+        );
+        None
+    }
+}
+
+// ── Online RL coefficient updates ────────────────────────────────────
+//
+// After each solved task, nudge the RL coefficients in the direction
+// that would have made the solution appear earlier. The update size
+// scales with task difficulty: easy tasks (low candidate count) produce
+// no update; hard tasks produce larger nudges.
+
+/// Update RL coefficients after finding a solution.
+///
+/// `candidates_explored`: how many candidates were tested before the solution
+/// `budget`: the max candidate budget for this task
+///
+/// The update rule:
+/// - difficulty = candidates / budget (0.0 = instant, 1.0 = barely found)
+/// - Only update when difficulty > 0.01 (solution was non-trivial)
+/// - Nudge cold_penalty more negative (prune dead entries harder)
+/// - Nudge warm_bonus higher (boost partial matches more)
+/// - Learning rate proportional to difficulty (hard tasks teach more)
+/// - Clamp to reasonable ranges to prevent runaway
+pub fn update_rl_coefficients(
+    coeffs: &mut RlCoefficients,
+    candidates_explored: usize,
+    budget: usize,
+) {
+    let difficulty = candidates_explored as f64 / budget.max(1) as f64;
+
+    // Only learn from non-trivial tasks
+    if difficulty < 0.01 {
+        return;
+    }
+
+    let lr = 0.05 * difficulty;
+
+    // Strengthen both signals: prune dead entries harder, boost partial matches more.
+    // When a task is hard, there were likely many dead-end pool entries diluting
+    // the search, and useful partial-match entries that could have been ranked higher.
+    coeffs.cold_penalty -= lr * 10.0;
+    coeffs.warm_bonus += lr * 5.0;
+
+    // Clamp to reasonable ranges
+    coeffs.cold_penalty = coeffs.cold_penalty.max(-200.0).min(0.0);
+    coeffs.warm_bonus = coeffs.warm_bonus.max(0.0).min(100.0);
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -922,5 +1128,113 @@ mod tests {
             score_str,
             score_num
         );
+    }
+
+    // ── Rank-based heuristic evaluation ─────────────────────────────
+
+    fn make_test_snapshot() -> PoolSnapshot {
+        // Simulate a task where the solution uses "add" (comp priority 0.0)
+        // and there are candidates from multiply, add, and string-upper.
+        // The solution is the last entry (add with arg_priority_sum=200.0).
+        PoolSnapshot {
+            task_name: "test_task".into(),
+            task_context: num_task_context(),
+            candidates: vec![
+                CandidateRecord { comp_name: "multiply".into(), arg_priority_sum: 100.0 },
+                CandidateRecord { comp_name: "string-upper".into(), arg_priority_sum: 50.0 },
+                CandidateRecord { comp_name: "add".into(), arg_priority_sum: 150.0 },
+                CandidateRecord { comp_name: "multiply".into(), arg_priority_sum: 200.0 },
+                CandidateRecord { comp_name: "add".into(), arg_priority_sum: 200.0 }, // solution
+            ],
+            depth0_count: 3, // 3 atoms tested before compositions
+        }
+    }
+
+    #[test]
+    fn test_rank_solution_default_heuristic() {
+        let snapshot = make_test_snapshot();
+        let comps = simple_components();
+        let h = Heuristic::default_heuristic();
+
+        let rank = rank_solution(&snapshot, &h, &comps);
+        assert!(rank.is_some());
+        // With default heuristic (pass-through priority), all comps have
+        // priority 0.0, so scores are just arg_priority_sum. Solution has
+        // arg_priority_sum=200.0, tied with multiply(200.0). Stable sort
+        // preserves order, so solution (idx 4) comes after multiply (idx 3).
+        let r = rank.unwrap();
+        assert!(r > 0, "rank should be positive: {}", r);
+    }
+
+    #[test]
+    fn test_rank_solution_empty_snapshot() {
+        let snapshot = PoolSnapshot {
+            task_name: "empty".into(),
+            task_context: num_task_context(),
+            candidates: vec![],
+            depth0_count: 0,
+        };
+        let comps = simple_components();
+        let h = Heuristic::default_heuristic();
+        assert!(rank_solution(&snapshot, &h, &comps).is_none());
+    }
+
+    #[test]
+    fn test_rank_solution_type_match_helps() {
+        let snapshot = make_test_snapshot();
+        let comps = simple_components();
+
+        // Default heuristic: all comps have same priority (0.0)
+        let default_h = Heuristic::default_heuristic();
+        let default_rank = rank_solution(&snapshot, &default_h, &comps).unwrap();
+
+        // Number-specialist: boosts add (ret_type=NUM=0) for numeric tasks
+        let candidates = build_candidate_heuristics();
+        let num_specialist = candidates.iter()
+            .find(|h| h.name == "number-specialist")
+            .unwrap();
+        let specialist_rank = rank_solution(&snapshot, num_specialist, &comps).unwrap();
+
+        // The number specialist should help (lower or equal rank) because
+        // it boosts arithmetic ops and the solution uses "add"
+        assert!(
+            specialist_rank <= default_rank,
+            "specialist rank {} should be <= default rank {}",
+            specialist_rank, default_rank,
+        );
+    }
+
+    #[test]
+    fn test_evaluate_heuristic_by_rank() {
+        let snapshot = make_test_snapshot();
+        let comps = simple_components();
+        let h = Heuristic::default_heuristic();
+
+        let avg_rank = evaluate_heuristic_by_rank(&[snapshot], &h, &comps);
+        assert!(avg_rank > 0.0, "avg rank should be positive: {}", avg_rank);
+        assert!(avg_rank.is_finite());
+    }
+
+    #[test]
+    fn test_evaluate_heuristic_by_rank_empty() {
+        let comps = simple_components();
+        let h = Heuristic::default_heuristic();
+        let avg = evaluate_heuristic_by_rank(&[], &h, &comps);
+        assert_eq!(avg, f64::MAX);
+    }
+
+    #[test]
+    fn test_optimize_heuristic_by_rank_empty() {
+        let comps = simple_components();
+        assert!(optimize_heuristic_by_rank(&[], &comps).is_none());
+    }
+
+    #[test]
+    fn test_optimize_heuristic_by_rank_runs() {
+        // Smoke test: optimization should run without panicking
+        let snapshot = make_test_snapshot();
+        let comps = simple_components();
+        // Result may or may not find improvement — just verify no crash
+        let _ = optimize_heuristic_by_rank(&[snapshot], &comps);
     }
 }
