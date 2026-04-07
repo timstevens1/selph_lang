@@ -1,6 +1,8 @@
 //! Evaluator (standalone, no PyO3 dependency)
 
+use crate::intern::{Sym, intern, resolve};
 use crate::types::*;
+use std::rc::Rc;
 
 // Maximum eval recursion depth to prevent stack overflow from
 // deeply nested or self-referential macros.
@@ -10,7 +12,15 @@ thread_local! {
     static EVAL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-pub fn eval(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String> {
+/// Shared empty node slice for builtins that need a node reference (map, reduce, filter, apply).
+fn empty_nodes() -> Rc<[Node]> {
+    thread_local! {
+        static EMPTY: Rc<[Node]> = Rc::from(Vec::<Node>::new());
+    }
+    EMPTY.with(|e| Rc::clone(e))
+}
+
+pub fn eval(nodes: &Rc<[Node]>, idx: usize, env: &mut Env) -> Result<Value, String> {
     let depth = EVAL_DEPTH.with(|d| {
         let v = d.get();
         d.set(v + 1);
@@ -25,16 +35,16 @@ pub fn eval(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String> 
     result
 }
 
-fn eval_inner(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String> {
+fn eval_inner(nodes: &Rc<[Node]>, idx: usize, env: &mut Env) -> Result<Value, String> {
     match &nodes[idx] {
         Node::Num(n) => Ok(Value::Num(*n)),
         Node::Str(s) => Ok(Value::Str(s.clone())),
         Node::Bool(b) => Ok(Value::Bool(*b)),
         Node::Symbol(name) => {
-            env_lookup(env, name).ok_or_else(|| format!("unbound: {}", name))
+            env_lookup(env, *name).ok_or_else(|| format!("unbound: {}", resolve(*name)))
         }
         Node::Lambda(params, body) => {
-            Ok(Value::Closure(params.clone(), *body, env.clone(), nodes.to_vec(), None))
+            Ok(Value::Closure(params.clone(), *body, env.clone(), Rc::clone(nodes), None))
         }
         Node::If(cond, then_br, else_br) => {
             let cond_val = eval(nodes, *cond, env)?;
@@ -61,14 +71,14 @@ fn eval_inner(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String
             ));
 
             // Track which binding names got closure values
-            let mut closure_names: Vec<String> = Vec::new();
+            let mut closure_names: Vec<Sym> = Vec::new();
 
             for (name, val_idx) in bindings {
                 let val = eval(nodes, *val_idx, env)?;
                 if matches!(&val, Value::Closure(..)) {
-                    closure_names.push(name.clone());
+                    closure_names.push(*name);
                 }
-                env_define(env, name.clone(), val);
+                env_define(env, *name, val);
             }
 
             // Patch closures: give them the shared scope so recursive
@@ -77,7 +87,7 @@ fn eval_inner(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String
                 if let Some(scope) = env.last_mut() {
                     for cname in &closure_names {
                         if let Some(Value::Closure(params, body_idx, captured_env, nodes_vec, _)) = scope.get(cname).cloned() {
-                            scope.insert(cname.clone(), Value::Closure(
+                            scope.insert(*cname, Value::Closure(
                                 params, body_idx, captured_env, nodes_vec,
                                 Some(shared_scope.clone()),
                             ));
@@ -89,7 +99,7 @@ fn eval_inner(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String
                 if let Some(scope) = env.last() {
                     let mut shared = shared_scope.borrow_mut();
                     for (k, v) in scope.iter() {
-                        shared.insert(k.clone(), v.clone());
+                        shared.insert(*k, v.clone());
                     }
                 }
             }
@@ -105,26 +115,27 @@ fn eval_inner(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String
 
             // Check for special forms
             if let Node::Symbol(name) = &nodes[children[0]] {
-                match name.as_str() {
+                let name_str = resolve(*name);
+                match name_str.as_str() {
                     "define" if children.len() == 3 => {
                         if let Node::Symbol(var_name) = &nodes[children[1]] {
                             let val = eval(nodes, children[2], env)?;
-                            env_define(env, var_name.clone(), val.clone());
+                            env_define(env, *var_name, val.clone());
                             return Ok(val);
                         }
                     }
                     "defmacro" if children.len() == 4 => {
                         if let Node::Symbol(macro_name) = &nodes[children[1]] {
                             if let Node::App(param_indices) = &nodes[children[2]] {
-                                let params: Vec<String> = param_indices.iter()
+                                let params: Vec<Sym> = param_indices.iter()
                                     .filter_map(|&i| {
-                                        if let Node::Symbol(s) = &nodes[i] { Some(s.clone()) }
+                                        if let Node::Symbol(s) = &nodes[i] { Some(*s) }
                                         else { None }
                                     }).collect();
                                 let body_idx = children[3];
                                 let macro_val = Value::RustMacro(
-                                    params, nodes.to_vec(), body_idx);
-                                env_define(env, macro_name.clone(), macro_val.clone());
+                                    params, Rc::clone(nodes), body_idx);
+                                env_define(env, *macro_name, macro_val.clone());
                                 return Ok(macro_val);
                             }
                         }
@@ -162,7 +173,7 @@ fn eval_inner(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String
                                 if pair.len() == 2 {
                                     if let Node::Symbol(key) = &nodes[pair[0]] {
                                         let val = eval(nodes, pair[1], env)?;
-                                        entries.insert(key.clone(), val);
+                                        entries.insert(resolve(*key), val);
                                     }
                                 }
                             }
@@ -190,9 +201,10 @@ fn eval_inner(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String
                         if roots.is_empty() {
                             return Ok(Value::Nil);
                         }
+                        let new_nodes_rc: Rc<[Node]> = new_nodes.into();
                         let mut last = Value::Nil;
                         for &r in &roots {
-                            last = eval(&new_nodes, r, env)?;
+                            last = eval(&new_nodes_rc, r, env)?;
                         }
                         return Ok(last);
                     }
@@ -210,7 +222,7 @@ fn eval_inner(nodes: &[Node], idx: usize, env: &mut Env) -> Result<Value, String
     }
 }
 
-pub fn apply(fn_val: &Value, args: &[Value], nodes: &[Node], env: &mut Env) -> Result<Value, String> {
+pub fn apply(fn_val: &Value, args: &[Value], _nodes: &Rc<[Node]>, env: &mut Env) -> Result<Value, String> {
     match fn_val {
         Value::Closure(params, body, closed_env, closure_nodes, letrec_scope) => {
             let mut new_env = closed_env.clone();
@@ -222,25 +234,25 @@ pub fn apply(fn_val: &Value, args: &[Value], nodes: &[Node], env: &mut Env) -> R
             let mut scope = std::collections::HashMap::new();
             for (i, param) in params.iter().enumerate() {
                 if i < args.len() {
-                    scope.insert(param.clone(), args[i].clone());
+                    scope.insert(*param, args[i].clone());
                 }
             }
             new_env.push(scope);
             // Use the closure's captured nodes, not the caller's nodes
             eval(closure_nodes, *body, &mut new_env)
         }
-        Value::Builtin(name) => apply_builtin(name, args),
+        Value::Builtin(name) => apply_builtin(*name, args),
         Value::RustMacro(params, macro_nodes, body_root) => {
             let mut macro_env = make_default_env();
             for scope in env.iter() {
                 for (k, v) in scope {
-                    env_define(&mut macro_env, k.clone(), v.clone());
+                    env_define(&mut macro_env, *k, v.clone());
                 }
             }
             let mut scope = std::collections::HashMap::new();
             for (i, param) in params.iter().enumerate() {
                 if i < args.len() {
-                    scope.insert(param.clone(), args[i].clone());
+                    scope.insert(*param, args[i].clone());
                 }
             }
             macro_env.push(scope);
@@ -250,9 +262,10 @@ pub fn apply(fn_val: &Value, args: &[Value], nodes: &[Node], env: &mut Env) -> R
     }
 }
 
-pub fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+pub fn apply_builtin(name: Sym, args: &[Value]) -> Result<Value, String> {
     // Minimal builtins for the CLI. Add more as needed.
-    match name {
+    let name_str = resolve(name);
+    match name_str.as_str() {
         "add" | "+" => num2(args, |a, b| a + b),
         "subtract" | "-" => num2(args, |a, b| a - b),
         "multiply" | "*" => num2(args, |a, b| a * b),
@@ -311,7 +324,7 @@ pub fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         "cons" => { let mut l = list(&args[1])?; l.insert(0, args[0].clone()); Ok(Value::List(l)) },
         "map" => {
             let l = list(&args[1])?;
-            let empty: Vec<Node> = Vec::new();
+            let empty = empty_nodes();
             let mut env = make_default_env();
             let mut results = Vec::new();
             for item in &l {
@@ -321,7 +334,7 @@ pub fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         "reduce" => {
             let l = list(&args[1])?;
-            let empty: Vec<Node> = Vec::new();
+            let empty = empty_nodes();
             let mut env = make_default_env();
             let mut acc = if args.len() > 2 { args[2].clone() } else { l[0].clone() };
             let items = if args.len() > 2 { &l[..] } else { &l[1..] };
@@ -332,7 +345,7 @@ pub fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         "filter" => {
             let l = list(&args[1])?;
-            let empty: Vec<Node> = Vec::new();
+            let empty = empty_nodes();
             let mut env = make_default_env();
             let mut results = Vec::new();
             for item in &l {
@@ -649,10 +662,11 @@ pub fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
             if roots.is_empty() {
                 return Ok(Value::Nil);
             }
+            let nodes_rc: Rc<[Node]> = nodes.into();
             let mut env = make_default_env();
             let mut last = Value::Nil;
             for &r in &roots {
-                last = eval(&nodes, r, &mut env)?;
+                last = eval(&nodes_rc, r, &mut env)?;
             }
             Ok(last)
         }
@@ -668,10 +682,11 @@ pub fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
             if roots.is_empty() {
                 return Ok(Value::Nil);
             }
+            let nodes_rc: Rc<[Node]> = nodes.into();
             let mut env = make_default_env();
             let mut last = Value::Nil;
             for &r in &roots {
-                last = eval(&nodes, r, &mut env)?;
+                last = eval(&nodes_rc, r, &mut env)?;
             }
             Ok(last)
         }
@@ -749,7 +764,7 @@ pub fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         "apply" => {
             let func = &args[0];
             let arg_list = list(&args[1])?;
-            let empty: Vec<Node> = Vec::new();
+            let empty = empty_nodes();
             let mut env = make_default_env();
             apply(func, &arg_list, &empty, &mut env)
         }
@@ -758,7 +773,7 @@ pub fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         // (error "something went wrong")
         "error" => Err(value_to_string(&args[0])),
 
-        _ => Err(format!("unknown builtin: {}", name)),
+        _ => Err(format!("unknown builtin: {}", name_str)),
     }
 }
 
@@ -796,9 +811,9 @@ pub fn value_to_string(v: &Value) -> String {
             format!("({})", parts.join(" "))
         }
         Value::Nil => "nil".to_string(),
-        Value::Closure(params, _, _, _, _) => format!("<lambda ({})>", params.join(" ")),
-        Value::Builtin(name) => format!("<builtin {}>", name),
-        Value::RustMacro(params, _, _) => format!("<macro ({})>", params.join(" ")),
+        Value::Closure(params, _, _, _, _) => format!("<lambda ({})>", params.iter().map(|p| resolve(*p)).collect::<Vec<_>>().join(" ")),
+        Value::Builtin(name) => format!("<builtin {}>", resolve(*name)),
+        Value::RustMacro(params, _, _) => format!("<macro ({})>", params.iter().map(|p| resolve(*p)).collect::<Vec<_>>().join(" ")),
         Value::Namespace(map) => {
             let keys: Vec<&String> = map.keys().collect();
             format!("<namespace {:?}>", keys)
@@ -832,35 +847,38 @@ fn extract_trees_from_ns(ns: &std::collections::HashMap<String, Value>) -> Vec<(
     }
 }
 
+/// List of all builtin function names.
+pub const BUILTIN_NAMES: &[&str] = &[
+    "add", "+", "subtract", "-", "multiply", "*", "divide", "/",
+    "modulo", "%", "abs", "negate", "min", "max", "floor", "ceil",
+    "<", ">", "<=", ">=", "=", "not", "even", "odd",
+    "string-upper", "string-lower", "string-reverse", "string-trim",
+    "string-length", "string-contains", "string-split", "string-join",
+    "concat", "to-string", "to-number",
+    "list", "head", "tail", "length", "cons",
+    "nth", "slice", "sort", "reverse", "append",
+    "range", "contains", "zip", "enumerate",
+    "round", "pow", "sqrt", "log",
+    "string-nth", "string-slice", "char-code", "code-char",
+    "count-char", "string-replace", "string-chars",
+    "string-starts-with", "string-ends-with",
+    "map", "reduce", "filter", "identity", "print",
+    "ns-get", "ns-put", "ns-keys", "ns-values", "ns-merge",
+    "ns-size", "ns-flatten", "ns?", "ns-empty",
+    "ns-get-or", "ns-has",
+    "synthesize", "synthesize-optimize",
+    "eval-source", "eval-in", "type-of",
+    "number?", "string?", "bool?", "list?", "nil?", "function?",
+    "apply", "error",
+];
+
 pub fn make_default_env() -> Env {
-    let builtins = [
-        "add", "+", "subtract", "-", "multiply", "*", "divide", "/",
-        "modulo", "%", "abs", "negate", "min", "max", "floor", "ceil",
-        "<", ">", "<=", ">=", "=", "not", "even", "odd",
-        "string-upper", "string-lower", "string-reverse", "string-trim",
-        "string-length", "string-contains", "string-split", "string-join",
-        "concat", "to-string", "to-number",
-        "list", "head", "tail", "length", "cons",
-        "nth", "slice", "sort", "reverse", "append",
-        "range", "contains", "zip", "enumerate",
-        "round", "pow", "sqrt", "log",
-        "string-nth", "string-slice", "char-code", "code-char",
-        "count-char", "string-replace", "string-chars",
-        "string-starts-with", "string-ends-with",
-        "map", "reduce", "filter", "identity", "print",
-        "ns-get", "ns-put", "ns-keys", "ns-values", "ns-merge",
-        "ns-size", "ns-flatten", "ns?", "ns-empty",
-        "ns-get-or", "ns-has",
-        "synthesize", "synthesize-optimize",
-        "eval-source", "eval-in", "type-of",
-        "number?", "string?", "bool?", "list?", "nil?", "function?",
-        "apply", "error",
-    ];
     let mut scope = std::collections::HashMap::new();
-    for name in builtins {
-        scope.insert(name.to_string(), Value::Builtin(name.to_string()));
+    for name in BUILTIN_NAMES {
+        let sym = intern(name);
+        scope.insert(sym, Value::Builtin(sym));
     }
-    scope.insert("nil".to_string(), Value::Nil);
+    scope.insert(intern("nil"), Value::Nil);
 
     // __builtins__: introspectable namespace of all builtins with metadata.
     // Lets SELPH programs reason about the component library.
@@ -947,6 +965,6 @@ pub fn make_default_env() -> Env {
         ("filter", 2, vec!["function", "list"], "list"),
     ] { let (k, v) = bi(n, a, &p, r); builtins_ns.insert(k, v); }
 
-    scope.insert("__builtins__".to_string(), Value::Namespace(builtins_ns));
+    scope.insert(intern("__builtins__"), Value::Namespace(builtins_ns));
     vec![scope]
 }

@@ -4,17 +4,19 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::intern::{Sym, resolve};
+
 /// AST node.
 #[derive(Clone, Debug)]
 pub enum Node {
     Num(f64),
     Str(String),
     Bool(bool),
-    Symbol(String),
+    Symbol(Sym),
     App(Vec<usize>),
     If(usize, usize, usize),
-    Lambda(Vec<String>, usize),
-    Let(Vec<(String, usize)>, usize),
+    Lambda(Vec<Sym>, usize),
+    Let(Vec<(Sym, usize)>, usize),
 }
 
 /// Runtime value.
@@ -28,28 +30,28 @@ pub enum Value {
     /// Closure: (params, body_index, captured_env, captured_nodes, letrec_scope)
     /// The optional letrec_scope is a shared mutable scope that enables
     /// self-referential and mutually-recursive let bindings.
-    Closure(Vec<String>, usize, Env, Vec<Node>, Option<SharedScope>),
-    Builtin(String),
-    RustMacro(Vec<String>, Vec<Node>, usize),
+    Closure(Vec<Sym>, usize, Env, Rc<[Node]>, Option<SharedScope>),
+    Builtin(Sym),
+    RustMacro(Vec<Sym>, Rc<[Node]>, usize),
     Namespace(HashMap<String, Value>),
 }
 
 /// Lexical environment: stack of scopes.
-pub type Env = Vec<HashMap<String, Value>>;
+pub type Env = Vec<HashMap<Sym, Value>>;
 
 /// Shared mutable scope for letrec bindings, enabling self/mutual recursion.
-pub type SharedScope = Rc<RefCell<HashMap<String, Value>>>;
+pub type SharedScope = Rc<RefCell<HashMap<Sym, Value>>>;
 
-pub fn env_lookup(env: &Env, name: &str) -> Option<Value> {
+pub fn env_lookup(env: &Env, name: Sym) -> Option<Value> {
     for scope in env.iter().rev() {
-        if let Some(v) = scope.get(name) {
+        if let Some(v) = scope.get(&name) {
             return Some(v.clone());
         }
     }
     None
 }
 
-pub fn env_define(env: &mut Env, name: String, val: Value) {
+pub fn env_define(env: &mut Env, name: Sym, val: Value) {
     if let Some(scope) = env.last_mut() {
         scope.insert(name, val);
     }
@@ -64,7 +66,7 @@ pub fn node_to_source(nodes: &[Node], idx: usize) -> String {
         }
         Node::Str(s) => format!("\"{}\"", s),
         Node::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
-        Node::Symbol(name) => name.clone(),
+        Node::Symbol(sym) => resolve(*sym),
         Node::App(children) => {
             if children.is_empty() { return "()".to_string(); }
             let parts: Vec<String> = children.iter().map(|c| node_to_source(nodes, *c)).collect();
@@ -74,12 +76,13 @@ pub fn node_to_source(nodes: &[Node], idx: usize) -> String {
             node_to_source(nodes, *c),
             node_to_source(nodes, *t),
             node_to_source(nodes, *e)),
-        Node::Lambda(params, body) => format!("(lambda ({}) {})",
-            params.join(" "),
-            node_to_source(nodes, *body)),
+        Node::Lambda(params, body) => {
+            let param_strs: Vec<String> = params.iter().map(|p| resolve(*p)).collect();
+            format!("(lambda ({}) {})", param_strs.join(" "), node_to_source(nodes, *body))
+        }
         Node::Let(bindings, body) => {
             let bs: Vec<String> = bindings.iter()
-                .map(|(name, idx)| format!("({} {})", name, node_to_source(nodes, *idx)))
+                .map(|(name, idx)| format!("({} {})", resolve(*name), node_to_source(nodes, *idx)))
                 .collect();
             format!("(let ({}) {})", bs.join(" "), node_to_source(nodes, *body))
         }

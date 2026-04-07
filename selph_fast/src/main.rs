@@ -8,6 +8,7 @@
 //!   selph run <curriculum.selph>      — run a curriculum
 
 // Import core modules (shared with the PyO3 library)
+mod intern;
 mod types;
 mod parser;
 mod eval;
@@ -23,9 +24,12 @@ mod multitree;
 mod stochastic;
 mod meta;
 mod taskgen;
+mod vm;
 
 use std::env;
 use std::fs;
+use std::rc::Rc;
+use intern::{Sym, intern, resolve};
 use types::*;
 use parser::*;
 use eval::*;
@@ -106,13 +110,14 @@ fn cmd_eval(args: &[String]) {
     };
 
     // Parse
-    let (nodes, roots) = match parse_file(&source) {
+    let (nodes_vec, roots) = match parse_file(&source) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Parse error: {}", e);
             return;
         }
     };
+    let nodes: Rc<[Node]> = nodes_vec.into();
 
     // Evaluate each top-level expression
     let mut env = make_default_env();
@@ -189,7 +194,8 @@ fn cmd_repl() {
         }
 
         match parse_source(&source) {
-            Ok((nodes, root)) => {
+            Ok((nodes_vec, root)) => {
+                let nodes: Rc<[Node]> = nodes_vec.into();
                 match eval(&nodes, root, &mut env) {
                     Ok(val) => {
                         let s = value_to_string(&val);
@@ -375,17 +381,18 @@ fn node_to_value(nodes: &[Node], idx: usize) -> Option<Value> {
         Node::Str(s) => Some(Value::Str(s.clone())),
         Node::Bool(b) => Some(Value::Bool(*b)),
         Node::Symbol(s) => {
+            let name = resolve(*s);
             // Try parsing as bool, then number, then fall back to string
-            if s == "true" {
+            if name == "true" {
                 Some(Value::Bool(true))
-            } else if s == "false" {
+            } else if name == "false" {
                 Some(Value::Bool(false))
-            } else if s == "nil" {
+            } else if name == "nil" {
                 Some(Value::Nil)
-            } else if let Ok(n) = s.parse::<f64>() {
+            } else if let Ok(n) = name.parse::<f64>() {
                 Some(Value::Num(n))
             } else {
-                Some(Value::Str(s.clone()))
+                Some(Value::Str(name))
             }
         }
         _ => None,
@@ -404,17 +411,17 @@ fn load_library_macros(source: &str) -> Vec<(String, Vec<String>, Vec<Node>, usi
         if let Node::App(children) = &nodes[root] {
             if children.len() == 4 {
                 if let Node::Symbol(s) = &nodes[children[0]] {
-                    if s == "defmacro" {
+                    if *s == intern("defmacro") {
                         if let Node::Symbol(name) = &nodes[children[1]] {
                             if let Node::App(param_indices) = &nodes[children[2]] {
                                 let params: Vec<String> = param_indices.iter()
                                     .filter_map(|&i| {
-                                        if let Node::Symbol(s) = &nodes[i] { Some(s.clone()) }
+                                        if let Node::Symbol(s) = &nodes[i] { Some(resolve(*s)) }
                                         else { None }
                                     }).collect();
                                 // Clone the body subtree
                                 macros.push((
-                                    name.clone(), params,
+                                    resolve(*name), params,
                                     nodes.clone(), children[3],
                                 ));
                             }
@@ -436,7 +443,8 @@ fn load_namespace_trees(paths: &[String]) -> Vec<(String, Value)> {
     let mut trees = Vec::new();
     for (idx, path) in paths.iter().enumerate() {
         if let Ok(src) = fs::read_to_string(path) {
-            if let Ok((nodes, roots)) = parse_file(&src) {
+            if let Ok((nodes_vec, roots)) = parse_file(&src) {
+                let nodes: Rc<[Node]> = nodes_vec.into();
                 let mut env = make_default_env();
                 let mut last_val = Value::Nil;
                 for &r in &roots {
@@ -557,16 +565,18 @@ fn synth_search(
     {
         let mut ln = entry.nodes.clone();
         let lr = ln.len();
-        ln.push(Node::Lambda(vec!["x".into()], entry.root));
+        ln.push(Node::Lambda(vec![intern("x")], entry.root));
+        let ln_rc: Rc<[Node]> = ln.clone().into();
         let mut beh = Vec::new();
         let mut ok = true;
         for (inp, exp) in inputs.iter().zip(expected.iter()) {
             let mut env = make_default_env();
             for (nm, ps, mn, mr) in &macro_env {
-                env_define(&mut env, nm.clone(), Value::RustMacro(ps.clone(), mn.clone(), *mr));
+                let mn_rc: Rc<[Node]> = mn.clone().into();
+                env_define(&mut env, intern(nm), Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), mn_rc, *mr));
             }
-            let fv = match eval(&ln, lr, &mut env) { Ok(v) => v, Err(_) => { ok = false; break; } };
-            match apply(&fv, &[inp.clone()], &ln, &mut env) {
+            let fv = match eval(&ln_rc, lr, &mut env) { Ok(v) => v, Err(_) => { ok = false; break; } };
+            match apply(&fv, &[inp.clone()], &ln_rc, &mut env) {
                 Ok(a) => { beh.push(val_hash(&a)); if !vals_equal(&a, exp) { ok = false; } }
                 Err(_) => { ok = false; break; }
             }
@@ -580,7 +590,7 @@ fn synth_search(
     for comp in components {
         if comp.arity != 0 { continue; }
         let mut nodes = Vec::new();
-        if comp.name == "x" { nodes.push(Node::Symbol("x".into())); }
+        if comp.name == "x" { nodes.push(Node::Symbol(intern("x"))); }
         else if let Ok(n) = comp.name.parse::<f64>() { nodes.push(Node::Num(n)); }
         else { nodes.push(Node::Str(comp.name.clone())); }
         pool.push(SynthPool { nodes, root: 0, ret_type: comp.ret_type, priority: comp.priority });
@@ -603,12 +613,13 @@ fn synth_search(
             if comp.arity == 0 || comp.builtin.is_none() { continue; }
             let bn = comp.builtin.as_ref().unwrap();
 
+            let bn_sym = intern(bn);
             if comp.arity == 1 {
                 for pi in prev.clone() {
                     let p = pool[pi].clone();
                     if p.ret_type != comp.param_types[0] && comp.param_types[0] != 255 { continue; }
                     let mut n = p.nodes.clone();
-                    let fi = n.len(); n.push(Node::Symbol(bn.clone()));
+                    let fi = n.len(); n.push(Node::Symbol(bn_sym));
                     let ai = n.len(); n.push(Node::App(vec![fi, p.root]));
                     let e = SynthPool { nodes: n, root: ai, ret_type: comp.ret_type, priority: comp.priority };
                     explored += 1;
@@ -626,7 +637,7 @@ fn synth_search(
                         let mut n = p1.nodes.clone();
                         let off = n.len();
                         for nd in &p2.nodes { n.push(remap_n(nd, off)); }
-                        let fi = n.len(); n.push(Node::Symbol(bn.clone()));
+                        let fi = n.len(); n.push(Node::Symbol(bn_sym));
                         let api = n.len(); n.push(Node::App(vec![fi, p1.root, p2.root + off]));
                         let e = SynthPool { nodes: n, root: api, ret_type: comp.ret_type, priority: comp.priority };
                         explored += 1;
@@ -644,7 +655,7 @@ fn synth_search(
                         let mut n = p1.nodes.clone();
                         let off = n.len();
                         for nd in &p2.nodes { n.push(remap_n(nd, off)); }
-                        let fi = n.len(); n.push(Node::Symbol(bn.clone()));
+                        let fi = n.len(); n.push(Node::Symbol(bn_sym));
                         let api = n.len(); n.push(Node::App(vec![fi, p1.root, p2.root + off]));
                         let e = SynthPool { nodes: n, root: api, ret_type: comp.ret_type, priority: comp.priority };
                         explored += 1;
@@ -668,7 +679,7 @@ fn remap_n(node: &Node, offset: usize) -> Node {
         Node::If(c, t, e) => Node::If(c + offset, t + offset, e + offset),
         Node::Lambda(p, b) => Node::Lambda(p.clone(), b + offset),
         Node::Let(bs, b) => Node::Let(
-            bs.iter().map(|(n, i)| (n.clone(), i + offset)).collect(),
+            bs.iter().map(|(n, i)| (*n, i + offset)).collect(),
             b + offset),
         other => other.clone(),
     }
@@ -799,7 +810,8 @@ fn cmd_curriculum(args: &[String]) {
             match fs::read_to_string(fp) {
                 Ok(src) => {
                     match parse_file(&src) {
-                        Ok((nodes, roots)) if !roots.is_empty() => {
+                        Ok((nodes_vec, roots)) if !roots.is_empty() => {
+                            let nodes: Rc<[Node]> = nodes_vec.into();
                             let mut fenv = make_default_env();
                             match eval(&nodes, roots[roots.len() - 1], &mut fenv) {
                                 Ok(filter_val) => {
@@ -836,13 +848,14 @@ fn cmd_curriculum(args: &[String]) {
 
     // Load learned RL coefficients from library if present
     for (mname, _params, mnodes, mroot) in &all_macros {
+        let mnodes_rc: Rc<[Node]> = mnodes.clone().into();
         if mname == "__selph_rl_cold__" {
-            if let Ok(val) = eval::eval(mnodes, *mroot, &mut eval::make_default_env()) {
+            if let Ok(val) = eval::eval(&mnodes_rc, *mroot, &mut eval::make_default_env()) {
                 if let Value::Num(n) = val { current_rl_coeffs.cold_penalty = n; }
             }
         }
         if mname == "__selph_rl_warm__" {
-            if let Ok(val) = eval::eval(mnodes, *mroot, &mut eval::make_default_env()) {
+            if let Ok(val) = eval::eval(&mnodes_rc, *mroot, &mut eval::make_default_env()) {
                 if let Value::Num(n) = val { current_rl_coeffs.warm_bonus = n; }
             }
         }
@@ -962,11 +975,11 @@ fn cmd_curriculum(args: &[String]) {
                                         if let Node::App(param_indices) = &mnodes[children[2]] {
                                             let params: Vec<String> = param_indices.iter()
                                                 .filter_map(|&i| {
-                                                    if let Node::Symbol(s) = &mnodes[i] { Some(s.clone()) }
+                                                    if let Node::Symbol(s) = &mnodes[i] { Some(resolve(*s)) }
                                                     else { None }
                                                 }).collect();
                                             all_macros.push((
-                                                mname.clone(), params,
+                                                resolve(*mname), params,
                                                 mnodes.clone(), children[3],
                                             ));
                                         }
@@ -1021,11 +1034,11 @@ fn cmd_curriculum(args: &[String]) {
                                     if let Node::App(param_indices) = &mnodes[children[2]] {
                                         let params: Vec<String> = param_indices.iter()
                                             .filter_map(|&i| {
-                                                if let Node::Symbol(s) = &mnodes[i] { Some(s.clone()) }
+                                                if let Node::Symbol(s) = &mnodes[i] { Some(resolve(*s)) }
                                                 else { None }
                                             }).collect();
                                         all_macros.push((
-                                            mname.clone(), params,
+                                            resolve(*mname), params,
                                             mnodes.clone(), children[3],
                                         ));
                                     }
@@ -1072,10 +1085,10 @@ fn cmd_curriculum(args: &[String]) {
                                     if let Node::App(param_indices) = &mnodes[children[2]] {
                                         let params: Vec<String> = param_indices.iter()
                                             .filter_map(|&i| {
-                                                if let Node::Symbol(s) = &mnodes[i] { Some(s.clone()) }
+                                                if let Node::Symbol(s) = &mnodes[i] { Some(resolve(*s)) }
                                                 else { None }
                                             }).collect();
-                                        all_macros.push((mname.clone(), params, mnodes.clone(), children[3]));
+                                        all_macros.push((resolve(*mname), params, mnodes.clone(), children[3]));
                                     }
                                 }
                             }
@@ -1142,10 +1155,10 @@ fn cmd_curriculum(args: &[String]) {
                                     if let Node::App(param_indices) = &mnodes[children[2]] {
                                         let params: Vec<String> = param_indices.iter()
                                             .filter_map(|&pi| {
-                                                if let Node::Symbol(s) = &mnodes[pi] { Some(s.clone()) }
+                                                if let Node::Symbol(s) = &mnodes[pi] { Some(resolve(*s)) }
                                                 else { None }
                                             }).collect();
-                                        all_macros.push((mname.clone(), params, mnodes.clone(), children[3]));
+                                        all_macros.push((resolve(*mname), params, mnodes.clone(), children[3]));
                                     }
                                 }
                             }
@@ -1257,12 +1270,12 @@ fn parse_curriculum_tasks(source: &str, default_depth: usize)
         if let Node::App(children) = &nodes[root] {
             if children.len() < 4 { continue; }
             if let Node::Symbol(s) = &nodes[children[0]] {
-                if s != "task" { continue; }
+                if *s != intern("task") { continue; }
             } else { continue; }
 
             let name = match &nodes[children[1]] {
                 Node::Str(s) => s.clone(),
-                Node::Symbol(s) => s.clone(),
+                Node::Symbol(s) => resolve(*s),
                 _ => continue,
             };
 
@@ -1315,7 +1328,9 @@ fn bool_decompose(
 
     for (mname, params, mnodes, mroot) in macros {
         if params.len() != 1 { continue; }
-        let val = Value::RustMacro(params.clone(), mnodes.clone(), *mroot);
+        let mnodes_rc: Rc<[Node]> = mnodes.clone().into();
+        let sym_params: Vec<Sym> = params.iter().map(|s| intern(s)).collect();
+        let val = Value::RustMacro(sym_params, mnodes_rc.clone(), *mroot);
 
         let mut outputs = Vec::new();
         let mut all_bool = true;
@@ -1323,10 +1338,11 @@ fn bool_decompose(
             let mut env = eval::make_default_env();
             // Also load other macros so compositions work
             for (mn2, p2, n2, r2) in macros {
-                env_define(&mut env, mn2.clone(),
-                    Value::RustMacro(p2.clone(), n2.clone(), *r2));
+                let n2_rc: Rc<[Node]> = n2.clone().into();
+                env_define(&mut env, intern(mn2),
+                    Value::RustMacro(p2.iter().map(|s| intern(s)).collect(), n2_rc, *r2));
             }
-            match eval::apply(&val, &[inp.clone()], mnodes, &mut env) {
+            match eval::apply(&val, &[inp.clone()], &mnodes_rc, &mut env) {
                 Ok(Value::Bool(b)) => outputs.push(b),
                 _ => { all_bool = false; break; }
             }
@@ -1549,17 +1565,19 @@ fn cmd_verify(args: &[String]) {
     };
 
     // Parse program
-    let (nodes, roots) = match parse_file(&source) {
+    let (nodes_vec, roots) = match parse_file(&source) {
         Ok(r) => r,
         Err(e) => { eprintln!("Parse error: {}", e); return; }
     };
+    let nodes: Rc<[Node]> = nodes_vec.into();
     if roots.is_empty() { eprintln!("No expressions found"); return; }
 
     // Load library macros
     let mut env = make_default_env();
     if let Some(lib_path) = &library_path {
         if let Ok(lib_src) = fs::read_to_string(lib_path) {
-            if let Ok((ln, lr)) = parse_file(&lib_src) {
+            if let Ok((ln_vec, lr)) = parse_file(&lib_src) {
+                let ln: Rc<[Node]> = ln_vec.into();
                 for &r in &lr {
                     let _ = eval(&ln, r, &mut env);
                 }
@@ -1685,7 +1703,8 @@ fn cmd_multi_synth(args: &[String]) {
     let mut macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = Vec::new();
     if let Some(lib_path) = &library_path {
         if let Ok(lib_src) = fs::read_to_string(lib_path) {
-            if let Ok((ln, lr)) = parse_file(&lib_src) {
+            if let Ok((ln_vec, lr)) = parse_file(&lib_src) {
+                let ln: Rc<[Node]> = ln_vec.into();
                 let mut lib_env = make_default_env();
                 for &r in &lr {
                     let _ = eval(&ln, r, &mut lib_env);

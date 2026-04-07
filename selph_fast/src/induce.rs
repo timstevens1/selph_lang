@@ -10,6 +10,8 @@
 //!   2. Constant discovery: analyze input/output pairs to discover
 //!      useful constants (differences, ratios), then retry synthesis.
 
+use std::rc::Rc;
+use crate::intern::{Sym, intern, resolve};
 use crate::eval;
 use crate::synth::{self, SynthComponent};
 use crate::types::*;
@@ -115,7 +117,7 @@ fn generate_intermediates(inputs: &[Value]) -> Vec<IntermediateSet> {
         let mut values = Vec::with_capacity(inputs.len());
         let mut valid = true;
         for inp in inputs {
-            match eval::apply_builtin(fn_name, &[inp.clone()]) {
+            match eval::apply_builtin(intern(fn_name), &[inp.clone()]) {
                 Ok(v) => values.push(v),
                 Err(_) => { valid = false; break; }
             }
@@ -135,7 +137,7 @@ fn generate_intermediates(inputs: &[Value]) -> Vec<IntermediateSet> {
             let mut values = Vec::with_capacity(inputs.len());
             let mut valid = true;
             for inp in inputs {
-                match eval::apply_builtin(fn_name, &[inp.clone(), const_val.clone()]) {
+                match eval::apply_builtin(intern(fn_name), &[inp.clone(), const_val.clone()]) {
                     Ok(v) => values.push(v),
                     Err(_) => { valid = false; break; }
                 }
@@ -284,24 +286,25 @@ fn compose_steps(
 
     // Wrap in lambda
     let lambda_idx = nodes.len();
-    nodes.push(Node::Lambda(vec!["x".into()], composed_root_idx));
+    nodes.push(Node::Lambda(vec![intern("x")], composed_root_idx));
 
     // Verify the composed program produces correct outputs
     let macro_env: Vec<(String, Vec<String>, Vec<Node>, usize)> = macros.to_vec();
+    let nodes_rc: Rc<[Node]> = nodes.clone().into();
     for (inp, exp) in inputs.iter().zip(expected.iter()) {
         let mut env = eval::make_default_env();
         for (nm, ps, mn, mr) in &macro_env {
             env_define(
                 &mut env,
-                nm.clone(),
-                Value::RustMacro(ps.clone(), mn.clone(), *mr),
+                intern(nm),
+                Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), mn.clone().into(), *mr),
             );
         }
-        let fv = match eval::eval(&nodes, lambda_idx, &mut env) {
+        let fv = match eval::eval(&nodes_rc, lambda_idx, &mut env) {
             Ok(v) => v,
             Err(_) => return None,
         };
-        match eval::apply(&fv, &[inp.clone()], &nodes, &mut env) {
+        match eval::apply(&fv, &[inp.clone()], &nodes_rc, &mut env) {
             Ok(ref v) if synth::vals_equal(v, exp) => {}
             _ => return None,
         }
@@ -318,13 +321,14 @@ fn compose_steps(
 /// we rebuild the relevant node pointing to `replacement_idx` where
 /// it previously pointed to a Symbol("x") node.
 fn substitute_x(nodes: &[Node], idx: usize, replacement_idx: usize) -> Node {
+    let x_sym = intern("x");
     match &nodes[idx] {
-        Node::Symbol(name) if name == "x" => {
+        Node::Symbol(name) if *name == x_sym => {
             // Instead of returning the symbol, return a reference that
             // the parent will use. Since we can't return "an index",
             // we handle this at the App/If/Let level.
             // This case is handled by the callers checking children.
-            Node::Symbol("x".into()) // sentinel -- handled by parent
+            Node::Symbol(x_sym) // sentinel -- handled by parent
         }
         Node::App(children) => {
             let new_children: Vec<usize> = children.iter().map(|&c| {
@@ -339,9 +343,9 @@ fn substitute_x(nodes: &[Node], idx: usize, replacement_idx: usize) -> Node {
             Node::If(nc, nt, ne)
         }
         Node::Let(bindings, body) => {
-            let new_bindings: Vec<(String, usize)> = bindings.iter().map(|(name, idx_val)| {
+            let new_bindings: Vec<(Sym, usize)> = bindings.iter().map(|(name, idx_val)| {
                 let ni = if is_x_symbol(nodes, *idx_val) { replacement_idx } else { *idx_val };
-                (name.clone(), ni)
+                (*name, ni)
             }).collect();
             let nb = if is_x_symbol(nodes, *body) { replacement_idx } else { *body };
             Node::Let(new_bindings, nb)
@@ -352,7 +356,8 @@ fn substitute_x(nodes: &[Node], idx: usize, replacement_idx: usize) -> Node {
 
 /// Check if nodes[idx] is Symbol("x").
 fn is_x_symbol(nodes: &[Node], idx: usize) -> bool {
-    matches!(&nodes[idx], Node::Symbol(name) if name == "x")
+    let x_sym = intern("x");
+    matches!(&nodes[idx], Node::Symbol(name) if *name == x_sym)
 }
 
 // ── Strategy 2: Constant discovery ──────────────────────────────────

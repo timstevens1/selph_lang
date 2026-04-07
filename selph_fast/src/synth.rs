@@ -6,9 +6,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use crate::types::*;
 use crate::eval;
 use crate::hm;
+use crate::intern::{intern, resolve};
 
 // ── Type tag constants ──────────────────────────────────────────────
 
@@ -496,7 +498,7 @@ pub fn make_selph_depth_filter(
         ctx.insert("depth".to_string(), Value::Num(depth as f64));
         let ns_arg = Value::Namespace(ctx);
 
-        let empty_nodes: Vec<Node> = Vec::new();
+        let empty_nodes: Rc<[Node]> = Vec::<Node>::new().into();
         let mut env = eval::make_default_env();
         match eval::apply(&filter_val, &[ns_arg], &empty_nodes, &mut env) {
             Ok(Value::Bool(b)) => b,
@@ -520,7 +522,7 @@ pub fn make_selph_scorer(
         ctx.insert("depth".to_string(), Value::Num(depth as f64));
         let ns_arg = Value::Namespace(ctx);
 
-        let empty_nodes: Vec<Node> = Vec::new();
+        let empty_nodes: Rc<[Node]> = Vec::<Node>::new().into();
         let mut env = eval::make_default_env();
         match eval::apply(&scorer_val, &[ns_arg], &empty_nodes, &mut env) {
             Ok(Value::Num(n)) => n,
@@ -610,6 +612,11 @@ pub fn synthesize_full(
     let mut seen: HashSet<Vec<u64>> = HashSet::new();
     let macro_env = build_macro_env(macros);
     let mut snapshot = snapshot;
+
+    // ── VM setup for fast candidate evaluation ──────────────────────
+    let vm_ctx = crate::vm::CompileCtx::new(crate::eval::BUILTIN_NAMES, macros);
+    let vm_macro_chunks = crate::vm::compile_macros(macros, &vm_ctx);
+    let mut vm_stack: Vec<Value> = Vec::with_capacity(32);
 
     // ── Namespace-based scoping ─────────────────────────────────────
     // Infer the input/output types from examples, then filter out
@@ -723,12 +730,12 @@ pub fn synthesize_full(
             // Probe: try calling the macro with the first input
             let macro_data = macros.iter().find(|(mn, _, _, _)| mn == bn);
             if let Some((_, params, mnodes, mroot)) = macro_data {
-                let val = Value::RustMacro(params.clone(), mnodes.clone(), *mroot);
-                let empty: Vec<Node> = Vec::new();
+                let val = Value::RustMacro(params.iter().map(|s| intern(s)).collect(), Rc::from(mnodes.clone()), *mroot);
+                let empty: Rc<[Node]> = Vec::<Node>::new().into();
                 let mut env = eval::make_default_env();
                 for (nm, ps, mn, mr) in &macro_env {
-                    env_define(&mut env, nm.clone(),
-                        Value::RustMacro(ps.clone(), mn.clone(), *mr));
+                    env_define(&mut env, intern(nm),
+                        Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr));
                 }
                 eval::apply(&val, &[test_input.clone()], &empty, &mut env).is_ok()
             } else {
@@ -754,7 +761,8 @@ pub fn synthesize_full(
     // zero matches signal dead ends for Bayesian pruning.
     let test = |entry: &SynthPool,
                 seen: &mut HashSet<Vec<u64>>,
-                explored: &mut usize|
+                explored: &mut usize,
+                vm_stack: &mut Vec<Value>|
         -> (Option<(Vec<Node>, usize)>, f64)
     {
         // Type gate: skip evaluation if the candidate's return type
@@ -771,37 +779,54 @@ pub fn synthesize_full(
             return (None, -1.0);
         }
 
-        // Wrap the body in (lambda (x) body)
-        let mut ln = entry.nodes.clone();
-        let lr = ln.len();
-        ln.push(Node::Lambda(vec!["x".into()], entry.root));
-
         let mut beh = Vec::new();
         let mut matches = 0usize;
         let mut evaluated = 0usize;
-        for (inp, exp) in inputs.iter().zip(expected.iter()) {
-            let mut env = eval::make_default_env();
-            for (nm, ps, mn, mr) in &macro_env {
-                env_define(
-                    &mut env,
-                    nm.clone(),
-                    Value::RustMacro(ps.clone(), mn.clone(), *mr),
-                );
-            }
-            for (name, val) in extra_bindings {
-                env_define(&mut env, name.clone(), val.clone());
-            }
-            let fv = match eval::eval(&ln, lr, &mut env) {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-            match eval::apply(&fv, &[inp.clone()], &ln, &mut env) {
-                Ok(a) => {
-                    beh.push(val_hash(&a));
-                    evaluated += 1;
-                    if vals_equal(&a, exp) { matches += 1; }
+
+        // Try VM compilation — if it succeeds, use fast path for all examples
+        if let Ok(chunk) = crate::vm::compile(&entry.nodes, entry.root, &vm_ctx) {
+            // ── VM fast path: no env creation, no tree walking ──
+            for (inp, exp) in inputs.iter().zip(expected.iter()) {
+                match crate::vm::execute(&chunk, inp, &vm_macro_chunks, vm_stack) {
+                    Ok(a) => {
+                        beh.push(val_hash(&a));
+                        evaluated += 1;
+                        if vals_equal(&a, exp) { matches += 1; }
+                    }
+                    Err(_) => break,
                 }
-                Err(_) => break,
+            }
+        } else {
+            // ── Tree-walker fallback for unsupported constructs ──
+            let mut ln = entry.nodes.clone();
+            let lr = ln.len();
+            ln.push(Node::Lambda(vec![intern("x")], entry.root));
+            let ln_rc: Rc<[Node]> = ln.into();
+
+            for (inp, exp) in inputs.iter().zip(expected.iter()) {
+                let mut env = eval::make_default_env();
+                for (nm, ps, mn, mr) in &macro_env {
+                    env_define(
+                        &mut env,
+                        intern(nm),
+                        Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr),
+                    );
+                }
+                for (name, val) in extra_bindings {
+                    env_define(&mut env, intern(name), val.clone());
+                }
+                let fv = match eval::eval(&ln_rc, lr, &mut env) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                match eval::apply(&fv, &[inp.clone()], &ln_rc, &mut env) {
+                    Ok(a) => {
+                        beh.push(val_hash(&a));
+                        evaluated += 1;
+                        if vals_equal(&a, exp) { matches += 1; }
+                    }
+                    Err(_) => break,
+                }
             }
         }
 
@@ -821,11 +846,22 @@ pub fn synthesize_full(
             // Held-out validation: if validation examples provided,
             // check the candidate generalises beyond training data.
             if let Some(val_exs) = validation_examples {
-                if !validate_candidate(&ln, lr, val_exs, &macro_env, extra_bindings) {
-                    return (None, match_frac); // passes training but fails validation
+                // Validation always uses tree-walker (correctness over speed)
+                let mut ln = entry.nodes.clone();
+                let lr = ln.len();
+                ln.push(Node::Lambda(vec![intern("x")], entry.root));
+                let ln_rc: Rc<[Node]> = ln.into();
+                if !validate_candidate(&ln_rc, lr, val_exs, &macro_env, extra_bindings) {
+                    return (None, match_frac);
                 }
+                (Some((ln_rc.to_vec(), lr)), match_frac)
+            } else {
+                // Build the lambda-wrapped nodes for the result
+                let mut ln = entry.nodes.clone();
+                let lr = ln.len();
+                ln.push(Node::Lambda(vec![intern("x")], entry.root));
+                (Some((ln, lr)), match_frac)
             }
-            (Some((ln, lr)), match_frac)
         } else {
             (None, match_frac)
         }
@@ -838,7 +874,7 @@ pub fn synthesize_full(
         if comp.arity != 0 { continue; }
         let mut nodes = Vec::new();
         if comp.name == "x" {
-            nodes.push(Node::Symbol("x".into()));
+            nodes.push(Node::Symbol(intern("x")));
         } else if let Ok(n) = comp.name.parse::<f64>() {
             nodes.push(Node::Num(n));
         } else if comp.name == "true" {
@@ -953,7 +989,7 @@ pub fn synthesize_full(
         if explored >= max_candidates {
             return SynthResult { found: false, nodes: None, root: None, candidates_explored: explored };
         }
-        let (result, score) = test(e, &mut seen, &mut explored);
+        let (result, score) = test(e, &mut seen, &mut explored, &mut vm_stack);
         pool_scores.push(score);
         if let Some((n, r)) = result {
             return SynthResult::success(n, r, explored);
@@ -1163,7 +1199,7 @@ pub fn synthesize_full(
                 let p = &pool[desc.arg1];
                 let mut n = p.nodes.clone();
                 let fi = n.len();
-                n.push(Node::Symbol(bn.clone()));
+                n.push(Node::Symbol(intern(bn)));
                 let ai = n.len();
                 n.push(Node::App(vec![fi, p.root]));
                 SynthPool { nodes: n, root: ai, ret_type: desc.ret_type, priority: desc.score }
@@ -1176,7 +1212,7 @@ pub fn synthesize_full(
                     n.push(remap_node(nd, off));
                 }
                 let fi = n.len();
-                n.push(Node::Symbol(bn.clone()));
+                n.push(Node::Symbol(intern(bn)));
                 let api = n.len();
                 n.push(Node::App(vec![fi, p1.root, p2.root + off]));
                 SynthPool { nodes: n, root: api, ret_type: desc.ret_type, priority: desc.score }
@@ -1195,7 +1231,7 @@ pub fn synthesize_full(
                     n.push(remap_node(nd, off3));
                 }
                 let fi = n.len();
-                n.push(Node::Symbol(bn.clone()));
+                n.push(Node::Symbol(intern(bn)));
                 let api = n.len();
                 n.push(Node::App(vec![fi, p1.root, p2.root + off2, p3.root + off3]));
                 SynthPool { nodes: n, root: api, ret_type: desc.ret_type, priority: desc.score }
@@ -1210,7 +1246,7 @@ pub fn synthesize_full(
                 });
             }
 
-            let (result, match_frac) = test(&entry, &mut seen, &mut explored);
+            let (result, match_frac) = test(&entry, &mut seen, &mut explored, &mut vm_stack);
 
             // RL reward: track best partial match per component
             if match_frac >= 0.0 {
@@ -1259,7 +1295,7 @@ pub fn synthesize_full(
                 inputs, expected, &macro_env, extra_bindings,
             );
             for e in if_entries {
-                let (result, _) = test(&e, &mut seen, &mut explored);
+                let (result, _) = test(&e, &mut seen, &mut explored, &mut vm_stack);
                 if let Some((sn, sr)) = result {
                     return SynthResult::success(sn, sr, explored);
                 }
@@ -1296,23 +1332,24 @@ fn validate_candidate(
     macro_env: &[(String, Vec<String>, Vec<Node>, usize)],
     extra_bindings: &[(String, Value)],
 ) -> bool {
+    let nodes_rc: Rc<[Node]> = nodes.to_vec().into();
     for (inp, exp) in validation_examples {
         let mut env = eval::make_default_env();
         for (nm, ps, mn, mr) in macro_env {
             env_define(
                 &mut env,
-                nm.clone(),
-                Value::RustMacro(ps.clone(), mn.clone(), *mr),
+                intern(nm),
+                Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr),
             );
         }
         for (name, val) in extra_bindings {
-            env_define(&mut env, name.clone(), val.clone());
+            env_define(&mut env, intern(name), val.clone());
         }
-        let fv = match eval::eval(nodes, lambda_root, &mut env) {
+        let fv = match eval::eval(&nodes_rc, lambda_root, &mut env) {
             Ok(v) => v,
             Err(_) => return false,
         };
-        match eval::apply(&fv, &[inp.clone()], nodes, &mut env) {
+        match eval::apply(&fv, &[inp.clone()], &nodes_rc, &mut env) {
             Ok(a) => {
                 if !vals_equal(&a, exp) {
                     return false;
@@ -1381,7 +1418,8 @@ fn generate_if_programs(
         let p = &pool[bi];
         let mut ln = p.nodes.clone();
         let lr = ln.len();
-        ln.push(Node::Lambda(vec!["x".into()], p.root));
+        ln.push(Node::Lambda(vec![intern("x")], p.root));
+        let ln_rc: Rc<[Node]> = ln.into();
 
         let mut pattern = Vec::with_capacity(inputs.len());
         let mut valid = true;
@@ -1391,18 +1429,18 @@ fn generate_if_programs(
             for (nm, ps, mn, mr) in macro_env {
                 env_define(
                     &mut env,
-                    nm.clone(),
-                    Value::RustMacro(ps.clone(), mn.clone(), *mr),
+                    intern(nm),
+                    Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr),
                 );
             }
             for (name, val) in extra_bindings {
-                env_define(&mut env, name.clone(), val.clone());
+                env_define(&mut env, intern(name), val.clone());
             }
-            let fv = match eval::eval(&ln, lr, &mut env) {
+            let fv = match eval::eval(&ln_rc, lr, &mut env) {
                 Ok(v) => v,
                 Err(_) => { valid = false; break; }
             };
-            match eval::apply(&fv, &[inp.clone()], &ln, &mut env) {
+            match eval::apply(&fv, &[inp.clone()], &ln_rc, &mut env) {
                 Ok(Value::Bool(b)) => pattern.push(b),
                 Ok(_) => { valid = false; break; }
                 Err(_) => { valid = false; break; }
@@ -1436,7 +1474,8 @@ fn generate_if_programs(
         let p = &pool[vi];
         let mut ln = p.nodes.clone();
         let lr = ln.len();
-        ln.push(Node::Lambda(vec!["x".into()], p.root));
+        ln.push(Node::Lambda(vec![intern("x")], p.root));
+        let ln_rc: Rc<[Node]> = ln.into();
 
         let mut outputs = Vec::with_capacity(inputs.len());
         let mut valid = true;
@@ -1446,18 +1485,18 @@ fn generate_if_programs(
             for (nm, ps, mn, mr) in macro_env {
                 env_define(
                     &mut env,
-                    nm.clone(),
-                    Value::RustMacro(ps.clone(), mn.clone(), *mr),
+                    intern(nm),
+                    Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr),
                 );
             }
             for (name, val) in extra_bindings {
-                env_define(&mut env, name.clone(), val.clone());
+                env_define(&mut env, intern(name), val.clone());
             }
-            let fv = match eval::eval(&ln, lr, &mut env) {
+            let fv = match eval::eval(&ln_rc, lr, &mut env) {
                 Ok(v) => v,
                 Err(_) => { valid = false; break; }
             };
-            match eval::apply(&fv, &[inp.clone()], &ln, &mut env) {
+            match eval::apply(&fv, &[inp.clone()], &ln_rc, &mut env) {
                 Ok(v) => outputs.push(v),
                 Err(_) => { valid = false; break; }
             }
@@ -1550,7 +1589,7 @@ fn generate_if_programs(
 fn pool_has_variable(nodes: &[Node]) -> bool {
     for node in nodes {
         if let Node::Symbol(name) = node {
-            if !is_builtin_name(name) {
+            if !is_builtin_name(&resolve(*name)) {
                 return true;
             }
         }
@@ -1593,7 +1632,8 @@ fn infer_macro_types(
     if params.is_empty() {
         // Zero-arity macro: evaluate it directly to find return type
         let mut env = eval::make_default_env();
-        if let Ok(val) = eval::eval(mnodes, mroot, &mut env) {
+        let mnodes_rc: Rc<[Node]> = mnodes.to_vec().into();
+        if let Ok(val) = eval::eval(&mnodes_rc, mroot, &mut env) {
             return (vec![], value_type_tag(&val));
         }
         return (vec![], default_ret);
@@ -1611,14 +1651,15 @@ fn infer_macro_types(
     let str_args: Vec<Value> = vec![test_str.clone(); params.len()];
     let num_args: Vec<Value> = vec![test_num.clone(); params.len()];
 
+    let mnodes_rc: Rc<[Node]> = mnodes.to_vec().into();
     let try_call = |args: &[Value]| -> Option<Value> {
         let mut env = eval::make_default_env();
         let val = Value::RustMacro(
-            params.iter().cloned().collect(),
-            mnodes.to_vec(),
+            params.iter().map(|s| intern(s)).collect(),
+            mnodes_rc.clone(),
             mroot,
         );
-        eval::apply(&val, args, mnodes, &mut env).ok()
+        eval::apply(&val, args, &mnodes_rc, &mut env).ok()
     };
 
     // Try string args
@@ -1826,7 +1867,7 @@ pub fn default_synth_components_with_trees(
         let default_scope = default_env.last().unwrap();
         for (k, v) in scope {
             if !default_scope.contains_key(k) {
-                extra_bindings.push((k.clone(), v.clone()));
+                extra_bindings.push((resolve(*k).to_string(), v.clone()));
             }
         }
     }
@@ -1957,27 +1998,29 @@ pub fn synthesize_optimize(
     let components = &scoped_components;
 
     // Evaluate fitness for a candidate. Returns Some(score) or None on error.
+    let fitness_nodes_rc: Rc<[Node]> = fitness_nodes.to_vec().into();
     let eval_fitness = |entry: &SynthPool, macro_env: &[(String, Vec<String>, Vec<Node>, usize)]| -> Option<f64> {
         // Wrap body in (lambda (x) body)
         let mut ln = entry.nodes.clone();
         let lr = ln.len();
-        ln.push(Node::Lambda(vec!["x".into()], entry.root));
+        ln.push(Node::Lambda(vec![intern("x")], entry.root));
+        let ln_rc: Rc<[Node]> = ln.into();
 
         // If base examples are provided, check them first
         if !base_inputs.is_empty() {
             for (inp, exp) in base_inputs.iter().zip(base_expected.iter()) {
                 let mut env = eval::make_default_env();
                 for (nm, ps, mn, mr) in macro_env {
-                    env_define(&mut env, nm.clone(), Value::RustMacro(ps.clone(), mn.clone(), *mr));
+                    env_define(&mut env, intern(nm), Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr));
                 }
                 for (name, val) in extra_bindings {
-                    env_define(&mut env, name.clone(), val.clone());
+                    env_define(&mut env, intern(name), val.clone());
                 }
-                let fv = match eval::eval(&ln, lr, &mut env) {
+                let fv = match eval::eval(&ln_rc, lr, &mut env) {
                     Ok(v) => v,
                     Err(_) => return None,
                 };
-                match eval::apply(&fv, &[inp.clone()], &ln, &mut env) {
+                match eval::apply(&fv, &[inp.clone()], &ln_rc, &mut env) {
                     Ok(a) => {
                         if !vals_equal(&a, exp) { return None; }
                     }
@@ -1989,26 +2032,26 @@ pub fn synthesize_optimize(
         // Evaluate the fitness function on the candidate lambda
         let mut env = eval::make_default_env();
         for (nm, ps, mn, mr) in macro_env {
-            env_define(&mut env, nm.clone(), Value::RustMacro(ps.clone(), mn.clone(), *mr));
+            env_define(&mut env, intern(nm), Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr));
         }
         for (name, val) in extra_bindings {
-            env_define(&mut env, name.clone(), val.clone());
+            env_define(&mut env, intern(name), val.clone());
         }
 
         // Evaluate the fitness function node
-        let ffit = match eval::eval(fitness_nodes, fitness_root, &mut env) {
+        let ffit = match eval::eval(&fitness_nodes_rc, fitness_root, &mut env) {
             Ok(v) => v,
             Err(_) => return None,
         };
 
         // Evaluate the candidate lambda
-        let candidate = match eval::eval(&ln, lr, &mut env) {
+        let candidate = match eval::eval(&ln_rc, lr, &mut env) {
             Ok(v) => v,
             Err(_) => return None,
         };
 
         // Apply fitness_fn(candidate)
-        match eval::apply(&ffit, &[candidate], &ln, &mut env) {
+        match eval::apply(&ffit, &[candidate], &ln_rc, &mut env) {
             Ok(Value::Num(score)) => Some(score),
             _ => None,
         }
@@ -2027,23 +2070,24 @@ pub fn synthesize_optimize(
         // Behavior hash for dedup
         let mut ln = entry.nodes.clone();
         let lr = ln.len();
-        ln.push(Node::Lambda(vec!["x".into()], entry.root));
+        ln.push(Node::Lambda(vec![intern("x")], entry.root));
+        let ln_rc: Rc<[Node]> = ln.into();
 
         let mut beh = Vec::new();
         if !base_inputs.is_empty() {
             for inp in base_inputs {
                 let mut env = eval::make_default_env();
                 for (nm, ps, mn, mr) in &macro_env {
-                    env_define(&mut env, nm.clone(), Value::RustMacro(ps.clone(), mn.clone(), *mr));
+                    env_define(&mut env, intern(nm), Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr));
                 }
                 for (name, val) in extra_bindings {
-                    env_define(&mut env, name.clone(), val.clone());
+                    env_define(&mut env, intern(name), val.clone());
                 }
-                let fv = match eval::eval(&ln, lr, &mut env) {
+                let fv = match eval::eval(&ln_rc, lr, &mut env) {
                     Ok(v) => v,
                     Err(_) => return,
                 };
-                match eval::apply(&fv, &[inp.clone()], &ln, &mut env) {
+                match eval::apply(&fv, &[inp.clone()], &ln_rc, &mut env) {
                     Ok(a) => beh.push(val_hash(&a)),
                     Err(_) => return,
                 }
@@ -2052,12 +2096,13 @@ pub fn synthesize_optimize(
             // No base inputs: use direct evaluation for dedup
             let mut env = eval::make_default_env();
             for (nm, ps, mn, mr) in &macro_env {
-                env_define(&mut env, nm.clone(), Value::RustMacro(ps.clone(), mn.clone(), *mr));
+                env_define(&mut env, intern(nm), Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr));
             }
             for (name, val) in extra_bindings {
-                env_define(&mut env, name.clone(), val.clone());
+                env_define(&mut env, intern(name), val.clone());
             }
-            match eval::eval(&entry.nodes, entry.root, &mut env) {
+            let entry_nodes_rc: Rc<[Node]> = entry.nodes.clone().into();
+            match eval::eval(&entry_nodes_rc, entry.root, &mut env) {
                 Ok(v) => beh.push(val_hash(&v)),
                 Err(_) => return,
             }
@@ -2079,7 +2124,7 @@ pub fn synthesize_optimize(
                 // Store the lambda-wrapped version
                 let mut ln = entry.nodes.clone();
                 let lr = ln.len();
-                ln.push(Node::Lambda(vec!["x".into()], entry.root));
+                ln.push(Node::Lambda(vec![intern("x")], entry.root));
                 best_nodes = Some(ln);
                 best_root = Some(lr);
             }
@@ -2092,7 +2137,7 @@ pub fn synthesize_optimize(
         if comp.arity != 0 { continue; }
         let mut nodes = Vec::new();
         if comp.name == "x" {
-            nodes.push(Node::Symbol("x".into()));
+            nodes.push(Node::Symbol(intern("x")));
         } else if let Ok(n) = comp.name.parse::<f64>() {
             nodes.push(Node::Num(n));
         } else if comp.name == "true" {
@@ -2137,7 +2182,7 @@ pub fn synthesize_optimize(
                     }
                     let mut n = p.nodes.clone();
                     let fi = n.len();
-                    n.push(Node::Symbol(bn.clone()));
+                    n.push(Node::Symbol(intern(bn)));
                     let ai = n.len();
                     n.push(Node::App(vec![fi, p.root]));
                     let e = SynthPool {
@@ -2168,7 +2213,7 @@ pub fn synthesize_optimize(
                             n.push(remap_node(nd, off));
                         }
                         let fi = n.len();
-                        n.push(Node::Symbol(bn.clone()));
+                        n.push(Node::Symbol(intern(bn)));
                         let api = n.len();
                         n.push(Node::App(vec![fi, p1.root, p2.root + off]));
                         let e = SynthPool {
@@ -2201,7 +2246,7 @@ pub fn synthesize_optimize(
                                 n.push(remap_node(nd, off));
                             }
                             let fi = n.len();
-                            n.push(Node::Symbol(bn.clone()));
+                            n.push(Node::Symbol(intern(bn)));
                             let api = n.len();
                             n.push(Node::App(vec![fi, p1.root, p2.root + off]));
                             let e = SynthPool {
@@ -2234,7 +2279,7 @@ pub fn synthesize_optimize(
                             let off3 = n.len();
                             for nd in &p3.nodes { n.push(remap_node(nd, off3)); }
                             let fi = n.len();
-                            n.push(Node::Symbol(bn.clone()));
+                            n.push(Node::Symbol(intern(bn)));
                             let api = n.len();
                             n.push(Node::App(vec![fi, p1.root, p2.root + off2, p3.root + off3]));
                             let e = SynthPool { nodes: n, root: api, ret_type: comp.ret_type, priority: comp.priority };
@@ -2261,7 +2306,7 @@ pub fn synthesize_optimize(
                                 let off3 = n.len();
                                 for nd in &p3.nodes { n.push(remap_node(nd, off3)); }
                                 let fi = n.len();
-                                n.push(Node::Symbol(bn.clone()));
+                                n.push(Node::Symbol(intern(bn)));
                                 let api = n.len();
                                 n.push(Node::App(vec![fi, p1.root, p2.root + off2, p3.root + off3]));
                                 let e = SynthPool { nodes: n, root: api, ret_type: comp.ret_type, priority: comp.priority };
@@ -2289,7 +2334,7 @@ pub fn synthesize_optimize(
                                 let off3 = n.len();
                                 for nd in &p3.nodes { n.push(remap_node(nd, off3)); }
                                 let fi = n.len();
-                                n.push(Node::Symbol(bn.clone()));
+                                n.push(Node::Symbol(intern(bn)));
                                 let api = n.len();
                                 n.push(Node::App(vec![fi, p1.root, p2.root + off2, p3.root + off3]));
                                 let e = SynthPool { nodes: n, root: api, ret_type: comp.ret_type, priority: comp.priority };

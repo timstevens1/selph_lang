@@ -8,6 +8,8 @@
 //!   5. Compose into nested if-expressions
 
 use std::collections::HashMap;
+use std::rc::Rc;
+use crate::intern::{Sym, intern};
 use crate::types::*;
 use crate::eval;
 use crate::synth::{self, SynthComponent, SynthPool, remap_node, vals_equal, val_hash};
@@ -119,7 +121,7 @@ pub fn divide_and_conquer(
             // Verify the full program against all examples.
             let mut ln = nodes.clone();
             let lr = ln.len();
-            ln.push(Node::Lambda(vec!["x".into()], root));
+            ln.push(Node::Lambda(vec![intern("x")], root));
 
             let all_ok = verify_program(&ln, lr, inputs, expected, macros);
 
@@ -171,20 +173,21 @@ fn verify_program(
     expected: &[Value],
     macros: &[(String, Vec<String>, Vec<Node>, usize)],
 ) -> bool {
+    let nodes_rc: Rc<[Node]> = nodes.to_vec().into();
     for (inp, exp) in inputs.iter().zip(expected.iter()) {
         let mut env = eval::make_default_env();
         for (nm, ps, mn, mr) in macros {
             env_define(
                 &mut env,
-                nm.clone(),
-                Value::RustMacro(ps.clone(), mn.clone(), *mr),
+                intern(nm),
+                Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), mn.clone().into(), *mr),
             );
         }
-        let fv = match eval::eval(nodes, lambda_root, &mut env) {
+        let fv = match eval::eval(&nodes_rc, lambda_root, &mut env) {
             Ok(v) => v,
             Err(_) => return false,
         };
-        match eval::apply(&fv, &[inp.clone()], nodes, &mut env) {
+        match eval::apply(&fv, &[inp.clone()], &nodes_rc, &mut env) {
             Ok(ref a) if vals_equal(a, exp) => {}
             _ => return false,
         }
@@ -343,7 +346,7 @@ fn find_separator(
         if comp.arity != 0 { continue; }
         let mut nodes = Vec::new();
         if comp.name == "x" {
-            nodes.push(Node::Symbol("x".into()));
+            nodes.push(Node::Symbol(intern("x")));
         } else if let Ok(n) = comp.name.parse::<f64>() {
             nodes.push(Node::Num(n));
         } else if comp.name == "true" {
@@ -393,7 +396,7 @@ fn find_separator(
                     }
                     let mut n = p.nodes.clone();
                     let fi = n.len();
-                    n.push(Node::Symbol(bn.clone()));
+                    n.push(Node::Symbol(intern(bn)));
                     let ai = n.len();
                     n.push(Node::App(vec![fi, p.root]));
                     let e = SynthPool {
@@ -429,7 +432,7 @@ fn find_separator(
                             n.push(remap_node(nd, off));
                         }
                         let fi = n.len();
-                        n.push(Node::Symbol(bn.clone()));
+                        n.push(Node::Symbol(intern(bn)));
                         let api = n.len();
                         n.push(Node::App(vec![fi, p1.root, p2.root + off]));
                         let e = SynthPool {
@@ -465,7 +468,7 @@ fn find_separator(
                             n.push(remap_node(nd, off));
                         }
                         let fi = n.len();
-                        n.push(Node::Symbol(bn.clone()));
+                        n.push(Node::Symbol(intern(bn)));
                         let api = n.len();
                         n.push(Node::App(vec![fi, p1.root, p2.root + off]));
                         let e = SynthPool {
@@ -507,7 +510,8 @@ fn test_separator(
 ) -> bool {
     let mut ln = entry.nodes.clone();
     let lr = ln.len();
-    ln.push(Node::Lambda(vec!["x".into()], entry.root));
+    ln.push(Node::Lambda(vec![intern("x")], entry.root));
+    let ln_rc: Rc<[Node]> = ln.into();
 
     // Check true indices first.
     for &i in true_indices {
@@ -515,15 +519,15 @@ fn test_separator(
         for (nm, ps, mn, mr) in macro_env {
             env_define(
                 &mut env,
-                nm.clone(),
-                Value::RustMacro(ps.clone(), mn.clone(), *mr),
+                intern(nm),
+                Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), mn.clone().into(), *mr),
             );
         }
-        let fv = match eval::eval(&ln, lr, &mut env) {
+        let fv = match eval::eval(&ln_rc, lr, &mut env) {
             Ok(v) => v,
             Err(_) => return false,
         };
-        match eval::apply(&fv, &[inputs[i].clone()], &ln, &mut env) {
+        match eval::apply(&fv, &[inputs[i].clone()], &ln_rc, &mut env) {
             Ok(Value::Bool(true)) => {}
             _ => return false,
         }
@@ -535,15 +539,15 @@ fn test_separator(
         for (nm, ps, mn, mr) in macro_env {
             env_define(
                 &mut env,
-                nm.clone(),
-                Value::RustMacro(ps.clone(), mn.clone(), *mr),
+                intern(nm),
+                Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), mn.clone().into(), *mr),
             );
         }
-        let fv = match eval::eval(&ln, lr, &mut env) {
+        let fv = match eval::eval(&ln_rc, lr, &mut env) {
             Ok(v) => v,
             Err(_) => return false,
         };
-        match eval::apply(&fv, &[inputs[i].clone()], &ln, &mut env) {
+        match eval::apply(&fv, &[inputs[i].clone()], &ln_rc, &mut env) {
             Ok(Value::Bool(false)) => {}
             _ => return false,
         }

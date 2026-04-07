@@ -15,6 +15,7 @@
 //! This mirrors the Python `meta_curriculum.py` but targets the Rust
 //! synthesizer and evaluator.
 
+use std::rc::Rc;
 use crate::eval;
 use crate::parser;
 use crate::synth::{CandidateRecord, RlCoefficients, SynthComponent, synthesize, value_type_tag, TYPE_NUM, TYPE_STR};
@@ -157,13 +158,14 @@ pub fn evaluate_heuristic(
     let ctx_val = component_to_namespace(component, task_context);
 
     let mut env = eval::make_default_env();
+    let nodes_rc: Rc<[Node]> = heuristic.nodes.clone().into();
     // Evaluate the heuristic lambda
-    let fn_val = match eval::eval(&heuristic.nodes, heuristic.root, &mut env) {
+    let fn_val = match eval::eval(&nodes_rc, heuristic.root, &mut env) {
         Ok(v) => v,
         Err(_) => return 0.0,
     };
     // Apply it to the context namespace
-    match eval::apply(&fn_val, &[ctx_val], &heuristic.nodes, &mut env) {
+    match eval::apply(&fn_val, &[ctx_val], &nodes_rc, &mut env) {
         Ok(Value::Num(n)) => {
             if n.is_finite() {
                 n

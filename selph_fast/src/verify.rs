@@ -11,6 +11,8 @@
 //! is needed for Stages 0-2. The spec defines what success looks like, and
 //! verification is purely mechanical.
 
+use std::rc::Rc;
+use crate::intern::intern;
 use crate::eval::{apply, make_default_env, value_to_string};
 use crate::types::{Env, Node, Value};
 
@@ -289,7 +291,7 @@ pub fn verify_fn(spec: &Spec, program_fn: &Value, env: &mut Env) -> Verification
     if let Some(ref expected) = spec.expected_type {
         if let Some(Goal::Examples(pairs)) = &spec.goal {
             if let Some((input, _)) = pairs.first() {
-                let nodes: Vec<Node> = Vec::new();
+                let nodes: Rc<[Node]> = Vec::<Node>::new().into();
                 if let Ok(first_output) = apply(program_fn, &[input.clone()], &nodes, env) {
                     check_type(expected, &first_output, &mut result);
                 }
@@ -472,7 +474,7 @@ fn check_one_constraint(
             }
         }
         Constraint::Predicate(pred_val) => {
-            let nodes: Vec<Node> = Vec::new();
+            let nodes: Rc<[Node]> = Vec::<Node>::new().into();
             match apply(pred_val, &[output.clone()], &nodes, env) {
                 Ok(Value::Bool(true)) => {}
                 Ok(Value::Bool(false)) => {
@@ -626,7 +628,7 @@ fn check_goal_examples_fn(
     let total = pairs.len();
     let mut passed = 0usize;
     let mut failures: Vec<String> = Vec::new();
-    let nodes: Vec<Node> = Vec::new();
+    let nodes: Rc<[Node]> = Vec::<Node>::new().into();
     let mut env = make_default_env();
 
     for (input, expected) in pairs {
@@ -814,7 +816,7 @@ fn check_goal_satisfy(
     env: &mut Env,
     result: &mut VerificationResult,
 ) {
-    let nodes: Vec<Node> = Vec::new();
+    let nodes: Rc<[Node]> = Vec::<Node>::new().into();
     match apply(predicate, &[output.clone()], &nodes, env) {
         Ok(Value::Bool(true)) => {
             result.goal_score = 1.0;
@@ -1316,17 +1318,17 @@ mod tests {
         // Build a closure that doubles its input: (lambda (x) (* 2 x))
         // We construct nodes for: [Symbol("*"), Num(2.0), Symbol("x"), App([0,1,2])]
         let nodes = vec![
-            Node::Symbol("*".to_string()), // 0
+            Node::Symbol(intern("*")), // 0
             Node::Num(2.0),                // 1
-            Node::Symbol("x".to_string()), // 2
+            Node::Symbol(intern("x")), // 2
             Node::App(vec![0, 1, 2]),      // 3: (* 2 x)
         ];
         let env = make_default_env();
         let double_fn = Value::Closure(
-            vec!["x".to_string()],
+            vec![intern("x")],
             3, // body is node 3
             env.clone(),
-            nodes,
+            nodes.into(),
             None,
         );
 
@@ -1353,14 +1355,14 @@ mod tests {
     fn test_goal_examples_fn_partial_pass() {
         // Build identity: (lambda (x) x)
         let nodes = vec![
-            Node::Symbol("x".to_string()), // 0
+            Node::Symbol(intern("x")), // 0
         ];
         let env = make_default_env();
         let identity_fn = Value::Closure(
-            vec!["x".to_string()],
+            vec![intern("x")],
             0,
             env.clone(),
-            nodes,
+            nodes.into(),
             None,
         );
 
@@ -1449,17 +1451,17 @@ mod tests {
     fn test_goal_satisfy_passes() {
         // Build predicate: (lambda (x) (> x 0))
         let nodes = vec![
-            Node::Symbol(">".to_string()),  // 0
-            Node::Symbol("x".to_string()),  // 1
+            Node::Symbol(intern(">")),  // 0
+            Node::Symbol(intern("x")),  // 1
             Node::Num(0.0),                 // 2
             Node::App(vec![0, 1, 2]),       // 3: (> x 0)
         ];
         let env = make_default_env();
         let pred = Value::Closure(
-            vec!["x".to_string()],
+            vec![intern("x")],
             3,
             env.clone(),
-            nodes,
+            nodes.into(),
             None,
         );
 
@@ -1481,17 +1483,17 @@ mod tests {
     fn test_goal_satisfy_fails() {
         // Build predicate: (lambda (x) (> x 0))
         let nodes = vec![
-            Node::Symbol(">".to_string()),
-            Node::Symbol("x".to_string()),
+            Node::Symbol(intern(">")),
+            Node::Symbol(intern("x")),
             Node::Num(0.0),
             Node::App(vec![0, 1, 2]),
         ];
         let env = make_default_env();
         let pred = Value::Closure(
-            vec!["x".to_string()],
+            vec![intern("x")],
             3,
             env.clone(),
-            nodes,
+            nodes.into(),
             None,
         );
 

@@ -3,6 +3,7 @@
 //! Tokenizes source text, then parses into the Node AST.
 
 use crate::types::Node;
+use crate::intern::intern;
 
 #[derive(Debug, Clone)]
 pub struct ParseError {
@@ -246,7 +247,7 @@ impl Parser {
                 } else if tok.value == "false" {
                     nodes.push(Node::Bool(false));
                 } else {
-                    nodes.push(Node::Symbol(tok.value.clone()));
+                    nodes.push(Node::Symbol(intern(&tok.value)));
                 }
                 Ok(idx)
             }
@@ -254,7 +255,7 @@ impl Parser {
                 // Keywords as symbols
                 self.advance();
                 let idx = nodes.len();
-                nodes.push(Node::Symbol(tok.value.clone()));
+                nodes.push(Node::Symbol(intern(&tok.value)));
                 Ok(idx)
             }
             TokenKind::LParen => {
@@ -317,7 +318,7 @@ impl Parser {
         while let Some(tok) = self.peek() {
             if tok.kind == TokenKind::RParen { break; }
             let tok = self.advance().clone();
-            params.push(tok.value);
+            params.push(intern(&tok.value));
         }
         self.expect(TokenKind::RParen)?;
         // Parse body
@@ -339,7 +340,7 @@ impl Parser {
             let name_tok = self.advance().clone();
             let val = self.parse_expr(nodes)?;
             self.expect(TokenKind::RParen)?;
-            bindings.push((name_tok.value, val));
+            bindings.push((intern(&name_tok.value), val));
         }
         self.expect(TokenKind::RParen)?;
         // Parse body
@@ -408,7 +409,7 @@ mod tests {
     #[test]
     fn test_parse_symbol() {
         let (nodes, root) = parse_source("add").unwrap();
-        assert!(matches!(&nodes[root], Node::Symbol(s) if s == "add"));
+        assert!(matches!(&nodes[root], Node::Symbol(s) if *s == intern("add")));
     }
 
     #[test]

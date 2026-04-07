@@ -11,6 +11,8 @@
 //! components are registered directly in the eval environment.
 
 use std::collections::HashMap;
+use std::rc::Rc;
+use crate::intern::{Sym, intern, resolve};
 use crate::types::*;
 use crate::eval;
 use crate::synth::{
@@ -90,7 +92,7 @@ fn extract_recursive(
                 if let Some((param_types, ret_type)) = infer_callable_type(val, env) {
                     // Register the callable in the env so the synthesizer can
                     // invoke it by its qualified name.
-                    env_define(env, full_name.clone(), val.clone());
+                    env_define(env, intern(&full_name), val.clone());
 
                     components.push(SynthComponent {
                         name: full_name.clone(),
@@ -181,7 +183,7 @@ pub fn infer_callable_type(
         (Value::Bool(true), TYPE_BOOL),
     ];
 
-    let empty_nodes: Vec<Node> = Vec::new();
+    let empty_nodes: Rc<[Node]> = Vec::<Node>::new().into();
 
     for (test_val, test_tag) in &test_inputs {
         let args: Vec<Value> = vec![test_val.clone(); arity];
@@ -204,7 +206,7 @@ pub fn infer_callable_type(
 /// Determine the arity of a builtin by trying increasing argument counts.
 /// Uses catch_unwind because some builtins index args without bounds checks.
 fn probe_arity(val: &Value, _env: &mut Env) -> Option<usize> {
-    let empty_nodes: Vec<Node> = Vec::new();
+    let empty_nodes: Rc<[Node]> = Vec::<Node>::new().into();
     for arity in 1..=4 {
         let args: Vec<Value> = vec![Value::Num(0.0); arity];
         let val_clone = val.clone();
@@ -281,11 +283,11 @@ pub fn multi_synthesize(
         // Collect extra bindings from the env
         let default_env = eval::make_default_env();
         let default_scope = default_env.last().unwrap();
-        let mut bindings = Vec::new();
+        let mut bindings: Vec<(String, Value)> = Vec::new();
         if let Some(scope) = env.last() {
             for (k, v) in scope {
                 if !default_scope.contains_key(k) {
-                    bindings.push((k.clone(), v.clone()));
+                    bindings.push((resolve(*k), v.clone()));
                 }
             }
         }
@@ -362,10 +364,11 @@ fn scan_node(
     }
     match &nodes[idx] {
         Node::Symbol(name) => {
+            let name_str = resolve(*name);
             for tree_name in tree_names {
                 let prefix = format!("{}.", tree_name);
-                if name.starts_with(&prefix) {
-                    let path = name[prefix.len()..].to_string();
+                if name_str.starts_with(&prefix) {
+                    let path = name_str[prefix.len()..].to_string();
                     if let Some(paths) = usage.get_mut(tree_name) {
                         paths.push(path);
                     }
@@ -477,7 +480,7 @@ mod tests {
     #[test]
     fn test_extract_builtins() {
         let ns = make_ns(vec![
-            ("double", Value::Builtin("add".to_string())),
+            ("double", Value::Builtin(intern("add"))),
         ]);
         let mut env = eval::make_default_env();
         let comps = extract_components_from_namespace(&ns, "ops", "", &mut env, 5);
@@ -530,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_infer_builtin_add() {
-        let val = Value::Builtin("add".to_string());
+        let val = Value::Builtin(intern("add"));
         let mut env = eval::make_default_env();
         let result = infer_callable_type(&val, &mut env);
         assert!(result.is_some());
@@ -541,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_infer_builtin_string_upper() {
-        let val = Value::Builtin("string-upper".to_string());
+        let val = Value::Builtin(intern("string-upper"));
         let mut env = eval::make_default_env();
         let result = infer_callable_type(&val, &mut env);
         assert!(result.is_some());
@@ -552,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_infer_builtin_not() {
-        let val = Value::Builtin("not".to_string());
+        let val = Value::Builtin(intern("not"));
         let mut env = eval::make_default_env();
         let result = infer_callable_type(&val, &mut env);
         assert!(result.is_some());
@@ -572,17 +575,18 @@ mod tests {
     fn test_infer_closure() {
         // Create a simple closure: (lambda (a b) (add a b))
         let nodes = vec![
-            Node::Symbol("add".to_string()),   // 0
-            Node::Symbol("a".to_string()),      // 1
-            Node::Symbol("b".to_string()),      // 2
+            Node::Symbol(intern("add")),   // 0
+            Node::Symbol(intern("a")),      // 1
+            Node::Symbol(intern("b")),      // 2
             Node::App(vec![0, 1, 2]),           // 3: (add a b)
         ];
         let env = eval::make_default_env();
+        let nodes_rc: Rc<[Node]> = nodes.into();
         let closure = Value::Closure(
-            vec!["a".to_string(), "b".to_string()],
+            vec![intern("a"), intern("b")],
             3,          // body index
             env.clone(),
-            nodes,
+            nodes_rc,
             None,
         );
         let mut test_env = eval::make_default_env();
@@ -607,8 +611,8 @@ mod tests {
     #[test]
     fn test_trace_with_tree_references() {
         let nodes = vec![
-            Node::Symbol("math.double".to_string()),  // 0
-            Node::Symbol("x".to_string()),             // 1
+            Node::Symbol(intern("math.double")),  // 0
+            Node::Symbol(intern("x")),             // 1
             Node::App(vec![0, 1]),                     // 2: (math.double x)
         ];
         let tree_names = vec!["math".to_string(), "str".to_string()];
@@ -619,10 +623,10 @@ mod tests {
     #[test]
     fn test_trace_multiple_trees() {
         let nodes = vec![
-            Node::Symbol("str.clean".to_string()),     // 0
-            Node::Symbol("x".to_string()),              // 1
+            Node::Symbol(intern("str.clean")),     // 0
+            Node::Symbol(intern("x")),              // 1
             Node::App(vec![0, 1]),                      // 2: (str.clean x)
-            Node::Symbol("math.double".to_string()),    // 3
+            Node::Symbol(intern("math.double")),    // 3
             Node::App(vec![3, 2]),                      // 4: (math.double (str.clean x))
         ];
         let tree_names = vec!["math".to_string(), "str".to_string()];
@@ -636,8 +640,8 @@ mod tests {
     #[test]
     fn test_trace_nested_paths() {
         let nodes = vec![
-            Node::Symbol("lib.math.trig.sin".to_string()),  // 0
-            Node::Symbol("x".to_string()),                    // 1
+            Node::Symbol(intern("lib.math.trig.sin")),  // 0
+            Node::Symbol(intern("x")),                    // 1
             Node::App(vec![0, 1]),                            // 2
         ];
         let tree_names = vec!["lib".to_string()];
@@ -648,10 +652,10 @@ mod tests {
     #[test]
     fn test_trace_if_expression() {
         let nodes = vec![
-            Node::Symbol("ops.check".to_string()),  // 0
-            Node::Symbol("x".to_string()),           // 1
+            Node::Symbol(intern("ops.check")),  // 0
+            Node::Symbol(intern("x")),           // 1
             Node::App(vec![0, 1]),                   // 2: (ops.check x)
-            Node::Symbol("ops.then".to_string()),    // 3
+            Node::Symbol(intern("ops.then")),    // 3
             Node::App(vec![3, 1]),                   // 4: (ops.then x)
             Node::Num(0.0),                          // 5
             Node::If(2, 4, 5),                       // 6: (if (ops.check x) (ops.then x) 0)
@@ -667,11 +671,11 @@ mod tests {
     #[test]
     fn test_trace_deduplicates() {
         let nodes = vec![
-            Node::Symbol("math.add".to_string()),   // 0
-            Node::Symbol("x".to_string()),            // 1
+            Node::Symbol(intern("math.add")),   // 0
+            Node::Symbol(intern("x")),            // 1
             Node::App(vec![0, 1, 1]),                 // 2: (math.add x x)
             // Duplicate symbol reference
-            Node::Symbol("math.add".to_string()),    // 3
+            Node::Symbol(intern("math.add")),    // 3
             Node::App(vec![3, 2, 2]),                 // 4: (math.add (math.add x x) (math.add x x))
         ];
         let tree_names = vec!["math".to_string()];
@@ -686,7 +690,7 @@ mod tests {
     fn test_multi_synthesize_with_builtin_tree() {
         // Build a tree that contains "add" as a component named "ops.plus"
         let ns = make_ns(vec![
-            ("plus", Value::Builtin("add".to_string())),
+            ("plus", Value::Builtin(intern("add"))),
         ]);
         let trees = vec![("ops".to_string(), ns)];
         let macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = Vec::new();

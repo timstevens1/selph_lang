@@ -10,6 +10,7 @@
 //!   4. Extraction pipeline: the main entry point that ties it all together
 
 use std::collections::{HashMap, HashSet};
+use crate::intern::{Sym, intern, resolve};
 use crate::types::Node;
 
 // ── Builtin set (for structural fingerprinting) ─────────────────────
@@ -134,8 +135,9 @@ pub fn structural_fingerprint(nodes: &[Node], idx: usize) -> String {
         Node::Str(_) => "STR".to_string(),
         Node::Bool(_) => "BOOL".to_string(),
         Node::Symbol(name) => {
-            if is_builtin(name) {
-                name.clone()
+            let s = resolve(*name);
+            if is_builtin(&s) {
+                s
             } else {
                 "_".to_string()
             }
@@ -291,7 +293,7 @@ fn anti_unify_rec(
     *counter += 1;
     params.push(name.clone());
     let idx = out.len();
-    out.push(Node::Symbol(name));
+    out.push(Node::Symbol(intern(&name)));
     idx
 }
 
@@ -315,7 +317,7 @@ fn clone_subtree(src: &[Node], idx: usize, dst: &mut Vec<Node>) -> usize {
         }
         Node::Symbol(s) => {
             let i = dst.len();
-            dst.push(Node::Symbol(s.clone()));
+            dst.push(Node::Symbol(*s));
             i
         }
         Node::App(children) => {
@@ -342,9 +344,9 @@ fn clone_subtree(src: &[Node], idx: usize, dst: &mut Vec<Node>) -> usize {
             i
         }
         Node::Let(bindings, body) => {
-            let new_bindings: Vec<(String, usize)> = bindings
+            let new_bindings: Vec<(Sym, usize)> = bindings
                 .iter()
-                .map(|(name, v)| (name.clone(), clone_subtree(src, *v, dst)))
+                .map(|(name, v)| (*name, clone_subtree(src, *v, dst)))
                 .collect();
             let nb = clone_subtree(src, *body, dst);
             let i = dst.len();
@@ -362,7 +364,7 @@ fn clone_subtree(src: &[Node], idx: usize, dst: &mut Vec<Node>) -> usize {
 fn anti_unify_many(trees: &[(Vec<Node>, usize)]) -> (Vec<Node>, usize, Vec<String>) {
     if trees.is_empty() {
         let mut nodes = Vec::new();
-        nodes.push(Node::Symbol("_".to_string()));
+        nodes.push(Node::Symbol(intern("_")));
         return (nodes, 0, Vec::new());
     }
     if trees.len() == 1 {
@@ -394,8 +396,11 @@ fn collect_params(nodes: &[Node], idx: usize) -> Vec<String> {
 
 fn collect_params_rec(nodes: &[Node], idx: usize, out: &mut HashSet<String>) {
     match &nodes[idx] {
-        Node::Symbol(name) if name.starts_with("_p") => {
-            out.insert(name.clone());
+        Node::Symbol(name) => {
+            let s = resolve(*name);
+            if s.starts_with("_p") {
+                out.insert(s);
+            }
         }
         Node::App(children) => {
             for &c in children {
@@ -566,10 +571,11 @@ fn rename_params_rec(
     match &src[idx] {
         Node::Symbol(name) => {
             let i = dst.len();
-            if let Some(new_name) = mapping.get(name) {
-                dst.push(Node::Symbol(new_name.clone()));
+            let name_str = resolve(*name);
+            if let Some(new_name) = mapping.get(&name_str) {
+                dst.push(Node::Symbol(intern(new_name)));
             } else {
-                dst.push(Node::Symbol(name.clone()));
+                dst.push(Node::Symbol(*name));
             }
             i
         }
@@ -612,9 +618,13 @@ fn rename_params_rec(
             i
         }
         Node::Let(bindings, body) => {
-            let new_bindings: Vec<(String, usize)> = bindings
+            let new_bindings: Vec<(Sym, usize)> = bindings
                 .iter()
-                .map(|(name, v)| (name.clone(), rename_params_rec(src, *v, mapping, dst)))
+                .map(|(name, v)| {
+                    let name_str = resolve(*name);
+                    let new_name = mapping.get(&name_str).map(|s| intern(s)).unwrap_or(*name);
+                    (new_name, rename_params_rec(src, *v, mapping, dst))
+                })
                 .collect();
             let nb = rename_params_rec(src, *body, mapping, dst);
             let i = dst.len();
@@ -664,7 +674,7 @@ pub fn extract_abstractions(
 
         // If anti-unification collapsed everything to a single param, skip
         if let Node::Symbol(name) = &pattern_nodes[pattern_root] {
-            if name.starts_with("_p") {
+            if resolve(*name).starts_with("_p") {
                 continue;
             }
         }
@@ -829,8 +839,8 @@ mod tests {
         // Result should be App with 3 children: add, _p0, 1
         if let Node::App(children) = &result[root] {
             assert_eq!(children.len(), 3);
-            assert!(matches!(&result[children[0]], Node::Symbol(s) if s == "add"));
-            assert!(matches!(&result[children[1]], Node::Symbol(s) if s == "_p0"));
+            assert!(matches!(&result[children[0]], Node::Symbol(s) if *s == intern("add")));
+            assert!(matches!(&result[children[1]], Node::Symbol(s) if *s == intern("_p0")));
             assert!(matches!(&result[children[2]], Node::Num(n) if *n == 1.0));
         } else {
             panic!("expected App node");
@@ -846,9 +856,9 @@ mod tests {
         assert_eq!(params.len(), 2);
         if let Node::App(children) = &result[root] {
             assert_eq!(children.len(), 3);
-            assert!(matches!(&result[children[0]], Node::Symbol(s) if s == "add"));
-            assert!(matches!(&result[children[1]], Node::Symbol(s) if s.starts_with("_p")));
-            assert!(matches!(&result[children[2]], Node::Symbol(s) if s.starts_with("_p")));
+            assert!(matches!(&result[children[0]], Node::Symbol(s) if *s == intern("add")));
+            assert!(matches!(&result[children[1]], Node::Symbol(s) if resolve(*s).starts_with("_p")));
+            assert!(matches!(&result[children[2]], Node::Symbol(s) if resolve(*s).starts_with("_p")));
         } else {
             panic!("expected App node");
         }
@@ -861,7 +871,7 @@ mod tests {
         let (n2, r2) = parse("(multiply x 1)");
         let (result, root, params) = anti_unify(&n1, r1, &n2, r2);
         assert_eq!(params.len(), 1);
-        assert!(matches!(&result[root], Node::Symbol(s) if s == "_p0"));
+        assert!(matches!(&result[root], Node::Symbol(s) if *s == intern("_p0")));
     }
 
     #[test]
@@ -1023,9 +1033,9 @@ mod tests {
     fn test_collect_params_some() {
         // Manually build a tree with _p0 and _p1
         let nodes = vec![
-            Node::Symbol("add".to_string()),    // 0
-            Node::Symbol("_p0".to_string()),     // 1
-            Node::Symbol("_p1".to_string()),     // 2
+            Node::Symbol(intern("add")),    // 0
+            Node::Symbol(intern("_p0")),     // 1
+            Node::Symbol(intern("_p1")),     // 2
             Node::App(vec![0, 1, 2]),            // 3
         ];
         let params = collect_params(&nodes, 3);

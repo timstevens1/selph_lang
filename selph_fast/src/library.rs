@@ -4,6 +4,8 @@
 //! programs into macros, behavioral pruning, and usage tracking.
 
 use std::collections::HashMap;
+use std::rc::Rc;
+use crate::intern::{Sym, intern, resolve};
 use crate::types::*;
 use crate::parser;
 use crate::eval;
@@ -72,7 +74,7 @@ pub fn load_library(
 
         // children[0] must be the symbol "defmacro"
         let head_name = match &nodes[children[0]] {
-            Node::Symbol(s) => s.clone(),
+            Node::Symbol(s) => resolve(*s),
             _ => continue,
         };
         if head_name != "defmacro" {
@@ -81,7 +83,7 @@ pub fn load_library(
 
         // children[1] = macro name
         let macro_name = match &nodes[children[1]] {
-            Node::Symbol(s) => s.clone(),
+            Node::Symbol(s) => resolve(*s),
             _ => continue,
         };
 
@@ -92,7 +94,7 @@ pub fn load_library(
                     .iter()
                     .filter_map(|&i| {
                         if let Node::Symbol(s) = &nodes[i] {
-                            Some(s.clone())
+                            Some(resolve(*s))
                         } else {
                             None
                         }
@@ -131,11 +133,14 @@ pub fn promote_solution(name: &str, source: &str) -> Option<(String, String)> {
                 return None;
             }
 
+            // Resolve Sym params to strings for textual manipulation
+            let param_strs: Vec<String> = params.iter().map(|p| resolve(*p)).collect();
+
             // Rebuild the body source, substituting each original param
             // with `s` (single-arg convention).  If there are multiple
             // params we keep them as-is.
-            let body_source = if params.len() == 1 {
-                let original = &params[0];
+            let body_source = if param_strs.len() == 1 {
+                let original = &param_strs[0];
                 let body_src = node_to_source(&nodes, *body_idx);
                 // Simple textual replacement of the parameter name.
                 // Safe because SELPH identifiers don't appear as
@@ -146,10 +151,10 @@ pub fn promote_solution(name: &str, source: &str) -> Option<(String, String)> {
                 node_to_source(&nodes, *body_idx)
             };
 
-            let macro_params = if params.len() == 1 {
+            let macro_params = if param_strs.len() == 1 {
                 vec!["s".to_string()]
             } else {
-                params.clone()
+                param_strs
             };
 
             let macro_name = name.to_string();
@@ -280,19 +285,22 @@ fn compute_macro_fingerprint(
         return None;
     }
 
+    let nodes_rc: Rc<[Node]> = nodes.to_vec().into();
     let mut env = eval::make_default_env();
+    let sym_params: Vec<Sym> = params.iter().map(|s| intern(s)).collect();
     env_define(
         &mut env,
-        name.to_string(),
-        Value::RustMacro(params.to_vec(), nodes.to_vec(), body_root),
+        intern(name),
+        Value::RustMacro(sym_params.clone(), nodes_rc.clone(), body_root),
     );
 
+    let empty_rc: Rc<[Node]> = Vec::<Node>::new().into();
     let mut outputs = Vec::new();
     for input in test_inputs {
         match eval::apply(
-            &Value::RustMacro(params.to_vec(), nodes.to_vec(), body_root),
+            &Value::RustMacro(sym_params.clone(), nodes_rc.clone(), body_root),
             &[input.clone()],
-            &[] as &[Node],
+            &empty_rc,
             &mut env,
         ) {
             Ok(val) => outputs.push(eval::value_to_string(&val)),
@@ -312,7 +320,7 @@ fn compute_builtin_fingerprints(test_inputs: &[Value]) -> std::collections::Hash
         let mut outputs = Vec::new();
         for input in test_inputs {
             let args: Vec<Value> = vec![input.clone()];
-            match eval::apply_builtin(builtin_name, &args) {
+            match eval::apply_builtin(intern(builtin_name), &args) {
                 Ok(val) => outputs.push(eval::value_to_string(&val)),
                 Err(_) => outputs.push("ERR".to_string()),
             }
@@ -377,8 +385,9 @@ fn collect_symbols(
 ) {
     match &nodes[idx] {
         Node::Symbol(name) => {
-            if seen.insert(name.clone()) {
-                result.push(name.clone());
+            let s = resolve(*name);
+            if seen.insert(s.clone()) {
+                result.push(s);
             }
         }
         Node::App(children) => {
