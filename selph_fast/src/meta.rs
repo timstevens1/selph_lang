@@ -369,6 +369,11 @@ pub fn synthesize_heuristic(
 /// - Prefer components whose input type matches the task input type
 /// - Prefer higher-arity components (composition over atoms)
 /// - Penalize type mismatches
+/// Public wrapper for building candidate heuristics (used by meta-opt command).
+pub fn build_candidate_heuristics_pub() -> Vec<Heuristic> {
+    build_candidate_heuristics()
+}
+
 fn build_candidate_heuristics() -> Vec<Heuristic> {
     let templates = [
         // H1: Boost components whose return type matches target output type

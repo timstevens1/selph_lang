@@ -1,0 +1,52 @@
+; String slicing curriculum
+; Input: a string
+; Output: a string (slice) or number (length/index)
+;
+; Teaches string-take and string-drop (arity-2 prefix/suffix ops),
+; then composes with half_len for dynamic halving.
+; Requires: arithmetic library (halve, third).
+
+; === Stage 0: Fixed-length take/drop ===
+; prefix3: first 3 characters
+; Expected: (string-take x 3)
+(task "prefix3" 2
+  ("abcdef" "abc") ("hello!" "hel") ("xyzabc" "xyz") ("testme" "tes")
+  ("qrstuv" "qrs") ("mnopqr" "mno") ("abcxyz" "abc") ("foobar" "foo"))
+
+; suffix_from3: everything after first 3 characters
+; Expected: (string-drop x 3)
+(task "suffix_from3" 2
+  ("abcdef" "def") ("hello!" "lo!") ("xyzabc" "abc") ("testme" "tme")
+  ("qrstuv" "tuv") ("mnopqr" "pqr") ("abcxyz" "xyz") ("foobar" "bar"))
+
+; prefix1: first character via take
+; Expected: (string-take x 1)
+(task "prefix1" 2
+  ("abc" "a") ("hello" "h") ("xy" "x") ("test" "t")
+  ("z" "z") ("abcdef" "a") ("qr" "q") ("mn" "m"))
+
+; drop_first: remove first character
+; Expected: (string-drop x 1)
+(task "drop_first" 2
+  ("abc" "bc") ("hello" "ello") ("xy" "y") ("test" "est")
+  ("abcdef" "bcdef") ("qr" "r") ("abcd" "bcd") ("mn" "n"))
+
+; === Stage 1: Compose with string-length ===
+; half_len: half the string length (scaffolding for dynamic halving)
+; Expected: (halve (string-length x))
+(task "half_len" 2
+  ("ab" 1) ("abcd" 2) ("abcdef" 3) ("abcdefgh" 4)
+  ("a" 0) ("abc" 1) ("abcde" 2) ("abcdefghij" 5))
+
+; === Stage 2: Dynamic halving (compose take/drop with half_len) ===
+; first_half: first half of the string
+; Expected: (string-take x (half_len x))
+(task "first_half" 2
+  ("abcd" "ab") ("abcdef" "abc") ("aabb" "aa") ("abab" "ab")
+  ("xxxx" "xx") ("xxyy" "xx") ("abcabc" "abc") ("xxxxxx" "xxx"))
+
+; second_half: second half of the string
+; Expected: (string-drop x (half_len x))
+(task "second_half" 2
+  ("abcd" "cd") ("abcdef" "def") ("aabb" "bb") ("abab" "ab")
+  ("xxxx" "xx") ("xxyy" "yy") ("abcabc" "abc") ("xxxxxx" "xxx"))

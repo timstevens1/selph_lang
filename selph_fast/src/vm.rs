@@ -23,6 +23,7 @@ pub enum Op {
     PushNum(f64),
     PushBool(bool),
     PushStr(u16),              // index into Chunk::strings
+    PushNamespace(u16),        // index into Chunk::namespaces — pre-built constant
     LoadArg,                   // push the lambda argument (x)
     CallBuiltin(Sym, u8),      // call builtin with N args from stack
     CallMacro(u16, u8),        // call pre-compiled macro chunk by index, N args
@@ -36,6 +37,7 @@ pub enum Op {
 pub struct Chunk {
     pub ops: Vec<Op>,
     pub strings: Vec<String>,
+    pub namespaces: Vec<Value>,  // pre-built namespace constants
 }
 
 /// Pre-compiled macro table entry.
@@ -51,6 +53,7 @@ pub struct CompileCtx {
     pub sym_x: Sym,
     pub builtin_names: std::collections::HashSet<Sym>,
     pub macro_names: Vec<(Sym, u16)>, // (name_sym, macro_chunk_index)
+    pub macro_compiled: Vec<bool>,    // which macro indices compiled successfully
 }
 
 impl CompileCtx {
@@ -64,7 +67,8 @@ impl CompileCtx {
         for (i, (name, _, _, _)) in macros.iter().enumerate() {
             macro_names.push((intern(name), i as u16));
         }
-        CompileCtx { sym_x, builtin_names, macro_names }
+        let macro_compiled = vec![false; macros.len()];
+        CompileCtx { sym_x, builtin_names, macro_names, macro_compiled }
     }
 
     fn lookup_macro(&self, sym: Sym) -> Option<u16> {
@@ -72,11 +76,15 @@ impl CompileCtx {
             .find(|(s, _)| *s == sym)
             .map(|(_, idx)| *idx)
     }
+
+    fn macro_compiled(&self, idx: u16) -> bool {
+        self.macro_compiled.get(idx as usize).copied().unwrap_or(false)
+    }
 }
 
 /// Compile a node tree into bytecodes.
 pub fn compile(nodes: &[Node], root: usize, ctx: &CompileCtx) -> Result<Chunk, String> {
-    let mut chunk = Chunk { ops: Vec::new(), strings: Vec::new() };
+    let mut chunk = Chunk { ops: Vec::new(), strings: Vec::new(), namespaces: Vec::new() };
     compile_node(nodes, root, ctx, &mut chunk)?;
     chunk.ops.push(Op::Return);
     Ok(chunk)
@@ -98,7 +106,7 @@ pub fn compile_macros(
             param_sym: intern(&params[0]),
             outer_ctx: ctx,
         };
-        let mut chunk = Chunk { ops: Vec::new(), strings: Vec::new() };
+        let mut chunk = Chunk { ops: Vec::new(), strings: Vec::new(), namespaces: Vec::new() };
         match compile_macro_node(nodes, *root, &macro_ctx, &mut chunk) {
             Ok(()) => {
                 chunk.ops.push(Op::Return);
@@ -141,6 +149,33 @@ fn compile_macro_node(
         Node::App(children) => {
             if children.is_empty() { return Err("vm: empty app in macro".into()); }
             if let Node::Symbol(fn_sym) = &nodes[children[0]] {
+                let fn_name = resolve(*fn_sym);
+                // Special form: (ns ("key" value) ...) — build namespace constant
+                if fn_name == "ns" || fn_name == "namespace" {
+                    let mut entries = std::collections::HashMap::new();
+                    for &child_idx in &children[1..] {
+                        if let Node::App(pair) = &nodes[child_idx] {
+                            if pair.len() == 2 {
+                                let key = match &nodes[pair[0]] {
+                                    Node::Str(s) => s.clone(),
+                                    Node::Symbol(s) => resolve(*s),
+                                    _ => return Err("vm: non-string key in ns".into()),
+                                };
+                                let val = match &nodes[pair[1]] {
+                                    Node::Num(n) => Value::Num(*n),
+                                    Node::Bool(b) => Value::Bool(*b),
+                                    Node::Str(s) => Value::Str(s.clone()),
+                                    _ => return Err("vm: non-constant value in ns".into()),
+                                };
+                                entries.insert(key, val);
+                            }
+                        }
+                    }
+                    let ns_idx = chunk.namespaces.len() as u16;
+                    chunk.namespaces.push(Value::Namespace(entries));
+                    chunk.ops.push(Op::PushNamespace(ns_idx));
+                    return Ok(());
+                }
                 // Compile arguments
                 for &arg_idx in &children[1..] {
                     compile_macro_node(nodes, arg_idx, ctx, chunk)?;
@@ -150,8 +185,12 @@ fn compile_macro_node(
                     chunk.ops.push(Op::CallBuiltin(*fn_sym, arity));
                     Ok(())
                 } else if let Some(macro_idx) = ctx.outer_ctx.lookup_macro(*fn_sym) {
-                    chunk.ops.push(Op::CallMacro(macro_idx, arity));
-                    Ok(())
+                    if ctx.outer_ctx.macro_compiled(macro_idx) {
+                        chunk.ops.push(Op::CallMacro(macro_idx, arity));
+                        Ok(())
+                    } else {
+                        Err(format!("vm: macro {} not VM-compilable", fn_name))
+                    }
                 } else {
                     Err("vm: unknown function in macro".into())
                 }
@@ -209,8 +248,13 @@ fn compile_node(
                     chunk.ops.push(Op::CallBuiltin(*fn_sym, arity));
                     Ok(())
                 } else if let Some(macro_idx) = ctx.lookup_macro(*fn_sym) {
-                    chunk.ops.push(Op::CallMacro(macro_idx, arity));
-                    Ok(())
+                    // Only emit CallMacro if the macro was successfully compiled
+                    if ctx.macro_compiled(macro_idx) {
+                        chunk.ops.push(Op::CallMacro(macro_idx, arity));
+                        Ok(())
+                    } else {
+                        Err(format!("vm: macro {} not VM-compilable", resolve(*fn_sym)))
+                    }
                 } else {
                     Err(format!("vm: unknown function {}", resolve(*fn_sym)))
                 }
@@ -272,6 +316,7 @@ fn execute_inner(
             Op::PushNum(n) => stack.push(Value::Num(*n)),
             Op::PushBool(b) => stack.push(Value::Bool(*b)),
             Op::PushStr(si) => stack.push(Value::Str(chunk.strings[*si as usize].clone())),
+            Op::PushNamespace(ni) => stack.push(chunk.namespaces[*ni as usize].clone()),
             Op::LoadArg => stack.push(arg.clone()),
             Op::CallBuiltin(sym, arity) => {
                 let n = *arity as usize;

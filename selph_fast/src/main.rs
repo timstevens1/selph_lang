@@ -25,6 +25,7 @@ mod stochastic;
 mod meta;
 mod taskgen;
 mod vm;
+mod trace;
 
 use std::env;
 use std::fs;
@@ -52,6 +53,7 @@ fn main() {
         "generate" => cmd_generate(&args[2..]),
         "verify" => cmd_verify(&args[2..]),
         "multi-synth" => cmd_multi_synth(&args[2..]),
+        "meta-opt" => cmd_meta_optimize(&args[2..]),
         "help" | "--help" | "-h" => print_usage(),
         other => {
             // If it's a .selph file, evaluate it
@@ -275,11 +277,6 @@ fn cmd_synth(args: &[String]) {
         for comp in &mut synth_comps {
             if comp.name == "x" { comp.ret_type = 1; }
         }
-        for comp in &mut synth_comps {
-            if comp.priority == 30.0 && comp.arity > 0 {
-                comp.param_types = vec![1; comp.arity];
-            }
-        }
     }
 
     eprintln!("Synthesizing from {} examples, depth={}, budget={}, components={}",
@@ -385,7 +382,15 @@ fn node_to_value(nodes: &[Node], idx: usize) -> Option<Value> {
                     return alts.map(Value::Alt);
                 }
             }
-            None
+            // List literal: (1 2 3) → Value::List([1, 2, 3])
+            let elems: Vec<Value> = children.iter()
+                .filter_map(|&c| node_to_value(nodes, c))
+                .collect();
+            if elems.len() == children.len() {
+                Some(Value::List(elems))
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -714,6 +719,7 @@ fn cmd_curriculum(args: &[String]) {
     if args.is_empty() {
         eprintln!("Usage: selph grow <tasks.selph> [--library base.selph] [--output grown.selph]");
         eprintln!("       selph grow <tasks.selph> --budget 200000 --depth 3");
+        eprintln!("       selph grow <tasks.selph> --heuristic heuristic.selph");
         eprintln!("       selph grow <tasks.selph> --meta --extract");
         eprintln!();
         eprintln!("Task file format:");
@@ -732,6 +738,8 @@ fn cmd_curriculum(args: &[String]) {
     let mut enable_extract = false;
     let mut enable_validate = false;
     let mut filter_path: Option<String> = None;
+    let mut trace_path: Option<String> = None;
+    let mut heuristic_path: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -747,6 +755,8 @@ fn cmd_curriculum(args: &[String]) {
             "--extract" => { enable_extract = true; i += 1; }
             "--validate" => { enable_validate = true; i += 1; }
             "--filter" => { filter_path = args.get(i + 1).cloned(); i += 2; }
+            "--trace" => { trace_path = args.get(i + 1).cloned(); i += 2; }
+            "--heuristic" => { heuristic_path = args.get(i + 1).cloned(); i += 2; }
             other => { task_file = other.to_string(); i += 1; }
         }
     }
@@ -764,14 +774,11 @@ fn cmd_curriculum(args: &[String]) {
 
     // Load libraries
     let mut all_macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = Vec::new();
-    let mut library_source = String::new();
+    let mut base_macro_count: usize = 0; // count of macros from loaded libraries (before promotion)
 
     for lib_path in &library_paths {
         match fs::read_to_string(lib_path) {
             Ok(s) => {
-                if library_source.is_empty() {
-                    library_source = s.clone();
-                }
                 let lib_macros = load_library(&s);
                 eprintln!("Loaded {} macros from {}", lib_macros.len(), lib_path);
                 all_macros.extend(lib_macros);
@@ -779,6 +786,19 @@ fn cmd_curriculum(args: &[String]) {
             Err(e) => eprintln!("Warning: couldn't load library {}: {}", lib_path, e),
         }
     }
+    // Deduplicate base macros: if multiple libraries define the same name, keep the last one
+    {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::new();
+        for m in all_macros.into_iter().rev() {
+            if seen.insert(m.0.clone()) {
+                deduped.push(m);
+            }
+        }
+        deduped.reverse();
+        all_macros = deduped;
+    }
+    base_macro_count = all_macros.len();
 
     // Parse tasks
     let tasks = parse_curriculum_tasks(&task_source, default_depth);
@@ -794,6 +814,10 @@ fn cmd_curriculum(args: &[String]) {
     if enable_meta { eprintln!("  Meta-heuristic learning: enabled"); }
     if enable_extract { eprintln!("  Abstraction extraction: enabled"); }
     if enable_validate { eprintln!("  Validation: enabled (20% held out when >= 5 examples)"); }
+    if let Some(ref tp) = trace_path { eprintln!("  Trace: {}", tp); }
+
+    // Initialize curriculum trace
+    let mut curriculum_trace = trace::CurriculumTrace::new(default_budget, default_depth);
 
     // Load SELPH depth filter if provided
     let depth_filter: Option<Box<dyn Fn(&synth::SynthComponent, usize) -> bool>> =
@@ -816,6 +840,26 @@ fn cmd_curriculum(args: &[String]) {
                     }
                 }
                 Err(e) => { eprintln!("  Filter load error: {}", e); None }
+            }
+        } else {
+            None
+        };
+
+    // Load SELPH heuristic if provided
+    let heuristic: Option<meta::Heuristic> =
+        if let Some(ref hp) = heuristic_path {
+            match fs::read_to_string(hp) {
+                Ok(src) => {
+                    let trimmed = src.trim();
+                    match meta::Heuristic::from_source("loaded", trimmed) {
+                        Some(h) => {
+                            eprintln!("  Heuristic: {} ({})", hp, trimmed);
+                            Some(h)
+                        }
+                        None => { eprintln!("  Heuristic parse error: {}", hp); None }
+                    }
+                }
+                Err(e) => { eprintln!("  Heuristic load error: {}", e); None }
             }
         } else {
             None
@@ -865,17 +909,57 @@ fn cmd_curriculum(args: &[String]) {
         // for tasks that don't specify a depth in the curriculum file.
         let depth = *task_depth;
         let input_is_string = matches!(&inputs[0], Value::Str(_));
+        let input_is_list = matches!(&inputs[0], Value::List(_));
+
+        // Compute task features for tracing
+        let output_is_boolean = expected.iter().all(|v| matches!(v, Value::Bool(_)));
+        let num_distinct_outputs = {
+            let mut distinct: Vec<String> = expected.iter().map(|v| format!("{:?}", v)).collect();
+            distinct.sort();
+            distinct.dedup();
+            distinct.len()
+        };
+        let unary_macro_count = all_macros.iter().filter(|(_, p, _, _)| p.len() == 1).count();
+        let task_features = trace::TaskFeatures {
+            num_examples: inputs.len(),
+            input_type: if input_is_string { "string".to_string() } else { "number".to_string() },
+            output_is_boolean,
+            num_distinct_outputs,
+            library_size: all_macros.len(),
+            bool_macros_available: unary_macro_count,
+        };
+        let num_synth_comps_before = 0usize; // will be set after component creation
+        let mut trace_steps: Vec<trace::SolveStep> = Vec::new();
         let mut synth_comps = synth::default_synth_components(&all_macros);
         let extra_bindings: Vec<(String, Value)> = Vec::new();
         if input_is_string {
             for comp in &mut synth_comps {
-                if comp.name == "x" { comp.ret_type = 1; }
+                if comp.name == "x" { comp.ret_type = synth::TYPE_STR; }
             }
+        } else if input_is_list {
+            // Infer element type from the list contents
+            let elem_type = if let Value::List(elems) = &inputs[0] {
+                if elems.iter().all(|v| matches!(v, Value::Num(_))) {
+                    synth::TYPE_NUM
+                } else if elems.iter().all(|v| matches!(v, Value::Str(_))) {
+                    synth::TYPE_STR
+                } else {
+                    synth::TYPE_ANY
+                }
+            } else { synth::TYPE_ANY };
+
             for comp in &mut synth_comps {
-                if comp.priority == 30.0 && comp.arity > 0 {
-                    comp.param_types = vec![1; comp.arity];
+                if comp.name == "x" { comp.ret_type = synth::TYPE_LIST; }
+            }
+            // head/nth return the element type, not ANY
+            for comp in &mut synth_comps {
+                if (comp.name == "head" || comp.name == "nth") && comp.ret_type == synth::TYPE_ANY {
+                    comp.ret_type = elem_type;
                 }
             }
+            // Note: macro param_types are already inferred by infer_macro_types.
+            // Don't override them — macros may accept different types than the
+            // raw input (e.g. num→num macros used as intermediate compositions).
         }
 
         // Apply learned priorities from previous solves
@@ -885,12 +969,15 @@ fn cmd_curriculum(args: &[String]) {
             }
         }
 
-        // Sort by learned priority — interleaved search handles the rest.
-        // The priority sort ensures high-value components seed the pool first,
-        // and the interleaved candidate generation (in synth.rs) sorts
-        // compositions by combined priority of component + arguments.
-        synth_comps.sort_by(|a, b| b.priority.partial_cmp(&a.priority)
-            .unwrap_or(std::cmp::Ordering::Equal));
+        // Apply loaded heuristic if present — replaces static priority with
+        // task-dependent scoring. Otherwise fall back to sorting by learned priority.
+        if let Some(ref h) = heuristic {
+            let task_ctx = meta::TaskContext::from_examples(inputs, expected);
+            synth_comps = meta::apply_heuristic(h, &synth_comps, &task_ctx);
+        } else {
+            synth_comps.sort_by(|a, b| b.priority.partial_cmp(&a.priority)
+                .unwrap_or(std::cmp::Ordering::Equal));
+        }
 
         // Split examples into train/validation if --validate enabled
         let (train_inputs, train_expected, val_pairs) = if enable_validate && inputs.len() >= 5 {
@@ -905,6 +992,10 @@ fn cmd_curriculum(args: &[String]) {
             (inputs.as_slice(), expected.as_slice(), None)
         };
 
+        let num_components = synth_comps.len();
+        let mut task_solving_strategy: Option<String> = None;
+        let mut task_total_candidates: usize = 0;
+        let mut task_components_used: Vec<String> = Vec::new();
         let start = std::time::Instant::now();
         let filter_ref: Option<&dyn Fn(&synth::SynthComponent, usize) -> bool> =
             depth_filter.as_ref().map(|f| f.as_ref());
@@ -924,8 +1015,12 @@ fn cmd_curriculum(args: &[String]) {
                 eprintln!("  OK  {:30}  {:6} cand  {:.3}s  {}",
                          name, explored, elapsed.as_secs_f64(), source);
 
+                task_solving_strategy = Some("Flat".to_string());
+                task_total_candidates = explored;
+
                 // Update priorities: boost components that appeared in the solution
                 let used_components = library::extract_components(&source);
+                task_components_used = used_components.clone();
                 for comp_name in &used_components {
                     let entry = priorities.entry(comp_name.clone()).or_insert(0.0);
                     *entry += learn_rate;
@@ -1010,7 +1105,11 @@ fn cmd_curriculum(args: &[String]) {
                 eprintln!("  BD  {:30}         0.000s  {}",
                          name, source);
 
+                task_solving_strategy = Some("BD".to_string());
+                task_total_candidates = sr.candidates_explored;
+
                 let used_components = library::extract_components(&source);
+                task_components_used = used_components.clone();
                 for comp_name in &used_components {
                     let entry = priorities.entry(comp_name.clone()).or_insert(0.0);
                     *entry += learn_rate;
@@ -1061,7 +1160,11 @@ fn cmd_curriculum(args: &[String]) {
                 eprintln!("  IN  {:30}  {:6} cand  {:.3}s  {}",
                          name, ir.candidates_explored, elapsed.as_secs_f64(), source);
 
+                task_solving_strategy = Some("Induction".to_string());
+                task_total_candidates = sr.candidates_explored + ir.candidates_explored;
+
                 let used_components = library::extract_components(&source);
+                task_components_used = used_components.clone();
                 for comp_name in &used_components {
                     let entry = priorities.entry(comp_name.clone()).or_insert(0.0);
                     *entry += learn_rate;
@@ -1106,8 +1209,33 @@ fn cmd_curriculum(args: &[String]) {
                     eprintln!("  DC  {:30}  {:6} cand  {:.3}s  {}",
                              name, dr.candidates_explored, elapsed.as_secs_f64(), source);
 
+                    task_solving_strategy = Some("D&C".to_string());
+                    task_total_candidates = sr.candidates_explored + dr.candidates_explored;
+                    task_components_used = library::extract_components(&source);
+
                     let body_source = extract_lambda_body(&source);
                     let macro_line = format!("(defmacro {} (s) {})", name, body_source);
+
+                    // Register D&C solution as macro so later tasks can use it
+                    if let Ok((mnodes, mroots)) = parse_file(&macro_line) {
+                        if !mroots.is_empty() {
+                            if let Node::App(children) = &mnodes[mroots[0]] {
+                                if children.len() == 4 {
+                                    if let Node::Symbol(mname) = &mnodes[children[1]] {
+                                        if let Node::App(param_indices) = &mnodes[children[2]] {
+                                            let params: Vec<String> = param_indices.iter()
+                                                .filter_map(|&i| {
+                                                    if let Node::Symbol(s) = &mnodes[i] { Some(resolve(*s)) }
+                                                    else { None }
+                                                }).collect();
+                                            all_macros.push((resolve(*mname), params, mnodes.clone(), children[3]));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     promoted_source.push_str(&format!(
                         "\n; {} (D&C): found in {} candidates\n{}\n",
                         name, dr.candidates_explored, macro_line));
@@ -1122,6 +1250,9 @@ fn cmd_curriculum(args: &[String]) {
                         solved += 1;
                         eprintln!("  ME  {:30}  {:6} memo  {:.3}s  {}",
                                  name, inputs.len(), elapsed.as_secs_f64(), source);
+
+                        task_solving_strategy = Some("Memo".to_string());
+                        task_total_candidates = sr.candidates_explored;
 
                         let body_source = extract_lambda_body(&source);
                         let macro_line = format!("(defmacro {} (s) {})", name, body_source);
@@ -1153,10 +1284,29 @@ fn cmd_curriculum(args: &[String]) {
                         let explored = sr.candidates_explored;
                         eprintln!("  --  {:30}  {:6} cand  {:.3}s",
                                  name, explored, elapsed.as_secs_f64());
+                        task_total_candidates = explored;
                     }
                 }
             }
         } // end bool_decompose else
+        }
+
+        // Record trace for this task
+        if trace_path.is_some() {
+            let task_elapsed = start.elapsed();
+            let task_trace = trace::TaskTrace {
+                task_name: name.clone(),
+                task_depth: depth,
+                features: task_features,
+                steps: Vec::new(), // individual step breakdown not yet wired
+                solved: task_solving_strategy.is_some(),
+                solving_strategy: task_solving_strategy,
+                total_candidates: task_total_candidates,
+                total_wall_time_ms: task_elapsed.as_secs_f64() * 1000.0,
+                components_used: task_components_used,
+                components_available: num_components,
+            };
+            curriculum_trace.tasks.push(task_trace);
         }
 
         // Periodic abstraction extraction: every 10 solved tasks
@@ -1241,30 +1391,40 @@ fn cmd_curriculum(args: &[String]) {
              total_candidates, total_elapsed.as_secs_f64());
     eprintln!("Library grew by {} macros", solved);
 
+    // Write trace JSON if requested
+    if let Some(ref tp) = trace_path {
+        curriculum_trace.finalize();
+        let json = curriculum_trace.to_json();
+        match fs::write(tp, &json) {
+            Ok(_) => eprintln!("Trace saved to {} ({} tasks, {} candidates)",
+                tp, curriculum_trace.total_tasks, curriculum_trace.total_candidates),
+            Err(e) => eprintln!("Error writing trace to {}: {}", tp, e),
+        }
+    }
+
     // Save grown library — this IS the trained model.
-    // Contains: base library + promoted solutions + extracted abstractions
-    //         + learned heuristic (search strategy)
+    // Serialized from all_macros: deduplicated, base + promoted + extracted.
     let mut output = String::new();
     output.push_str("; SELPH library — trained model from curriculum runner\n");
-    output.push_str(&format!("; {} macros ({} promoted from this run)\n",
-                             all_macros.len(), solved));
+    output.push_str(&format!("; {} macros ({} base, {} promoted from this run)\n",
+                             all_macros.len(), base_macro_count, solved));
+    if !library_paths.is_empty() {
+        output.push_str(&format!("; Libraries: {}\n", library_paths.join(", ")));
+    }
     if enable_meta {
         output.push_str(&format!("; Includes learned RL coefficients (cold={:.1}, warm={:.1})\n",
             current_rl_coeffs.cold_penalty, current_rl_coeffs.warm_bonus));
     }
     output.push_str("\n");
 
-    // Include base library
-    if !library_source.is_empty() {
-        output.push_str("; --- Base library ---\n");
-        output.push_str(&library_source);
-        output.push_str("\n");
-    }
-
-    // Add promoted solutions
-    if !promoted_source.is_empty() {
-        output.push_str("; --- Promoted solutions ---");
-        output.push_str(&promoted_source);
+    // Serialize all macros from all_macros (base + promoted, deduplicated)
+    output.push_str("; --- Library macros ---\n");
+    for (mname, params, mnodes, mroot) in &all_macros {
+        // Skip internal RL coefficient macros — they're written separately below
+        if mname.starts_with("__selph_rl_") { continue; }
+        let body = node_to_source(mnodes, *mroot);
+        output.push_str(&format!("(defmacro {} ({}) {})\n",
+            mname, params.join(" "), body));
     }
 
 
@@ -1759,6 +1919,350 @@ fn cmd_verify(args: &[String]) {
     if let Some(gd) = &result.goal_details {
         println!("  goal_details:     {}", gd);
     }
+}
+
+// ── Meta-optimize command ──────────────────────────────────────────
+//
+// Reads trace JSON files from a chained curriculum run and synthesizes
+// a priority heuristic that minimizes total candidates across all tasks.
+//
+// Usage:
+//   selph meta-opt <tasks.selph> --library grown.selph --trace trace.json [--trace trace2.json]
+//   selph meta-opt examples/full_curriculum.selph --library chain_output/stage3_nl.selph \
+//     --trace chain_output/trace_seq.json --trace chain_output/trace_cf.json --trace chain_output/trace_nl.json
+
+fn cmd_meta_optimize(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: selph meta-opt <tasks.selph> --library grown.selph --trace trace.json");
+        return;
+    }
+
+    let mut task_files: Vec<String> = Vec::new();
+    let mut library_paths: Vec<String> = Vec::new();
+    let mut trace_paths: Vec<String> = Vec::new();
+    let mut budget: usize = 10000;
+    let mut depth: usize = 2;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--library" | "--tree" => {
+                if let Some(p) = args.get(i + 1) { library_paths.push(p.clone()); }
+                i += 2;
+            }
+            "--trace" => {
+                if let Some(p) = args.get(i + 1) { trace_paths.push(p.clone()); }
+                i += 2;
+            }
+            "--budget" => {
+                budget = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(budget);
+                i += 2;
+            }
+            "--depth" => {
+                depth = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(depth);
+                i += 2;
+            }
+            other => { task_files.push(other.to_string()); i += 1; }
+        }
+    }
+
+    // Load trace files and parse them to extract task-level data
+    let mut trace_tasks: Vec<TraceTask> = Vec::new();
+    for tp in &trace_paths {
+        match fs::read_to_string(tp) {
+            Ok(json) => {
+                let parsed = parse_trace_json(&json);
+                eprintln!("Loaded {} task traces from {}", parsed.len(), tp);
+                trace_tasks.extend(parsed);
+            }
+            Err(e) => eprintln!("Warning: couldn't read trace {}: {}", tp, e),
+        }
+    }
+
+    if trace_tasks.is_empty() {
+        eprintln!("No trace data found. Run a curriculum with --trace first.");
+        return;
+    }
+
+    // Load task files to rebuild training examples
+    let mut all_tasks: Vec<(String, usize, Vec<Value>, Vec<Value>)> = Vec::new();
+    for tf in &task_files {
+        match fs::read_to_string(tf) {
+            Ok(s) => {
+                let tasks = parse_curriculum_tasks(&s, depth);
+                eprintln!("Loaded {} tasks from {}", tasks.len(), tf);
+                all_tasks.extend(tasks);
+            }
+            Err(e) => eprintln!("Warning: couldn't read tasks {}: {}", tf, e),
+        }
+    }
+
+    // Load libraries
+    let mut all_macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = Vec::new();
+    for lib_path in &library_paths {
+        match fs::read_to_string(lib_path) {
+            Ok(s) => {
+                let lib_macros = load_library(&s);
+                eprintln!("Loaded {} macros from {}", lib_macros.len(), lib_path);
+                all_macros.extend(lib_macros);
+            }
+            Err(e) => eprintln!("Warning: couldn't load library {}: {}", lib_path, e),
+        }
+    }
+
+    // Build training tasks from the curriculum tasks that appear in traces
+    let trace_names: std::collections::HashSet<String> = trace_tasks.iter()
+        .map(|t| t.task_name.clone())
+        .collect();
+
+    let training_tasks: Vec<meta::TrainingTask> = all_tasks.iter()
+        .filter(|(name, _, _, _)| trace_names.contains(name))
+        .map(|(name, _, inputs, expected)| {
+            meta::TrainingTask {
+                name: name.clone(),
+                inputs: inputs.clone(),
+                expected: expected.clone(),
+            }
+        })
+        .collect();
+
+    eprintln!();
+    eprintln!("Meta-optimization Stage 3: Multi-task heuristic learning");
+    eprintln!("  Training tasks: {} (from traces)", training_tasks.len());
+    eprintln!("  Library: {} macros", all_macros.len());
+    eprintln!("  Per-task budget: {}", budget);
+    eprintln!();
+
+    // Print baseline statistics from traces
+    let total_cand: usize = trace_tasks.iter().map(|t| t.candidates).sum();
+    let solved_count = trace_tasks.iter().filter(|t| t.solved).count();
+    eprintln!("Baseline (from traces):");
+    eprintln!("  Solved: {}/{}", solved_count, trace_tasks.len());
+    eprintln!("  Total candidates: {}", total_cand);
+
+    // Identify hard tasks (top 50% by candidate count)
+    let mut by_difficulty: Vec<&TraceTask> = trace_tasks.iter()
+        .filter(|t| t.solved && t.candidates > 100)
+        .collect();
+    by_difficulty.sort_by(|a, b| b.candidates.cmp(&a.candidates));
+
+    eprintln!("  Hard tasks (>100 candidates):");
+    for t in by_difficulty.iter().take(10) {
+        eprintln!("    {:30} {:6} cand  strategy: {}",
+            t.task_name, t.candidates,
+            t.strategy.as_deref().unwrap_or("?"));
+    }
+    eprintln!();
+
+    // Build synth components from the final library
+    let synth_comps = synth::default_synth_components(&all_macros);
+
+    // Run heuristic optimization
+    eprintln!("Evaluating 8 candidate heuristics...");
+    let default_h = meta::Heuristic::default_heuristic();
+
+    // Evaluate baseline: run with default heuristic
+    let (baseline_solved, baseline_cands, baseline_results) = run_meta_eval(
+        &training_tasks, &default_h, &synth_comps, &all_macros, depth, budget);
+    eprintln!("  Baseline: {}/{} solved, {} total candidates",
+        baseline_solved, training_tasks.len(), baseline_cands);
+
+    // Try each candidate heuristic
+    let candidates = meta::build_candidate_heuristics_pub();
+    let mut best_h: Option<meta::Heuristic> = None;
+    let mut best_solved = baseline_solved;
+    let mut best_cands = baseline_cands;
+
+    for h in &candidates {
+        let (h_solved, h_cands, h_results) = run_meta_eval(
+            &training_tasks, h, &synth_comps, &all_macros, depth, budget);
+
+        let is_better = h_solved > best_solved
+            || (h_solved == best_solved && h_solved > 0 && h_cands < best_cands);
+
+        let indicator = if is_better { " *** NEW BEST" } else { "" };
+        eprintln!("  {}: {}/{} solved, {} candidates{}",
+            h.name, h_solved, training_tasks.len(), h_cands, indicator);
+
+        if is_better {
+            best_solved = h_solved;
+            best_cands = h_cands;
+            best_h = Some(h.clone());
+
+            // Print per-task improvements
+            for ((name, _, _), (_, base_ok, base_c)) in h_results.iter().zip(baseline_results.iter()) {
+                let (_, h_ok, h_c) = h_results.iter()
+                    .find(|(n, _, _)| n == name).unwrap();
+                if *h_c < *base_c && *base_c > 100 {
+                    eprintln!("    {} -> {} cand ({} -> {})",
+                        name, h_c, base_c, h_c);
+                }
+            }
+        }
+    }
+
+    eprintln!();
+    if let Some(ref h) = best_h {
+        let speedup = baseline_cands as f64 / best_cands.max(1) as f64;
+        eprintln!("=== Best heuristic: \"{}\" ===", h.name);
+        eprintln!("  Solved: {}/{} (baseline: {})", best_solved, training_tasks.len(), baseline_solved);
+        eprintln!("  Total candidates: {} (baseline: {}, {:.1}x speedup)",
+            best_cands, baseline_cands, speedup);
+        eprintln!("  Source: {}", h.source);
+        eprintln!();
+        eprintln!("To use: save as heuristic.selph and pass via --filter");
+
+        // Output the heuristic as a SELPH file
+        println!("; Meta-optimized heuristic: \"{}\"", h.name);
+        println!("; Trained on {} tasks from chained curriculum", training_tasks.len());
+        println!("; Speedup: {:.1}x ({} -> {} candidates)", speedup, baseline_cands, best_cands);
+        println!("{}", h.source);
+    } else {
+        eprintln!("No heuristic improved on the baseline.");
+        eprintln!("The default priority ordering is already near-optimal for this task suite.");
+    }
+}
+
+/// Minimal parsed trace task for meta-optimization.
+struct TraceTask {
+    task_name: String,
+    candidates: usize,
+    solved: bool,
+    strategy: Option<String>,
+    components_used: Vec<String>,
+}
+
+/// Parse trace JSON manually (no serde dependency).
+fn parse_trace_json(json: &str) -> Vec<TraceTask> {
+    let mut tasks = Vec::new();
+
+    // Split by task objects — look for "task_name" fields
+    let mut pos = 0;
+    while let Some(start) = json[pos..].find("\"task_name\"") {
+        let abs_start = pos + start;
+        // Find the task_name value
+        let name = extract_json_string(json, abs_start);
+
+        // Find total_candidates
+        let candidates = if let Some(tc_start) = json[abs_start..].find("\"total_candidates\"") {
+            extract_json_number(json, abs_start + tc_start) as usize
+        } else { 0 };
+
+        // Find solved
+        let solved = if let Some(s_start) = json[abs_start..].find("\"solved\"") {
+            let val_region = &json[abs_start + s_start..];
+            val_region.contains("true") && !val_region[..20.min(val_region.len())].contains("false")
+        } else { false };
+
+        // Find solving_strategy
+        let strategy = if let Some(ss_start) = json[abs_start..].find("\"solving_strategy\"") {
+            let val_start = abs_start + ss_start;
+            let val_region = &json[val_start..];
+            if val_region.contains("null") && val_region.find("null").unwrap() < val_region.find('"').unwrap_or(999).min(30) {
+                None
+            } else {
+                Some(extract_json_string(json, val_start))
+            }
+        } else { None };
+
+        // Find components_used
+        let mut components_used = Vec::new();
+        if let Some(cu_start) = json[abs_start..].find("\"components_used\"") {
+            let arr_start = abs_start + cu_start;
+            if let Some(bracket) = json[arr_start..].find('[') {
+                let arr_region_start = arr_start + bracket;
+                if let Some(bracket_end) = json[arr_region_start..].find(']') {
+                    let arr = &json[arr_region_start..arr_region_start + bracket_end];
+                    for part in arr.split('"') {
+                        let trimmed = part.trim().trim_matches(|c| c == ',' || c == '[' || c == ']' || c == ' ');
+                        if !trimmed.is_empty() {
+                            components_used.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if !name.is_empty() {
+            tasks.push(TraceTask {
+                task_name: name,
+                candidates,
+                solved,
+                strategy,
+                components_used,
+            });
+        }
+
+        pos = abs_start + 1;
+    }
+
+    tasks
+}
+
+/// Extract a JSON string value after a key at the given position.
+fn extract_json_string(json: &str, key_pos: usize) -> String {
+    // Find the colon after the key
+    if let Some(colon) = json[key_pos..].find(':') {
+        let after_colon = &json[key_pos + colon + 1..];
+        // Find the opening quote
+        if let Some(q1) = after_colon.find('"') {
+            let after_q1 = &after_colon[q1 + 1..];
+            // Find the closing quote (handle escapes simply)
+            if let Some(q2) = after_q1.find('"') {
+                return after_q1[..q2].to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Extract a JSON number value after a key at the given position.
+fn extract_json_number(json: &str, key_pos: usize) -> f64 {
+    if let Some(colon) = json[key_pos..].find(':') {
+        let after_colon = json[key_pos + colon + 1..].trim_start();
+        // Read until comma, }, or newline
+        let end = after_colon.find(|c: char| c == ',' || c == '}' || c == '\n')
+            .unwrap_or(after_colon.len());
+        let num_str = after_colon[..end].trim();
+        num_str.parse().unwrap_or(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// Run meta-evaluation: test all training tasks with a heuristic.
+fn run_meta_eval(
+    tasks: &[meta::TrainingTask],
+    heuristic: &meta::Heuristic,
+    components: &[synth::SynthComponent],
+    macros: &[(String, Vec<String>, Vec<Node>, usize)],
+    max_depth: usize,
+    per_task_budget: usize,
+) -> (usize, usize, Vec<(String, bool, usize)>) {
+    let mut solved = 0usize;
+    let mut total_cands = 0usize;
+    let mut results = Vec::new();
+
+    for task in tasks {
+        let ctx = meta::TaskContext::from_examples(&task.inputs, &task.expected);
+        let prioritized = meta::apply_heuristic(heuristic, components, &ctx);
+
+        let sr = synth::synthesize(
+            &prioritized,
+            &task.inputs,
+            &task.expected,
+            macros,
+            max_depth,
+            per_task_budget,
+            true,
+        );
+
+        if sr.found { solved += 1; }
+        total_cands += sr.candidates_explored;
+        results.push((task.name.clone(), sr.found, sr.candidates_explored));
+    }
+
+    (solved, total_cands, results)
 }
 
 // ── Multi-synth command ─────────────────────────────────────────────

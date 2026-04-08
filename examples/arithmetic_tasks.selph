@@ -1,0 +1,19 @@
+; Integer arithmetic curriculum
+; Input: number
+; Output: number
+;
+; Teaches divide, floor, and their compositions so they become
+; promoted high-priority macros for downstream curricula.
+
+; === Stage 0: Division scaffolding ===
+; halve: integer division by 2
+; Expected: (floor (divide x 2))
+(task "halve" 2
+  (2 1) (4 2) (6 3) (8 4)
+  (10 5) (3 1) (5 2) (7 3))
+
+; third: integer division by 3
+; Expected: (floor (divide x 3))
+(task "third" 2
+  (3 1) (6 2) (9 3) (12 4)
+  (1 0) (2 0) (5 1) (7 2))

@@ -1,0 +1,90 @@
+; Context-sensitive language curriculum
+; Input: a string over {a, b, c}
+; Output: boolean (recognition) or number/string (analysis)
+;
+; Builds on promoted CF macros: count_a, count_b, equal_ab, no_b_before_a,
+; remove_a, remove_b, anbn, etc. Loaded via --library stage2_cf.selph.
+;
+; Progression: counting c -> equality/ordering -> a^n b^n c^n -> string halving -> copy language -> reduce
+
+; === Stage 0: Extend counting to "c" ===
+; count_c: count occurrences of "c" in the string
+(task "count_c" 2
+  ("c" 1) ("cc" 2) ("ccc" 3) ("cccc" 4)
+  ("a" 0) ("abc" 1) ("aabbcc" 2) ("bcc" 2))
+
+; === Stage 1: Three-symbol equality and replacement ===
+; equal_bc: equal counts of b and c?
+(task "equal_bc" 2
+  ("bc" true) ("bbcc" true) ("bbbccc" true)
+  ("b" false) ("bbc" false) ("bcc" false)
+  ("c" false) ("" true))
+
+; remove_c: remove all c's from string
+(task "remove_c" 2
+  ("c" "") ("abc" "ab") ("aabbcc" "aabb") ("cc" "")
+  ("ab" "ab") ("bcbc" "bb") ("ccc" "")
+  ("aaa" "aaa"))
+
+; === Stage 2: Ordering checks for three symbols ===
+; no_c_before_b: all c's come after all b's (mirrors no_b_before_a pattern)
+; Key idea: remove a's, then check if remaining is "no_b_before_a"-like but for b,c
+; Approach: after removing a's, check that no c appears before a b — i.e., the b's
+; come before c's. This is equivalent to checking (no_b_before_a (remove_a x))
+; but with b->a, c->b relabeling. Alternatively: (no_b_before_a (string-replace (string-replace (remove_a x) "c" "b") "b" "a"))
+; The synthesizer should find a composition using existing string-replace + no_b_before_a.
+;
+; Simpler approach: check that removing c's preserves a*b* ordering,
+; and removing a's gives b*c* (which is the same pattern).
+(task "no_c_before_b" 2
+  ("abc" true) ("aabbcc" true) ("bc" true) ("aaabbbccc" true)
+  ("acb" false) ("cba" false) ("abcb" false) ("cb" false))
+
+; === Stage 3: Compose equality and ordering for a^n b^n c^n ===
+; equal_abc: all three character counts are equal
+; Expected: (and (equal_ab x) (equal_bc x))
+(task "equal_abc" 3
+  ("abc" true) ("aabbcc" true) ("aaabbbccc" true)
+  ("ab" false) ("aabbc" false) ("abcc" false)
+  ("a" false) ("" true))
+
+; abc_order: a's before b's before c's (proper ordering)
+; Expected: (and (no_b_before_a x) (no_c_before_b x))
+(task "abc_order" 3
+  ("abc" true) ("aabbcc" true) ("aaabbbccc" true) ("ab" true)
+  ("bac" false) ("acb" false) ("cba" false) ("abcabc" false))
+
+; anbncn: a^n b^n c^n — THE context-sensitive language
+; Expected: (and (equal_abc x) (abc_order x))
+(task "anbncn" 3
+  ("abc" true) ("aabbcc" true) ("aaabbbccc" true)
+  ("ab" false) ("abcabc" false) ("bac" false)
+  ("aabbc" false) ("" true))
+
+; === Stage 4: Copy and reversal languages ===
+; Requires promoted first_half, second_half from string slicing curriculum.
+; ww: copy language — string is two identical halves
+; Expected: (= (first_half x) (second_half x))
+(task "ww" 3
+  ("abab" true) ("aaaa" true) ("abcabc" true) ("xxyy" false)
+  ("abba" false) ("abcd" false) ("xx" true) ("xyxy" true))
+
+; wwr: string is first half followed by its reverse
+; Expected: (= (first_half x) (string-reverse (second_half x)))
+(task "wwr" 3
+  ("abba" true) ("abccba" true) ("aaaa" true) ("abab" false)
+  ("abcd" false) ("xxyy" false) ("xyyx" true) ("xx" true))
+
+; === Stage 5: Reduce tasks (test fused reduce components) ===
+; char_list: split string into character list (scaffolding)
+; Expected: (string-chars x)
+(task "char_list" 2
+  ("abc" ("a" "b" "c")) ("ab" ("a" "b")) ("a" ("a"))
+  ("xy" ("x" "y")) ("hello" ("h" "e" "l" "l" "o"))
+  ("" ()) ("xyz" ("x" "y" "z")) ("aa" ("a" "a")))
+
+; rejoin: join characters back into string via reduce
+; Expected: (reduce concat (string-chars x))
+(task "rejoin" 2
+  ("abc" "abc") ("hello" "hello") ("xy" "xy") ("a" "a")
+  ("test" "test") ("ab" "ab") ("xyz" "xyz") ("hi" "hi"))

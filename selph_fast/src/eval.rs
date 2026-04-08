@@ -166,15 +166,18 @@ fn eval_inner(nodes: &Rc<[Node]>, idx: usize, env: &mut Env) -> Result<Value, St
                         }
                         return Ok(result);
                     }
-                    "namespace" => {
+                    "ns" | "namespace" => {
                         let mut entries = std::collections::HashMap::new();
                         for &child in &children[1..] {
                             if let Node::App(pair) = &nodes[child] {
                                 if pair.len() == 2 {
-                                    if let Node::Symbol(key) = &nodes[pair[0]] {
-                                        let val = eval(nodes, pair[1], env)?;
-                                        entries.insert(resolve(*key), val);
-                                    }
+                                    let key = match &nodes[pair[0]] {
+                                        Node::Symbol(s) => resolve(*s),
+                                        Node::Str(s) => s.clone(),
+                                        _ => continue,
+                                    };
+                                    let val = eval(nodes, pair[1], env)?;
+                                    entries.insert(key, val);
                                 }
                             }
                         }
@@ -342,6 +345,18 @@ fn build_dispatch_table() -> std::collections::HashMap<Sym, BuiltinFn> {
         let chars: Vec<char> = s.chars().collect();
         let end = end.min(chars.len()); let start = start.min(end);
         Ok(Value::Str(chars[start..end].iter().collect()))
+    });
+    m.insert(intern("string-take"), |args| {
+        let s = string(&args[0])?; let n = num(&args[1])? as usize;
+        let chars: Vec<char> = s.chars().collect();
+        let n = n.min(chars.len());
+        Ok(Value::Str(chars[..n].iter().collect()))
+    });
+    m.insert(intern("string-drop"), |args| {
+        let s = string(&args[0])?; let n = num(&args[1])? as usize;
+        let chars: Vec<char> = s.chars().collect();
+        let n = n.min(chars.len());
+        Ok(Value::Str(chars[n..].iter().collect()))
     });
     m.insert(intern("count-char"), |args| {
         let s = string(&args[0])?; let c = string(&args[1])?;
@@ -520,6 +535,9 @@ fn apply_builtin_slow(name: Sym, args: &[Value]) -> Result<Value, String> {
         }
         "reduce" => {
             let l = list(&args[1])?;
+            if l.is_empty() && args.len() <= 2 {
+                return Err("reduce: empty list with no initial value".into());
+            }
             let empty = empty_nodes();
             let mut env = make_default_env();
             let mut acc = if args.len() > 2 { args[2].clone() } else { l[0].clone() };
@@ -794,7 +812,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "range", "contains", "zip", "enumerate",
     "round", "pow", "sqrt", "log",
     "string-nth", "string-slice", "char-code", "code-char",
-    "count-char", "string-replace", "string-chars",
+    "count-char", "string-replace", "string-chars", "string-take", "string-drop",
     "string-starts-with", "string-ends-with",
     "map", "reduce", "filter", "identity", "print",
     "ns-get", "ns-put", "ns-keys", "ns-values", "ns-merge",
@@ -870,6 +888,8 @@ pub fn make_default_env() -> Env {
         ("to-number", 1, vec!["string"], "number"),
         ("string-nth", 2, vec!["string", "number"], "string"),
         ("string-slice", 3, vec!["string", "number", "number"], "string"),
+        ("string-take", 2, vec!["string", "number"], "string"),
+        ("string-drop", 2, vec!["string", "number"], "string"),
         ("char-code", 1, vec!["string"], "number"),
         ("code-char", 1, vec!["number"], "string"),
         ("count-char", 2, vec!["string", "string"], "number"),

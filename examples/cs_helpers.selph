@@ -1,0 +1,6 @@
+; Context-sensitive language helpers
+; Most character constants are in cf_helpers.selph (char_a, char_b, char_c, char_empty).
+; This file adds any additional helpers needed for CS tasks.
+
+; Space constant for string-join operations
+(defmacro char_space (s) " ")

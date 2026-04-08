@@ -466,7 +466,15 @@ pub fn hm_infer_ret_type(
 
     let mut subst = hm::Subst::new();
     if hm::type_compatible(&param_types, &ret_type, &arg_types, &mut subst) {
-        hm::type_to_tag(&ret_type, &subst)
+        let inferred = hm::type_to_tag(&ret_type, &subst);
+        // If HM gives TYPE_ANY (unresolved var) but the component has a
+        // concrete ret_type (e.g., head patched to NUM for list-of-numbers),
+        // prefer the concrete type.
+        if inferred == TYPE_ANY && comp.ret_type != TYPE_ANY {
+            comp.ret_type
+        } else {
+            inferred
+        }
     } else {
         comp.ret_type
     }
@@ -733,6 +741,18 @@ pub fn synthesize_full(
             // Check if this is a library macro (not a builtin)
             let is_macro = macros.iter().any(|(mn, _, _, _)| mn == bn);
             if !is_macro { return true; }
+            // Only probe macros whose param type matches the input type.
+            // Macros with different param types (e.g. num→num macro when input
+            // is str) are meant for intermediate compositions, not raw input.
+            if let Some(inp) = input_type {
+                if !comp.param_types.is_empty()
+                    && comp.param_types[0] != inp
+                    && comp.param_types[0] != TYPE_ANY
+                    && inp != TYPE_ANY
+                {
+                    return true; // keep — don't probe with wrong input type
+                }
+            }
             // Probe: try calling the macro with the first input
             let macro_data = macros.iter().find(|(mn, _, _, _)| mn == bn);
             if let Some((_, params, mnodes, mroot)) = macro_data {
@@ -958,14 +978,21 @@ pub fn synthesize_full(
             }
         }
 
-        // Extract small numeric outputs as constants
-        for val in expected.iter() {
-            if let Value::Num(n) = val {
-                let ni = *n as i64;
+        // Extract small numeric constants from outputs and list elements
+        for val in inputs.iter().chain(expected.iter()) {
+            let nums: Vec<f64> = match val {
+                Value::Num(n) => vec![*n],
+                Value::List(elems) => elems.iter().filter_map(|v| {
+                    if let Value::Num(n) = v { Some(*n) } else { None }
+                }).collect(),
+                _ => vec![],
+            };
+            for n in nums {
+                let ni = n as i64;
                 if ni.abs() <= 100 && !seen_num_constants.contains(&ni) {
                     seen_num_constants.insert(ni);
                     pool.push(SynthPool {
-                        nodes: vec![Node::Num(*n)],
+                        nodes: vec![Node::Num(n)],
                         root: 0,
                         ret_type: TYPE_NUM,
                         priority: 0.0,
@@ -1060,7 +1087,7 @@ pub fn synthesize_full(
             if comp.arity == 1 {
                 for pi in prev.clone() {
                     let p = &pool[pi];
-                    if p.ret_type != comp.param_types[0] && comp.param_types[0] != 255 {
+                    if p.ret_type != comp.param_types[0] && comp.param_types[0] != 255 && p.ret_type != 255 {
                         continue;
                     }
                     if !hm_check_application(comp, &[p], &mut hm_counter) {
@@ -1077,12 +1104,12 @@ pub fn synthesize_full(
                 // Case 1: arg1 from new (prev), arg2 from all
                 for pi in prev.clone() {
                     let p1 = &pool[pi];
-                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 {
+                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 && p1.ret_type != 255 {
                         continue;
                     }
                     for ai in 0..all_end {
                         let p2 = &pool[ai];
-                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 {
+                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 && p2.ret_type != 255 {
                             continue;
                         }
                         if !hm_check_application(comp, &[p1, p2], &mut hm_counter) {
@@ -1099,12 +1126,12 @@ pub fn synthesize_full(
                 // Case 2: arg1 from old, arg2 from new (prev)
                 for ai in 0..prev_start {
                     let p1 = &pool[ai];
-                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 {
+                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 && p1.ret_type != 255 {
                         continue;
                     }
                     for pi in prev.clone() {
                         let p2 = &pool[pi];
-                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 {
+                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 && p2.ret_type != 255 {
                             continue;
                         }
                         if !hm_check_application(comp, &[p1, p2], &mut hm_counter) {
@@ -1134,13 +1161,13 @@ pub fn synthesize_full(
                 // Case 1: arg1 from prev, arg2+arg3 from all
                 for pi in prev.clone() {
                     let p1 = &pool[pi];
-                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 { continue; }
+                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 && p1.ret_type != 255 { continue; }
                     for a2 in 0..all_end {
                         let p2 = &pool[a2];
-                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 { continue; }
+                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 && p2.ret_type != 255 { continue; }
                         for a3 in 0..all_end {
                             let p3 = &pool[a3];
-                            if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 { continue; }
+                            if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 && p3.ret_type != 255 { continue; }
                             if !hm_check_application(comp, &[p1, p2, p3], &mut hm_counter) { continue; }
                             let inferred_ret = hm_infer_ret_type(comp, &[p1, p2, p3], &mut hm_counter);
                             let score = comp.priority + p1.priority + p2.priority + p3.priority;
@@ -1154,13 +1181,13 @@ pub fn synthesize_full(
                 // Case 2: arg1 from old, arg2 from prev, arg3 from all
                 for a1 in 0..prev_start {
                     let p1 = &pool[a1];
-                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 { continue; }
+                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 && p1.ret_type != 255 { continue; }
                     for pi in prev.clone() {
                         let p2 = &pool[pi];
-                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 { continue; }
+                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 && p2.ret_type != 255 { continue; }
                         for a3 in 0..all_end {
                             let p3 = &pool[a3];
-                            if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 { continue; }
+                            if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 && p3.ret_type != 255 { continue; }
                             if !hm_check_application(comp, &[p1, p2, p3], &mut hm_counter) { continue; }
                             let inferred_ret = hm_infer_ret_type(comp, &[p1, p2, p3], &mut hm_counter);
                             let score = comp.priority + p1.priority + p2.priority + p3.priority;
@@ -1174,13 +1201,13 @@ pub fn synthesize_full(
                 // Case 3: arg1+arg2 from old, arg3 from prev
                 for a1 in 0..prev_start {
                     let p1 = &pool[a1];
-                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 { continue; }
+                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 && p1.ret_type != 255 { continue; }
                     for a2 in 0..prev_start {
                         let p2 = &pool[a2];
-                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 { continue; }
+                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 && p2.ret_type != 255 { continue; }
                         for pi in prev.clone() {
                             let p3 = &pool[pi];
-                            if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 { continue; }
+                            if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 && p3.ret_type != 255 { continue; }
                             if !hm_check_application(comp, &[p1, p2, p3], &mut hm_counter) { continue; }
                             let inferred_ret = hm_infer_ret_type(comp, &[p1, p2, p3], &mut hm_counter);
                             let score = comp.priority + p1.priority + p2.priority + p3.priority;
@@ -1215,6 +1242,18 @@ pub fn synthesize_full(
                 n.push(Node::Symbol(intern(macro_name)));
                 let api = n.len();
                 n.push(Node::App(vec![map_sym, fn_sym, p.root]));
+                SynthPool { nodes: n, root: api, ret_type: desc.ret_type, priority: desc.score }
+            } else if comp.arity == 1 && bn.starts_with("reduce_") {
+                // Fused reduce component: emit (reduce <fn_name> arg)
+                let fn_name = &bn[7..]; // strip "reduce_" prefix
+                let p = &pool[desc.arg1];
+                let mut n = p.nodes.clone();
+                let reduce_sym = n.len();
+                n.push(Node::Symbol(intern("reduce")));
+                let fn_sym = n.len();
+                n.push(Node::Symbol(intern(fn_name)));
+                let api = n.len();
+                n.push(Node::App(vec![reduce_sym, fn_sym, p.root]));
                 SynthPool { nodes: n, root: api, ret_type: desc.ret_type, priority: desc.score }
             } else if comp.arity == 1 {
                 let p = &pool[desc.arg1];
@@ -1294,7 +1333,7 @@ pub fn synthesize_full(
                         let returns_target = comp2.ret_type == target || comp2.ret_type == TYPE_ANY;
                         let returns_useful = useful_types.contains(&comp2.ret_type);
                         if !returns_target && !returns_useful { continue; }
-                        if entry.ret_type != comp2.param_types[0] && comp2.param_types[0] != TYPE_ANY {
+                        if entry.ret_type != comp2.param_types[0] && comp2.param_types[0] != TYPE_ANY && entry.ret_type != TYPE_ANY {
                             continue;
                         }
                         let bn2 = comp2.builtin.as_ref().unwrap();
@@ -1308,6 +1347,21 @@ pub fn synthesize_full(
                             cn.push(Node::Symbol(crate::intern::intern(macro_name)));
                             let api = cn.len();
                             cn.push(Node::App(vec![map_sym, fn_sym, entry.root]));
+                            SynthPool {
+                                nodes: cn, root: api,
+                                ret_type: comp2.ret_type,
+                                priority: comp2.priority + entry.priority,
+                            }
+                        } else if bn2.starts_with("reduce_") {
+                            // Fused reduce: emit (reduce <fn_name> arg)
+                            let fn_name = &bn2[7..];
+                            let mut cn = entry.nodes.clone();
+                            let reduce_sym = cn.len();
+                            cn.push(Node::Symbol(crate::intern::intern("reduce")));
+                            let fn_sym = cn.len();
+                            cn.push(Node::Symbol(crate::intern::intern(fn_name)));
+                            let api = cn.len();
+                            cn.push(Node::App(vec![reduce_sym, fn_sym, entry.root]));
                             SynthPool {
                                 nodes: cn, root: api,
                                 ret_type: comp2.ret_type,
@@ -2022,6 +2076,54 @@ pub fn default_synth_components(
         name: "tail".into(), builtin: Some("tail".into()),
         arity: 1, ret_type: TYPE_LIST, param_types: vec![TYPE_LIST], priority: 0.0,
     });
+    comps.push(SynthComponent {
+        name: "nth".into(), builtin: Some("nth".into()),
+        arity: 2, ret_type: TYPE_ANY, param_types: vec![TYPE_LIST, TYPE_NUM], priority: 0.0,
+    });
+    comps.push(SynthComponent {
+        name: "list-length".into(), builtin: Some("length".into()),
+        arity: 1, ret_type: TYPE_NUM, param_types: vec![TYPE_LIST], priority: 0.0,
+    });
+    comps.push(SynthComponent {
+        name: "list-reverse".into(), builtin: Some("reverse".into()),
+        arity: 1, ret_type: TYPE_LIST, param_types: vec![TYPE_LIST], priority: 0.0,
+    });
+
+    // string-chars: str -> list (split string into character list)
+    comps.push(SynthComponent {
+        name: "string-chars".into(), builtin: Some("string-chars".into()),
+        arity: 1, ret_type: TYPE_LIST, param_types: vec![TYPE_STR], priority: 5.0,
+    });
+
+    // string-take: (str, num) -> str (first N characters)
+    comps.push(SynthComponent {
+        name: "string-take".into(), builtin: Some("string-take".into()),
+        arity: 2, ret_type: TYPE_STR, param_types: vec![TYPE_STR, TYPE_NUM], priority: 5.0,
+    });
+
+    // string-drop: (str, num) -> str (everything after first N characters)
+    comps.push(SynthComponent {
+        name: "string-drop".into(), builtin: Some("string-drop".into()),
+        arity: 2, ret_type: TYPE_STR, param_types: vec![TYPE_STR, TYPE_NUM], priority: 5.0,
+    });
+
+    // divide: (num, num) -> num
+    comps.push(SynthComponent {
+        name: "divide".into(), builtin: Some("divide".into()),
+        arity: 2, ret_type: TYPE_NUM, param_types: vec![TYPE_NUM, TYPE_NUM], priority: 0.0,
+    });
+
+    // floor: num -> num
+    comps.push(SynthComponent {
+        name: "floor".into(), builtin: Some("floor".into()),
+        arity: 1, ret_type: TYPE_NUM, param_types: vec![TYPE_NUM], priority: 0.0,
+    });
+
+    // string-slice: (str, num, num) -> str
+    comps.push(SynthComponent {
+        name: "string-slice".into(), builtin: Some("string-slice".into()),
+        arity: 3, ret_type: TYPE_STR, param_types: vec![TYPE_STR, TYPE_NUM, TYPE_NUM], priority: 5.0,
+    });
 
     // Add macro components — infer types by probing with sample inputs
     for (mname, params, mnodes, mroot) in macros {
@@ -2046,6 +2148,38 @@ pub fn default_synth_components(
                 builtin: Some(format!("map_{}", mname)),
                 arity: 1,
                 ret_type: TYPE_LIST,
+                param_types: vec![TYPE_LIST],
+                priority: 25.0,
+            });
+        }
+    }
+
+    // Fused reduce components for binary builtins with known return types.
+    // These emit (reduce <fn_name> <arg>) during materialization.
+    // NOT and/or — they are special forms, not callable values.
+    for &(name, ret) in &[
+        ("add", TYPE_NUM), ("subtract", TYPE_NUM), ("multiply", TYPE_NUM),
+        ("min", TYPE_NUM), ("max", TYPE_NUM), ("concat", TYPE_STR),
+    ] {
+        comps.push(SynthComponent {
+            name: format!("reduce_{}", name),
+            builtin: Some(format!("reduce_{}", name)),
+            arity: 1,
+            ret_type: ret,
+            param_types: vec![TYPE_LIST],
+            priority: 25.0,
+        });
+    }
+
+    // Fused reduce components for binary macros: reduce_m(list) -> inferred_ret
+    for (mname, params, mnodes, mroot) in macros {
+        if params.len() == 2 {
+            let (_, inferred_ret) = infer_macro_types(mname, params, mnodes, *mroot);
+            comps.push(SynthComponent {
+                name: format!("reduce_{}", mname),
+                builtin: Some(format!("reduce_{}", mname)),
+                arity: 1,
+                ret_type: inferred_ret,
                 param_types: vec![TYPE_LIST],
                 priority: 25.0,
             });
@@ -2394,7 +2528,7 @@ pub fn synthesize_optimize(
             if comp.arity == 1 {
                 for pi in prev.clone() {
                     let p = &pool[pi];
-                    if p.ret_type != comp.param_types[0] && comp.param_types[0] != 255 {
+                    if p.ret_type != comp.param_types[0] && comp.param_types[0] != 255 && p.ret_type != 255 {
                         continue;
                     }
                     let mut n = p.nodes.clone();
@@ -2416,12 +2550,12 @@ pub fn synthesize_optimize(
                 // Case 1: arg1 from new (prev), arg2 from all
                 for pi in prev.clone() {
                     let p1 = &pool[pi];
-                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 {
+                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 && p1.ret_type != 255 {
                         continue;
                     }
                     for ai in 0..all_end {
                         let p2 = &pool[ai];
-                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 {
+                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 && p2.ret_type != 255 {
                             continue;
                         }
                         let mut n = p1.nodes.clone();
@@ -2449,12 +2583,12 @@ pub fn synthesize_optimize(
                 if explored <= max_candidates {
                     for ai in 0..prev_start {
                         let p1 = &pool[ai];
-                        if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 {
+                        if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 && p1.ret_type != 255 {
                             continue;
                         }
                         for pi in prev.clone() {
                             let p2 = &pool[pi];
-                            if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 {
+                            if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 && p2.ret_type != 255 {
                                 continue;
                             }
                             let mut n = p1.nodes.clone();
@@ -2483,13 +2617,13 @@ pub fn synthesize_optimize(
                 // Case 1: arg1 from prev, arg2+arg3 from all
                 'a3c1: for pi in prev.clone() {
                     let p1 = &pool[pi];
-                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 { continue; }
+                    if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 && p1.ret_type != 255 { continue; }
                     for a2 in 0..all_end {
                         let p2 = &pool[a2];
-                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 { continue; }
+                        if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 && p2.ret_type != 255 { continue; }
                         for a3 in 0..all_end {
                             let p3 = &pool[a3];
-                            if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 { continue; }
+                            if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 && p3.ret_type != 255 { continue; }
                             let mut n = p1.nodes.clone();
                             let off2 = n.len();
                             for nd in &p2.nodes { n.push(remap_node(nd, off2)); }
@@ -2510,13 +2644,13 @@ pub fn synthesize_optimize(
                 if explored <= max_candidates {
                     'a3c2: for a1 in 0..prev_start {
                         let p1 = &pool[a1];
-                        if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 { continue; }
+                        if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 && p1.ret_type != 255 { continue; }
                         for pi in prev.clone() {
                             let p2 = &pool[pi];
-                            if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 { continue; }
+                            if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 && p2.ret_type != 255 { continue; }
                             for a3 in 0..all_end {
                                 let p3 = &pool[a3];
-                                if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 { continue; }
+                                if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 && p3.ret_type != 255 { continue; }
                                 let mut n = p1.nodes.clone();
                                 let off2 = n.len();
                                 for nd in &p2.nodes { n.push(remap_node(nd, off2)); }
@@ -2538,13 +2672,13 @@ pub fn synthesize_optimize(
                 if explored <= max_candidates {
                     'a3c3: for a1 in 0..prev_start {
                         let p1 = &pool[a1];
-                        if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 { continue; }
+                        if p1.ret_type != comp.param_types[0] && comp.param_types[0] != 255 && p1.ret_type != 255 { continue; }
                         for a2 in 0..prev_start {
                             let p2 = &pool[a2];
-                            if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 { continue; }
+                            if p2.ret_type != comp.param_types[1] && comp.param_types[1] != 255 && p2.ret_type != 255 { continue; }
                             for pi in prev.clone() {
                                 let p3 = &pool[pi];
-                                if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 { continue; }
+                                if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 && p3.ret_type != 255 { continue; }
                                 let mut n = p1.nodes.clone();
                                 let off2 = n.len();
                                 for nd in &p2.nodes { n.push(remap_node(nd, off2)); }

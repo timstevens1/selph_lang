@@ -2,9 +2,9 @@
 
 ## From Enumerative Solver to Self-Building Architecture
 
-**Version 0.8 — April 7, 2026**
+**Version 0.9 — April 7, 2026**
 
-Based on implementation experience with the v0.1 Architecture Spec, the Rust-native migration, the April 6-7 session (decomposition via synthesis, tracing, 7.2x search optimization, namespace literals, memorization), the April 7 session that added: bytecode VM (22.9x eval speedup), `synthesize` builtin `:library`/`:priorities` support, early depth extension for compositional search, optimization curriculum with meta-optimization, NL curriculum, and chained curriculum execution, and the April 7 evening session that added: unified library/tree/namespace loading, TYPE_LIST in the type system, higher-order synthesis via fused map components, 3-word sentence structures, and variable-length sentence tagging via `(string-join (map pos_tag (string-split x " ")) " ")`.
+Based on implementation experience with the v0.1 Architecture Spec, the Rust-native migration, the April 6-7 session (decomposition via synthesis, tracing, 7.2x search optimization, namespace literals, memorization), the April 7 session that added: bytecode VM (22.9x eval speedup), `synthesize` builtin `:library`/`:priorities` support, early depth extension for compositional search, optimization curriculum with meta-optimization, NL curriculum, and chained curriculum execution, the April 7 evening session that added: unified library/tree/namespace loading, TYPE_LIST in the type system, higher-order synthesis via fused map components, 3-word sentence structures, and variable-length sentence tagging via `(string-join (map pos_tag (string-split x " ")) " ")`, and the April 7 late session that added: full 3-domain chained curriculum (55/55 tasks), trace instrumentation infrastructure (`--trace` JSON output), and meta-optimization Stage 3 — multi-task heuristic learning across the full task suite, producing the `priority-plus-type-match` heuristic (26/55 vs 21/55 baseline at budget 5000).
 
 ---
 
@@ -86,44 +86,51 @@ The system now runs as a single Rust binary (`selph`) with zero runtime dependen
 - `synthesize` exposed as a SELPH builtin for self-improvement loops; accepts `:library` (namespace of macros) and `:priorities` (namespace of component name → priority boost)
 - Meta-heuristic synthesis available via `--meta` flag (failure-triggered, not periodic)
 
-### 2.7 CLI Commands (10 total)
+### 2.7 CLI Commands (11 total)
 ```
 selph eval       Evaluate SELPH files or expressions
 selph parse      Parse and print AST
 selph synth      Synthesize from examples (--tree, --minimize, --maximize, --validate)
-selph grow       Run curriculum (--meta, --extract, --validate, --filter, --tree)
+selph grow       Run curriculum (--meta, --extract, --validate, --filter, --tree, --trace, --heuristic)
 selph bench      Run stochastic benchmark suite
 selph generate   Generate a curriculum in .selph format
 selph verify     Verify a program against a spec
 selph multi-synth Synthesize across namespace trees
+selph meta-opt   Optimize heuristics from trace data (--trace, --library, --budget)
 selph repl       Interactive REPL
 selph help       Show usage
 ```
 
-### 2.8 Rust Modules (17 source files)
-types.rs, parser.rs, eval.rs, synth.rs, hm.rs, library.rs, namespace.rs, induce.rs, divide.rs, verify.rs, abstraction.rs, multitree.rs, stochastic.rs, meta.rs, taskgen.rs, intern.rs, vm.rs
+### 2.8 Rust Modules (18 source files)
+types.rs, parser.rs, eval.rs, synth.rs, hm.rs, library.rs, namespace.rs, induce.rs, divide.rs, verify.rs, abstraction.rs, multitree.rs, stochastic.rs, meta.rs, taskgen.rs, intern.rs, vm.rs, trace.rs
 
 222 tests, all passing.
 
 ### 2.9 Validated Results
 
-**Sequence curriculum (13 tasks): 13/13 (100%)**
+**Sequence curriculum (13 tasks): 13/13 (100%) — list inputs, 0.7s**
+
+Inputs are native lists `(idx v0 v1 v2 v3)`, not encoded strings. No `seq_helpers.selph` needed — `head`, `nth`, `tail` are builtin list ops. Type filtering excludes all string operations, yielding 28x fewer candidates vs string encoding.
 
 | Task | Candidates | Solution |
 |------|-----------|----------|
 | const_1 | 2 | `1` |
 | const_5 | 6 | `5` |
-| identity | 13 | `(idx x)` |
-| double_idx | 1,987 | `(add (idx x) (idx x))` |
-| triple_idx | 2,395 | `(add (idx x) (double_idx x))` |
-| last_plus_1 | 1,510 | `(add (count-char x x) (last x))` |
-| last_minus_1 | 1,721 | `(subtract (v3 x) (count-char x x))` |
-| **squares** | **5,930** | **`(multiply (idx x) (idx x))`** |
-| triangular | 2,099 | `(add (idx x) (last x))` |
-| fibonacci | 9,574 | `(add (v3 x) (v2 x))` |
-| double_prev | 2,509 | `(add (last x) (last x))` |
-| **cubes** | **9,794** | **`(multiply (idx x) (squares x))`** |
-| idx_plus_last | 59 | `(triangular x)` |
+| identity | 502 | `(head x)` |
+| double_idx | 81 | `(multiply (head x) 2)` |
+| triple_idx | 33 | `(multiply (head x) 3)` |
+| last_plus_1 | 3,425 | `(add (nth x 1) 4)` |
+| last_minus_1 | 558 | `(subtract (nth x 1) 4)` |
+| **squares** | **249** | **`(multiply (nth x 0) (head x))`** |
+| triangular | 1,048 | `(add (nth x 4) (head x))` |
+| fibonacci | 1,056 | `(add (nth x 4) (nth x 3))` |
+| double_prev | 453 | `(multiply (nth x 1) 16)` |
+| **cubes** | **6,116** | **`(multiply (squares x) (nth x 0))`** |
+| idx_plus_last | 1,307 | `(add (nth x 4) (nth x 0))` |
+
+Key improvement: `squares` found in 249 candidates (was 5,930 with string encoding). `cubes` composes `squares` — library cascade works with list types.
+
+Previous string-encoded results (for reference): 415K candidates, 27s. List inputs: 14.8K candidates, 0.7s.
 
 **Context-free language curriculum (20 tasks): 20/20 (100%) in 15.7 seconds** (was 293s before optimizations; 96s after search opts; 15.7s after bytecode VM)
 
@@ -180,7 +187,18 @@ Candidates compiled to bytecodes via `vm.rs`. String interning (`intern.rs`) rep
 VM supports: builtins, pre-compiled macro calls, if-expressions, constants. Unsupported constructs (e.g., `ns` special form in memorized macros) fall back to tree-walker automatically.
 
 ### 2.12 Chained Curriculum
-Validated: sequence (13 tasks) → CF (20 tasks) = 33/33 (100%). Library grows from 6 helpers → 17 after sequence → 37 after CF. Cross-domain macro filtering via `scope_library_for_task` ensures sequence macros don't pollute CF search space.
+Validated: sequence (13) → CF (20) → NL (22) = **55/55 (100%)** in ~31 minutes (release build). Library grows from 6 helpers → 20 after sequence → 47 after CF → 69 after NL. Domain isolation via separate `grow` runs (not a single run) is essential: loading all helpers simultaneously causes cross-domain pollution (sequence tasks find wrong D&C solutions using NL macros like `first_word`). Orchestrated via `run_full_chain.sh`.
+
+| Stage | Tasks | Solved | Candidates | Time | Library |
+|-------|-------|--------|-----------|------|---------|
+| Sequence (list inputs) | 13 | 13/13 | **14.8K** | **0.7s** | 0 → 15 |
+| CF | 20 | 20/20 | 802K | 111s | 22 → 42 |
+| NL | 22 | 22/22 | 2.8M | 1650s | 47 → 69 |
+| **Total** | **55** | **55/55** | **3.7M** | **~29m** | **0 → 69** |
+
+Previous (string-encoded sequence): 4.8M candidates, ~31m. List inputs yield 28x sequence speedup and correct compositional solutions (no D&C memorization for squares/cubes).
+
+RL coefficients transfer across stages: cold=-50.8, warm=30.4 after CF, carried into NL.
 
 ### 2.13 Optimization Curriculum & Meta-Optimization
 `(opt-task ...)` form in curriculum runner dispatches to `synthesize_optimize`. Validated on 5 tasks including constant optimization, constrained optimization, and **meta-optimization** — a fitness function that calls `synthesize` internally to measure candidate count, enabling the system to optimize its own search strategy.
@@ -216,6 +234,20 @@ Libraries, trees, and namespaces are unified into a single concept. A library fi
 Validated: `(string-join (map pos_tag (string-split x " ")) " ")` found in 230 candidates (0.054s). Works for 2-word, 3-word, and any-length sentences.
 
 The `synthesize` builtin accepts `:library` (namespace of macros) for SELPH-level library control, and `:priorities` for search tuning.
+
+### 2.17 List-Typed Inputs and Element Type Inference
+Curriculum tasks can now use native list inputs: `((4 0 1 4 9) 16)` instead of `("4 0 1 4 9" 16)`. The task parser (`node_to_value`) recursively converts `Node::App` to `Value::List`. The grow command infers element types from list contents: if all elements are numbers, `head`/`nth` return `TYPE_NUM` instead of `TYPE_ANY`.
+
+This eliminates the need for `seq_helpers.selph` — `idx` becomes `(head x)`, `v3` becomes `(nth x 4)`, `last` becomes `(head (list-reverse x))`. Type filtering correctly excludes string operations since inputs are `TYPE_LIST`, not `TYPE_STR`.
+
+**28x candidate reduction:** sequence curriculum drops from 415K candidates (string encoding) to 14.8K (list inputs). `squares` goes from 5,930 to 249 candidates. `cubes` still composes `squares` — library cascade works with list types.
+
+Additional list synthesis components: `nth : list × num → any`, `list-length : list → num`, `list-reverse : list → list`.
+
+**TYPE_ANY fix:** Pool entries with `ret_type = TYPE_ANY` (e.g., from polymorphic builtins like `head : list(a) → a`) now match any parameter type during candidate generation. Previously, `TYPE_ANY` was only treated as a wildcard on the *parameter* side, not the *return* side, causing `head(x)` to be invisible to `multiply`. When HM inference returns `TYPE_ANY` for an unresolved type variable but the component has been patched with a concrete return type, the concrete type is preferred.
+
+### 2.18 Merged Library Output
+The `grow` command now serializes all macros from `all_macros` (the in-memory deduplicated set) instead of embedding raw library source strings. This ensures chained curriculum outputs contain all macros from all loaded libraries, not just the first one. D&C solutions are now also registered into `all_macros` so they can be used by later tasks in the same run and persisted correctly.
 
 ---
 
@@ -265,8 +297,8 @@ Each meta-level uses the infrastructure from the level below it, and the learned
          (lambda (heuristic)
            (total-candidates-using heuristic task-suite))))
 ```
-**Current status:** Heuristics as SELPH programs work. Interleaved online learning updates priorities. Domain-specific heuristic gives 23.5x speedup.
-**What's missing:** The heuristic needs to read task features (not just component metadata) to generalize across task types.
+**Current status:** Heuristics as SELPH programs work. Interleaved online learning updates priorities. Domain-specific heuristic gives 23.5x speedup. **Multi-task meta-optimization validated (Stage 3):** `selph meta-opt` evaluates 8 candidate heuristic programs across the full 55-task suite using trace data from chained curriculum runs. Winner: `priority-plus-type-match` — blends learned priority with +50 return-type match bonus. Solves 26/55 vs 21/55 baseline at budget 5000. Notable per-task improvements: `first_of_sentence` 50x faster (1152→23 candidates), `last_of_sentence` 46x faster.
+**What's missing:** Heuristics are still selected from 8 hand-crafted templates. The next step (Stage 4) is to synthesize heuristic programs via the synthesizer itself — synthesis of search strategies. The heuristic also doesn't yet read task-specific features (example patterns, example count) beyond type tags.
 
 **Curriculum design:**
 - Stage M1.0: Learn to predict output type from examples
@@ -368,14 +400,21 @@ Phase 1: Enumerative solver (DONE)
   - Generates training data for all meta-levels
   - Establishes the curriculum framework
 
-Phase 2: Learned heuristics (VALIDATED)
+Phase 2: Learned heuristics (INTEGRATED — heuristic wired into grow)
   - Meta-1 replaces hardcoded search ordering
   - First loop validated: meta_count_char_boost synthesized a priority
     boost by running synthesis inside the fitness function (0.7s)
   - The synthesize builtin accepts :priorities and :library for
     SELPH-level control of search strategy
-  - Training data: synthesis logs from Phase 1 + chained curriculum (33 tasks)
-  - Validation: does learned heuristic match domain-specific hand-written ones?
+  - Multi-task meta-optimization (Stage 3) validated on 55-task suite:
+    priority-plus-type-match heuristic solves 26/55 vs 21/55 baseline
+    (1.1x speedup, 50x on first_of_sentence)
+  - `--heuristic` flag integrated: loads a SELPH lambda, applies per-task
+    via meta::apply_heuristic() with full task context. Sequence curriculum:
+    13,721→11,263 cand (~2x wall-clock speedup), identity 42x faster.
+  - Training data: trace JSON from 3-domain chained curriculum (55 tasks)
+  - Validation: learned heuristic solves 5 more tasks than baseline
+  - Remaining: Stage 4 — synthesize heuristics via the synthesizer itself
 
 Phase 3: Learned decomposition
   - Meta-2 replaces hardcoded induction/D&C
@@ -521,12 +560,21 @@ Candidate generation and materialization extended to arity-3 with adaptive type-
 ### 8.9 ~~Boolean decomposition fallback~~ ✓
 When flat synthesis fails on bool-target tasks, tries all `(and P Q)`, `(or P Q)`, `(not P)` combinations of bool-returning macros. O(macros²).
 
+### 8.10 ~~Full 3-domain chained curriculum~~ ✓
+Sequence (13) → CF (20) → NL (22) = 55/55 (100%) via `run_full_chain.sh`. Three separate `grow` runs with domain-scoped helpers, each feeding its output library to the next. Total: 4.8M candidates, ~31 minutes (release build). Library grows from 6 → 69 macros. Key insight: domain isolation via separate runs is essential — single-run with all helpers causes cross-domain search pollution.
+
+### 8.11 ~~Trace instrumentation~~ ✓
+`--trace trace.json` flag on `grow` command. `trace.rs` captures per-task: candidates explored, wall time, solving strategy (Flat/BD/Induction/D&C/Memo), task features (input type, output type, num examples, library size), components used, components available. Manual JSON serialization (no serde dependency). Three trace files generated per chained run.
+
+### 8.12 ~~Meta-optimization Stage 3: multi-task heuristic learning~~ ✓
+`selph meta-opt` command reads trace JSON + curriculum files, rebuilds training tasks, evaluates 8 hand-crafted heuristic templates by re-running synthesis across the full 55-task suite. Winner: `priority-plus-type-match` — `(lambda (ctx) (add (ns-get ctx "priority") (if (= (ns-get ctx "ret-type") (ns-get ctx "output-type")) 50.0 0.0)))`. Solves 26/55 vs 21/55 baseline at budget 5000 (1.1x candidate reduction, up to 50x on individual tasks). Saved to `chain_output/heuristic_priority_plus_type_match.selph`.
+
 ---
 
 ## 9. Immediate Next Steps
 
-### ~~9.1 Chained curriculum execution~~ ✓
-Validated: sequence (13 tasks) → CF (20 tasks) = 33/33 (100%). Library grows from 6 helpers → 17 after sequence → 37 after CF. Cross-domain macro filtering ensures sequence macros don't pollute CF search space. RL coefficients transfer across domains.
+### ~~9.1 Chained curriculum execution~~ ✓ (extended to 3-domain)
+Validated: sequence (13) → CF (20) → NL (22) = 55/55 (100%). Library grows 6 → 69 macros. Domain isolation via separate `grow` runs prevents cross-domain pollution. RL coefficients transfer across stages.
 
 ### ~~9.2 Early depth extension~~ ✓
 Implemented as targeted composition probe: after each depth-1 candidate, immediately try composing it with arity-1 components whose return type matches the target. Finds `(is_noun (last_word x))` in 8 candidates instead of exhausting 200K. Combined with bytecode VM, the CF curriculum runs in 15.7s (was 293s baseline).
@@ -581,20 +629,42 @@ TYPE_LIST (u8=3) added to the type system. `string-split`, `string-join`, `head`
 - **Libraries, trees, and namespaces are the same thing:** A library IS a namespace. Loading a file evaluates it and extracts `RustMacro` entries from the resulting namespace. No separate `--tree` concept — everything goes through `--library`. Homoiconicity demands it: data must be expressible as code, and code must be loadable as data.
 - **Fused components bridge higher-order and first-order synthesis:** Instead of teaching the synthesizer about function-typed pool entries, generate `map_<macro>` components that materialize as `(map macro list)`. The synthesizer treats them as regular arity-1 list→list operations. This is decomposition: higher-order synthesis becomes first-order + naming.
 - **Chained early depth extension catches multi-step type conversions:** The original probe only tried compositions whose return type matched the target. With TYPE_LIST, the answer requires LIST as an intermediate: `string-split → map → string-join`. The chained probe follows intermediate useful types, testing arity-2 compositions on the result.
+- **Use native types, not string encoding:** Sequence inputs should be lists `(4 0 1 4 9)`, not strings `"4 0 1 4 9"`. With list inputs, the type system sees `list → number` and excludes all string operations automatically. This yields 28x candidate reduction for the sequence curriculum. String encoding forces parsing helpers (`idx`, `v0`) and allows string ops to pollute the search space. Lisp got this right: data should carry its type.
+- **Domain isolation is essential for chained curricula:** Loading helpers from all domains in a single `grow` run causes catastrophic search pollution. Sequence tasks find wrong D&C solutions using NL helpers (`first_word`, `string-starts-with`). The fix is chaining separate `grow` runs, where each run only loads domain-relevant helpers plus the accumulated library from prior stages. This is orchestrated via `run_full_chain.sh`.
+- **Meta-optimization works at modest scale:** 8 hand-crafted heuristic templates, evaluated on 55 tasks at budget 5000 each, found a heuristic that solves 5 additional tasks. The key signal is return-type matching: boosting components whose output type matches the target. This is a learned version of what type reachability filtering does statically — but applied as a soft priority rather than a hard filter.
+- **Trace data enables offline heuristic search:** By recording per-task features, candidate counts, and component usage during curriculum runs, heuristic optimization can be done offline — re-running synthesis with different priority orderings without regenerating traces. The `meta-opt` command demonstrates this: it reads trace JSON, rebuilds training tasks from curriculum files, and evaluates heuristics by actual synthesis, not proxy metrics.
 
 ### 9.13 Next priorities (updated April 7, 2026)
 
-With 3-word structures, unified loading, TYPE_LIST, and `map` synthesis all complete, the priority shifts toward scaling and meta-learning:
+With 55-task chained curriculum validated and meta-optimization Stage 3 complete, the priority shifts toward integrating the learned heuristic and extending the system's capabilities:
+
+**Completed (April 7 evening):**
+
+1. ~~**Full chained curriculum: sequence → CF → NL.**~~ ✓ Chain all three domains via `run_full_chain.sh`: 13 + 20 + 22 = 55/55 solved (100%). Library grows from 6 → 20 → 47 → 69 macros across stages. Domain isolation via separate grow runs prevents cross-domain pollution. Trace output via `--trace` flag captures per-task candidates, strategy, timing, features, and components used.
+
+   Results: Seq 27s (415K cand), CF 135s (907K cand), NL 1680s (3.5M cand). Total: ~31 minutes, 4.8M candidates.
+
+   Key insight: Loading all three helper libraries in a single run causes massive search space pollution — sequence tasks find wrong D&C solutions using NL helpers like `first_word`. Chaining separate runs with domain-specific helpers is essential.
+
+2. ~~**Meta-optimization Stage 3: multi-task heuristic learning.**~~ ✓ `selph meta-opt` command reads trace JSON from chained runs, rebuilds training tasks, and evaluates 8 candidate heuristics by re-running synthesis on the full 55-task suite. Winner: `priority-plus-type-match` — blends learned priority with +50 return-type match bonus.
+
+   Results at budget 5000: baseline 21/55 solved → **26/55 solved** (+5 tasks, 1.1x speedup). Notable: `first_of_sentence` 50x faster (1152→23 cand), `last_of_sentence` 46x faster. Heuristic saved to `chain_output/heuristic_priority_plus_type_match.selph`.
+
+   Infrastructure added: `trace.rs` (JSON serialization), `--trace` flag on `grow`, `meta-opt` CLI command with trace JSON parser. All without external dependencies (no serde).
+
+**Completed (April 7 night):**
+
+1. ~~**Integrate winning heuristic into grow command.**~~ ✓ `--heuristic <file>` flag loads a SELPH lambda and applies it per task via `meta::apply_heuristic()`. Each component is scored by the heuristic with full task context (input/output types, example count) and component metadata (name, arity, return type, priority). Replaces static priority ordering with learned, task-dependent ordering.
+
+   Results on sequence curriculum (budget 5000): baseline 13,721 cand / 6.1s → **11,263 cand / 3.1s** (~2x speedup). Notable: `identity` 42x faster (502→12 cand), `last_plus_1` ~10x faster (3425→350 cand). The heuristic composes with existing learned-priority and RL-coefficient systems — heuristic scoring incorporates the accumulated priority from prior solves.
 
 **Highest-value next steps:**
 
-1. **Full chained curriculum: sequence → CF → NL.** Chain all three domains into one pipeline: 13 + 20 + 22 = 55 tasks, ~40+ macros. This is the training set for real meta-optimization. Tests cross-domain library scaling.
+1. **Types as a SELPH program.** The type vocabulary (NUM, STR, BOOL, LIST) is currently hardcoded. Making type inference a curriculum target lets the system learn to expand its own type vocabulary. A type inference stage teaches "if `string-split` produces it, and `head` consumes it, they share a type."
 
-2. **Meta-optimization Stage 3: multi-task heuristic learning.** With 55 tasks and traces, synthesize a priority function that minimizes total candidates across the full suite. Uses the `:priorities` field in the `synthesize` builtin.
+2. **`reduce`/`fold` as synthesis components.** Extends higher-order synthesis beyond `map`. Needed for context-sensitive languages (a^n b^n c^n) and accumulator-based processing. Same fused-component approach: `reduce_<macro>` auto-generated for each binary macro.
 
-3. **Types as a SELPH program.** The type vocabulary (NUM, STR, BOOL, LIST) is currently hardcoded. Making type inference a curriculum target lets the system learn to expand its own type vocabulary. A type inference stage teaches "if `string-split` produces it, and `head` consumes it, they share a type."
-
-4. **`reduce`/`fold` as synthesis components.** Extends higher-order synthesis beyond `map`. Needed for context-sensitive languages (a^n b^n c^n) and accumulator-based processing. Same fused-component approach: `reduce_<macro>` auto-generated for each binary macro.
+3. **Deeper meta-optimization.** The current Stage 3 evaluates 8 hand-crafted heuristic templates. Stage 4 would synthesize heuristic programs via the synthesizer itself — synthesis of search strategies. The `meta_count_char_boost` precedent (§2.13) shows this is feasible.
 
 **Lower priority (infrastructure):**
 - Fix the `synthesize` builtin's `:library` extraction for defmacro-captured macros
@@ -608,7 +678,7 @@ With 3-word structures, unified loading, TYPE_LIST, and `map` synthesis all comp
 
 The growing system plan succeeds if:
 
-1. **Phase 2 validation:** A learned SELPH heuristic outperforms the default ordering on held-out tasks without domain-specific engineering.
+1. **Phase 2 validation:** A learned SELPH heuristic outperforms the default ordering on held-out tasks without domain-specific engineering. **Partially met:** `priority-plus-type-match` solves 5 more tasks than baseline (26 vs 21 at budget 5000) with up to 50x speedup on individual tasks. The heuristic is domain-general (return-type matching), not domain-specific. Remaining: validate on held-out tasks from unseen domains.
 
 2. **Phase 3 validation:** A learned SELPH decomposer solves tasks that the flat solver + hand-written induction can't.
 
