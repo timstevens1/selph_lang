@@ -68,7 +68,8 @@ The system now runs as a single Rust binary (`selph`) with zero runtime dependen
 - Failure-driven induction (intermediate value decomposition)
 - Observational equivalence deduplication
 - **Bytecode VM fast path:** candidates compiled to bytecodes for evaluation (22.9x speedup). Macros with unsupported constructs (e.g., `ns` special form) automatically fall back to tree-walker.
-- **Early depth extension:** after each depth-1 candidate, immediately try composing it with arity-1 components whose return type matches the target. Finds `(is_noun (last_word x))` in 8 candidates instead of exhausting 200K. Key enabler for compositional NL tasks.
+- **Early depth extension:** after each candidate, immediately try composing it with arity-1 and arity-2 components whose return type matches the target. Finds `(is_noun (last_word x))` in 8 candidates instead of exhausting 200K. Expensive chained probes (arity-2 intermediate → arity-2 final) gated to depth 2+ to avoid blowing up the search at depth 1. Key enabler for compositional NL tasks.
+- **Domain-based component filtering:** at synthesis start, computes "reachable types" from input/output types and excludes all components whose param/return types are outside that set. Grid components excluded for string tasks, string ops excluded for pure numeric tasks, etc. Combined with lazy grid registration (`default_synth_components_opts`), reduces component count from 120 to 67 for non-grid tasks. **300x speedup** on arithmetic curriculum, **155x candidate reduction** on trivial string tasks.
 - **Auto-constant extraction:** unique characters and numbers from examples added to pool, scored by frequency
 - **Probe-and-filter:** macros that error on actual inputs automatically excluded
 - **Trivial promotion skip:** prevents self-referential macros (e.g., `(defmacro f (x) (f x))`)
@@ -588,7 +589,7 @@ Fused `reduce_<fn>` components for binary builtins (`add`, `subtract`, `multiply
 Removed blanket `param_types` override in `cmd_synth`/`cmd_curriculum` that rewrote all macro types to match input type. This destroyed inferred types for cross-type macros (e.g., `halve: num→num` became `str→str` on string-input tasks), causing probe-and-filter to incorrectly exclude them. Also added type-aware probe-and-filter: macros whose param type doesn't match the input type are skipped (not probed with wrong input). Together, these fixes enable cross-type compositions like `(halve (string-length x))`.
 
 ### 8.17 ~~Arithmetic and string slicing curricula~~ ✓
-- **`arithmetic_tasks.selph`** (2 tasks): `halve` → `(floor (divide x 2))` in 168K candidates, `third` → `(floor (divide x 3))` in 2.6K (warmed by halve).
+- **`arithmetic_tasks.selph`** (2 tasks): `halve` → `(floor (divide x 2))` in 169K candidates (0.19s), `third` → `(floor (divide x 3))` in 3.9K (0.68s, warmed by halve). Total: 0.9s (was 269.6s before domain filtering fix, see §8.19).
 - **`string_slice_tasks.selph`** (7 tasks): prefix/suffix extraction via `string-take`/`string-drop`, composes with promoted `halve` for `half_len` → `(halve (string-length x))`.
 - **`run_full_chain.sh`** extended to 6 stages: seq → CF → NL → arithmetic → string slicing → CS.
 
@@ -601,6 +602,26 @@ Removed blanket `param_types` override in `cmd_synth`/`cmd_curriculum` that rewr
 Key design: the "flattening trick" — ctx namespace fields become depth-0 atoms during enumeration, then get wrapped back into `(ns-get ctx "field")` via `wrap_as_lambda()` to produce valid SELPH. This transforms heuristic synthesis from "programs over namespaces" into "arithmetic expressions over 7 variables" — exactly what the enumerator does well.
 
 Infrastructure: `enumerate_heuristic_candidates()` and `validate_heuristic_candidates()` in `meta.rs`, `run_meta_eval_with_snapshots()` in `main.rs` for PoolSnapshot capture. 230 tests (8 new), all passing.
+
+### 8.19 ~~Domain-based component filtering and search regression fix~~ ✓ (April 8, 2026)
+
+The ARC-AGI grid infrastructure (commit 91b1655) added ~50 grid components to `default_synth_components`, inflating the component count from 46 to 120 for ALL synthesis runs. Combined with the early depth extension's speculative probing (which multiplies combinatorially with component count), this caused severe regressions on non-grid tasks:
+
+| Benchmark | Before (46 comp) | Broken (120 comp) | Fixed (67 comp) |
+|-----------|-------------------|--------------------|------------------|
+| string-upper | 22 cand, 0.004s | 3,412 cand, 0.473s | 159 cand, 0.012s |
+| arithmetic halve | — | 275K cand, 2.5s (overfitted) | 169K cand, 0.19s (correct) |
+| arithmetic third | — | 149s (overfitted w/ if-exprs) | 0.68s (correct `floor(divide x 3)`) |
+
+**Three fixes:**
+
+1. **Domain-based component filtering** (`synthesize_full`): Computes "reachable types" from input/output types. A component is kept only if all its param types and return type are in the reachable set. For string→string tasks, grid components are unreachable. Also always includes BOOL (for if-conditions) and NUM (common intermediate). STR and LIST co-include each other (string-split/join bridge them).
+
+2. **Chained probe depth gating**: The early depth extension's expensive chained probes (arity-1 → intermediate type → arity-2 final) now only run at depth 2+. Cheap arity-1 and arity-2 probes still run at all depths (needed for finding `(add (add x x) 1)` at depth 1).
+
+3. **Lazy grid registration**: `default_synth_components_opts(macros, include_grid)` only registers grid components when the `include_grid` flag is true. Call sites in `cmd_synth`, `cmd_curriculum`, and `cmd_arc` pass `input_is_grid`. The no-arg `default_synth_components()` wrapper defaults to `false`.
+
+**Net effect:** Arithmetic curriculum 269.6s → 0.9s (**300x**). CF curriculum 20/20 in 31.7s. "third" now finds the correct generalization instead of memorizing with if-expressions.
 
 ---
 

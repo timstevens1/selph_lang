@@ -276,7 +276,7 @@ fn cmd_synth(args: &[String]) {
     let input_is_grid = matches!(&inputs[0], Value::Grid(_));
 
     // Build components
-    let mut synth_comps = synth::default_synth_components(&macros);
+    let mut synth_comps = synth::default_synth_components_opts(&macros, input_is_grid);
     if input_is_grid {
         for comp in &mut synth_comps {
             if comp.name == "x" { comp.ret_type = synth::TYPE_GRID; }
@@ -1061,7 +1061,7 @@ fn cmd_curriculum(args: &[String]) {
         let num_synth_comps_before = 0usize; // will be set after component creation
         let mut trace_steps: Vec<trace::SolveStep> = Vec::new();
         let input_is_grid = matches!(&inputs[0], Value::Grid(_));
-        let mut synth_comps = synth::default_synth_components(&all_macros);
+        let mut synth_comps = synth::default_synth_components_opts(&all_macros, input_is_grid);
         let extra_bindings: Vec<(String, Value)> = Vec::new();
         if input_is_grid {
             for comp in &mut synth_comps {
@@ -2204,7 +2204,7 @@ fn cmd_arc(args: &[String]) {
         let total = tasks.len();
         for task in &tasks {
             let (inputs, expected) = arc::arc_task_to_spec(task);
-            let mut synth_comps = synth::default_synth_components(&macros);
+            let mut synth_comps = synth::default_synth_components_opts(&macros, true);
             // Set x type to grid
             for comp in &mut synth_comps {
                 if comp.name == "x" { comp.ret_type = synth::TYPE_GRID; }

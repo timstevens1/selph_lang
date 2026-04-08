@@ -681,31 +681,58 @@ pub fn synthesize_full(
 
     // Fix up `x` variable type: its ret_type should match the actual
     // input type, not always be TYPE_NUM.
+    //
+    // ── Domain-based component filtering ──────────────────────────────
+    // Determine which type domains are "reachable" from the input/output
+    // types.  A component is kept only if ALL its param types and its
+    // return type belong to the reachable set.  This eliminates entire
+    // irrelevant domains (e.g. all grid ops for string tasks) early,
+    // massively reducing the combinatorial search space.
+    let reachable_types: HashSet<u8> = {
+        let mut reach = HashSet::new();
+        reach.insert(TYPE_ANY); // always reachable
+        // Seed with input and output types
+        if let Some(it) = input_type { reach.insert(it); }
+        if let Some(ot) = target_output_type { reach.insert(ot); }
+        // Always include BOOL (needed for if-conditions) and NUM (common intermediate)
+        reach.insert(TYPE_BOOL);
+        reach.insert(TYPE_NUM);
+        // If either input or output is LIST or STR, include both
+        // (string-split produces LIST from STR, string-join produces STR from LIST)
+        if reach.contains(&TYPE_STR) || reach.contains(&TYPE_LIST) {
+            reach.insert(TYPE_STR);
+            reach.insert(TYPE_LIST);
+        }
+        reach
+    };
+
     let scoped_components: Vec<&SynthComponent> = {
-        // Keep all components — only exclude those that are provably
-        // useless:  pure string→string ops when output is numeric, and
-        // pure num→num ops when output is string (at depth >= 2 these
-        // may still be useful as intermediates, but str→str when we
-        // need num can never help).
         let mut scoped: Vec<&SynthComponent> = Vec::new();
         for comp in components.iter() {
-            // Fix x's type tag to match actual input type
-            // (We can't mutate, so we handle x specially in the pool below)
+            if comp.arity == 0 {
+                // Atoms: keep if their type is reachable
+                if reachable_types.contains(&comp.ret_type) {
+                    scoped.push(comp);
+                }
+                continue;
+            }
+            // Skip components that operate in unreachable domains
+            let all_types_reachable = comp.param_types.iter().all(|&pt| reachable_types.contains(&pt))
+                && reachable_types.contains(&comp.ret_type);
+            if !all_types_reachable { continue; }
 
             // Exclude pure string→string ops when target is numeric
             if let Some(target) = target_output_type {
                 if target == TYPE_NUM
                     && comp.ret_type == TYPE_STR
-                    && comp.arity > 0
                     && !comp.param_types.is_empty()
                     && comp.param_types[0] == TYPE_STR
                 {
-                    continue; // e.g. string-upper, string-lower when we need numbers
+                    continue;
                 }
-                // Exclude pure num→num ops when target is string (and no macros bridge)
+                // Exclude pure num→num ops when target is string
                 if target == TYPE_STR
                     && comp.ret_type == TYPE_NUM
-                    && comp.arity > 0
                     && !comp.param_types.is_empty()
                     && comp.param_types[0] == TYPE_NUM
                 {
@@ -719,7 +746,10 @@ pub fn synthesize_full(
             let conditions = scope_for_condition(components);
             for c in conditions {
                 if !scoped.iter().any(|s| std::ptr::eq(*s, c)) {
-                    scoped.push(c);
+                    // Only add if all types are reachable
+                    let ok = c.param_types.iter().all(|&pt| reachable_types.contains(&pt))
+                        && reachable_types.contains(&c.ret_type);
+                    if ok { scoped.push(c); }
                 }
             }
         }
@@ -1324,9 +1354,9 @@ pub fn synthesize_full(
             // ── Early depth extension: targeted composition probe ────────
             // For each new pool entry, immediately try composing it with
             // components whose output type matches the target:
-            //   - Arity-1: (comp entry) — catches (is_noun (last_word x))
-            //   - Arity-2: (comp entry pool_entry) and (comp pool_entry entry)
-            //     — catches concat(tag_first(x), concat(" ", tag_last(x)))
+            //   - Arity-1: (comp entry) — always done (cheap, catches 2x+1 etc.)
+            //   - Chained + Arity-2 probes — only at depth 2+ (expensive, not
+            //     needed when depth-2 iteration will cover them systematically)
             {
                 if let Some(target) = target_output_type {
                     // Arity-1 probe: try components that return target type OR
@@ -1389,7 +1419,8 @@ pub fn synthesize_full(
                         // Chained probe: if composed returns a useful non-target type,
                         // try arity-2 compositions that convert it to the target.
                         // Catches: (string-join (map_pos_tag (string-split x " ")) " ")
-                        if composed.ret_type != target && useful_types.contains(&composed.ret_type) {
+                        // Only at depth 2+: these are expensive and redundant at depth 1.
+                        if _depth >= 2 && composed.ret_type != target && useful_types.contains(&composed.ret_type) {
                             for comp3 in components.iter() {
                                 if comp3.arity != 2 || comp3.builtin.is_none() { continue; }
                                 if comp3.ret_type != target && comp3.ret_type != TYPE_ANY { continue; }
@@ -1935,6 +1966,16 @@ fn infer_macro_types(
 pub fn default_synth_components(
     macros: &[(String, Vec<String>, Vec<Node>, usize)],
 ) -> Vec<SynthComponent> {
+    default_synth_components_opts(macros, false)
+}
+
+/// Build synthesis components with optional grid domain.
+/// When `include_grid` is false, all grid-typed components are omitted,
+/// reducing the search space for non-grid tasks.
+pub fn default_synth_components_opts(
+    macros: &[(String, Vec<String>, Vec<Node>, usize)],
+    include_grid: bool,
+) -> Vec<SynthComponent> {
     let mut comps = vec![
         SynthComponent { name: "x".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 100.0 },
         SynthComponent { name: "0".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
@@ -2135,7 +2176,8 @@ pub fn default_synth_components(
         arity: 3, ret_type: TYPE_STR, param_types: vec![TYPE_STR, TYPE_NUM, TYPE_NUM], priority: 5.0,
     });
 
-    // ── Grid components (ARC-AGI) ──────────────────────────────────
+    // ── Grid components (ARC-AGI) — only when grid domain is active ──
+    if include_grid {
 
     // Grid unary transforms: Grid → Grid
     for name in &[
@@ -2243,6 +2285,7 @@ pub fn default_synth_components(
         name: "grid-make".into(), builtin: Some("grid-make".into()),
         arity: 3, ret_type: TYPE_GRID, param_types: vec![TYPE_NUM, TYPE_NUM, TYPE_NUM], priority: 0.0,
     });
+    } // end if include_grid
 
     // Add macro components — infer types by probing with sample inputs
     for (mname, params, mnodes, mroot) in macros {
