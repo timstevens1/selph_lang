@@ -476,6 +476,7 @@ fn build_dispatch_table() -> std::collections::HashMap<Sym, BuiltinFn> {
             Value::Num(_) => "number", Value::Str(_) => "string", Value::Bool(_) => "bool",
             Value::List(_) => "list", Value::Namespace(_) => "namespace", Value::Nil => "nil",
             Value::Closure(..) | Value::Builtin(_) | Value::RustMacro(..) => "function",
+            Value::Alt(_) => "alt",
         };
         Ok(Value::Str(type_name.to_string()))
     });
@@ -746,6 +747,10 @@ pub fn value_to_string(v: &Value) -> String {
         Value::Namespace(map) => {
             let keys: Vec<&String> = map.keys().collect();
             format!("<namespace {:?}>", keys)
+        }
+        Value::Alt(alts) => {
+            let parts: Vec<String> = alts.iter().map(|v| value_to_string(v)).collect();
+            format!("(or {})", parts.join(" "))
         }
     }
 }

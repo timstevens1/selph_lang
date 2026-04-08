@@ -203,6 +203,7 @@ pub fn value_type_name(value: &Value) -> &'static str {
         Value::Builtin(_) => "function",
         Value::RustMacro(..) => "function",
         Value::Namespace(_) => "namespace",
+        Value::Alt(_) => "alt",
     }
 }
 

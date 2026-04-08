@@ -379,6 +379,7 @@ pub fn val_hash(v: &Value) -> u64 {
 }
 
 /// Check if two Values are equal (structural equality for synthesis).
+/// When `b` is `Value::Alt`, returns true if `a` matches any alternative.
 pub fn vals_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Num(x), Value::Num(y)) => x == y,
@@ -388,6 +389,8 @@ pub fn vals_equal(a: &Value, b: &Value) -> bool {
         (Value::List(xs), Value::List(ys)) => {
             xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(a, b)| vals_equal(a, b))
         }
+        // Alt on the expected side: actual must match any alternative
+        (_, Value::Alt(alts)) => alts.iter().any(|alt| vals_equal(a, alt)),
         _ => false,
     }
 }
@@ -619,9 +622,6 @@ pub fn synthesize_full(
     // ── VM setup for fast candidate evaluation ──────────────────────
     let mut vm_ctx = crate::vm::CompileCtx::new(crate::eval::BUILTIN_NAMES, macros);
     let vm_macro_chunks = crate::vm::compile_macros(macros, &vm_ctx);
-    // Mark which macros compiled successfully so candidates calling
-    // un-compiled macros fall through to the tree-walker.
-    vm_ctx.macro_compiled = vm_macro_chunks.iter().map(|c| c.is_some()).collect();
     let mut vm_stack: Vec<Value> = Vec::with_capacity(32);
 
     // ── Namespace-based scoping ─────────────────────────────────────

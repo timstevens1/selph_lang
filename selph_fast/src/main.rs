@@ -374,6 +374,19 @@ fn node_to_value(nodes: &[Node], idx: usize) -> Option<Value> {
                 Some(Value::Str(name))
             }
         }
+        // (or val1 val2 ...) → Value::Alt — any alternative is acceptable
+        Node::App(children) if children.len() >= 2 => {
+            if let Node::Symbol(s) = &nodes[children[0]] {
+                if resolve(*s) == "or" {
+                    let alts: Option<Vec<Value>> = children[1..]
+                        .iter()
+                        .map(|&c| node_to_value(nodes, c))
+                        .collect();
+                    return alts.map(Value::Alt);
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -692,6 +705,7 @@ fn vals_equal(a: &Value, b: &Value) -> bool {
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Nil, Value::Nil) => true,
+        (_, Value::Alt(alts)) => alts.iter().any(|alt| vals_equal(a, alt)),
         _ => false,
     }
 }

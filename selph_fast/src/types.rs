@@ -34,6 +34,9 @@ pub enum Value {
     Builtin(Sym),
     RustMacro(Vec<Sym>, Rc<[Node]>, usize),
     Namespace(HashMap<String, Value>),
+    /// Spec alternative: matches if actual equals any of the contained values.
+    /// Used in synthesis specs, e.g. (or "quick" "speedy") means either is acceptable.
+    Alt(Vec<Value>),
 }
 
 /// Lexical environment: stack of scopes.

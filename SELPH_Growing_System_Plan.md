@@ -47,6 +47,12 @@ The system now runs as a single Rust binary (`selph`) with zero runtime dependen
 - Reward computation: `hard_gate * (w_goal + w_parent + w_global)`
 - Held-out validation for generalization (`--validate` flag)
 - Optimization synthesis: `--minimize`/`--maximize` for objective-driven search
+- **Alt specs:** Expected values can be SELPH expressions. `(or "quick" "speedy")` in the expected position means either output is acceptable. Parsed as `Value::Alt(Vec<Value>)`, matched via `vals_equal`. Enables multi-answer tasks (e.g., synonyms, non-deterministic outputs) in curricula:
+  ```lisp
+  (task "synonyms" 3
+    ("fast" (or "quick" "speedy"))
+    ("big" (or "large" "huge")))
+  ```
 
 ### 2.4 Synthesis
 - **Priority-weighted interleaved search:** candidates sorted by combined priority of component + arguments. High-value compositions tried first regardless of which component they use.
