@@ -33,6 +33,7 @@ The system now runs as a single Rust binary (`selph`) with zero runtime dependen
 - **Comparison:** <, >, <=, >=, =, not, even, odd
 - **String:** upper, lower, reverse, trim, length, contains, split, join, concat, nth, slice, starts-with, ends-with, replace, chars
 - **Character:** char-code, code-char (char/number conversion)
+- **String indexing:** string-take, string-drop (prefix/suffix by count)
 - **String analysis:** count-char (occurrence counting)
 - **List:** list, head, tail, length, cons, nth, slice, sort, reverse, append, range, contains, zip, enumerate
 - **Higher-order:** map, reduce, filter, apply, identity
@@ -569,6 +570,26 @@ Sequence (13) → CF (20) → NL (22) = 55/55 (100%) via `run_full_chain.sh`. Th
 ### 8.12 ~~Meta-optimization Stage 3: multi-task heuristic learning~~ ✓
 `selph meta-opt` command reads trace JSON + curriculum files, rebuilds training tasks, evaluates 8 hand-crafted heuristic templates by re-running synthesis across the full 55-task suite. Winner: `priority-plus-type-match` — `(lambda (ctx) (add (ns-get ctx "priority") (if (= (ns-get ctx "ret-type") (ns-get ctx "output-type")) 50.0 0.0)))`. Solves 26/55 vs 21/55 baseline at budget 5000 (1.1x candidate reduction, up to 50x on individual tasks). Saved to `chain_output/heuristic_priority_plus_type_match.selph`.
 
+### 8.13 ~~Fused reduce components~~ ✓
+Fused `reduce_<fn>` components for binary builtins (`add`, `subtract`, `multiply`, `min`, `max`, `concat`) and binary macros. Same pattern as fused map: registered as arity-1 `list → ret_type`, materialized as `(reduce fn arg)`, handled in early depth extension. Validated: `remove_c` independently discovered `(reduce concat (string-split x "c"))` — the synthesizer used reduce without being taught explicitly.
+
+### 8.14 ~~Context-sensitive language curriculum~~ ✓ (a^n b^n c^n)
+**a^n b^n c^n solved** via boolean decomposition of promoted CF macros. 14-task curriculum: count_c → equal_bc → remove_c → no_c_before_b → equal_abc → abc_order → anbncn → string halving → copy/reversal → reduce tests. 14/14 solved (100%) standalone at budget 50K. Key: the CS language didn't need `reduce` — string-replace + ordering compositions sufficed.
+
+### 8.15 ~~New builtins and synth components~~ ✓
+- **`string-take`** (str, num) → str: first N characters. Arity-2 alternative to arity-3 `string-slice`.
+- **`string-drop`** (str, num) → str: everything after first N characters.
+- **`string-chars`**, **`divide`**, **`floor`**, **`string-slice`** registered as synth components (previously builtins only).
+- **`reduce` empty-list fix**: returns error instead of panicking on `l[0]` when list is empty.
+
+### 8.16 ~~Type-override bug fix~~ ✓
+Removed blanket `param_types` override in `cmd_synth`/`cmd_curriculum` that rewrote all macro types to match input type. This destroyed inferred types for cross-type macros (e.g., `halve: num→num` became `str→str` on string-input tasks), causing probe-and-filter to incorrectly exclude them. Also added type-aware probe-and-filter: macros whose param type doesn't match the input type are skipped (not probed with wrong input). Together, these fixes enable cross-type compositions like `(halve (string-length x))`.
+
+### 8.17 ~~Arithmetic and string slicing curricula~~ ✓
+- **`arithmetic_tasks.selph`** (2 tasks): `halve` → `(floor (divide x 2))` in 168K candidates, `third` → `(floor (divide x 3))` in 2.6K (warmed by halve).
+- **`string_slice_tasks.selph`** (7 tasks): prefix/suffix extraction via `string-take`/`string-drop`, composes with promoted `halve` for `half_len` → `(halve (string-length x))`.
+- **`run_full_chain.sh`** extended to 6 stages: seq → CF → NL → arithmetic → string slicing → CS.
+
 ---
 
 ## 9. Immediate Next Steps
@@ -585,12 +606,8 @@ Currently one (cold, warm) pair for all tasks. Different task types may benefit 
 ### ~~9.5 Meta-2: Learn decomposition as SELPH programs~~ ✓
 The `synthesize` builtin accepts `:library` — a SELPH program can restrict the component set and call synthesis on sub-problems. Decomposition IS parameterized synthesis, expressible end-to-end from SELPH.
 
-### 9.6 Deeper curriculum: context-sensitive languages
-With a^n b^n solved, the next frontier is context-sensitive patterns:
-- a^n b^n c^n (equal counts of three symbols)
-- Copy language: ww (string repeated twice)
-- Reversal: w^R (string followed by its reverse)
-These likely need `reduce`/`fold` over characters or recursive decomposition.
+### 9.6 Deeper curriculum: context-sensitive languages (PARTIALLY DONE)
+a^n b^n c^n **solved** without needing reduce — the synthesizer found clever string-replace + ordering compositions, composing promoted CF macros via boolean decomposition. Copy language (ww) and reversal (ww^R) require string halving, which depends on the scaffolding chain: arithmetic (halve) → string slicing (string-take/drop) → dynamic halving (first_half/second_half). `first_half` remains unsolved compositionally — the arity-2 early depth extension probe doesn't reach `(string-take x (half_len x))` within budget. See 9.15 for details.
 
 ### ~~9.7 Optimization curriculum~~ ✓ (Stage 0-2)
 `(opt-task ...)` form in curriculum runner. Stage 0-1 validated (constant + constrained optimization). Stage 2 (meta-optimization) validated — fitness function calls `synthesize` internally to optimize search priorities. First self-improvement loop: `meta_count_char_boost` found in 0.7s.
@@ -633,6 +650,24 @@ TYPE_LIST (u8=3) added to the type system. `string-split`, `string-join`, `head`
 - **Domain isolation is essential for chained curricula:** Loading helpers from all domains in a single `grow` run causes catastrophic search pollution. Sequence tasks find wrong D&C solutions using NL helpers (`first_word`, `string-starts-with`). The fix is chaining separate `grow` runs, where each run only loads domain-relevant helpers plus the accumulated library from prior stages. This is orchestrated via `run_full_chain.sh`.
 - **Meta-optimization works at modest scale:** 8 hand-crafted heuristic templates, evaluated on 55 tasks at budget 5000 each, found a heuristic that solves 5 additional tasks. The key signal is return-type matching: boosting components whose output type matches the target. This is a learned version of what type reachability filtering does statically — but applied as a soft priority rather than a hard filter.
 - **Trace data enables offline heuristic search:** By recording per-task features, candidate counts, and component usage during curriculum runs, heuristic optimization can be done offline — re-running synthesis with different priority orderings without regenerating traces. The `meta-opt` command demonstrates this: it reads trace JSON, rebuilds training tasks from curriculum files, and evaluates heuristics by actual synthesis, not proxy metrics.
+- **Cross-type composition requires correct type inference:** Macros like `halve` (num→num) are used as intermediate compositions on string-input tasks via `(halve (string-length x))`. The blanket type override (forcing all macros to match input type) destroys this — `infer_macro_types` must be trusted. The probe-and-filter must also respect types: don't test `halve("ab")` when halve is `num→num`.
+- **Arity-3 is effectively unreachable without helpers:** `string-slice` (str, num, num) → str was never found by the synthesizer despite being registered. The combinatorial space of three-argument compositions is too large. The fix is decomposing arity-3 into arity-2 wrappers: `string-take` (str, num) → str and `string-drop` (str, num) → str. This is the same decomposition principle as fused map/reduce — reduce the arity the synthesizer must handle.
+- **The synthesizer finds creative workarounds:** When `string-take` wasn't available, the system discovered `(string-join (tail (string-chars x)) "")` for `drop_first` and `(reduce concat (string-split x "c"))` for `remove_c`. These are correct but non-obvious compositions — evidence that the search explores a richer space than hand-designed solutions would suggest.
+- **Scaffolding must match the composition chain:** `first_half` requires `(string-take x (half_len x))` which chains: arithmetic (floor, divide) → halve macro → half_len macro → string-take composition. Each step must be a separate curriculum stage so the promoted macro has correct types and high priority. Missing any link in the chain causes memorization fallback.
+- **Integer decomposition as a future meta-learning target:** Analogous to boolean decomposition (BD) for bool targets, an integer decomposition (ID) would try arithmetic compositions of numeric pool entries when flat synthesis fails on numeric targets. O(entries²) cost. Would catch `(floor (divide x 2))` directly instead of requiring scaffolding. Candidate for Meta-2 curriculum.
+
+### 9.15 Context-sensitive language status (April 7, 2026)
+
+**Solved:**
+- a^n b^n c^n via boolean decomposition composing CF-promoted macros
+- `reduce` as a synthesis component — `remove_c` found `(reduce concat (string-split x "c"))`
+- `half_len` → `(halve (string-length x))` via cross-type composition after type-override fix
+
+**Remaining:**
+- `first_half` — `(string-take x (half_len x))` not found within budget. The arity-2 early depth extension probe generates the candidate but budget exhausts before reaching it. Needs either higher budget, priority boosting for `string-take`, or integer decomposition.
+- `second_half` — found a roundabout `string-drop` composition but not the clean `(string-drop x (half_len x))`
+- Copy language (ww) and reversal (ww^R) — blocked on first_half/second_half
+- `rejoin` trivially solves as `x` (identity) since reducing concat over chars of a string gives the string back
 
 ### 9.13 Next priorities (updated April 7, 2026)
 
@@ -660,15 +695,21 @@ With 55-task chained curriculum validated and meta-optimization Stage 3 complete
 
 **Highest-value next steps:**
 
-1. **Types as a SELPH program.** The type vocabulary (NUM, STR, BOOL, LIST) is currently hardcoded. Making type inference a curriculum target lets the system learn to expand its own type vocabulary. A type inference stage teaches "if `string-split` produces it, and `head` consumes it, they share a type."
+1. **Unblock `first_half` / copy language.** `(string-take x (half_len x))` is the simplest correct solution but the arity-2 early depth extension doesn't reach it within budget. Options: (a) integer decomposition fallback (try arithmetic compositions of numeric pool entries when flat synthesis fails — analogous to BD), (b) priority boosting for `string-take`/`string-drop` when target is string and numeric intermediates exist, (c) deeper scaffolding tasks.
 
-2. **`reduce`/`fold` as synthesis components.** Extends higher-order synthesis beyond `map`. Needed for context-sensitive languages (a^n b^n c^n) and accumulator-based processing. Same fused-component approach: `reduce_<macro>` auto-generated for each binary macro.
+2. **Types as a SELPH program.** The type vocabulary (NUM, STR, BOOL, LIST) is currently hardcoded. Making type inference a curriculum target lets the system learn to expand its own type vocabulary. A type inference stage teaches "if `string-split` produces it, and `head` consumes it, they share a type."
 
 3. **Deeper meta-optimization.** The current Stage 3 evaluates 8 hand-crafted heuristic templates. Stage 4 would synthesize heuristic programs via the synthesizer itself — synthesis of search strategies. The `meta_count_char_boost` precedent (§2.13) shows this is feasible.
 
+**Completed this session:**
+- ~~`reduce`/`fold` as synthesis components~~ ✓ — fused reduce for builtins and macros
+- ~~Context-sensitive languages~~ ✓ — a^n b^n c^n solved, 6-stage chain pipeline
+- ~~`string-take`/`string-drop` builtins~~ ✓ — arity-2 alternatives to arity-3 `string-slice`
+- ~~Type-override bug fix~~ ✓ — enables cross-type macro compositions
+- ~~Arithmetic and string slicing curricula~~ ✓
+
 **Lower priority (infrastructure):**
 - Fix the `synthesize` builtin's `:library` extraction for defmacro-captured macros
-- 9.6 context-sensitive languages (a^n b^n c^n) — needs `reduce`/`fold`
 - 9.8 vector/tensor builtins — prerequisite for linear models
 - VM compilation of `ns` in the candidate path
 
