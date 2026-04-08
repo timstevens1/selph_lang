@@ -17,6 +17,7 @@ mod synth;
 mod hm;
 mod induce;
 mod divide;
+mod decompose;
 mod library;
 mod verify;
 mod abstraction;
@@ -1198,6 +1199,57 @@ fn cmd_curriculum(args: &[String]) {
                     solved_programs.push((ir.nodes.clone(), ir.root));
                 }
             } else {
+                // Fallback 1.5: Try template decomposition (higher-order)
+                let ho_r = decompose::try_decomposition(
+                    &synth_comps, inputs, expected, &all_macros, depth, default_budget / 2);
+                total_candidates += ho_r.candidates_explored;
+
+                if ho_r.found {
+                    let source = node_to_source(&ho_r.nodes, ho_r.root);
+                    solved += 1;
+                    eprintln!("  HO  {:30}  {:6} cand  {:.3}s  {}",
+                             name, ho_r.candidates_explored, elapsed.as_secs_f64(), source);
+
+                    task_solving_strategy = Some(format!("Decomp({})", ho_r.template_used));
+                    task_total_candidates = sr.candidates_explored + ir.candidates_explored + ho_r.candidates_explored;
+
+                    let used_components = library::extract_components(&source);
+                    task_components_used = used_components.clone();
+                    for comp_name in &used_components {
+                        let entry = priorities.entry(comp_name.clone()).or_insert(0.0);
+                        *entry += learn_rate;
+                    }
+
+                    let body_source = extract_lambda_body(&source);
+                    let macro_line = format!("(defmacro {} (s) {})", name, body_source);
+                    if let Ok((mnodes, mroots)) = parse_file(&macro_line) {
+                        if !mroots.is_empty() {
+                            if let Node::App(children) = &mnodes[mroots[0]] {
+                                if children.len() == 4 {
+                                    if let Node::Symbol(mname) = &mnodes[children[1]] {
+                                        if let Node::App(param_indices) = &mnodes[children[2]] {
+                                            let params: Vec<String> = param_indices.iter()
+                                                .filter_map(|&i| {
+                                                    if let Node::Symbol(s) = &mnodes[i] { Some(resolve(*s)) }
+                                                    else { None }
+                                                }).collect();
+                                            all_macros.push((resolve(*mname), params, mnodes.clone(), children[3]));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    promoted_source.push_str(&format!(
+                        "\n; {} (HO: {}): found in {} candidates\n{}\n",
+                        name, ho_r.template_used, ho_r.candidates_explored, macro_line));
+
+                    if enable_extract {
+                        solved_programs.push((ho_r.nodes.clone(), ho_r.root));
+                    }
+                } else {
+
                 // Fallback 2: Try divide-and-conquer
                 let dr = divide::divide_and_conquer(
                     &synth_comps, inputs, expected, &all_macros, depth, default_budget / 2);
@@ -1288,6 +1340,7 @@ fn cmd_curriculum(args: &[String]) {
                     }
                 }
             }
+            } // end HO else
         } // end bool_decompose else
         }
 

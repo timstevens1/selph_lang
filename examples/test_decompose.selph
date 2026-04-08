@@ -1,0 +1,48 @@
+; Test curriculum for higher-order template decomposition
+; Each task should be solved via the HO (higher-order) strategy
+
+; === list-map: element-wise transformation ===
+; double each element: [1,2,3] -> [2,4,6]
+(task "list_double" 2
+  ((1 2 3) (2 4 6))
+  ((4 5 6) (8 10 12))
+  ((0 1 0) (0 2 0))
+  ((10 20) (20 40)))
+
+; negate each element: [1,2,3] -> [-1,-2,-3]
+(task "list_negate" 2
+  ((1 2 3) (-1 -2 -3))
+  ((4 5) (-4 -5))
+  ((0 10 20) (0 -10 -20))
+  ((7 8 9 10) (-7 -8 -9 -10)))
+
+; === split-map-join: string word-level transformation ===
+; uppercase each word: "hello world" -> "HELLO WORLD"
+(task "upper_words" 2
+  ("hello world" "HELLO WORLD")
+  ("foo bar" "FOO BAR")
+  ("abc def ghi" "ABC DEF GHI")
+  ("cat" "CAT"))
+
+; reverse each word: "hello world" -> "olleh dlrow"
+(task "reverse_words" 2
+  ("hello world" "olleh dlrow")
+  ("foo bar" "oof rab")
+  ("abc def" "cba fed")
+  ("cat dog bird" "tac god drib"))
+
+; === char-map-join: per-character transformation ===
+; uppercase each char (short strings)
+(task "upper_chars" 2
+  ("abc" "ABC") ("xyz" "XYZ") ("hello" "HELLO")
+  ("dog" "DOG") ("cat" "CAT") ("fox" "FOX"))
+
+; === list-filter: keep elements matching a predicate ===
+; Note: filter requires the predicate to be synthesizable from element -> bool
+; Keep positive numbers (need "positive?" or "> x 0" synthesizable)
+; This one may be harder - the sub-synthesis needs (> x 0)
+(task "keep_positive" 2
+  ((1 -2 3 -4 5) (1 3 5))
+  ((-1 2 -3 4) (2 4))
+  ((0 -5 10 -15 20) (10 20))
+  ((7 -8 9) (7 9)))
