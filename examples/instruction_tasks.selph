@@ -1,0 +1,140 @@
+; Instruction-following curriculum
+; Bridges from example-based synthesis to instruction-conditioned execution.
+; Requires: nl_helpers.selph (first_word, second_word, last_word)
+;
+; Core mechanism: the `dispatch` builtin looks up a macro by name (a string)
+; in the current environment and applies it. The library IS the dispatch
+; table — each promoted macro is an entry. The system learns:
+;   1. Individual operations (promotes named macros)
+;   2. Instruction following via (dispatch (first_word x) (last_word x))
+;
+; This is analogous to `map`: the system doesn't learn HOW dispatch works,
+; it learns WHAT to dispatch on and HOW to parse instructions.
+
+; === Stage 0: Teach individual operations ===
+; Each task produces a named macro that dispatch can look up.
+; Task names = operation keywords used in instructions.
+; Solutions are direct builtin wrappers: (string-reverse x), etc.
+
+(task "reverse" 2
+  ("hello" "olleh")
+  ("world" "dlrow")
+  ("abc" "cba")
+  ("moon" "noom")
+  ("fog" "gof")
+  ("sky" "yks"))
+
+(task "upper" 2
+  ("hello" "HELLO")
+  ("world" "WORLD")
+  ("abc" "ABC")
+  ("moon" "MOON")
+  ("fog" "FOG")
+  ("sky" "SKY"))
+
+(task "lower" 2
+  ("HELLO" "hello")
+  ("WORLD" "world")
+  ("ABC" "abc")
+  ("MOON" "moon")
+  ("FOG" "fog")
+  ("SKY" "sky"))
+
+(task "len" 2
+  ("hello" 5)
+  ("world" 5)
+  ("abc" 3)
+  ("moon" 4)
+  ("fog" 3)
+  ("sky" 3)
+  ("hi" 2)
+  ("it" 2))
+
+; === Stage 1: Two-word instruction dispatch ===
+; Format: "OP ARG". The synthesizer should discover:
+;   (dispatch (first_word x) (last_word x))
+; This is a depth-2 composition: dispatch takes two depth-1 args.
+
+(task "follow_str" 2
+  ("reverse hello" "olleh")
+  ("reverse moon" "noom")
+  ("reverse abc" "cba")
+  ("upper hello" "HELLO")
+  ("upper moon" "MOON")
+  ("upper abc" "ABC")
+  ("lower HELLO" "hello")
+  ("lower MOON" "moon"))
+
+; Numeric dispatch: same mechanism, different output type.
+(task "follow_num" 2
+  ("len hello" 5)
+  ("len moon" 4)
+  ("len abc" 3)
+  ("len fog" 3)
+  ("len hi" 2)
+  ("len it" 2))
+
+; === Stage 2: Three-word NL instructions ===
+; Format: "FILLER OP ARG". Now the operation is second_word, not first_word.
+; Expected: (dispatch (second_word x) (last_word x))
+
+(task "follow_nl" 2
+  ("please reverse hello" "olleh")
+  ("kindly reverse moon" "noom")
+  ("now reverse abc" "cba")
+  ("please upper hello" "HELLO")
+  ("kindly upper moon" "MOON")
+  ("now upper abc" "ABC")
+  ("please lower HELLO" "hello")
+  ("kindly lower MOON" "moon"))
+
+; === Stage 3: Compositional instructions (HO decomposition) ===
+; Element-wise operations on multi-word data. The split-map-join template
+; in decompose.rs discovers these automatically:
+;   (string-join (map string-reverse (string-split x " ")) " ")
+; These show that once operations exist in the library, the system
+; composes them over structured data without new primitives.
+
+(task "reverse_words" 2
+  ("hello moon" "olleh noom")
+  ("abc fog" "cba gof")
+  ("sky gem" "yks meg")
+  ("hi no" "ih on")
+  ("ice bay" "eci yab")
+  ("den fog" "ned gof"))
+
+(task "upper_words" 2
+  ("hello moon" "HELLO MOON")
+  ("abc fog" "ABC FOG")
+  ("sky gem" "SKY GEM")
+  ("hi no" "HI NO")
+  ("ice bay" "ICE BAY")
+  ("den fog" "DEN FOG"))
+
+; === Design notes ===
+;
+; Why dispatch as a special form (not a regular builtin):
+;   dispatch needs the dynamic environment to find promoted macros.
+;   Regular builtins are fn(&[Value]) -> Result without env access.
+;   As a special form in eval_inner, dispatch has the full env.
+;
+; Why task names = operation keywords:
+;   The promoted macro name IS the dispatch key. When the curriculum
+;   solves "reverse" and promotes (defmacro reverse (s) (string-reverse s)),
+;   then (dispatch "reverse" "hello") finds it by name. The library
+;   IS the dispatch table.
+;
+; Naming conflicts:
+;   "reverse" and "length" shadow builtins within this curriculum run.
+;   Using "len" instead of "length" to minimize shadowing. Domain
+;   isolation (separate grow runs) prevents cross-contamination.
+;
+; Generalization path:
+;   - Richer NL: "find the reverse of hello" needs keyword extraction
+;     from arbitrary positions (string-contains as synth component).
+;   - Parameterized ops: "take 3 from hello" needs numeric argument
+;     parsing (parse-int builtin).
+;   - Chained ops: "reverse then upper hello" needs sequential parsing.
+;   - The endgame: dispatch over the full learned library. Every
+;     synthesized operation becomes dispatchable by name. The library
+;     grows, and the instruction vocabulary grows with it.

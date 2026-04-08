@@ -647,6 +647,58 @@ The `synthesize` builtin accepts `:library` — a SELPH program can restrict the
 
 **Design insight:** Decomposition should ultimately be just another candidate in the search space, not a fallback. The function-typed hole in `(map [HOLE] list)` is a sub-synthesis call embedded in candidate generation. The strategy selector that decides *when* to decompose should itself be a learnable Selph program — the meta-language endgame where `synthesize` is a component the solver can call recursively on derived sub-specs.
 
+### 9.17 Priority scoring fix: average instead of sum ✓ (April 8, 2026)
+
+PendingDesc scores were computed as `comp.priority + sum(arg_priorities)`. Since `x` has priority 100:
+- Arity-1 `string-upper(x)`: score = 0 + 100 = **100**
+- Arity-2 `concat(x, x)`: score = 0 + 100 + 100 = **200**
+- Arity-3 `string-replace(x, x, x)`: score = 0 + 100 + 100 + 100 = **300**
+
+Higher arities always scored higher, so the simplest arity-1 solutions were tested **last**. The budget was consumed by arity-2/3 candidates before `string-upper(x)` was ever reached. This caused `string-upper(x)`, `string-lower(x)`, and other trivial arity-1 compositions to go unfound, falling to memorization even with 200K budget.
+
+**Fix:** Changed to average of arg priorities: `comp.priority + avg(arg_priorities)`. Now all compositions involving `x` score 100 regardless of arity. Ties broken by generation order (arity-1 first, then arity-2, then arity-3).
+
+**Impact on Stage 0 instruction ops (4 tasks, no helpers):**
+- Before: 144s, 593K candidates. `upper` and `lower` memorized. `reverse` found at 92K via complex roundabout.
+- After: **1.5s, 8K candidates**. All 4 found cleanly: `(string-upper x)`, `(string-lower x)`, `(string-join (reverse (string-chars x)) "")`, `(length (string-chars x))`.
+
+**Requires validation:** The scoring change affects ALL synthesis. The full 55-task chained curriculum needs re-running to verify no regressions. CF tasks like `equal_ab` relied on arity-2 compositions being prioritized — the average scoring might slow them down.
+
+### 9.18 Instruction-following curriculum and `dispatch` builtin ✓ (April 8, 2026)
+
+**Goal:** Bridge from example-based synthesis to instruction-conditioned execution. In the current system, specs are opaque — `("aabbcc", true)` gives the synthesizer no signal about HOW to solve the problem. In NL instructions, the intent is in the input: `"reverse hello"` names the operation.
+
+**`dispatch` builtin:** Special form in `eval_inner` (not a regular builtin) that looks up a macro by name (a string) and applies it. Implemented as a special form because it needs the dynamic environment with promoted macros — regular builtins only get `fn(&[Value])` without env access. Intentionally NOT in `BUILTIN_NAMES` so the VM compiler fails on dispatch candidates, triggering the tree-walker fallback where the special form has env access.
+
+```lisp
+(dispatch "reverse" "hello")  ; → looks up "reverse" macro, applies to "hello" → "olleh"
+```
+
+Registered as a synthesis component: arity 2, `(STR, ANY) → ANY`, priority 15.
+
+**Curriculum design (3 files):**
+
+1. `instruction_ops.selph` — Pure operations WITHOUT NL helpers loaded. Promotes clean wrappers: `reverse`, `upper`, `lower`, `len`. Run as separate grow pass to prevent word extractors from contaminating the operations.
+
+2. `instruction_dispatch.selph` — Dispatch tasks WITH NL helpers + ops library. The synthesizer discovers `(dispatch (first_word x) (last_word x))` for 2-word instructions and `(dispatch (second_word x) (last_word x))` for 3-word NL instructions.
+
+3. `instruction_tasks.selph` — Combined single-file version (for reference).
+
+**Results:**
+- `dispatch` found `(dispatch (first_word x) (second_word x))` in **1574 candidates** with clean macros.
+- HO decomposition found `(string-join (map reverse (string-split x " ")) " ")` for `reverse_words`.
+- `upper_words` found `(upper x)` — trivial application of the promoted macro.
+
+**Remaining issue:** Complex promoted macros (e.g., `reverse` promoted as `(string-join (reverse (string-chars s)) "")`) fail when called via `dispatch` because the dispatch env doesn't propagate all necessary builtins for nested calls. The builtin `reverse` (list reverse) is needed inside the macro body but shadows/conflicts in the dispatch context. Clean macros like `(string-reverse s)` work perfectly. Fix: either ensure simple promotions (may require `string-reverse(x)` to be found first — see §9.17) or propagate the full macro env in dispatch.
+
+**Design insight: the library IS the dispatch table.** Each promoted macro is an entry. `dispatch` is the meta-primitive that connects string-valued operation names to the learned function library. The system doesn't learn HOW dispatch works — it learns WHAT to dispatch on (argument extraction from instructions) and WHICH operations to learn (the Stage 0 curriculum). This parallels `map`: the system doesn't learn how `map` works, it learns what to map.
+
+**Future directions:**
+- **Tokenization curriculum:** Teach "command" as a part of speech. The NL curriculum has noun/verb/adj/art but not command/imperative. A command POS type would let the system classify instruction keywords.
+- **String equality in synthesis:** Currently `=` is num-only. Adding `(str, str) → bool` equality would enable `(= (first_word x) "reverse")` for dispatch conditions, as an alternative to `dispatch`.
+- **Env propagation fix:** Make dispatch's env include all promoted macros so complex compositions work.
+- **Word-level auto-constants:** Extract words (not just chars) from examples. Would enable `(= (first_word x) "reverse")` without needing helper-provided constants.
+
 ### 9.6 Deeper curriculum: context-sensitive languages (PARTIALLY DONE)
 a^n b^n c^n **solved** without needing reduce — the synthesizer found clever string-replace + ordering compositions, composing promoted CF macros via boolean decomposition. Copy language (ww) and reversal (ww^R) require string halving, which depends on the scaffolding chain: arithmetic (halve) → string slicing (string-take/drop) → dynamic halving (first_half/second_half). `first_half` remains unsolved compositionally — the arity-2 early depth extension probe doesn't reach `(string-take x (half_len x))` within budget. See 9.15 for details.
 
@@ -697,6 +749,10 @@ TYPE_LIST (u8=3) added to the type system. `string-split`, `string-join`, `head`
 - **Scaffolding must match the composition chain:** `first_half` requires `(string-take x (half_len x))` which chains: arithmetic (floor, divide) → halve macro → half_len macro → string-take composition. Each step must be a separate curriculum stage so the promoted macro has correct types and high priority. Missing any link in the chain causes memorization fallback.
 - **Decomposition is just another candidate:** The distinction between "strategy selection" and "search" is artificial. `(string-join (map f (string-split x " ")) " ")` is a program in the search space — the only reason the flat enumerator can't find it is that `f` is a function-typed argument requiring sub-synthesis. Template decomposition (§9.16) fills this gap: when the enumerator encounters a higher-order component like `map`, it derives a sub-spec and calls `synthesize()` recursively. The long-term design: the strategy selector is itself a Selph program, and `synthesize` is a component the solver can invoke on derived sub-specs.
 - **Integer decomposition as a future meta-learning target:** Analogous to boolean decomposition (BD) for bool targets, an integer decomposition (ID) would try arithmetic compositions of numeric pool entries when flat synthesis fails on numeric targets. O(entries²) cost. Would catch `(floor (divide x 2))` directly instead of requiring scaffolding. Candidate for Meta-2 curriculum.
+- **Priority scoring must normalize by arity:** Sum-based scoring (`comp.priority + sum(arg_priorities)`) creates a systematic bias toward higher-arity compositions. Arity-2 with (x, x) scores 200 vs arity-1 with x at 100. The budget is consumed by the ~900 arity-2 candidates before ANY arity-1 candidate is tested. Average-based scoring (`comp.priority + avg(arg_priorities)`) normalizes this. All compositions involving `x` score 100 regardless of arity. Arity-1 is tested first due to generation order.
+- **Promoted macros must be pure operations for dispatch:** If NL helpers (first_word, last_word) are loaded during operation learning, the promoted macros bake in word extraction: `(string-reverse (last_word s))` instead of `(string-reverse s)`. These composite macros fail when `dispatch` calls them with single-word arguments because the extraction is redundant but harmless — however, they fail when the inner macro body references other macros not available in the dispatch env. **Domain isolation extends to the operation level:** learn pure operations in one run (no helpers), dispatch in another (with helpers + operations).
+- **dispatch as a special form, not a builtin:** The `dispatch` primitive needs the dynamic environment to find promoted macros. Regular builtins (`fn(&[Value])`) don't have env access. Implementing dispatch as a special form in `eval_inner` gives it full env access. It must NOT be in `BUILTIN_NAMES` so the VM compiler fails and triggers the tree-walker fallback. This is the same pattern as `ns` — constructs that need the environment can't be VM-compiled.
+- **The library IS the dispatch table:** In SELPH, promoted macros live in the environment as named functions. `dispatch("reverse", arg)` is just `env_lookup("reverse")` + `apply`. No separate dispatch table needed — the library file IS the model, and the model IS the dispatch table. This is homoiconicity at the system level: the trained model (library) serves as both the learned knowledge base and the runtime dispatch mechanism.
 
 ### 9.15 Context-sensitive language status (April 7, 2026)
 
@@ -752,6 +808,9 @@ With 55-task chained curriculum validated and meta-optimization Stage 3 complete
 
 **Completed (April 8, 2026):**
 - ~~Higher-order template decomposition~~ ✓ — `decompose.rs` with list-map, split-map-join, char-map-join, list-filter. Fills function holes via recursive sub-synthesis. Key result: `reverse_words` solved compositionally (818 cand) where flat synthesis can't reach it. See §9.16.
+- ~~Priority scoring fix~~ ✓ — PendingDesc scores used sum of arg priorities, biasing toward higher arities (arity-2 scored 200 vs arity-1 at 100 when both use `x`). Changed to average: `comp.priority + avg(arg_priorities)`. Stage 0 ops: 144s/92K → 1.5s/8K cand. `string-upper(x)` now found at 4K cand instead of memorizing. See §9.17.
+- ~~`dispatch` builtin~~ ✓ — Special form in eval that looks up a macro by name (string) and applies it. Registered as arity-2 synth component (STR, ANY) → ANY. Enables instruction-following: `(dispatch (first_word x) (last_word x))` found in 1574 cand with clean macros. See §9.18.
+- ~~Instruction-following curriculum~~ ✓ (partial) — Three files: `instruction_ops.selph` (pure operations), `instruction_dispatch.selph` (dispatch tasks), `instruction_tasks.selph` (combined). Two-stage pipeline validated. Dispatch works with simple macros but complex promoted macros (e.g., `string-join(reverse(string-chars x), "")`) fail in dispatch env due to incomplete macro propagation. See §9.18.
 
 **Lower priority (infrastructure):**
 - Fix the `synthesize` builtin's `:library` extraction for defmacro-captured macros

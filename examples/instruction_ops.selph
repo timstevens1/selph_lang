@@ -1,0 +1,41 @@
+; Instruction operations curriculum (Stage 0)
+; Teaches pure string operations WITHOUT word extractors loaded.
+; This ensures promoted macros are clean wrappers around builtins,
+; not compositions with first_word/last_word baked in.
+;
+; Run WITHOUT --library (no NL helpers):
+;   selph grow examples/instruction_ops.selph --output chain_output/stage_ops.selph
+
+(task "reverse" 2
+  ("hello" "olleh")
+  ("world" "dlrow")
+  ("abc" "cba")
+  ("moon" "noom")
+  ("fog" "gof")
+  ("sky" "yks"))
+
+(task "upper" 2
+  ("hello" "HELLO")
+  ("world" "WORLD")
+  ("abc" "ABC")
+  ("moon" "MOON")
+  ("fog" "FOG")
+  ("sky" "SKY"))
+
+(task "lower" 2
+  ("HELLO" "hello")
+  ("WORLD" "world")
+  ("ABC" "abc")
+  ("MOON" "moon")
+  ("FOG" "fog")
+  ("SKY" "sky"))
+
+(task "len" 2
+  ("hello" 5)
+  ("world" 5)
+  ("abc" 3)
+  ("moon" 4)
+  ("fog" 3)
+  ("sky" 3)
+  ("hi" 2)
+  ("it" 2))

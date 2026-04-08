@@ -22,6 +22,8 @@ pub enum Type {
     TNil,
     /// Homogeneous list with element type.
     TList(Box<Type>),
+    /// 2D grid of integers 0-9 (ARC-AGI).
+    TGrid,
     /// Function type: (params...) -> return.
     TFn(Vec<Type>, Box<Type>),
     /// Type variable (for unification / polymorphism).
@@ -57,7 +59,7 @@ pub fn apply(ty: &Type, subst: &Subst) -> Type {
             Box::new(apply(ret, subst)),
         ),
         // Ground types are unchanged.
-        Type::TNum | Type::TStr | Type::TBool | Type::TNil => ty.clone(),
+        Type::TNum | Type::TStr | Type::TBool | Type::TNil | Type::TGrid => ty.clone(),
     }
 }
 
@@ -72,7 +74,7 @@ fn occurs_in(var_id: u32, ty: &Type, subst: &Subst) -> bool {
             params.iter().any(|p| occurs_in(var_id, p, subst))
                 || occurs_in(var_id, ret, subst)
         }
-        Type::TNum | Type::TStr | Type::TBool | Type::TNil => false,
+        Type::TNum | Type::TStr | Type::TBool | Type::TNil | Type::TGrid => false,
     }
 }
 
@@ -129,7 +131,7 @@ pub fn unify(t1: &Type, t2: &Type, subst: &mut Subst) -> Result<(), String> {
 
 // ── Conversion from u8 type tags ────────────────────────────────────
 
-use crate::synth::{TYPE_NUM, TYPE_STR, TYPE_BOOL, TYPE_LIST, TYPE_ANY};
+use crate::synth::{TYPE_NUM, TYPE_STR, TYPE_BOOL, TYPE_LIST, TYPE_GRID, TYPE_ANY};
 
 /// Convert a u8 type tag to an HM Type.
 ///
@@ -141,6 +143,7 @@ pub fn type_from_tag(tag: u8, counter: &mut u32) -> Type {
         TYPE_STR => Type::TStr,
         TYPE_BOOL => Type::TBool,
         TYPE_LIST => Type::TList(Box::new(fresh_var(counter))),
+        TYPE_GRID => Type::TGrid,
         TYPE_ANY => fresh_var(counter),
         _ => fresh_var(counter), // unknown tags become variables
     }
@@ -156,6 +159,7 @@ pub fn type_to_tag(ty: &Type, subst: &Subst) -> u8 {
         Type::TStr => TYPE_STR,
         Type::TBool => TYPE_BOOL,
         Type::TList(_) => TYPE_LIST,
+        Type::TGrid => TYPE_GRID,
         _ => TYPE_ANY,
     }
 }

@@ -18,6 +18,7 @@ pub const TYPE_NUM: u8 = 0;
 pub const TYPE_STR: u8 = 1;
 pub const TYPE_BOOL: u8 = 2;
 pub const TYPE_LIST: u8 = 3;
+pub const TYPE_GRID: u8 = 4;
 pub const TYPE_ANY: u8 = 255;
 
 // ── Domain / Kind classification (§12) ──────────────────────────────
@@ -1116,7 +1117,9 @@ pub fn synthesize_full(
                             continue;
                         }
                         let inferred_ret = hm_infer_ret_type(comp, &[p1, p2], &mut hm_counter);
-                        let score = comp.priority + p1.priority + p2.priority;
+                        // Use average of arg priorities instead of sum so arity-2
+                        // doesn't automatically outrank arity-1 compositions.
+                        let score = comp.priority + (p1.priority + p2.priority) / 2.0;
                         pending.push(PendingDesc {
                             comp_idx: ci, arg1: pi, arg2: ai, arg3: 0,
                             ret_type: inferred_ret, score,
@@ -1138,7 +1141,7 @@ pub fn synthesize_full(
                             continue;
                         }
                         let inferred_ret = hm_infer_ret_type(comp, &[p1, p2], &mut hm_counter);
-                        let score = comp.priority + p1.priority + p2.priority;
+                        let score = comp.priority + (p1.priority + p2.priority) / 2.0;
                         pending.push(PendingDesc {
                             comp_idx: ci, arg1: ai, arg2: pi, arg3: 0,
                             ret_type: inferred_ret, score,
@@ -1170,7 +1173,7 @@ pub fn synthesize_full(
                             if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 && p3.ret_type != 255 { continue; }
                             if !hm_check_application(comp, &[p1, p2, p3], &mut hm_counter) { continue; }
                             let inferred_ret = hm_infer_ret_type(comp, &[p1, p2, p3], &mut hm_counter);
-                            let score = comp.priority + p1.priority + p2.priority + p3.priority;
+                            let score = comp.priority + (p1.priority + p2.priority + p3.priority) / 3.0;
                             pending.push(PendingDesc {
                                 comp_idx: ci, arg1: pi, arg2: a2, arg3: a3,
                                 ret_type: inferred_ret, score,
@@ -1190,7 +1193,7 @@ pub fn synthesize_full(
                             if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 && p3.ret_type != 255 { continue; }
                             if !hm_check_application(comp, &[p1, p2, p3], &mut hm_counter) { continue; }
                             let inferred_ret = hm_infer_ret_type(comp, &[p1, p2, p3], &mut hm_counter);
-                            let score = comp.priority + p1.priority + p2.priority + p3.priority;
+                            let score = comp.priority + (p1.priority + p2.priority + p3.priority) / 3.0;
                             pending.push(PendingDesc {
                                 comp_idx: ci, arg1: a1, arg2: pi, arg3: a3,
                                 ret_type: inferred_ret, score,
@@ -1210,7 +1213,7 @@ pub fn synthesize_full(
                             if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 && p3.ret_type != 255 { continue; }
                             if !hm_check_application(comp, &[p1, p2, p3], &mut hm_counter) { continue; }
                             let inferred_ret = hm_infer_ret_type(comp, &[p1, p2, p3], &mut hm_counter);
-                            let score = comp.priority + p1.priority + p2.priority + p3.priority;
+                            let score = comp.priority + (p1.priority + p2.priority + p3.priority) / 3.0;
                             pending.push(PendingDesc {
                                 comp_idx: ci, arg1: a1, arg2: a2, arg3: pi,
                                 ret_type: inferred_ret, score,
@@ -2029,6 +2032,13 @@ pub fn default_synth_components(
         arity: 2, ret_type: 2, param_types: vec![1, 1], priority: 0.0,
     });
 
+    // dispatch: (str, any) -> any — look up macro by name, apply to arg
+    // Enables instruction-following: (dispatch (first_word x) (last_word x))
+    comps.push(SynthComponent {
+        name: "dispatch".into(), builtin: Some("dispatch".into()),
+        arity: 2, ret_type: TYPE_ANY, param_types: vec![TYPE_STR, TYPE_ANY], priority: 15.0,
+    });
+
     // Comparison operators: num->num->bool (for if-expression conditions)
     for name in &["<", ">", "<=", ">=", "=", "!="] {
         comps.push(SynthComponent {
@@ -2123,6 +2133,115 @@ pub fn default_synth_components(
     comps.push(SynthComponent {
         name: "string-slice".into(), builtin: Some("string-slice".into()),
         arity: 3, ret_type: TYPE_STR, param_types: vec![TYPE_STR, TYPE_NUM, TYPE_NUM], priority: 5.0,
+    });
+
+    // ── Grid components (ARC-AGI) ──────────────────────────────────
+
+    // Grid unary transforms: Grid → Grid
+    for name in &[
+        "grid-rotate-cw", "grid-rotate-ccw", "grid-rotate-180",
+        "grid-flip-h", "grid-flip-v", "grid-transpose", "grid-trim",
+        "grid-border",
+    ] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 1, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID], priority: 0.0,
+        });
+    }
+    // Grid → Num analysis
+    for name in &[
+        "grid-width", "grid-height", "grid-most-common", "grid-background",
+        "grid-object-count", "grid-object-area",
+    ] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 1, ret_type: TYPE_NUM, param_types: vec![TYPE_GRID], priority: 0.0,
+        });
+    }
+    // Grid → Bool predicates
+    for name in &["grid-symmetric-h", "grid-symmetric-v", "grid-is-rectangle"] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 1, ret_type: TYPE_BOOL, param_types: vec![TYPE_GRID], priority: 0.0,
+        });
+    }
+    // Grid → List analysis
+    for name in &[
+        "grid-colors", "grid-bounding-box", "grid-size", "grid-object-center",
+        "grid-objects", "grid-objects-8", "grid-object-colors",
+        "grid-detect-rectangles", "grid-quarter",
+    ] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 1, ret_type: TYPE_LIST, param_types: vec![TYPE_GRID], priority: 0.0,
+        });
+    }
+    // Grid × Num → Grid
+    for name in &["grid-scale", "grid-gravity", "grid-fill-enclosed"] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 2, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID, TYPE_NUM], priority: 0.0,
+        });
+    }
+    // Grid × Num → Num
+    comps.push(SynthComponent {
+        name: "grid-count-color".into(), builtin: Some("grid-count-color".into()),
+        arity: 2, ret_type: TYPE_NUM, param_types: vec![TYPE_GRID, TYPE_NUM], priority: 0.0,
+    });
+    // Grid × Num → List
+    for name in &["grid-row", "grid-col", "grid-find-color", "grid-hsplit", "grid-vsplit"] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 2, ret_type: TYPE_LIST, param_types: vec![TYPE_GRID, TYPE_NUM], priority: 0.0,
+        });
+    }
+    // Grid × Num × Num → Grid
+    for name in &["grid-replace-color", "grid-tile", "grid-pad"] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 3, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID, TYPE_NUM, TYPE_NUM], priority: 0.0,
+        });
+    }
+    // Grid × Num × Num → Num
+    for name in &["grid-get", "grid-neighbor-count"] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 3, ret_type: TYPE_NUM, param_types: vec![TYPE_GRID, TYPE_NUM, TYPE_NUM], priority: 0.0,
+        });
+    }
+    // Grid × Grid → Grid
+    for name in &["grid-hconcat", "grid-vconcat", "grid-mask", "grid-xor", "grid-and", "grid-or", "grid-overlay-center"] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 2, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID, TYPE_GRID], priority: 0.0,
+        });
+    }
+    // Grid × Grid → Bool
+    for name in &["grid-equal", "grid-dimensions-equal", "grid-objects-touching"] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 2, ret_type: TYPE_BOOL, param_types: vec![TYPE_GRID, TYPE_GRID], priority: 0.0,
+        });
+    }
+    // Grid × Grid → List
+    comps.push(SynthComponent {
+        name: "grid-find-subgrid".into(), builtin: Some("grid-find-subgrid".into()),
+        arity: 2, ret_type: TYPE_LIST, param_types: vec![TYPE_GRID, TYPE_GRID], priority: 0.0,
+    });
+    // Grid × Num × Num × Num → Grid (flood-fill)
+    comps.push(SynthComponent {
+        name: "grid-flood-fill".into(), builtin: Some("grid-flood-fill".into()),
+        arity: 4, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID, TYPE_NUM, TYPE_NUM, TYPE_NUM], priority: 0.0,
+    });
+    // High-arity: draw-line-h (5), draw-line-v (5), ray (6), fill-rect (6)
+    // These are available as builtins but NOT registered as synth components
+    // because arity >= 5 makes them unreachable at typical search depths.
+    // They'll be composed into macros by the curriculum instead.
+
+    // Grid-make: Num × Num × Num → Grid
+    comps.push(SynthComponent {
+        name: "grid-make".into(), builtin: Some("grid-make".into()),
+        arity: 3, ret_type: TYPE_GRID, param_types: vec![TYPE_NUM, TYPE_NUM, TYPE_NUM], priority: 0.0,
     });
 
     // Add macro components — infer types by probing with sample inputs
@@ -2858,5 +2977,44 @@ mod tests {
         assert_eq!(value_type_tag(&Value::Str("a".into())), TYPE_STR);
         assert_eq!(value_type_tag(&Value::Bool(true)), TYPE_BOOL);
         assert_eq!(value_type_tag(&Value::Nil), TYPE_ANY);
+    }
+
+    #[test]
+    fn test_vm_string_reverse() {
+        use crate::types::Node;
+        use crate::eval::BUILTIN_NAMES;
+        use crate::intern::intern;
+        let nodes = vec![
+            Node::Symbol(intern("x")),
+            Node::Symbol(intern("string-reverse")),
+            Node::App(vec![1, 0]),
+        ];
+        let macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = vec![];
+        let ctx = crate::vm::CompileCtx::new(BUILTIN_NAMES, &macros);
+        let chunk = crate::vm::compile(&nodes, 2, &ctx).expect("should compile");
+        let macro_chunks = crate::vm::compile_macros(&macros, &ctx);
+        let mut stack = Vec::new();
+        let result = crate::vm::execute(&chunk, &Value::Str("hello".into()), &macro_chunks, &mut stack);
+        eprintln!("VM string-reverse result: {:?}", result);
+        assert!(result.is_ok(), "VM should succeed");
+        assert!(vals_equal(&result.unwrap(), &Value::Str("olleh".into())), "should produce olleh");
+    }
+
+    #[test]
+    fn test_synth_finds_string_reverse() {
+        let macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = vec![];
+        let comps = vec![
+            SynthComponent { name: "x".into(), builtin: None, arity: 0, ret_type: TYPE_STR, param_types: vec![], priority: 100.0 },
+            SynthComponent { name: "string-reverse".into(), builtin: Some("string-reverse".into()), arity: 1, ret_type: TYPE_STR, param_types: vec![TYPE_STR], priority: 0.0 },
+        ];
+        let inputs = vec![Value::Str("hello".into()), Value::Str("ab".into())];
+        let expected = vec![Value::Str("olleh".into()), Value::Str("ba".into())];
+        let sr = synthesize_with_validation(&comps, &inputs, &expected, &macros, 1, 100, false, None, &[]);
+        eprintln!("synth found={}, cand={}", sr.found, sr.candidates_explored);
+        if sr.found {
+            let src = crate::node_to_source(sr.nodes.as_ref().unwrap(), sr.root.unwrap());
+            eprintln!("synth solution: {}", src);
+        }
+        assert!(sr.found);
     }
 }

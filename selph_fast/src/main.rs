@@ -27,6 +27,7 @@ mod meta;
 mod taskgen;
 mod vm;
 mod trace;
+mod arc;
 
 use std::env;
 use std::fs;
@@ -55,6 +56,7 @@ fn main() {
         "verify" => cmd_verify(&args[2..]),
         "multi-synth" => cmd_multi_synth(&args[2..]),
         "meta-opt" => cmd_meta_optimize(&args[2..]),
+        "arc" => cmd_arc(&args[2..]),
         "help" | "--help" | "-h" => print_usage(),
         other => {
             // If it's a .selph file, evaluate it
@@ -271,12 +273,17 @@ fn cmd_synth(args: &[String]) {
 
     // Detect input type
     let input_is_string = matches!(&inputs[0], Value::Str(_));
+    let input_is_grid = matches!(&inputs[0], Value::Grid(_));
 
     // Build components
     let mut synth_comps = synth::default_synth_components(&macros);
-    if input_is_string {
+    if input_is_grid {
         for comp in &mut synth_comps {
-            if comp.name == "x" { comp.ret_type = 1; }
+            if comp.name == "x" { comp.ret_type = synth::TYPE_GRID; }
+        }
+    } else if input_is_string {
+        for comp in &mut synth_comps {
+            if comp.name == "x" { comp.ret_type = synth::TYPE_STR; }
         }
     }
 
@@ -381,6 +388,25 @@ fn node_to_value(nodes: &[Node], idx: usize) -> Option<Value> {
                         .map(|&c| node_to_value(nodes, c))
                         .collect();
                     return alts.map(Value::Alt);
+                }
+            }
+            // (#grid ((0 1) (1 0))) → Value::Grid
+            if let Node::Symbol(s) = &nodes[children[0]] {
+                if resolve(*s) == "#grid" && children.len() == 2 {
+                    if let Some(Value::List(rows)) = node_to_value(nodes, children[1]) {
+                        let mut grid_rows = Vec::new();
+                        for row_val in &rows {
+                            if let Value::List(cells) = row_val {
+                                let grid_row: Vec<i8> = cells.iter().filter_map(|c| {
+                                    if let Value::Num(n) = c { Some(*n as i8) } else { None }
+                                }).collect();
+                                if grid_row.len() == cells.len() {
+                                    grid_rows.push(grid_row);
+                                } else { return None; }
+                            } else { return None; }
+                        }
+                        return Some(Value::Grid(grid_rows));
+                    }
                 }
             }
             // List literal: (1 2 3) → Value::List([1, 2, 3])
@@ -532,6 +558,109 @@ fn default_synth_components(
     comps.push(SynthComponent {
         name: "string-length".into(), builtin: Some("string-length".into()),
         arity: 1, ret_type: 0, param_types: vec![1], priority: 0.0,
+    });
+
+    // Grid unary transforms: Grid → Grid
+    for name in &[
+        "grid-rotate-cw", "grid-rotate-ccw", "grid-rotate-180",
+        "grid-flip-h", "grid-flip-v", "grid-transpose", "grid-trim",
+    ] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 1, ret_type: 4, param_types: vec![4], priority: 0.0,
+        });
+    }
+    // Grid → Num analysis
+    for name in &[
+        "grid-width", "grid-height", "grid-most-common", "grid-background",
+        "grid-object-count",
+    ] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 1, ret_type: 0, param_types: vec![4], priority: 0.0,
+        });
+    }
+    // Grid → Bool predicates
+    for name in &["grid-symmetric-h", "grid-symmetric-v"] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 1, ret_type: 2, param_types: vec![4], priority: 0.0,
+        });
+    }
+    // Grid → List analysis
+    for name in &[
+        "grid-colors", "grid-bounding-box", "grid-size",
+        "grid-objects", "grid-objects-8", "grid-object-colors",
+    ] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 1, ret_type: 3, param_types: vec![4], priority: 0.0,
+        });
+    }
+    // Grid × Num → Grid
+    comps.push(SynthComponent {
+        name: "grid-scale".into(), builtin: Some("grid-scale".into()),
+        arity: 2, ret_type: 4, param_types: vec![4, 0], priority: 0.0,
+    });
+    // Grid × Num → Num
+    comps.push(SynthComponent {
+        name: "grid-count-color".into(), builtin: Some("grid-count-color".into()),
+        arity: 2, ret_type: 0, param_types: vec![4, 0], priority: 0.0,
+    });
+    // Grid × Num → List
+    for name in &["grid-row", "grid-col", "grid-find-color"] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 2, ret_type: 3, param_types: vec![4, 0], priority: 0.0,
+        });
+    }
+    // Grid × Num × Num → Grid (replace-color)
+    comps.push(SynthComponent {
+        name: "grid-replace-color".into(), builtin: Some("grid-replace-color".into()),
+        arity: 3, ret_type: 4, param_types: vec![4, 0, 0], priority: 0.0,
+    });
+    // Grid × Num × Num → Num (get)
+    comps.push(SynthComponent {
+        name: "grid-get".into(), builtin: Some("grid-get".into()),
+        arity: 3, ret_type: 0, param_types: vec![4, 0, 0], priority: 0.0,
+    });
+    // Grid × Grid → Grid
+    for name in &["grid-hconcat", "grid-vconcat", "grid-mask"] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 2, ret_type: 4, param_types: vec![4, 4], priority: 0.0,
+        });
+    }
+    // Grid × Grid → Bool
+    for name in &["grid-equal", "grid-dimensions-equal"] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 2, ret_type: 2, param_types: vec![4, 4], priority: 0.0,
+        });
+    }
+    // Grid × Num → List (split)
+    for name in &["grid-hsplit", "grid-vsplit"] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 2, ret_type: 3, param_types: vec![4, 0], priority: 0.0,
+        });
+    }
+    // Grid → List (quarter)
+    comps.push(SynthComponent {
+        name: "grid-quarter".into(), builtin: Some("grid-quarter".into()),
+        arity: 1, ret_type: 3, param_types: vec![4], priority: 0.0,
+    });
+    // Grid × Num × Num → Grid (tile, pad)
+    for name in &["grid-tile", "grid-pad"] {
+        comps.push(SynthComponent {
+            name: name.to_string(), builtin: Some(name.to_string()),
+            arity: 3, ret_type: 4, param_types: vec![4, 0, 0], priority: 0.0,
+        });
+    }
+    // Grid-make: Num × Num × Num → Grid
+    comps.push(SynthComponent {
+        name: "grid-make".into(), builtin: Some("grid-make".into()),
+        arity: 3, ret_type: 4, param_types: vec![0, 0, 0], priority: 0.0,
     });
 
     // Add macro components
@@ -931,9 +1060,14 @@ fn cmd_curriculum(args: &[String]) {
         };
         let num_synth_comps_before = 0usize; // will be set after component creation
         let mut trace_steps: Vec<trace::SolveStep> = Vec::new();
+        let input_is_grid = matches!(&inputs[0], Value::Grid(_));
         let mut synth_comps = synth::default_synth_components(&all_macros);
         let extra_bindings: Vec<(String, Value)> = Vec::new();
-        if input_is_string {
+        if input_is_grid {
+            for comp in &mut synth_comps {
+                if comp.name == "x" { comp.ret_type = synth::TYPE_GRID; }
+            }
+        } else if input_is_string {
             for comp in &mut synth_comps {
                 if comp.name == "x" { comp.ret_type = synth::TYPE_STR; }
             }
@@ -1983,6 +2117,133 @@ fn cmd_verify(args: &[String]) {
 //   selph meta-opt <tasks.selph> --library grown.selph --trace trace.json [--trace trace2.json]
 //   selph meta-opt examples/full_curriculum.selph --library chain_output/stage3_nl.selph \
 //     --trace chain_output/trace_seq.json --trace chain_output/trace_cf.json --trace chain_output/trace_nl.json
+
+// ── ARC-AGI task loader ──────────────────────────────────────────────
+//   selph arc <path>               — load ARC task(s), convert to .selph or run synthesis
+//   selph arc <dir> --output tasks.selph  — generate curriculum from all tasks in dir
+//   selph arc <file.json> --synth  — run synthesis on a single ARC task
+
+fn cmd_arc(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: selph arc <path> [--output tasks.selph] [--synth] [--depth N] [--budget N] [--library lib.selph]");
+        return;
+    }
+
+    let path = &args[0];
+    let mut output_file: Option<String> = None;
+    let mut do_synth = false;
+    let mut depth = 2usize;
+    let mut budget = 100000usize;
+    let mut library_files: Vec<String> = Vec::new();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--output" | "-o" => { i += 1; output_file = Some(args[i].clone()); }
+            "--synth" | "-s" => { do_synth = true; }
+            "--depth" => { i += 1; depth = args[i].parse().unwrap_or(2); }
+            "--budget" => { i += 1; budget = args[i].parse().unwrap_or(100000); }
+            "--library" => { i += 1; library_files.push(args[i].clone()); }
+            _ => { eprintln!("Unknown flag: {}", args[i]); return; }
+        }
+        i += 1;
+    }
+
+    let meta = std::fs::metadata(path);
+    let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+
+    let tasks: Vec<arc::ArcTask> = if is_dir {
+        // Load all JSON files in directory
+        let mut tasks = Vec::new();
+        let mut entries: Vec<_> = std::fs::read_dir(path).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "json"))
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let file_path = entry.path();
+            let id = file_path.file_stem().unwrap().to_string_lossy().to_string();
+            let json = std::fs::read_to_string(&file_path).unwrap();
+            match arc::parse_arc_task(&id, &json) {
+                Ok(task) => tasks.push(task),
+                Err(e) => eprintln!("Error parsing {}: {}", file_path.display(), e),
+            }
+        }
+        eprintln!("Loaded {} ARC tasks from {}", tasks.len(), path);
+        tasks
+    } else {
+        // Single file
+        let id = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
+        let json = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("Error reading {}: {}", path, e); std::process::exit(1);
+        });
+        match arc::parse_arc_task(&id, &json) {
+            Ok(task) => vec![task],
+            Err(e) => { eprintln!("Error parsing {}: {}", path, e); return; }
+        }
+    };
+
+    // Generate curriculum file
+    if let Some(ref out) = output_file {
+        let curriculum = arc::arc_dir_to_curriculum(&tasks, depth);
+        std::fs::write(out, &curriculum).unwrap();
+        eprintln!("Wrote curriculum to {}", out);
+    }
+
+    // Run synthesis on each task
+    if do_synth {
+        let mut macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = Vec::new();
+        for lib_file in &library_files {
+            match library::load_library(lib_file) {
+                Ok(lib_macros) => macros.extend(lib_macros),
+                Err(e) => eprintln!("Warning: failed to load library {}: {}", lib_file, e),
+            }
+        }
+
+        let mut solved = 0;
+        let total = tasks.len();
+        for task in &tasks {
+            let (inputs, expected) = arc::arc_task_to_spec(task);
+            let mut synth_comps = synth::default_synth_components(&macros);
+            // Set x type to grid
+            for comp in &mut synth_comps {
+                if comp.name == "x" { comp.ret_type = synth::TYPE_GRID; }
+            }
+
+            let start = std::time::Instant::now();
+            let sr = synth::synthesize_with_validation(
+                &synth_comps, &inputs, &expected, &macros,
+                depth, budget, true, None, &[]);
+            let elapsed = start.elapsed();
+
+            if sr.found {
+                solved += 1;
+                let source = types::node_to_source(sr.nodes.as_ref().unwrap(), sr.root.unwrap());
+                println!("SOLVED {} ({} candidates, {:.2}s): {}",
+                    task.id, sr.candidates_explored, elapsed.as_secs_f64(), source);
+            } else {
+                println!("FAILED {} ({} candidates, {:.2}s)",
+                    task.id, sr.candidates_explored, elapsed.as_secs_f64());
+            }
+        }
+        println!("\nResults: {}/{} solved ({:.1}%)", solved, total, solved as f64 / total as f64 * 100.0);
+    }
+
+    // If no action specified, just print info
+    if output_file.is_none() && !do_synth {
+        for task in &tasks {
+            let (inputs, expected) = arc::arc_task_to_spec(task);
+            let in_dims = if let Value::Grid(g) = &inputs[0] {
+                format!("{}x{}", g.len(), g.first().map_or(0, |r| r.len()))
+            } else { "?".into() };
+            let out_dims = if let Value::Grid(g) = &expected[0] {
+                format!("{}x{}", g.len(), g.first().map_or(0, |r| r.len()))
+            } else { "?".into() };
+            println!("{}: {} train examples, {} test, input={}, output={}",
+                task.id, task.train.len(), task.test.len(), in_dims, out_dims);
+        }
+    }
+}
 
 fn cmd_meta_optimize(args: &[String]) {
     if args.is_empty() {

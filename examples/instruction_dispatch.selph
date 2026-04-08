@@ -1,0 +1,64 @@
+; Instruction dispatch curriculum (Stage 1+)
+; Requires: nl_helpers.selph + stage_ops.selph (promoted pure operations)
+;
+; Run WITH libraries:
+;   selph grow examples/instruction_dispatch.selph \
+;     --library examples/nl_helpers.selph \
+;     --library chain_output/stage_ops.selph \
+;     --output chain_output/stage_dispatch.selph
+;
+; The dispatch builtin looks up a macro by name (a string) in the
+; current environment and applies it. The promoted operations from
+; Stage 0 become the dispatch table. The system discovers:
+;   (dispatch (first_word x) (last_word x))
+
+; === Two-word instruction dispatch ===
+; Format: "OP ARG"
+(task "follow_str" 2
+  ("reverse hello" "olleh")
+  ("reverse moon" "noom")
+  ("reverse abc" "cba")
+  ("upper hello" "HELLO")
+  ("upper moon" "MOON")
+  ("upper abc" "ABC")
+  ("lower HELLO" "hello")
+  ("lower MOON" "moon"))
+
+; Numeric dispatch
+(task "follow_num" 2
+  ("len hello" 5)
+  ("len moon" 4)
+  ("len abc" 3)
+  ("len fog" 3)
+  ("len hi" 2)
+  ("len it" 2))
+
+; === Three-word NL instructions ===
+; Format: "FILLER OP ARG"
+; Expected: (dispatch (second_word x) (last_word x))
+(task "follow_nl" 2
+  ("please reverse hello" "olleh")
+  ("kindly reverse moon" "noom")
+  ("now reverse abc" "cba")
+  ("please upper hello" "HELLO")
+  ("kindly upper moon" "MOON")
+  ("now upper abc" "ABC")
+  ("please lower HELLO" "hello")
+  ("kindly lower MOON" "moon"))
+
+; === Compositional (HO decomposition) ===
+(task "reverse_words" 2
+  ("hello moon" "olleh noom")
+  ("abc fog" "cba gof")
+  ("sky gem" "yks meg")
+  ("hi no" "ih on")
+  ("ice bay" "eci yab")
+  ("den fog" "ned gof"))
+
+(task "upper_words" 2
+  ("hello moon" "HELLO MOON")
+  ("abc fog" "ABC FOG")
+  ("sky gem" "SKY GEM")
+  ("hi no" "HI NO")
+  ("ice bay" "ICE BAY")
+  ("den fog" "DEN FOG"))

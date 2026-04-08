@@ -28,6 +28,28 @@ const BUILTINS: &[&str] = &[
     "range", "empty?", "contains", "sort",
     "map", "filter", "reduce", "compose", "pipe", "apply",
     "identity", "if", "let", "lambda", "defmacro", "define", "do", "quote",
+    // Grid
+    "grid-make", "grid-from-list", "grid-to-list",
+    "grid-width", "grid-height", "grid-size", "grid-get", "grid-set",
+    "grid-row", "grid-col",
+    "grid-rotate-cw", "grid-rotate-ccw", "grid-rotate-180",
+    "grid-flip-h", "grid-flip-v", "grid-transpose",
+    "grid-crop", "grid-overlay", "grid-tile", "grid-scale",
+    "grid-replace-color", "grid-mask", "grid-pad",
+    "grid-colors", "grid-count-color", "grid-most-common", "grid-background",
+    "grid-equal", "grid-find-color", "grid-symmetric-h", "grid-symmetric-v",
+    "grid-dimensions-equal", "grid-bounding-box", "grid-trim",
+    "grid-objects", "grid-objects-8", "grid-object-count", "grid-object-colors",
+    "grid-hconcat", "grid-vconcat", "grid-hsplit", "grid-vsplit", "grid-quarter",
+    // Tier 1: Perceptual
+    "grid-flood-fill", "grid-fill-enclosed",
+    "grid-draw-line-h", "grid-draw-line-v", "grid-ray",
+    "grid-gravity", "grid-xor", "grid-and", "grid-or",
+    // Tier 2: Shape analysis
+    "grid-object-area", "grid-object-center", "grid-is-rectangle",
+    "grid-detect-rectangles", "grid-objects-touching", "grid-overlay-center",
+    // Tier 3: Advanced
+    "grid-find-subgrid", "grid-neighbor-count", "grid-border", "grid-fill-rect",
 ];
 
 fn is_builtin(name: &str) -> bool {

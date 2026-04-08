@@ -34,6 +34,8 @@ pub enum Value {
     Builtin(Sym),
     RustMacro(Vec<Sym>, Rc<[Node]>, usize),
     Namespace(HashMap<String, Value>),
+    /// 2D grid of integers 0-9 (row-major). Used for ARC-AGI tasks.
+    Grid(Vec<Vec<i8>>),
     /// Spec alternative: matches if actual equals any of the contained values.
     /// Used in synthesis specs, e.g. (or "quick" "speedy") means either is acceptable.
     Alt(Vec<Value>),

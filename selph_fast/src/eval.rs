@@ -211,6 +211,20 @@ fn eval_inner(nodes: &Rc<[Node]>, idx: usize, env: &mut Env) -> Result<Value, St
                         }
                         return Ok(last);
                     }
+                    // dispatch: look up a macro by name string and apply it
+                    // (dispatch "reverse" "hello") → looks up "reverse" in env, applies to "hello"
+                    "dispatch" if children.len() == 3 => {
+                        let name_val = eval(nodes, children[1], env)?;
+                        let name_str = match &name_val {
+                            Value::Str(s) => s.clone(),
+                            _ => return Err("dispatch: first arg must be string".into()),
+                        };
+                        let arg = eval(nodes, children[2], env)?;
+                        let key = intern(&name_str);
+                        let func = env_lookup(env, key)
+                            .ok_or_else(|| format!("dispatch: unknown operation '{}'", name_str))?;
+                        return apply(&func, &[arg], nodes, env);
+                    }
                     _ => {}
                 }
             }
@@ -489,7 +503,7 @@ fn build_dispatch_table() -> std::collections::HashMap<Sym, BuiltinFn> {
     m.insert(intern("type-of"), |args| {
         let type_name = match &args[0] {
             Value::Num(_) => "number", Value::Str(_) => "string", Value::Bool(_) => "bool",
-            Value::List(_) => "list", Value::Namespace(_) => "namespace", Value::Nil => "nil",
+            Value::List(_) => "list", Value::Grid(_) => "grid", Value::Namespace(_) => "namespace", Value::Nil => "nil",
             Value::Closure(..) | Value::Builtin(_) | Value::RustMacro(..) => "function",
             Value::Alt(_) => "alt",
         };
@@ -504,6 +518,698 @@ fn build_dispatch_table() -> std::collections::HashMap<Sym, BuiltinFn> {
     m.insert(intern("try"), |args| Ok(args[0].clone()));
     m.insert(intern("define"), |_args| Err("define: must be used as a special form, not called".into()));
     m.insert(intern("error"), |args| Err(value_to_string(&args[0])));
+
+    // ── Grid predicates ─────────────────────────────────────────────
+    m.insert(intern("grid?"), |args| Ok(Value::Bool(matches!(&args[0], Value::Grid(_)))));
+
+    // ── Grid construction & access ──────────────────────────────────
+    m.insert(intern("grid-make"), |args| {
+        let h = num(&args[0])? as usize;
+        let w = num(&args[1])? as usize;
+        let c = num(&args[2])? as i8;
+        Ok(Value::Grid(vec![vec![c; w]; h]))
+    });
+    m.insert(intern("grid-from-list"), |args| {
+        let outer = list(&args[0])?;
+        let mut rows = Vec::with_capacity(outer.len());
+        for row_val in &outer {
+            let row_list = match row_val { Value::List(l) => l, _ => return Err("grid-from-list: expected list of lists".into()) };
+            let row: Vec<i8> = row_list.iter().map(|v| match v { Value::Num(n) => Ok(*n as i8), _ => Err("grid-from-list: expected numbers".to_string()) }).collect::<Result<Vec<i8>, String>>()?;
+            rows.push(row);
+        }
+        Ok(Value::Grid(rows))
+    });
+    m.insert(intern("grid-to-list"), |args| {
+        let g = grid(&args[0])?;
+        let rows: Vec<Value> = g.iter().map(|row| {
+            Value::List(row.iter().map(|c| Value::Num(*c as f64)).collect())
+        }).collect();
+        Ok(Value::List(rows))
+    });
+    m.insert(intern("grid-width"), |args| {
+        let g = grid(&args[0])?;
+        Ok(Value::Num(g.first().map_or(0, |r| r.len()) as f64))
+    });
+    m.insert(intern("grid-height"), |args| {
+        let g = grid(&args[0])?;
+        Ok(Value::Num(g.len() as f64))
+    });
+    m.insert(intern("grid-size"), |args| {
+        let g = grid(&args[0])?;
+        let h = g.len() as f64;
+        let w = g.first().map_or(0, |r| r.len()) as f64;
+        Ok(Value::List(vec![Value::Num(h), Value::Num(w)]))
+    });
+    m.insert(intern("grid-get"), |args| {
+        let g = grid(&args[0])?;
+        let r = num(&args[1])? as usize;
+        let c = num(&args[2])? as usize;
+        if r < g.len() && c < g[r].len() { Ok(Value::Num(g[r][c] as f64)) }
+        else { Err(format!("grid-get: index ({},{}) out of bounds ({}x{})", r, c, g.len(), g.first().map_or(0, |r| r.len()))) }
+    });
+    m.insert(intern("grid-set"), |args| {
+        let mut g = grid(&args[0])?;
+        let r = num(&args[1])? as usize;
+        let c = num(&args[2])? as usize;
+        let v = num(&args[3])? as i8;
+        if r < g.len() && c < g[r].len() { g[r][c] = v; Ok(Value::Grid(g)) }
+        else { Err("grid-set: index out of bounds".into()) }
+    });
+    m.insert(intern("grid-row"), |args| {
+        let g = grid(&args[0])?;
+        let r = num(&args[1])? as usize;
+        if r < g.len() { Ok(Value::List(g[r].iter().map(|c| Value::Num(*c as f64)).collect())) }
+        else { Err("grid-row: row out of bounds".into()) }
+    });
+    m.insert(intern("grid-col"), |args| {
+        let g = grid(&args[0])?;
+        let c = num(&args[1])? as usize;
+        let col: Result<Vec<Value>, String> = g.iter().map(|row| {
+            if c < row.len() { Ok(Value::Num(row[c] as f64)) }
+            else { Err("grid-col: col out of bounds".into()) }
+        }).collect();
+        Ok(Value::List(col?))
+    });
+
+    // ── Grid transformations ────────────────────────────────────────
+    m.insert(intern("grid-rotate-cw"), |args| {
+        let g = grid(&args[0])?;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        let mut out = vec![vec![0i8; h]; w];
+        for r in 0..h { for c in 0..w { out[c][h - 1 - r] = g[r][c]; } }
+        Ok(Value::Grid(out))
+    });
+    m.insert(intern("grid-rotate-ccw"), |args| {
+        let g = grid(&args[0])?;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        let mut out = vec![vec![0i8; h]; w];
+        for r in 0..h { for c in 0..w { out[w - 1 - c][r] = g[r][c]; } }
+        Ok(Value::Grid(out))
+    });
+    m.insert(intern("grid-rotate-180"), |args| {
+        let g = grid(&args[0])?;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        let mut out = vec![vec![0i8; w]; h];
+        for r in 0..h { for c in 0..w { out[h - 1 - r][w - 1 - c] = g[r][c]; } }
+        Ok(Value::Grid(out))
+    });
+    m.insert(intern("grid-flip-h"), |args| {
+        let g = grid(&args[0])?;
+        let out: Vec<Vec<i8>> = g.iter().map(|row| { let mut r = row.clone(); r.reverse(); r }).collect();
+        Ok(Value::Grid(out))
+    });
+    m.insert(intern("grid-flip-v"), |args| {
+        let mut g = grid(&args[0])?;
+        g.reverse();
+        Ok(Value::Grid(g))
+    });
+    m.insert(intern("grid-transpose"), |args| {
+        let g = grid(&args[0])?;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        let mut out = vec![vec![0i8; h]; w];
+        for r in 0..h { for c in 0..w { out[c][r] = g[r][c]; } }
+        Ok(Value::Grid(out))
+    });
+    m.insert(intern("grid-crop"), |args| {
+        let g = grid(&args[0])?;
+        let r1 = num(&args[1])? as usize;
+        let c1 = num(&args[2])? as usize;
+        let r2 = num(&args[3])? as usize;
+        let c2 = num(&args[4])? as usize;
+        let out: Vec<Vec<i8>> = g[r1..r2].iter().map(|row| row[c1..c2].to_vec()).collect();
+        Ok(Value::Grid(out))
+    });
+    m.insert(intern("grid-overlay"), |args| {
+        let mut base = grid(&args[0])?;
+        let over = grid(&args[1])?;
+        let dr = num(&args[2])? as usize;
+        let dc = num(&args[3])? as usize;
+        for r in 0..over.len() {
+            for c in 0..over[r].len() {
+                if over[r][c] != 0 {
+                    let tr = dr + r; let tc = dc + c;
+                    if tr < base.len() && tc < base[tr].len() { base[tr][tc] = over[r][c]; }
+                }
+            }
+        }
+        Ok(Value::Grid(base))
+    });
+    m.insert(intern("grid-tile"), |args| {
+        let g = grid(&args[0])?;
+        let nr = num(&args[1])? as usize;
+        let nc = num(&args[2])? as usize;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        let mut out = vec![vec![0i8; w * nc]; h * nr];
+        for tr in 0..nr { for tc in 0..nc { for r in 0..h { for c in 0..w { out[tr * h + r][tc * w + c] = g[r][c]; } } } }
+        Ok(Value::Grid(out))
+    });
+    m.insert(intern("grid-scale"), |args| {
+        let g = grid(&args[0])?;
+        let s = num(&args[1])? as usize;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        let mut out = vec![vec![0i8; w * s]; h * s];
+        for r in 0..h { for c in 0..w { for dr in 0..s { for dc in 0..s { out[r * s + dr][c * s + dc] = g[r][c]; } } } }
+        Ok(Value::Grid(out))
+    });
+    m.insert(intern("grid-replace-color"), |args| {
+        let g = grid(&args[0])?;
+        let from = num(&args[1])? as i8;
+        let to = num(&args[2])? as i8;
+        let out: Vec<Vec<i8>> = g.iter().map(|row| row.iter().map(|&c| if c == from { to } else { c }).collect()).collect();
+        Ok(Value::Grid(out))
+    });
+    m.insert(intern("grid-mask"), |args| {
+        let g = grid(&args[0])?;
+        let mask = grid(&args[1])?;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        let mut out = vec![vec![0i8; w]; h];
+        for r in 0..h { for c in 0..w { out[r][c] = if r < mask.len() && c < mask[r].len() && mask[r][c] != 0 { g[r][c] } else { 0 }; } }
+        Ok(Value::Grid(out))
+    });
+    m.insert(intern("grid-pad"), |args| {
+        let g = grid(&args[0])?;
+        let pad = num(&args[1])? as usize;
+        let color = num(&args[2])? as i8;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        let new_h = h + 2 * pad; let new_w = w + 2 * pad;
+        let mut out = vec![vec![color; new_w]; new_h];
+        for r in 0..h { for c in 0..w { out[r + pad][c + pad] = g[r][c]; } }
+        Ok(Value::Grid(out))
+    });
+
+    // ── Grid analysis ───────────────────────────────────────────────
+    m.insert(intern("grid-colors"), |args| {
+        let g = grid(&args[0])?;
+        let mut seen = [false; 10];
+        for row in &g { for &c in row { if (c as usize) < 10 { seen[c as usize] = true; } } }
+        let colors: Vec<Value> = seen.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| Value::Num(i as f64)).collect();
+        Ok(Value::List(colors))
+    });
+    m.insert(intern("grid-count-color"), |args| {
+        let g = grid(&args[0])?;
+        let color = num(&args[1])? as i8;
+        let count = g.iter().flat_map(|row| row.iter()).filter(|&&c| c == color).count();
+        Ok(Value::Num(count as f64))
+    });
+    m.insert(intern("grid-most-common"), |args| {
+        let g = grid(&args[0])?;
+        Ok(Value::Num(detect_background(&g) as f64))
+    });
+    m.insert(intern("grid-background"), |args| {
+        let g = grid(&args[0])?;
+        Ok(Value::Num(detect_background(&g) as f64))
+    });
+    m.insert(intern("grid-equal"), |args| {
+        let a = grid(&args[0])?;
+        let b = grid(&args[1])?;
+        Ok(Value::Bool(a == b))
+    });
+    m.insert(intern("grid-find-color"), |args| {
+        let g = grid(&args[0])?;
+        let color = num(&args[1])? as i8;
+        let mut positions = Vec::new();
+        for (r, row) in g.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                if v == color { positions.push(Value::List(vec![Value::Num(r as f64), Value::Num(c as f64)])); }
+            }
+        }
+        Ok(Value::List(positions))
+    });
+    m.insert(intern("grid-symmetric-h"), |args| {
+        let g = grid(&args[0])?;
+        let sym = g.iter().all(|row| { let w = row.len(); (0..w / 2).all(|c| row[c] == row[w - 1 - c]) });
+        Ok(Value::Bool(sym))
+    });
+    m.insert(intern("grid-symmetric-v"), |args| {
+        let g = grid(&args[0])?;
+        let h = g.len();
+        let sym = (0..h / 2).all(|r| g[r] == g[h - 1 - r]);
+        Ok(Value::Bool(sym))
+    });
+    m.insert(intern("grid-dimensions-equal"), |args| {
+        let a = grid(&args[0])?;
+        let b = grid(&args[1])?;
+        let eq = a.len() == b.len() && a.first().map_or(0, |r| r.len()) == b.first().map_or(0, |r| r.len());
+        Ok(Value::Bool(eq))
+    });
+
+    // ── Grid bounding box & trim ────────────────────────────────────
+    m.insert(intern("grid-bounding-box"), |args| {
+        let g = grid(&args[0])?;
+        let bg = detect_background(&g);
+        let mut min_r = g.len(); let mut min_c = g.first().map_or(0, |r| r.len());
+        let mut max_r = 0usize; let mut max_c = 0usize;
+        for (r, row) in g.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                if v != bg { min_r = min_r.min(r); min_c = min_c.min(c); max_r = max_r.max(r); max_c = max_c.max(c); }
+            }
+        }
+        if max_r < min_r { Ok(Value::List(vec![Value::Num(0.0), Value::Num(0.0), Value::Num(0.0), Value::Num(0.0)])) }
+        else { Ok(Value::List(vec![Value::Num(min_r as f64), Value::Num(min_c as f64), Value::Num((max_r + 1) as f64), Value::Num((max_c + 1) as f64)])) }
+    });
+    m.insert(intern("grid-trim"), |args| {
+        let g = grid(&args[0])?;
+        let bg = detect_background(&g);
+        let mut min_r = g.len(); let mut min_c = g.first().map_or(0, |r| r.len());
+        let mut max_r = 0usize; let mut max_c = 0usize;
+        for (r, row) in g.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                if v != bg { min_r = min_r.min(r); min_c = min_c.min(c); max_r = max_r.max(r); max_c = max_c.max(c); }
+            }
+        }
+        if max_r < min_r || min_c > max_c { Ok(Value::Grid(vec![])) }
+        else if max_r >= g.len() || max_c >= g[0].len() { Ok(Value::Grid(vec![])) }
+        else {
+            let out: Vec<Vec<i8>> = g[min_r..=max_r].iter().map(|row| {
+                if max_c < row.len() { row[min_c..=max_c].to_vec() } else { vec![] }
+            }).collect();
+            Ok(Value::Grid(out))
+        }
+    });
+
+    // ── Grid object detection (connected components) ────────────────
+    m.insert(intern("grid-objects"), |args| {
+        let g = grid(&args[0])?;
+        if g.is_empty() { return Ok(Value::List(vec![])); }
+        let objects = grid_connected_components(&g, false);
+        Ok(Value::List(objects.into_iter().map(Value::Grid).collect()))
+    });
+    m.insert(intern("grid-objects-8"), |args| {
+        let g = grid(&args[0])?;
+        if g.is_empty() { return Ok(Value::List(vec![])); }
+        let objects = grid_connected_components(&g, true);
+        Ok(Value::List(objects.into_iter().map(Value::Grid).collect()))
+    });
+    m.insert(intern("grid-object-count"), |args| {
+        let g = grid(&args[0])?;
+        let count = grid_connected_components(&g, false).len();
+        Ok(Value::Num(count as f64))
+    });
+    m.insert(intern("grid-object-colors"), |args| {
+        // Extract single-color masks (one grid per non-background color)
+        let g = grid(&args[0])?;
+        let bg = detect_background(&g);
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        let mut color_grids: Vec<Value> = Vec::new();
+        for color in 0..10i8 {
+            if color == bg { continue; }
+            let has_color = g.iter().any(|row| row.contains(&color));
+            if has_color {
+                let mask: Vec<Vec<i8>> = g.iter().map(|row| row.iter().map(|&c| if c == color { color } else { 0 }).collect()).collect();
+                color_grids.push(Value::Grid(mask));
+            }
+        }
+        let _ = (h, w); // suppress unused
+        Ok(Value::List(color_grids))
+    });
+
+    // ── Grid composition ────────────────────────────────────────────
+    m.insert(intern("grid-hconcat"), |args| {
+        let a = grid(&args[0])?;
+        let b = grid(&args[1])?;
+        let h = a.len().max(b.len());
+        let wa = a.first().map_or(0, |r| r.len());
+        let wb = b.first().map_or(0, |r| r.len());
+        let mut out = vec![vec![0i8; wa + wb]; h];
+        for r in 0..h {
+            if r < a.len() { for c in 0..wa { out[r][c] = a[r][c]; } }
+            if r < b.len() { for c in 0..wb { out[r][wa + c] = b[r][c]; } }
+        }
+        Ok(Value::Grid(out))
+    });
+    m.insert(intern("grid-vconcat"), |args| {
+        let a = grid(&args[0])?;
+        let b = grid(&args[1])?;
+        let mut out = a;
+        out.extend(b);
+        Ok(Value::Grid(out))
+    });
+    m.insert(intern("grid-hsplit"), |args| {
+        let g = grid(&args[0])?;
+        let n = num(&args[1])? as usize;
+        let w = g.first().map_or(0, |r| r.len());
+        let chunk_w = w / n;
+        let parts: Vec<Value> = (0..n).map(|i| {
+            let start = i * chunk_w;
+            let end = if i == n - 1 { w } else { start + chunk_w };
+            Value::Grid(g.iter().map(|row| row[start..end].to_vec()).collect())
+        }).collect();
+        Ok(Value::List(parts))
+    });
+    m.insert(intern("grid-vsplit"), |args| {
+        let g = grid(&args[0])?;
+        let n = num(&args[1])? as usize;
+        let h = g.len();
+        let chunk_h = h / n;
+        let parts: Vec<Value> = (0..n).map(|i| {
+            let start = i * chunk_h;
+            let end = if i == n - 1 { h } else { start + chunk_h };
+            Value::Grid(g[start..end].to_vec())
+        }).collect();
+        Ok(Value::List(parts))
+    });
+    m.insert(intern("grid-quarter"), |args| {
+        let g = grid(&args[0])?;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        let mh = h / 2; let mw = w / 2;
+        let tl: Vec<Vec<i8>> = g[..mh].iter().map(|r| r[..mw].to_vec()).collect();
+        let tr: Vec<Vec<i8>> = g[..mh].iter().map(|r| r[mw..].to_vec()).collect();
+        let bl: Vec<Vec<i8>> = g[mh..].iter().map(|r| r[..mw].to_vec()).collect();
+        let br: Vec<Vec<i8>> = g[mh..].iter().map(|r| r[mw..].to_vec()).collect();
+        Ok(Value::List(vec![Value::Grid(tl), Value::Grid(tr), Value::Grid(bl), Value::Grid(br)]))
+    });
+
+    // ── Tier 1: Perceptual primitives ───────────────────────────────
+
+    m.insert(intern("grid-flood-fill"), |args| {
+        let mut g = grid(&args[0])?;
+        let r = num(&args[1])? as usize;
+        let c = num(&args[2])? as usize;
+        let fill = num(&args[3])? as i8;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        if r >= h || c >= w { return Ok(Value::Grid(g)); }
+        let orig = g[r][c];
+        if orig == fill { return Ok(Value::Grid(g)); }
+        let mut queue = vec![(r, c)];
+        g[r][c] = fill;
+        while let Some((cr, cc)) = queue.pop() {
+            for (dr, dc) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
+                let nr = cr as i32 + dr; let nc = cc as i32 + dc;
+                if nr >= 0 && nr < h as i32 && nc >= 0 && nc < w as i32 {
+                    let (nr, nc) = (nr as usize, nc as usize);
+                    if g[nr][nc] == orig { g[nr][nc] = fill; queue.push((nr, nc)); }
+                }
+            }
+        }
+        Ok(Value::Grid(g))
+    });
+
+    m.insert(intern("grid-fill-enclosed"), |args| {
+        let g = grid(&args[0])?;
+        let fill = num(&args[1])? as i8;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        if h == 0 || w == 0 { return Ok(Value::Grid(g)); }
+        // Use 0 as background (ARC convention), not detect_background
+        // which can be wrong for grids where the "wall" is the majority color
+        let bg = 0i8;
+        // Flood-fill background from all border cells to find "exterior"
+        let mut exterior = vec![vec![false; w]; h];
+        let mut queue: Vec<(usize, usize)> = Vec::new();
+        for r in 0..h { for c in 0..w {
+            if (r == 0 || r == h - 1 || c == 0 || c == w - 1) && g[r][c] == bg {
+                exterior[r][c] = true; queue.push((r, c));
+            }
+        }}
+        while let Some((cr, cc)) = queue.pop() {
+            for (dr, dc) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
+                let nr = cr as i32 + dr; let nc = cc as i32 + dc;
+                if nr >= 0 && nr < h as i32 && nc >= 0 && nc < w as i32 {
+                    let (nr, nc) = (nr as usize, nc as usize);
+                    if !exterior[nr][nc] && g[nr][nc] == bg { exterior[nr][nc] = true; queue.push((nr, nc)); }
+                }
+            }
+        }
+        // Fill all non-exterior background cells
+        let out: Vec<Vec<i8>> = g.iter().enumerate().map(|(r, row)| {
+            row.iter().enumerate().map(|(c, &v)| {
+                if v == bg && !exterior[r][c] { fill } else { v }
+            }).collect()
+        }).collect();
+        Ok(Value::Grid(out))
+    });
+
+    m.insert(intern("grid-draw-line-h"), |args| {
+        let mut g = grid(&args[0])?;
+        let r = num(&args[1])? as usize;
+        let c1 = num(&args[2])? as usize;
+        let c2 = num(&args[3])? as usize;
+        let color = num(&args[4])? as i8;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        if r < h {
+            for c in c1.min(c2)..=c1.max(c2) { if c < w { g[r][c] = color; } }
+        }
+        Ok(Value::Grid(g))
+    });
+
+    m.insert(intern("grid-draw-line-v"), |args| {
+        let mut g = grid(&args[0])?;
+        let c = num(&args[1])? as usize;
+        let r1 = num(&args[2])? as usize;
+        let r2 = num(&args[3])? as usize;
+        let color = num(&args[4])? as i8;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        if c < w {
+            for r in r1.min(r2)..=r1.max(r2) { if r < h { g[r][c] = color; } }
+        }
+        Ok(Value::Grid(g))
+    });
+
+    m.insert(intern("grid-ray"), |args| {
+        let mut g = grid(&args[0])?;
+        let mut r = num(&args[1])? as i32;
+        let mut c = num(&args[2])? as i32;
+        let dr = num(&args[3])? as i32;
+        let dc = num(&args[4])? as i32;
+        let color = num(&args[5])? as i8;
+        let h = g.len() as i32; let w = g.first().map_or(0, |r| r.len()) as i32;
+        while r >= 0 && r < h && c >= 0 && c < w {
+            g[r as usize][c as usize] = color;
+            r += dr; c += dc;
+        }
+        Ok(Value::Grid(g))
+    });
+
+    m.insert(intern("grid-gravity"), |args| {
+        let g = grid(&args[0])?;
+        let dir = num(&args[1])? as i32;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        if h == 0 || w == 0 { return Ok(Value::Grid(g)); }
+        let bg = detect_background(&g);
+        let mut out = vec![vec![bg; w]; h];
+        match dir {
+            0 => { // down
+                for c in 0..w {
+                    let mut write = h;
+                    for r in (0..h).rev() { if g[r][c] != bg { write -= 1; out[write][c] = g[r][c]; } }
+                }
+            }
+            1 => { // up
+                for c in 0..w {
+                    let mut write = 0;
+                    for r in 0..h { if g[r][c] != bg { out[write][c] = g[r][c]; write += 1; } }
+                }
+            }
+            2 => { // left
+                for r in 0..h {
+                    let mut write = 0;
+                    for c in 0..w { if g[r][c] != bg { out[r][write] = g[r][c]; write += 1; } }
+                }
+            }
+            3 => { // right
+                for r in 0..h {
+                    let mut write = w;
+                    for c in (0..w).rev() { if g[r][c] != bg { write -= 1; out[r][write] = g[r][c]; } }
+                }
+            }
+            _ => return Ok(Value::Grid(g)),
+        }
+        Ok(Value::Grid(out))
+    });
+
+    m.insert(intern("grid-xor"), |args| {
+        let a = grid(&args[0])?; let b = grid(&args[1])?;
+        let bg_a = detect_background(&a); let bg_b = detect_background(&b);
+        let h = a.len().max(b.len()); let w = a.first().map_or(0, |r| r.len()).max(b.first().map_or(0, |r| r.len()));
+        let mut out = vec![vec![0i8; w]; h];
+        for r in 0..h { for c in 0..w {
+            let va = if r < a.len() && c < a[r].len() { a[r][c] } else { bg_a };
+            let vb = if r < b.len() && c < b[r].len() { b[r][c] } else { bg_b };
+            let a_fg = va != bg_a; let b_fg = vb != bg_b;
+            out[r][c] = if a_fg && !b_fg { va } else if !a_fg && b_fg { vb } else { 0 };
+        }}
+        Ok(Value::Grid(out))
+    });
+
+    m.insert(intern("grid-and"), |args| {
+        let a = grid(&args[0])?; let b = grid(&args[1])?;
+        let bg_a = detect_background(&a); let bg_b = detect_background(&b);
+        let h = a.len().max(b.len()); let w = a.first().map_or(0, |r| r.len()).max(b.first().map_or(0, |r| r.len()));
+        let mut out = vec![vec![0i8; w]; h];
+        for r in 0..h { for c in 0..w {
+            let va = if r < a.len() && c < a[r].len() { a[r][c] } else { bg_a };
+            let vb = if r < b.len() && c < b[r].len() { b[r][c] } else { bg_b };
+            out[r][c] = if va != bg_a && vb != bg_b { va } else { 0 };
+        }}
+        Ok(Value::Grid(out))
+    });
+
+    m.insert(intern("grid-or"), |args| {
+        let a = grid(&args[0])?; let b = grid(&args[1])?;
+        let bg_a = detect_background(&a); let bg_b = detect_background(&b);
+        let h = a.len().max(b.len()); let w = a.first().map_or(0, |r| r.len()).max(b.first().map_or(0, |r| r.len()));
+        let mut out = vec![vec![0i8; w]; h];
+        for r in 0..h { for c in 0..w {
+            let va = if r < a.len() && c < a[r].len() { a[r][c] } else { bg_a };
+            let vb = if r < b.len() && c < b[r].len() { b[r][c] } else { bg_b };
+            out[r][c] = if va != bg_a { va } else if vb != bg_b { vb } else { 0 };
+        }}
+        Ok(Value::Grid(out))
+    });
+
+    // ── Tier 2: Shape analysis ──────────────────────────────────────
+
+    m.insert(intern("grid-object-area"), |args| {
+        let g = grid(&args[0])?;
+        let bg = detect_background(&g);
+        let count = g.iter().flat_map(|row| row.iter()).filter(|&&c| c != bg).count();
+        Ok(Value::Num(count as f64))
+    });
+
+    m.insert(intern("grid-object-center"), |args| {
+        let g = grid(&args[0])?;
+        let bg = detect_background(&g);
+        let mut sum_r = 0f64; let mut sum_c = 0f64; let mut count = 0f64;
+        for (r, row) in g.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                if v != bg { sum_r += r as f64; sum_c += c as f64; count += 1.0; }
+            }
+        }
+        if count == 0.0 { Ok(Value::List(vec![Value::Num(0.0), Value::Num(0.0)])) }
+        else { Ok(Value::List(vec![Value::Num((sum_r / count).floor()), Value::Num((sum_c / count).floor())])) }
+    });
+
+    m.insert(intern("grid-is-rectangle"), |args| {
+        let g = grid(&args[0])?;
+        let bg = detect_background(&g);
+        let mut min_r = g.len(); let mut min_c = g.first().map_or(0, |r| r.len());
+        let mut max_r = 0usize; let mut max_c = 0usize; let mut fg_count = 0usize;
+        for (r, row) in g.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                if v != bg { min_r = min_r.min(r); min_c = min_c.min(c); max_r = max_r.max(r); max_c = max_c.max(c); fg_count += 1; }
+            }
+        }
+        if fg_count == 0 { return Ok(Value::Bool(false)); }
+        let expected = (max_r - min_r + 1) * (max_c - min_c + 1);
+        Ok(Value::Bool(fg_count == expected))
+    });
+
+    m.insert(intern("grid-detect-rectangles"), |args| {
+        let g = grid(&args[0])?;
+        if g.is_empty() { return Ok(Value::List(vec![])); }
+        let objects = grid_connected_components(&g, false);
+        let rects: Vec<Value> = objects.into_iter().filter(|obj| {
+            let bg = 0i8; // objects are already trimmed with bg=0
+            let mut fg = 0usize; let mut area = 0usize;
+            let h = obj.len(); let w = obj.first().map_or(0, |r| r.len());
+            for row in obj { for &c in row { if c != bg { fg += 1; } } }
+            area = h * w;
+            fg > 0 && fg == area
+        }).map(Value::Grid).collect();
+        Ok(Value::List(rects))
+    });
+
+    m.insert(intern("grid-objects-touching"), |args| {
+        let a = grid(&args[0])?; let b = grid(&args[1])?;
+        let bg_a = detect_background(&a); let bg_b = detect_background(&b);
+        let h = a.len().max(b.len()); let w = a.first().map_or(0, |r| r.len()).max(b.first().map_or(0, |r| r.len()));
+        for r in 0..h { for c in 0..w {
+            let va = if r < a.len() && c < a[r].len() { a[r][c] } else { bg_a };
+            if va == bg_a { continue; }
+            for (dr, dc) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
+                let nr = r as i32 + dr; let nc = c as i32 + dc;
+                if nr >= 0 && nr < h as i32 && nc >= 0 && nc < w as i32 {
+                    let (nr, nc) = (nr as usize, nc as usize);
+                    let vb = if nr < b.len() && nc < b[nr].len() { b[nr][nc] } else { bg_b };
+                    if vb != bg_b { return Ok(Value::Bool(true)); }
+                }
+            }
+        }}
+        Ok(Value::Bool(false))
+    });
+
+    m.insert(intern("grid-overlay-center"), |args| {
+        let mut base = grid(&args[0])?;
+        let over = grid(&args[1])?;
+        let bh = base.len(); let bw = base.first().map_or(0, |r| r.len());
+        let oh = over.len(); let ow = over.first().map_or(0, |r| r.len());
+        let dr = (bh as i32 - oh as i32) / 2; let dc = (bw as i32 - ow as i32) / 2;
+        for r in 0..oh { for c in 0..ow {
+            if over[r][c] != 0 {
+                let tr = dr + r as i32; let tc = dc + c as i32;
+                if tr >= 0 && tr < bh as i32 && tc >= 0 && tc < bw as i32 {
+                    base[tr as usize][tc as usize] = over[r][c];
+                }
+            }
+        }}
+        Ok(Value::Grid(base))
+    });
+
+    // ── Tier 3: Advanced primitives ─────────────────────────────────
+
+    m.insert(intern("grid-find-subgrid"), |args| {
+        let g = grid(&args[0])?; let pat = grid(&args[1])?;
+        let gh = g.len(); let gw = g.first().map_or(0, |r| r.len());
+        let ph = pat.len(); let pw = pat.first().map_or(0, |r| r.len());
+        if ph == 0 || pw == 0 || ph > gh || pw > gw { return Ok(Value::List(vec![])); }
+        let pat_bg = detect_background(&pat);
+        let mut positions = Vec::new();
+        for r in 0..=(gh - ph) {
+            for c in 0..=(gw - pw) {
+                let mut matches = true;
+                'check: for pr in 0..ph { for pc in 0..pw {
+                    if pat[pr][pc] != pat_bg && g[r + pr][c + pc] != pat[pr][pc] { matches = false; break 'check; }
+                }}
+                if matches { positions.push(Value::List(vec![Value::Num(r as f64), Value::Num(c as f64)])); }
+            }
+        }
+        Ok(Value::List(positions))
+    });
+
+    m.insert(intern("grid-neighbor-count"), |args| {
+        let g = grid(&args[0])?;
+        let r = num(&args[1])? as i32;
+        let c = num(&args[2])? as i32;
+        let h = g.len() as i32; let w = g.first().map_or(0, |r| r.len()) as i32;
+        let bg = detect_background(&g);
+        let mut count = 0;
+        for (dr, dc) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
+            let nr = r + dr; let nc = c + dc;
+            if nr >= 0 && nr < h && nc >= 0 && nc < w && g[nr as usize][nc as usize] != bg { count += 1; }
+        }
+        Ok(Value::Num(count as f64))
+    });
+
+    m.insert(intern("grid-border"), |args| {
+        let g = grid(&args[0])?;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        let bg = detect_background(&g);
+        let mut out = vec![vec![bg; w]; h];
+        for r in 0..h { for c in 0..w {
+            if g[r][c] != bg {
+                let has_bg_neighbor = [(-1i32, 0), (1, 0), (0, -1i32), (0, 1)].iter().any(|(dr, dc)| {
+                    let nr = r as i32 + dr; let nc = c as i32 + dc;
+                    nr < 0 || nr >= h as i32 || nc < 0 || nc >= w as i32 || g[nr as usize][nc as usize] == bg
+                });
+                if has_bg_neighbor { out[r][c] = g[r][c]; }
+            }
+        }}
+        Ok(Value::Grid(out))
+    });
+
+    m.insert(intern("grid-fill-rect"), |args| {
+        let mut g = grid(&args[0])?;
+        let r1 = num(&args[1])? as usize;
+        let c1 = num(&args[2])? as usize;
+        let r2 = num(&args[3])? as usize;
+        let c2 = num(&args[4])? as usize;
+        let color = num(&args[5])? as i8;
+        let h = g.len(); let w = g.first().map_or(0, |r| r.len());
+        for r in r1.min(r2)..=r1.max(r2) { for c in c1.min(c2)..=c1.max(c2) {
+            if r < h && c < w { g[r][c] = color; }
+        }}
+        Ok(Value::Grid(g))
+    });
+
     m
 }
 
@@ -730,6 +1436,7 @@ fn num(v: &Value) -> Result<f64, String> {
 }
 
 fn nums(args: &[Value]) -> Result<(f64, f64), String> {
+    if args.len() < 2 { return Err("expected 2 arguments".into()); }
     Ok((num(&args[0])?, num(&args[1])?))
 }
 
@@ -744,6 +1451,78 @@ fn string(v: &Value) -> Result<String, String> {
 
 fn list(v: &Value) -> Result<Vec<Value>, String> {
     match v { Value::List(l) => Ok(l.clone()), _ => Err(format!("expected list, got {:?}", v)) }
+}
+
+fn grid(v: &Value) -> Result<Vec<Vec<i8>>, String> {
+    match v { Value::Grid(g) => Ok(g.clone()), _ => Err(format!("expected grid, got {:?}", v)) }
+}
+
+/// Detect the background color of a grid (most common color).
+fn detect_background(g: &[Vec<i8>]) -> i8 {
+    let mut counts = [0u32; 10];
+    for row in g { for &c in row { if (c as usize) < 10 { counts[c as usize] += 1; } } }
+    counts.iter().enumerate().max_by_key(|(_, n)| *n).map(|(i, _)| i as i8).unwrap_or(0)
+}
+
+/// Extract connected components from a grid, ignoring the background color.
+/// Each component is returned as a bounding-box-cropped grid with background=0.
+/// If `eight_connected` is true, uses 8-connectivity; otherwise 4-connectivity.
+fn grid_connected_components(g: &[Vec<i8>], eight_connected: bool) -> Vec<Vec<Vec<i8>>> {
+    let h = g.len();
+    let w = g.first().map_or(0, |r| r.len());
+    if h == 0 || w == 0 { return vec![]; }
+
+    let bg = detect_background(g);
+
+    let mut labels = vec![vec![0u32; w]; h];
+    let mut next_label = 1u32;
+    let dirs4: &[(i32, i32)] = &[(-1, 0), (1, 0), (0, -1), (0, 1)];
+    let dirs8: &[(i32, i32)] = &[(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)];
+    let dirs = if eight_connected { dirs8 } else { dirs4 };
+
+    // BFS flood fill
+    for r in 0..h {
+        for c in 0..w {
+            if g[r][c] != bg && labels[r][c] == 0 {
+                let label = next_label;
+                next_label += 1;
+                labels[r][c] = label;
+                let mut queue = vec![(r, c)];
+                while let Some((cr, cc)) = queue.pop() {
+                    for &(dr, dc) in dirs {
+                        let nr = cr as i32 + dr;
+                        let nc = cc as i32 + dc;
+                        if nr >= 0 && nr < h as i32 && nc >= 0 && nc < w as i32 {
+                            let (nr, nc) = (nr as usize, nc as usize);
+                            if labels[nr][nc] == 0 && g[nr][nc] != bg {
+                                labels[nr][nc] = label;
+                                queue.push((nr, nc));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Extract each component as a trimmed grid
+    let num_components = (next_label - 1) as usize;
+    let mut results = Vec::with_capacity(num_components);
+    for lbl in 1..next_label {
+        let mut min_r = h; let mut min_c = w;
+        let mut max_r = 0usize; let mut max_c = 0usize;
+        for r in 0..h { for c in 0..w {
+            if labels[r][c] == lbl { min_r = min_r.min(r); min_c = min_c.min(c); max_r = max_r.max(r); max_c = max_c.max(c); }
+        }}
+        if max_r >= min_r {
+            let mut comp = vec![vec![0i8; max_c - min_c + 1]; max_r - min_r + 1];
+            for r in min_r..=max_r { for c in min_c..=max_c {
+                if labels[r][c] == lbl { comp[r - min_r][c - min_c] = g[r][c]; }
+            }}
+            results.push(comp);
+        }
+    }
+    results
 }
 
 pub fn value_to_string(v: &Value) -> String {
@@ -762,6 +1541,13 @@ pub fn value_to_string(v: &Value) -> String {
         Value::Closure(params, _, _, _, _) => format!("<lambda ({})>", params.iter().map(|p| resolve(*p)).collect::<Vec<_>>().join(" ")),
         Value::Builtin(name) => format!("<builtin {}>", resolve(*name)),
         Value::RustMacro(params, _, _) => format!("<macro ({})>", params.iter().map(|p| resolve(*p)).collect::<Vec<_>>().join(" ")),
+        Value::Grid(rows) => {
+            let row_strs: Vec<String> = rows.iter().map(|row| {
+                let cells: Vec<String> = row.iter().map(|c| c.to_string()).collect();
+                format!("({})", cells.join(" "))
+            }).collect();
+            format!("(#grid ({}))", row_strs.join(" "))
+        }
         Value::Namespace(map) => {
             let keys: Vec<&String> = map.keys().collect();
             format!("<namespace {:?}>", keys)
@@ -822,6 +1608,35 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "eval-source", "eval-in", "type-of",
     "number?", "string?", "bool?", "list?", "nil?", "function?",
     "apply", "error",
+    // Note: "dispatch" is intentionally NOT in BUILTIN_NAMES.
+    // It's a special form handled in eval_inner, not a regular builtin.
+    // Keeping it out of BUILTIN_NAMES ensures the VM compiler fails on
+    // dispatch candidates, triggering the tree-walker fallback where
+    // the special form has access to the full env with promoted macros.
+    // Grid
+    "grid?",
+    "grid-make", "grid-from-list", "grid-to-list",
+    "grid-width", "grid-height", "grid-size",
+    "grid-get", "grid-set", "grid-row", "grid-col",
+    "grid-rotate-cw", "grid-rotate-ccw", "grid-rotate-180",
+    "grid-flip-h", "grid-flip-v", "grid-transpose",
+    "grid-crop", "grid-overlay", "grid-tile", "grid-scale",
+    "grid-replace-color", "grid-mask", "grid-pad",
+    "grid-colors", "grid-count-color", "grid-most-common", "grid-background",
+    "grid-equal", "grid-find-color",
+    "grid-symmetric-h", "grid-symmetric-v", "grid-dimensions-equal",
+    "grid-bounding-box", "grid-trim",
+    "grid-objects", "grid-objects-8", "grid-object-count", "grid-object-colors",
+    "grid-hconcat", "grid-vconcat", "grid-hsplit", "grid-vsplit", "grid-quarter",
+    // Tier 1: Perceptual
+    "grid-flood-fill", "grid-fill-enclosed",
+    "grid-draw-line-h", "grid-draw-line-v", "grid-ray",
+    "grid-gravity", "grid-xor", "grid-and", "grid-or",
+    // Tier 2: Shape analysis
+    "grid-object-area", "grid-object-center", "grid-is-rectangle",
+    "grid-detect-rectangles", "grid-objects-touching", "grid-overlay-center",
+    // Tier 3: Advanced
+    "grid-find-subgrid", "grid-neighbor-count", "grid-border", "grid-fill-rect",
 ];
 
 pub fn make_default_env() -> Env {
@@ -917,6 +1732,81 @@ pub fn make_default_env() -> Env {
         ("map", 2, vec!["function", "list"], "list"),
         ("reduce", 2, vec!["function", "list"], "any"),
         ("filter", 2, vec!["function", "list"], "list"),
+    ] { let (k, v) = bi(n, a, &p, r); builtins_ns.insert(k, v); }
+    // Grid builtins
+    for (n, a, p, r) in [
+        ("grid?", 1, vec!["any"], "bool"),
+        ("grid-make", 3, vec!["number", "number", "number"], "grid"),
+        ("grid-from-list", 1, vec!["list"], "grid"),
+        ("grid-to-list", 1, vec!["grid"], "list"),
+        ("grid-width", 1, vec!["grid"], "number"),
+        ("grid-height", 1, vec!["grid"], "number"),
+        ("grid-size", 1, vec!["grid"], "list"),
+        ("grid-get", 3, vec!["grid", "number", "number"], "number"),
+        ("grid-set", 4, vec!["grid", "number", "number", "number"], "grid"),
+        ("grid-row", 2, vec!["grid", "number"], "list"),
+        ("grid-col", 2, vec!["grid", "number"], "list"),
+        ("grid-rotate-cw", 1, vec!["grid"], "grid"),
+        ("grid-rotate-ccw", 1, vec!["grid"], "grid"),
+        ("grid-rotate-180", 1, vec!["grid"], "grid"),
+        ("grid-flip-h", 1, vec!["grid"], "grid"),
+        ("grid-flip-v", 1, vec!["grid"], "grid"),
+        ("grid-transpose", 1, vec!["grid"], "grid"),
+        ("grid-crop", 5, vec!["grid", "number", "number", "number", "number"], "grid"),
+        ("grid-overlay", 4, vec!["grid", "grid", "number", "number"], "grid"),
+        ("grid-tile", 3, vec!["grid", "number", "number"], "grid"),
+        ("grid-scale", 2, vec!["grid", "number"], "grid"),
+        ("grid-replace-color", 3, vec!["grid", "number", "number"], "grid"),
+        ("grid-mask", 2, vec!["grid", "grid"], "grid"),
+        ("grid-pad", 3, vec!["grid", "number", "number"], "grid"),
+        ("grid-colors", 1, vec!["grid"], "list"),
+        ("grid-count-color", 2, vec!["grid", "number"], "number"),
+        ("grid-most-common", 1, vec!["grid"], "number"),
+        ("grid-background", 1, vec!["grid"], "number"),
+        ("grid-equal", 2, vec!["grid", "grid"], "bool"),
+        ("grid-find-color", 2, vec!["grid", "number"], "list"),
+        ("grid-symmetric-h", 1, vec!["grid"], "bool"),
+        ("grid-symmetric-v", 1, vec!["grid"], "bool"),
+        ("grid-dimensions-equal", 2, vec!["grid", "grid"], "bool"),
+        ("grid-bounding-box", 1, vec!["grid"], "list"),
+        ("grid-trim", 1, vec!["grid"], "grid"),
+        ("grid-objects", 1, vec!["grid"], "list"),
+        ("grid-objects-8", 1, vec!["grid"], "list"),
+        ("grid-object-count", 1, vec!["grid"], "number"),
+        ("grid-object-colors", 1, vec!["grid"], "list"),
+        ("grid-hconcat", 2, vec!["grid", "grid"], "grid"),
+        ("grid-vconcat", 2, vec!["grid", "grid"], "grid"),
+        ("grid-hsplit", 2, vec!["grid", "number"], "list"),
+        ("grid-vsplit", 2, vec!["grid", "number"], "list"),
+        ("grid-quarter", 1, vec!["grid"], "list"),
+    ] { let (k, v) = bi(n, a, &p, r); builtins_ns.insert(k, v); }
+    // Tier 1: Perceptual
+    for (n, a, p, r) in [
+        ("grid-flood-fill", 4, vec!["grid", "number", "number", "number"], "grid"),
+        ("grid-fill-enclosed", 2, vec!["grid", "number"], "grid"),
+        ("grid-draw-line-h", 5, vec!["grid", "number", "number", "number", "number"], "grid"),
+        ("grid-draw-line-v", 5, vec!["grid", "number", "number", "number", "number"], "grid"),
+        ("grid-ray", 6, vec!["grid", "number", "number", "number", "number", "number"], "grid"),
+        ("grid-gravity", 2, vec!["grid", "number"], "grid"),
+        ("grid-xor", 2, vec!["grid", "grid"], "grid"),
+        ("grid-and", 2, vec!["grid", "grid"], "grid"),
+        ("grid-or", 2, vec!["grid", "grid"], "grid"),
+    ] { let (k, v) = bi(n, a, &p, r); builtins_ns.insert(k, v); }
+    // Tier 2: Shape analysis
+    for (n, a, p, r) in [
+        ("grid-object-area", 1, vec!["grid"], "number"),
+        ("grid-object-center", 1, vec!["grid"], "list"),
+        ("grid-is-rectangle", 1, vec!["grid"], "bool"),
+        ("grid-detect-rectangles", 1, vec!["grid"], "list"),
+        ("grid-objects-touching", 2, vec!["grid", "grid"], "bool"),
+        ("grid-overlay-center", 2, vec!["grid", "grid"], "grid"),
+    ] { let (k, v) = bi(n, a, &p, r); builtins_ns.insert(k, v); }
+    // Tier 3: Advanced
+    for (n, a, p, r) in [
+        ("grid-find-subgrid", 2, vec!["grid", "grid"], "list"),
+        ("grid-neighbor-count", 3, vec!["grid", "number", "number"], "number"),
+        ("grid-border", 1, vec!["grid"], "grid"),
+        ("grid-fill-rect", 6, vec!["grid", "number", "number", "number", "number", "number"], "grid"),
     ] { let (k, v) = bi(n, a, &p, r); builtins_ns.insert(k, v); }
 
     scope.insert(intern("__builtins__"), Value::Namespace(builtins_ns));
