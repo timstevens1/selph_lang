@@ -1942,6 +1942,7 @@ fn cmd_meta_optimize(args: &[String]) {
     let mut trace_paths: Vec<String> = Vec::new();
     let mut budget: usize = 10000;
     let mut depth: usize = 2;
+    let mut synthesize_heuristic = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1962,6 +1963,7 @@ fn cmd_meta_optimize(args: &[String]) {
                 depth = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(depth);
                 i += 2;
             }
+            "--synthesize" => { synthesize_heuristic = true; i += 1; }
             other => { task_files.push(other.to_string()); i += 1; }
         }
     }
@@ -2101,16 +2103,93 @@ fn cmd_meta_optimize(args: &[String]) {
         }
     }
 
+    // ── Stage 4: Synthesize heuristics via enumeration ──────────────
+    if synthesize_heuristic {
+        eprintln!();
+        eprintln!("Meta-optimization Stage 4: Synthesized heuristic search");
+        eprintln!("  Running baseline with snapshot capture...");
+
+        let (snap_solved, snap_cands, snap_results, snapshots) =
+            run_meta_eval_with_snapshots(
+                &training_tasks, &default_h, &synth_comps, &all_macros, depth, budget);
+        eprintln!("  Captured {} snapshots from {}/{} solved tasks",
+            snapshots.len(), snap_solved, training_tasks.len());
+
+        if !snapshots.is_empty() {
+            eprintln!();
+            eprintln!("  Phase A: Enumerating heuristic programs (depth 2)...");
+            let synth_candidates = meta::enumerate_heuristic_candidates(
+                &snapshots, &synth_comps, 2, 20);
+
+            if !synth_candidates.is_empty() {
+                eprintln!();
+                eprintln!("  Phase B: Validating top candidates with actual synthesis...");
+                let phase_b_budget = budget.min(5000); // cap Phase B budget
+                if let Some((synth_best, synth_solved, synth_total)) =
+                    meta::validate_heuristic_candidates(
+                        &synth_candidates,
+                        &training_tasks,
+                        &synth_comps,
+                        &all_macros,
+                        &snap_results,
+                        depth,
+                        phase_b_budget,
+                        10,
+                    )
+                {
+                    eprintln!();
+                    eprintln!("  Stage 4 best: {}/{} solved (hard subset), {} candidates",
+                        synth_solved, 15.min(training_tasks.len()), synth_total);
+                    eprintln!("  Source: {}", synth_best.source);
+
+                    // Compare with Stage 3 winner: run Stage 4 winner on full task set
+                    let (s4_full_solved, s4_full_cands, _) = run_meta_eval(
+                        &training_tasks, &synth_best, &synth_comps, &all_macros, depth, budget);
+
+                    let s4_better = s4_full_solved > best_solved
+                        || (s4_full_solved == best_solved && s4_full_cands < best_cands);
+
+                    if s4_better {
+                        eprintln!();
+                        eprintln!("  *** Stage 4 heuristic beats Stage 3! ***");
+                        eprintln!("  Stage 4: {}/{} solved, {} candidates",
+                            s4_full_solved, training_tasks.len(), s4_full_cands);
+                        if let Some(ref h3) = best_h {
+                            eprintln!("  Stage 3: {}/{} solved, {} candidates (\"{}\")",
+                                best_solved, training_tasks.len(), best_cands, h3.name);
+                        }
+                        best_h = Some(synth_best);
+                        best_solved = s4_full_solved;
+                        best_cands = s4_full_cands;
+                    } else {
+                        eprintln!();
+                        eprintln!("  Stage 4 full eval: {}/{} solved, {} candidates",
+                            s4_full_solved, training_tasks.len(), s4_full_cands);
+                        eprintln!("  Stage 3 winner still better — keeping it.");
+                    }
+                } else {
+                    eprintln!("  Phase B: no valid candidates passed validation.");
+                }
+            } else {
+                eprintln!("  Phase A: no candidates enumerated (snapshots may be too small).");
+            }
+        } else {
+            eprintln!("  No snapshots captured — cannot run Stage 4.");
+        }
+    }
+
+    // ── Output final winner ──────────────────────────────────────────
     eprintln!();
     if let Some(ref h) = best_h {
         let speedup = baseline_cands as f64 / best_cands.max(1) as f64;
-        eprintln!("=== Best heuristic: \"{}\" ===", h.name);
+        let stage = if synthesize_heuristic { "Stage 3+4" } else { "Stage 3" };
+        eprintln!("=== Best heuristic ({}) : \"{}\" ===", stage, h.name);
         eprintln!("  Solved: {}/{} (baseline: {})", best_solved, training_tasks.len(), baseline_solved);
         eprintln!("  Total candidates: {} (baseline: {}, {:.1}x speedup)",
             best_cands, baseline_cands, speedup);
         eprintln!("  Source: {}", h.source);
         eprintln!();
-        eprintln!("To use: save as heuristic.selph and pass via --filter");
+        eprintln!("To use: save as heuristic.selph and pass via --heuristic");
 
         // Output the heuristic as a SELPH file
         println!("; Meta-optimized heuristic: \"{}\"", h.name);
@@ -2263,6 +2342,60 @@ fn run_meta_eval(
     }
 
     (solved, total_cands, results)
+}
+
+/// Like `run_meta_eval` but also captures PoolSnapshots for rank-based
+/// heuristic synthesis (Stage 4).
+fn run_meta_eval_with_snapshots(
+    tasks: &[meta::TrainingTask],
+    heuristic: &meta::Heuristic,
+    components: &[synth::SynthComponent],
+    macros: &[(String, Vec<String>, Vec<Node>, usize)],
+    max_depth: usize,
+    per_task_budget: usize,
+) -> (usize, usize, Vec<(String, bool, usize)>, Vec<meta::PoolSnapshot>) {
+    let mut solved = 0usize;
+    let mut total_cands = 0usize;
+    let mut results = Vec::new();
+    let mut snapshots = Vec::new();
+
+    for task in tasks {
+        let ctx = meta::TaskContext::from_examples(&task.inputs, &task.expected);
+        let prioritized = meta::apply_heuristic(heuristic, components, &ctx);
+
+        let mut records: Vec<synth::CandidateRecord> = Vec::new();
+        let sr = synth::synthesize_full(
+            &prioritized,
+            &task.inputs,
+            &task.expected,
+            macros,
+            max_depth,
+            per_task_budget,
+            true,
+            None,
+            &[],
+            None,
+            Some(&mut records),
+            synth::RlCoefficients::default(),
+        );
+
+        if sr.found {
+            solved += 1;
+            // Only capture snapshots for solved tasks (rank_solution needs a solution)
+            if !records.is_empty() {
+                snapshots.push(meta::PoolSnapshot {
+                    task_name: task.name.clone(),
+                    task_context: ctx,
+                    candidates: records,
+                    depth0_count: 0,
+                });
+            }
+        }
+        total_cands += sr.candidates_explored;
+        results.push((task.name.clone(), sr.found, sr.candidates_explored));
+    }
+
+    (solved, total_cands, results, snapshots)
 }
 
 // ── Multi-synth command ─────────────────────────────────────────────

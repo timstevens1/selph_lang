@@ -2,7 +2,7 @@
 
 ## From Enumerative Solver to Self-Building Architecture
 
-**Version 0.9 — April 7, 2026**
+**Version 0.10 — April 8, 2026**
 
 Based on implementation experience with the v0.1 Architecture Spec, the Rust-native migration, the April 6-7 session (decomposition via synthesis, tracing, 7.2x search optimization, namespace literals, memorization), the April 7 session that added: bytecode VM (22.9x eval speedup), `synthesize` builtin `:library`/`:priorities` support, early depth extension for compositional search, optimization curriculum with meta-optimization, NL curriculum, and chained curriculum execution, the April 7 evening session that added: unified library/tree/namespace loading, TYPE_LIST in the type system, higher-order synthesis via fused map components, 3-word sentence structures, and variable-length sentence tagging via `(string-join (map pos_tag (string-split x " ")) " ")`, and the April 7 late session that added: full 3-domain chained curriculum (55/55 tasks), trace instrumentation infrastructure (`--trace` JSON output), and meta-optimization Stage 3 — multi-task heuristic learning across the full task suite, producing the `priority-plus-type-match` heuristic (26/55 vs 21/55 baseline at budget 5000).
 
@@ -105,7 +105,7 @@ selph help       Show usage
 ### 2.8 Rust Modules (18 source files)
 types.rs, parser.rs, eval.rs, synth.rs, hm.rs, library.rs, namespace.rs, induce.rs, divide.rs, verify.rs, abstraction.rs, multitree.rs, stochastic.rs, meta.rs, taskgen.rs, intern.rs, vm.rs, trace.rs
 
-222 tests, all passing.
+230 tests, all passing.
 
 ### 2.9 Validated Results
 
@@ -298,8 +298,8 @@ Each meta-level uses the infrastructure from the level below it, and the learned
          (lambda (heuristic)
            (total-candidates-using heuristic task-suite))))
 ```
-**Current status:** Heuristics as SELPH programs work. Interleaved online learning updates priorities. Domain-specific heuristic gives 23.5x speedup. **Multi-task meta-optimization validated (Stage 3):** `selph meta-opt` evaluates 8 candidate heuristic programs across the full 55-task suite using trace data from chained curriculum runs. Winner: `priority-plus-type-match` — blends learned priority with +50 return-type match bonus. Solves 26/55 vs 21/55 baseline at budget 5000. Notable per-task improvements: `first_of_sentence` 50x faster (1152→23 candidates), `last_of_sentence` 46x faster.
-**What's missing:** Heuristics are still selected from 8 hand-crafted templates. The next step (Stage 4) is to synthesize heuristic programs via the synthesizer itself — synthesis of search strategies. The heuristic also doesn't yet read task-specific features (example patterns, example count) beyond type tags.
+**Current status:** Heuristics as SELPH programs work. Interleaved online learning updates priorities. Domain-specific heuristic gives 23.5x speedup. **Multi-task meta-optimization validated (Stage 3):** `selph meta-opt` evaluates 8 candidate heuristic programs across the full 55-task suite using trace data from chained curriculum runs. Winner: `priority-plus-type-match` — blends learned priority with +50 return-type match bonus. Solves 26/55 vs 21/55 baseline at budget 5000. Notable per-task improvements: `first_of_sentence` 50x faster (1152→23 candidates), `last_of_sentence` 46x faster. **Stage 4 (synthesized heuristic search) implemented:** `selph meta-opt --synthesize` enumerates heuristic programs bottom-up over ctx fields, scoring via behavior-vector rank (no SELPH eval). Two-phase: rank-based enumeration (~2s) + synthesis validation on hard subset (~3s). Awaiting validation on full 55-task trace data.
+**What's missing:** The heuristic doesn't yet read task-specific features (example patterns, example count) beyond type tags. Stage 4 needs validation on the full chained curriculum traces to measure actual improvement over Stage 3.
 
 **Curriculum design:**
 - Stage M1.0: Learn to predict output type from examples
@@ -415,7 +415,9 @@ Phase 2: Learned heuristics (INTEGRATED — heuristic wired into grow)
     13,721→11,263 cand (~2x wall-clock speedup), identity 42x faster.
   - Training data: trace JSON from 3-domain chained curriculum (55 tasks)
   - Validation: learned heuristic solves 5 more tasks than baseline
-  - Remaining: Stage 4 — synthesize heuristics via the synthesizer itself
+  - Stage 4 implemented: `meta-opt --synthesize` enumerates heuristic
+    programs bottom-up. Awaiting validation on full trace data.
+  - Remaining: validate Stage 4 on 55-task traces, synthesize deeper heuristics
 
 Phase 3: Learned decomposition
   - Meta-2 replaces hardcoded induction/D&C
@@ -590,6 +592,16 @@ Removed blanket `param_types` override in `cmd_synth`/`cmd_curriculum` that rewr
 - **`string_slice_tasks.selph`** (7 tasks): prefix/suffix extraction via `string-take`/`string-drop`, composes with promoted `halve` for `half_len` → `(halve (string-length x))`.
 - **`run_full_chain.sh`** extended to 6 stages: seq → CF → NL → arithmetic → string slicing → CS.
 
+### 8.18 ~~Meta-optimization Stage 4: synthesized heuristic search~~ ✓
+`selph meta-opt --synthesize` enumerates heuristic program bodies bottom-up instead of choosing from 8 hand-crafted templates. Two-phase approach:
+
+- **Phase A (rank-based, ~2s):** Bottom-up enumeration over 7 ctx fields (`priority`, `arity`, `ret-type`, `first-param-type`, `input-type`, `output-type`, `num-examples`) + 8 numeric constants, composed with arithmetic (`add`, `subtract`, `multiply`, `min`, `max`), comparison (`=`, `<`, `>`), unary (`abs`, `negate`), and if-expressions. Behavior-hash dedup eliminates observationally equivalent candidates. Rank scoring computed directly from behavior vectors (no SELPH eval needed — microsecond cost per candidate).
+- **Phase B (synthesis validation, ~3s):** Top-K candidates from Phase A validated by running actual synthesis on the 15 hardest tasks.
+
+Key design: the "flattening trick" — ctx namespace fields become depth-0 atoms during enumeration, then get wrapped back into `(ns-get ctx "field")` via `wrap_as_lambda()` to produce valid SELPH. This transforms heuristic synthesis from "programs over namespaces" into "arithmetic expressions over 7 variables" — exactly what the enumerator does well.
+
+Infrastructure: `enumerate_heuristic_candidates()` and `validate_heuristic_candidates()` in `meta.rs`, `run_meta_eval_with_snapshots()` in `main.rs` for PoolSnapshot capture. 230 tests (8 new), all passing.
+
 ---
 
 ## 9. Immediate Next Steps
@@ -699,7 +711,7 @@ With 55-task chained curriculum validated and meta-optimization Stage 3 complete
 
 2. **Types as a SELPH program.** The type vocabulary (NUM, STR, BOOL, LIST) is currently hardcoded. Making type inference a curriculum target lets the system learn to expand its own type vocabulary. A type inference stage teaches "if `string-split` produces it, and `head` consumes it, they share a type."
 
-3. **Deeper meta-optimization.** The current Stage 3 evaluates 8 hand-crafted heuristic templates. Stage 4 would synthesize heuristic programs via the synthesizer itself — synthesis of search strategies. The `meta_count_char_boost` precedent (§2.13) shows this is feasible.
+3. ~~**Deeper meta-optimization.**~~ ✓ Stage 4 implemented: `meta-opt --synthesize` enumerates heuristic programs bottom-up over ctx fields, scored via behavior-vector rank. Two-phase: Phase A (cheap rank enumeration, ~2s) + Phase B (synthesis validation on hard subset, ~3s). Needs validation on the full 55-task traces.
 
 **Completed this session:**
 - ~~`reduce`/`fold` as synthesis components~~ ✓ — fused reduce for builtins and macros
@@ -719,7 +731,7 @@ With 55-task chained curriculum validated and meta-optimization Stage 3 complete
 
 The growing system plan succeeds if:
 
-1. **Phase 2 validation:** A learned SELPH heuristic outperforms the default ordering on held-out tasks without domain-specific engineering. **Partially met:** `priority-plus-type-match` solves 5 more tasks than baseline (26 vs 21 at budget 5000) with up to 50x speedup on individual tasks. The heuristic is domain-general (return-type matching), not domain-specific. Remaining: validate on held-out tasks from unseen domains.
+1. **Phase 2 validation:** A learned SELPH heuristic outperforms the default ordering on held-out tasks without domain-specific engineering. **Partially met:** `priority-plus-type-match` solves 5 more tasks than baseline (26 vs 21 at budget 5000) with up to 50x speedup on individual tasks. The heuristic is domain-general (return-type matching), not domain-specific. Stage 4 (synthesized heuristic search) implemented — can now search the space of heuristic programs instead of choosing from hand-crafted templates. Remaining: validate Stage 4 on full traces and on held-out tasks from unseen domains.
 
 2. **Phase 3 validation:** A learned SELPH decomposer solves tasks that the flat solver + hand-written induction can't.
 
