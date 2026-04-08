@@ -618,6 +618,35 @@ Currently one (cold, warm) pair for all tasks. Different task types may benefit 
 ### ~~9.5 Meta-2: Learn decomposition as SELPH programs~~ ✓
 The `synthesize` builtin accepts `:library` — a SELPH program can restrict the component set and call synthesis on sub-problems. Decomposition IS parameterized synthesis, expressible end-to-end from SELPH.
 
+### 9.16 Higher-order template decomposition ✓ (April 8, 2026)
+
+`decompose.rs` adds 4 templates that derive sub-specs from outer specs and fill function-typed holes via recursive `synthesize()` calls. Pipeline: Flat → BD → IN → **HO** → DC → Memo.
+
+**Templates:**
+1. **list-map:** `(lambda (x) (map HOLE x))` — element-wise list transformation
+2. **split-map-join:** `(lambda (x) (string-join (map HOLE (string-split x SEP)) SEP))` — delimiter discovery + per-part transformation
+3. **char-map-join:** `(lambda (x) (string-join (map HOLE (string-chars x)) ""))` — per-character transformation
+4. **list-filter:** `(lambda (x) (filter HOLE x))` — element predicate synthesis with boolean labeling
+
+**How it works:** Each template (1) checks applicability by type/structure, (2) derives a sub-spec by pairing decomposed input/output elements, (3) deduplicates sub-spec pairs (aborting on conflicts), (4) calls `synth::synthesize()` recursively with budget/4, (5) composes the sub-solution into the template AST, (6) verifies against all original examples.
+
+**Results on test curriculum (6 tasks, budget 200K):**
+
+| Task | Strategy | Candidates | Solution |
+|------|----------|-----------|----------|
+| list_double | HO (list-map) | 16 | `(map (lambda (x) (add x x)) x)` |
+| list_negate | HO (list-map) | 83 | `(map (lambda (x) (subtract x (add x x))) x)` |
+| upper_words | Flat | 117K | `(string-upper (string-drop x 0))` |
+| reverse_words | **HO (split-map-join)** | **818** | `(string-join (map (lambda (x) (string-reverse (string-drop x 0))) (string-split x " ")) " ")` |
+| upper_chars | Flat | 1,346 | `(string-upper (string-drop x 0))` |
+| keep_positive | HO (list-filter) | 229 | `(filter (lambda (x) (< (negate (add x x)) x)) x)` |
+
+**Key result:** `reverse_words` is the proof point — `(string-join (map string-reverse (string-split x " ")) " ")` is a genuinely compositional solution unreachable by flat enumeration. The system split by space, synthesized `string-reverse` for each word, and rejoined.
+
+**Difference from fused components (9.14):** Fused `map_<macro>` components only work with pre-existing macros. Template decomposition discovers *new* element-level functions via sub-synthesis. Fused is O(1) (no search), templates are O(sub-budget) but strictly more powerful.
+
+**Design insight:** Decomposition should ultimately be just another candidate in the search space, not a fallback. The function-typed hole in `(map [HOLE] list)` is a sub-synthesis call embedded in candidate generation. The strategy selector that decides *when* to decompose should itself be a learnable Selph program — the meta-language endgame where `synthesize` is a component the solver can call recursively on derived sub-specs.
+
 ### 9.6 Deeper curriculum: context-sensitive languages (PARTIALLY DONE)
 a^n b^n c^n **solved** without needing reduce — the synthesizer found clever string-replace + ordering compositions, composing promoted CF macros via boolean decomposition. Copy language (ww) and reversal (ww^R) require string halving, which depends on the scaffolding chain: arithmetic (halve) → string slicing (string-take/drop) → dynamic halving (first_half/second_half). `first_half` remains unsolved compositionally — the arity-2 early depth extension probe doesn't reach `(string-take x (half_len x))` within budget. See 9.15 for details.
 
@@ -666,6 +695,7 @@ TYPE_LIST (u8=3) added to the type system. `string-split`, `string-join`, `head`
 - **Arity-3 is effectively unreachable without helpers:** `string-slice` (str, num, num) → str was never found by the synthesizer despite being registered. The combinatorial space of three-argument compositions is too large. The fix is decomposing arity-3 into arity-2 wrappers: `string-take` (str, num) → str and `string-drop` (str, num) → str. This is the same decomposition principle as fused map/reduce — reduce the arity the synthesizer must handle.
 - **The synthesizer finds creative workarounds:** When `string-take` wasn't available, the system discovered `(string-join (tail (string-chars x)) "")` for `drop_first` and `(reduce concat (string-split x "c"))` for `remove_c`. These are correct but non-obvious compositions — evidence that the search explores a richer space than hand-designed solutions would suggest.
 - **Scaffolding must match the composition chain:** `first_half` requires `(string-take x (half_len x))` which chains: arithmetic (floor, divide) → halve macro → half_len macro → string-take composition. Each step must be a separate curriculum stage so the promoted macro has correct types and high priority. Missing any link in the chain causes memorization fallback.
+- **Decomposition is just another candidate:** The distinction between "strategy selection" and "search" is artificial. `(string-join (map f (string-split x " ")) " ")` is a program in the search space — the only reason the flat enumerator can't find it is that `f` is a function-typed argument requiring sub-synthesis. Template decomposition (§9.16) fills this gap: when the enumerator encounters a higher-order component like `map`, it derives a sub-spec and calls `synthesize()` recursively. The long-term design: the strategy selector is itself a Selph program, and `synthesize` is a component the solver can invoke on derived sub-specs.
 - **Integer decomposition as a future meta-learning target:** Analogous to boolean decomposition (BD) for bool targets, an integer decomposition (ID) would try arithmetic compositions of numeric pool entries when flat synthesis fails on numeric targets. O(entries²) cost. Would catch `(floor (divide x 2))` directly instead of requiring scaffolding. Candidate for Meta-2 curriculum.
 
 ### 9.15 Context-sensitive language status (April 7, 2026)
@@ -720,6 +750,9 @@ With 55-task chained curriculum validated and meta-optimization Stage 3 complete
 - ~~Type-override bug fix~~ ✓ — enables cross-type macro compositions
 - ~~Arithmetic and string slicing curricula~~ ✓
 
+**Completed (April 8, 2026):**
+- ~~Higher-order template decomposition~~ ✓ — `decompose.rs` with list-map, split-map-join, char-map-join, list-filter. Fills function holes via recursive sub-synthesis. Key result: `reverse_words` solved compositionally (818 cand) where flat synthesis can't reach it. See §9.16.
+
 **Lower priority (infrastructure):**
 - Fix the `synthesize` builtin's `:library` extraction for defmacro-captured macros
 - 9.8 vector/tensor builtins — prerequisite for linear models
@@ -733,7 +766,7 @@ The growing system plan succeeds if:
 
 1. **Phase 2 validation:** A learned SELPH heuristic outperforms the default ordering on held-out tasks without domain-specific engineering. **Partially met:** `priority-plus-type-match` solves 5 more tasks than baseline (26 vs 21 at budget 5000) with up to 50x speedup on individual tasks. The heuristic is domain-general (return-type matching), not domain-specific. Stage 4 (synthesized heuristic search) implemented — can now search the space of heuristic programs instead of choosing from hand-crafted templates. Remaining: validate Stage 4 on full traces and on held-out tasks from unseen domains.
 
-2. **Phase 3 validation:** A learned SELPH decomposer solves tasks that the flat solver + hand-written induction can't.
+2. **Phase 3 validation:** A learned SELPH decomposer solves tasks that the flat solver + hand-written induction can't. **Partially met:** Template-based HO decomposition (§9.16) solves `reverse_words` via split-map-join — a compositional solution unreachable by flat synthesis. 4 templates (list-map, split-map-join, char-map-join, list-filter) fill function-typed holes via recursive sub-synthesis. Remaining: decomposition as a candidate in the search space (not a fallback), and the strategy selector as a learnable Selph program.
 
 3. **Phase 4 validation:** A neural SELPH generator (trained on synthesis logs) proposes correct programs in fewer attempts than the enumerative solver.
 
