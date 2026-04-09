@@ -250,6 +250,8 @@ pub struct SynthComponent {
     pub ret_type: u8,
     pub param_types: Vec<u8>,
     pub priority: f64,
+    /// How many prior tasks in this curriculum run used this component.
+    pub usage_count: f64,
 }
 
 /// A candidate program stored as a flattened node tree.
@@ -272,11 +274,14 @@ pub struct RlCoefficients {
     /// Scale factor for partial match bonus. A candidate matching fraction
     /// f of examples gets priority += f * warm_bonus. Default: 30.0.
     pub warm_bonus: f64,
+    /// Inter-depth component priority boost. Components whose candidates
+    /// achieved partial matches get boosted for the next depth. Default: 15.0.
+    pub comp_warm_bonus: f64,
 }
 
 impl Default for RlCoefficients {
     fn default() -> Self {
-        RlCoefficients { cold_penalty: -50.0, warm_bonus: 30.0 }
+        RlCoefficients { cold_penalty: -50.0, warm_bonus: 30.0, comp_warm_bonus: 15.0 }
     }
 }
 
@@ -299,6 +304,7 @@ pub struct CandidateRecord {
     pub comp_name: String,
     pub arg_priority_sum: f64,
 }
+
 
 impl SynthResult {
     fn empty() -> Self {
@@ -394,6 +400,150 @@ pub fn vals_equal(a: &Value, b: &Value) -> bool {
         (_, Value::Alt(alts)) => alts.iter().any(|alt| vals_equal(a, alt)),
         _ => false,
     }
+}
+
+// ── Parallel synthesis types and helpers ─────────────────────────────
+
+/// Lightweight descriptor for a candidate to be tested.
+/// Stores indices rather than cloned node trees for memory efficiency.
+pub struct PendingDesc {
+    pub comp_idx: usize,    // index into components slice
+    pub arg1: usize,        // pool index of first argument
+    pub arg2: usize,        // pool index of second argument (unused for arity 1)
+    pub arg3: usize,        // pool index of third argument (unused for arity 1-2)
+    pub ret_type: u8,       // inferred return type
+    pub score: f64,
+}
+
+/// Result of evaluating a single candidate in the parallel phase.
+pub enum EvalResult {
+    /// Skipped due to type gate — no evaluation performed.
+    Skipped,
+    /// VM compilation failed — needs sequential tree-walker fallback.
+    NeedsTreeWalker,
+    /// Successfully evaluated via VM fast path.
+    Evaluated {
+        beh: Vec<u64>,
+        matches: usize,
+        evaluated: usize,
+    },
+}
+
+/// Materialize a PendingDesc into a full SynthPool entry by building
+/// the node tree from pool entries and the component.
+pub fn materialize(
+    desc: &PendingDesc,
+    pool: &[SynthPool],
+    components: &[&SynthComponent],
+) -> SynthPool {
+    let comp = &components[desc.comp_idx];
+    let bn = comp.builtin.as_ref().unwrap();
+
+    if comp.arity == 1 && bn.starts_with("map_") {
+        let macro_name = &bn[4..];
+        let p = &pool[desc.arg1];
+        let mut n = p.nodes.clone();
+        let map_sym = n.len();
+        n.push(Node::Symbol(intern("map")));
+        let fn_sym = n.len();
+        n.push(Node::Symbol(intern(macro_name)));
+        let api = n.len();
+        n.push(Node::App(vec![map_sym, fn_sym, p.root]));
+        SynthPool { nodes: n, root: api, ret_type: desc.ret_type, priority: desc.score }
+    } else if comp.arity == 1 && bn.starts_with("reduce_") {
+        let fn_name = &bn[7..];
+        let p = &pool[desc.arg1];
+        let mut n = p.nodes.clone();
+        let reduce_sym = n.len();
+        n.push(Node::Symbol(intern("reduce")));
+        let fn_sym = n.len();
+        n.push(Node::Symbol(intern(fn_name)));
+        let api = n.len();
+        n.push(Node::App(vec![reduce_sym, fn_sym, p.root]));
+        SynthPool { nodes: n, root: api, ret_type: desc.ret_type, priority: desc.score }
+    } else if comp.arity == 1 {
+        let p = &pool[desc.arg1];
+        let mut n = p.nodes.clone();
+        let fi = n.len();
+        n.push(Node::Symbol(intern(bn)));
+        let ai = n.len();
+        n.push(Node::App(vec![fi, p.root]));
+        SynthPool { nodes: n, root: ai, ret_type: desc.ret_type, priority: desc.score }
+    } else if comp.arity == 2 {
+        let p1 = &pool[desc.arg1];
+        let p2 = &pool[desc.arg2];
+        let mut n = p1.nodes.clone();
+        let off = n.len();
+        for nd in &p2.nodes {
+            n.push(remap_node(nd, off));
+        }
+        let fi = n.len();
+        n.push(Node::Symbol(intern(bn)));
+        let api = n.len();
+        n.push(Node::App(vec![fi, p1.root, p2.root + off]));
+        SynthPool { nodes: n, root: api, ret_type: desc.ret_type, priority: desc.score }
+    } else {
+        // Arity 3
+        let p1 = &pool[desc.arg1];
+        let p2 = &pool[desc.arg2];
+        let p3 = &pool[desc.arg3];
+        let mut n = p1.nodes.clone();
+        let off2 = n.len();
+        for nd in &p2.nodes {
+            n.push(remap_node(nd, off2));
+        }
+        let off3 = n.len();
+        for nd in &p3.nodes {
+            n.push(remap_node(nd, off3));
+        }
+        let fi = n.len();
+        n.push(Node::Symbol(intern(bn)));
+        let api = n.len();
+        n.push(Node::App(vec![fi, p1.root, p2.root + off2, p3.root + off3]));
+        SynthPool { nodes: n, root: api, ret_type: desc.ret_type, priority: desc.score }
+    }
+}
+
+/// Pure candidate evaluation via VM fast path.
+/// No side effects — does not touch `seen`, `explored`, or any shared state.
+pub fn eval_candidate(
+    entry: &SynthPool,
+    inputs: &[Value],
+    expected: &[Value],
+    vm_ctx: &crate::vm::CompileCtx,
+    vm_macro_chunks: &[Option<crate::vm::MacroChunk>],
+    target_output_type: Option<u8>,
+) -> EvalResult {
+    // Type gate
+    if let Some(target) = target_output_type {
+        if entry.ret_type != target && entry.ret_type != TYPE_ANY && target != TYPE_ANY {
+            return EvalResult::Skipped;
+        }
+    }
+
+    // Try VM compilation
+    let chunk = match crate::vm::compile(&entry.nodes, entry.root, vm_ctx) {
+        Ok(c) => c,
+        Err(_) => return EvalResult::NeedsTreeWalker,
+    };
+
+    let mut vm_stack = Vec::with_capacity(32);
+    let mut beh = Vec::with_capacity(inputs.len());
+    let mut matches = 0usize;
+    let mut evaluated = 0usize;
+
+    for (inp, exp) in inputs.iter().zip(expected.iter()) {
+        match crate::vm::execute(&chunk, inp, vm_macro_chunks, &mut vm_stack) {
+            Ok(a) => {
+                beh.push(val_hash(&a));
+                evaluated += 1;
+                if vals_equal(&a, exp) { matches += 1; }
+            }
+            Err(_) => break,
+        }
+    }
+
+    EvalResult::Evaluated { beh, matches, evaluated }
 }
 
 // ── HM type-aware pruning ────────────────────────────────────────────
@@ -940,6 +1090,10 @@ pub fn synthesize_full(
             nodes.push(Node::Bool(true));
         } else if comp.name == "false" {
             nodes.push(Node::Bool(false));
+        } else if comp.builtin.is_some() && comp.ret_type == TYPE_ANY {
+            // Named binding (e.g. data namespace from library tree) — emit as
+            // symbol so it resolves from the eval env via extra_bindings.
+            nodes.push(Node::Symbol(intern(&comp.name)));
         } else {
             nodes.push(Node::Str(comp.name.clone()));
         }
@@ -1069,6 +1223,7 @@ pub fn synthesize_full(
     // get priority boosts, while components with only zero-match
     // candidates get deprioritized.
     let mut comp_best_match: HashMap<usize, f64> = HashMap::new();
+    let mut comp_priority_boost: Vec<f64> = vec![0.0; components.len()];
 
     // HM type variable counter for fresh variables during synthesis.
     let mut hm_counter: u32 = 0;
@@ -1097,15 +1252,6 @@ pub fn synthesize_full(
         // Node trees are built on-demand during testing, so only one
         // materialized candidate exists at a time.
 
-        struct PendingDesc {
-            comp_idx: usize,    // index into components slice
-            arg1: usize,        // pool index of first argument
-            arg2: usize,        // pool index of second argument (unused for arity 1)
-            arg3: usize,        // pool index of third argument (unused for arity 1-2)
-            ret_type: u8,       // inferred return type
-            score: f64,
-        }
-
         let mut pending: Vec<PendingDesc> = Vec::new();
 
         for (ci, comp) in components.iter().enumerate() {
@@ -1125,7 +1271,7 @@ pub fn synthesize_full(
                         continue;
                     }
                     let inferred_ret = hm_infer_ret_type(comp, &[p], &mut hm_counter);
-                    let score = comp.priority + p.priority;
+                    let score = (comp.priority + comp_priority_boost[ci]) + p.priority;
                     pending.push(PendingDesc {
                         comp_idx: ci, arg1: pi, arg2: 0, arg3: 0,
                         ret_type: inferred_ret, score,
@@ -1149,7 +1295,7 @@ pub fn synthesize_full(
                         let inferred_ret = hm_infer_ret_type(comp, &[p1, p2], &mut hm_counter);
                         // Use average of arg priorities instead of sum so arity-2
                         // doesn't automatically outrank arity-1 compositions.
-                        let score = comp.priority + (p1.priority + p2.priority) / 2.0;
+                        let score = (comp.priority + comp_priority_boost[ci]) + (p1.priority + p2.priority) / 2.0;
                         pending.push(PendingDesc {
                             comp_idx: ci, arg1: pi, arg2: ai, arg3: 0,
                             ret_type: inferred_ret, score,
@@ -1171,7 +1317,7 @@ pub fn synthesize_full(
                             continue;
                         }
                         let inferred_ret = hm_infer_ret_type(comp, &[p1, p2], &mut hm_counter);
-                        let score = comp.priority + (p1.priority + p2.priority) / 2.0;
+                        let score = (comp.priority + comp_priority_boost[ci]) + (p1.priority + p2.priority) / 2.0;
                         pending.push(PendingDesc {
                             comp_idx: ci, arg1: ai, arg2: pi, arg3: 0,
                             ret_type: inferred_ret, score,
@@ -1203,7 +1349,7 @@ pub fn synthesize_full(
                             if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 && p3.ret_type != 255 { continue; }
                             if !hm_check_application(comp, &[p1, p2, p3], &mut hm_counter) { continue; }
                             let inferred_ret = hm_infer_ret_type(comp, &[p1, p2, p3], &mut hm_counter);
-                            let score = comp.priority + (p1.priority + p2.priority + p3.priority) / 3.0;
+                            let score = (comp.priority + comp_priority_boost[ci]) + (p1.priority + p2.priority + p3.priority) / 3.0;
                             pending.push(PendingDesc {
                                 comp_idx: ci, arg1: pi, arg2: a2, arg3: a3,
                                 ret_type: inferred_ret, score,
@@ -1223,7 +1369,7 @@ pub fn synthesize_full(
                             if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 && p3.ret_type != 255 { continue; }
                             if !hm_check_application(comp, &[p1, p2, p3], &mut hm_counter) { continue; }
                             let inferred_ret = hm_infer_ret_type(comp, &[p1, p2, p3], &mut hm_counter);
-                            let score = comp.priority + (p1.priority + p2.priority + p3.priority) / 3.0;
+                            let score = (comp.priority + comp_priority_boost[ci]) + (p1.priority + p2.priority + p3.priority) / 3.0;
                             pending.push(PendingDesc {
                                 comp_idx: ci, arg1: a1, arg2: pi, arg3: a3,
                                 ret_type: inferred_ret, score,
@@ -1243,7 +1389,7 @@ pub fn synthesize_full(
                             if p3.ret_type != comp.param_types[2] && comp.param_types[2] != 255 && p3.ret_type != 255 { continue; }
                             if !hm_check_application(comp, &[p1, p2, p3], &mut hm_counter) { continue; }
                             let inferred_ret = hm_infer_ret_type(comp, &[p1, p2, p3], &mut hm_counter);
-                            let score = comp.priority + (p1.priority + p2.priority + p3.priority) / 3.0;
+                            let score = (comp.priority + comp_priority_boost[ci]) + (p1.priority + p2.priority + p3.priority) / 3.0;
                             pending.push(PendingDesc {
                                 comp_idx: ci, arg1: a1, arg2: a2, arg3: pi,
                                 ret_type: inferred_ret, score,
@@ -1259,298 +1405,502 @@ pub fn synthesize_full(
             .unwrap_or(std::cmp::Ordering::Equal));
 
 
-        // Materialize and test in priority order — only one node tree alive at a time
-        for desc in &pending {
-            let comp = &components[desc.comp_idx];
-            let bn = comp.builtin.as_ref().unwrap();
+        // ── Parallel candidate evaluation ──────────────────────────────
+        // Check if inputs are safe to share across threads (no Rc-bearing variants).
+        // If safe and batch is large enough, use rayon for parallel evaluation.
+        // Otherwise fall back to sequential.
+        let min_parallel_threshold: usize = std::env::var("SELPH_SEQ")
+            .map(|_| usize::MAX)  // SELPH_SEQ=1 forces sequential
+            .unwrap_or(128);
+        let use_parallel = pending.len() >= min_parallel_threshold
+            && crate::types::values_are_sync_safe(inputs)
+            && crate::types::values_are_sync_safe(expected);
 
-            let entry = if comp.arity == 1 && bn.starts_with("map_") {
-                // Fused map component: emit (map <macro_name> arg)
-                let macro_name = &bn[4..]; // strip "map_" prefix
-                let p = &pool[desc.arg1];
-                let mut n = p.nodes.clone();
-                let map_sym = n.len();
-                n.push(Node::Symbol(intern("map")));
-                let fn_sym = n.len();
-                n.push(Node::Symbol(intern(macro_name)));
-                let api = n.len();
-                n.push(Node::App(vec![map_sym, fn_sym, p.root]));
-                SynthPool { nodes: n, root: api, ret_type: desc.ret_type, priority: desc.score }
-            } else if comp.arity == 1 && bn.starts_with("reduce_") {
-                // Fused reduce component: emit (reduce <fn_name> arg)
-                let fn_name = &bn[7..]; // strip "reduce_" prefix
-                let p = &pool[desc.arg1];
-                let mut n = p.nodes.clone();
-                let reduce_sym = n.len();
-                n.push(Node::Symbol(intern("reduce")));
-                let fn_sym = n.len();
-                n.push(Node::Symbol(intern(fn_name)));
-                let api = n.len();
-                n.push(Node::App(vec![reduce_sym, fn_sym, p.root]));
-                SynthPool { nodes: n, root: api, ret_type: desc.ret_type, priority: desc.score }
-            } else if comp.arity == 1 {
-                let p = &pool[desc.arg1];
-                let mut n = p.nodes.clone();
-                let fi = n.len();
-                n.push(Node::Symbol(intern(bn)));
-                let ai = n.len();
-                n.push(Node::App(vec![fi, p.root]));
-                SynthPool { nodes: n, root: ai, ret_type: desc.ret_type, priority: desc.score }
-            } else if comp.arity == 2 {
-                let p1 = &pool[desc.arg1];
-                let p2 = &pool[desc.arg2];
-                let mut n = p1.nodes.clone();
-                let off = n.len();
-                for nd in &p2.nodes {
-                    n.push(remap_node(nd, off));
-                }
-                let fi = n.len();
-                n.push(Node::Symbol(intern(bn)));
-                let api = n.len();
-                n.push(Node::App(vec![fi, p1.root, p2.root + off]));
-                SynthPool { nodes: n, root: api, ret_type: desc.ret_type, priority: desc.score }
-            } else {
-                // Arity 3: merge three node trees
-                let p1 = &pool[desc.arg1];
-                let p2 = &pool[desc.arg2];
-                let p3 = &pool[desc.arg3];
-                let mut n = p1.nodes.clone();
-                let off2 = n.len();
-                for nd in &p2.nodes {
-                    n.push(remap_node(nd, off2));
-                }
-                let off3 = n.len();
-                for nd in &p3.nodes {
-                    n.push(remap_node(nd, off3));
-                }
-                let fi = n.len();
-                n.push(Node::Symbol(intern(bn)));
-                let api = n.len();
-                n.push(Node::App(vec![fi, p1.root, p2.root + off2, p3.root + off3]));
-                SynthPool { nodes: n, root: api, ret_type: desc.ret_type, priority: desc.score }
+        if use_parallel {
+            // ── Batched parallel path ────────────────────────────────────
+            use rayon::prelude::*;
+
+            let batch_size = {
+                let threads = rayon::current_num_threads();
+                (threads * 4).clamp(256, 4096).min(pending.len())
             };
 
-            // Record candidate in snapshot before testing
-            if let Some(ref mut snap) = snapshot {
-                let arg_psum = desc.score - comp.priority;
-                snap.push(CandidateRecord {
-                    comp_name: bn.clone(),
-                    arg_priority_sum: arg_psum,
-                });
-            }
+            let mut pending_offset = 0;
+            while pending_offset < pending.len() {
+                let batch_end = (pending_offset + batch_size).min(pending.len());
+                let batch = &pending[pending_offset..batch_end];
+                pending_offset = batch_end;
 
-            let (result, match_frac) = test(&entry, &mut seen, &mut explored, &mut vm_stack);
+                // PARALLEL PHASE: materialize + evaluate via VM
+                let results: Vec<(SynthPool, EvalResult, usize)> = batch
+                    .par_iter()
+                    .map(|desc| {
+                        let entry = materialize(desc, &pool, components);
+                        let eval = eval_candidate(
+                            &entry, inputs, expected,
+                            &vm_ctx, &vm_macro_chunks, target_output_type,
+                        );
+                        (entry, eval, desc.comp_idx)
+                    })
+                    .collect();
 
-            // RL reward: track best partial match per component
-            if match_frac >= 0.0 {
-                let best = comp_best_match.entry(desc.comp_idx).or_insert(0.0);
-                if match_frac > *best { *best = match_frac; }
-            }
+                // SEQUENTIAL PHASE: dedup, budget, solution check, probes
+                for (ri, (entry, eval, comp_idx)) in results.into_iter().enumerate() {
+                    let desc = &batch[ri];
 
-            if let Some((sn, sr)) = result {
-                return SynthResult::success(sn, sr, explored);
-            }
+                    // Snapshot recording
+                    if let Some(ref mut snap) = snapshot {
+                        let comp = &components[desc.comp_idx];
+                        let bn = comp.builtin.as_ref().unwrap();
+                        let arg_psum = desc.score - comp.priority;
+                        snap.push(CandidateRecord {
+                            comp_name: bn.clone(),
+                            arg_priority_sum: arg_psum,
+                        });
+                    }
 
-            // ── Early depth extension: targeted composition probe ────────
-            // For each new pool entry, immediately try composing it with
-            // components whose output type matches the target:
-            //   - Arity-1: (comp entry) — always done (cheap, catches 2x+1 etc.)
-            //   - Chained + Arity-2 probes — only at depth 2+ (expensive, not
-            //     needed when depth-2 iteration will cover them systematically)
-            {
-                if let Some(target) = target_output_type {
-                    // Arity-1 probe: try components that return target type OR
-                    // useful intermediate types (for chained probing)
-                    for comp2 in components.iter() {
-                        if comp2.arity != 1 || comp2.builtin.is_none() { continue; }
-                        let returns_target = comp2.ret_type == target || comp2.ret_type == TYPE_ANY;
-                        let returns_useful = useful_types.contains(&comp2.ret_type);
-                        if !returns_target && !returns_useful { continue; }
-                        if entry.ret_type != comp2.param_types[0] && comp2.param_types[0] != TYPE_ANY && entry.ret_type != TYPE_ANY {
-                            continue;
+                    let match_frac = match eval {
+                        EvalResult::Skipped => { continue; }
+                        EvalResult::NeedsTreeWalker => {
+                            // Fall back to sequential test() for this candidate
+                            let (result, mf) = test(&entry, &mut seen, &mut explored, &mut vm_stack);
+                            if mf >= 0.0 {
+                                let best = comp_best_match.entry(comp_idx).or_insert(0.0);
+                                if mf > *best { *best = mf; }
+                            }
+                            if let Some((sn, sr)) = result {
+                                return SynthResult::success(sn, sr, explored);
+                            }
+                            mf
                         }
-                        let bn2 = comp2.builtin.as_ref().unwrap();
-                        let composed = if bn2.starts_with("map_") {
-                            // Fused map: emit (map <macro_name> arg)
-                            let macro_name = &bn2[4..];
-                            let mut cn = entry.nodes.clone();
-                            let map_sym = cn.len();
-                            cn.push(Node::Symbol(crate::intern::intern("map")));
-                            let fn_sym = cn.len();
-                            cn.push(Node::Symbol(crate::intern::intern(macro_name)));
-                            let api = cn.len();
-                            cn.push(Node::App(vec![map_sym, fn_sym, entry.root]));
-                            SynthPool {
-                                nodes: cn, root: api,
-                                ret_type: comp2.ret_type,
-                                priority: comp2.priority + entry.priority,
+                        EvalResult::Evaluated { beh, matches, evaluated } => {
+                            explored += 1;
+                            if explored > max_candidates {
+                                return SynthResult { found: false, nodes: None, root: None, candidates_explored: explored };
                             }
-                        } else if bn2.starts_with("reduce_") {
-                            // Fused reduce: emit (reduce <fn_name> arg)
-                            let fn_name = &bn2[7..];
-                            let mut cn = entry.nodes.clone();
-                            let reduce_sym = cn.len();
-                            cn.push(Node::Symbol(crate::intern::intern("reduce")));
-                            let fn_sym = cn.len();
-                            cn.push(Node::Symbol(crate::intern::intern(fn_name)));
-                            let api = cn.len();
-                            cn.push(Node::App(vec![reduce_sym, fn_sym, entry.root]));
-                            SynthPool {
-                                nodes: cn, root: api,
-                                ret_type: comp2.ret_type,
-                                priority: comp2.priority + entry.priority,
+
+                            let mf = if evaluated > 0 {
+                                matches as f64 / inputs.len() as f64
+                            } else { 0.0 };
+
+                            // Observational equivalence dedup
+                            if !beh.is_empty() {
+                                if seen.contains(&beh) { continue; }
+                                seen.insert(beh);
                             }
-                        } else {
-                            let mut cn = entry.nodes.clone();
-                            let fi = cn.len();
-                            cn.push(Node::Symbol(crate::intern::intern(bn2)));
-                            let api = cn.len();
-                            cn.push(Node::App(vec![fi, entry.root]));
-                            SynthPool {
-                                nodes: cn, root: api,
-                                ret_type: comp2.ret_type,
-                                priority: comp2.priority + entry.priority,
+
+                            // RL reward
+                            if mf >= 0.0 {
+                                let best = comp_best_match.entry(comp_idx).or_insert(0.0);
+                                if mf > *best { *best = mf; }
                             }
-                        };
-                        let (cresult, _cfrac) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
-                        if let Some((sn, sr)) = cresult {
-                            return SynthResult::success(sn, sr, explored);
+
+                            // Solution check
+                            if matches == inputs.len() && !inputs.is_empty() {
+                                if let Some(val_exs) = validation_examples {
+                                    let mut ln = entry.nodes.clone();
+                                    let lr = ln.len();
+                                    ln.push(Node::Lambda(vec![intern("x")], entry.root));
+                                    let ln_rc: Rc<[Node]> = ln.into();
+                                    if !validate_candidate(&ln_rc, lr, val_exs, &macro_env, extra_bindings) {
+                                        mf // continue — failed validation
+                                    } else {
+                                        return SynthResult::success(ln_rc.to_vec(), lr, explored);
+                                    }
+                                } else {
+                                    let mut ln = entry.nodes.clone();
+                                    let lr = ln.len();
+                                    ln.push(Node::Lambda(vec![intern("x")], entry.root));
+                                    return SynthResult::success(ln, lr, explored);
+                                }
+                            } else {
+                                mf
+                            }
                         }
-                        // Chained probe: if composed returns a useful non-target type,
-                        // try arity-2 compositions that convert it to the target.
-                        // Catches: (string-join (map_pos_tag (string-split x " ")) " ")
-                        // Only at depth 2+: these are expensive and redundant at depth 1.
-                        if _depth >= 2 && composed.ret_type != target && useful_types.contains(&composed.ret_type) {
-                            for comp3 in components.iter() {
-                                if comp3.arity != 2 || comp3.builtin.is_none() { continue; }
-                                if comp3.ret_type != target && comp3.ret_type != TYPE_ANY { continue; }
-                                let bn3 = comp3.builtin.as_ref().unwrap();
+                    };
+
+                    // ── Early depth extension probes (sequential) ────────────
+                    {
+                        if let Some(target) = target_output_type {
+                            for comp2 in components.iter() {
+                                if comp2.arity != 1 || comp2.builtin.is_none() { continue; }
+                                let returns_target = comp2.ret_type == target || comp2.ret_type == TYPE_ANY;
+                                let returns_useful = useful_types.contains(&comp2.ret_type);
+                                if !returns_target && !returns_useful { continue; }
+                                if entry.ret_type != comp2.param_types[0] && comp2.param_types[0] != TYPE_ANY && entry.ret_type != TYPE_ANY {
+                                    continue;
+                                }
+                                let bn2 = comp2.builtin.as_ref().unwrap();
+                                let composed = if bn2.starts_with("map_") {
+                                    let macro_name = &bn2[4..];
+                                    let mut cn = entry.nodes.clone();
+                                    let map_sym = cn.len();
+                                    cn.push(Node::Symbol(crate::intern::intern("map")));
+                                    let fn_sym = cn.len();
+                                    cn.push(Node::Symbol(crate::intern::intern(macro_name)));
+                                    let api = cn.len();
+                                    cn.push(Node::App(vec![map_sym, fn_sym, entry.root]));
+                                    SynthPool {
+                                        nodes: cn, root: api,
+                                        ret_type: comp2.ret_type,
+                                        priority: comp2.priority + entry.priority,
+                                    }
+                                } else if bn2.starts_with("reduce_") {
+                                    let fn_name = &bn2[7..];
+                                    let mut cn = entry.nodes.clone();
+                                    let reduce_sym = cn.len();
+                                    cn.push(Node::Symbol(crate::intern::intern("reduce")));
+                                    let fn_sym = cn.len();
+                                    cn.push(Node::Symbol(crate::intern::intern(fn_name)));
+                                    let api = cn.len();
+                                    cn.push(Node::App(vec![reduce_sym, fn_sym, entry.root]));
+                                    SynthPool {
+                                        nodes: cn, root: api,
+                                        ret_type: comp2.ret_type,
+                                        priority: comp2.priority + entry.priority,
+                                    }
+                                } else {
+                                    let mut cn = entry.nodes.clone();
+                                    let fi = cn.len();
+                                    cn.push(Node::Symbol(crate::intern::intern(bn2)));
+                                    let api = cn.len();
+                                    cn.push(Node::App(vec![fi, entry.root]));
+                                    SynthPool {
+                                        nodes: cn, root: api,
+                                        ret_type: comp2.ret_type,
+                                        priority: comp2.priority + entry.priority,
+                                    }
+                                };
+                                let (cresult, _cfrac) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
+                                if let Some((sn, sr)) = cresult {
+                                    return SynthResult::success(sn, sr, explored);
+                                }
+                                if _depth >= 2 && composed.ret_type != target && useful_types.contains(&composed.ret_type) {
+                                    for comp3 in components.iter() {
+                                        if comp3.arity != 2 || comp3.builtin.is_none() { continue; }
+                                        if comp3.ret_type != target && comp3.ret_type != TYPE_ANY { continue; }
+                                        let bn3 = comp3.builtin.as_ref().unwrap();
+                                        let pool_len = all_end;
+                                        let new_len = new_entries.len();
+                                        for ji in 0..(pool_len + new_len) {
+                                            let p = if ji < pool_len { &pool[ji] } else { &new_entries[ji - pool_len] };
+                                            if (composed.ret_type == comp3.param_types[0] || comp3.param_types[0] == TYPE_ANY)
+                                                && (p.ret_type == comp3.param_types[1] || comp3.param_types[1] == TYPE_ANY) {
+                                                let mut cn = composed.nodes.clone();
+                                                let off = cn.len();
+                                                for nd in &p.nodes { cn.push(remap_node(nd, off)); }
+                                                let fi = cn.len();
+                                                cn.push(Node::Symbol(crate::intern::intern(bn3)));
+                                                let api = cn.len();
+                                                cn.push(Node::App(vec![fi, composed.root, p.root + off]));
+                                                let chained = SynthPool {
+                                                    nodes: cn, root: api, ret_type: comp3.ret_type,
+                                                    priority: comp3.priority + composed.priority + p.priority,
+                                                };
+                                                let (cr, _) = test(&chained, &mut seen, &mut explored, &mut vm_stack);
+                                                if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
+                                                if explored > max_candidates { break; }
+                                            }
+                                            if (p.ret_type == comp3.param_types[0] || comp3.param_types[0] == TYPE_ANY)
+                                                && (composed.ret_type == comp3.param_types[1] || comp3.param_types[1] == TYPE_ANY) {
+                                                let mut cn = p.nodes.clone();
+                                                let off = cn.len();
+                                                for nd in &composed.nodes { cn.push(remap_node(nd, off)); }
+                                                let fi = cn.len();
+                                                cn.push(Node::Symbol(crate::intern::intern(bn3)));
+                                                let api = cn.len();
+                                                cn.push(Node::App(vec![fi, p.root, composed.root + off]));
+                                                let chained = SynthPool {
+                                                    nodes: cn, root: api, ret_type: comp3.ret_type,
+                                                    priority: comp3.priority + p.priority + composed.priority,
+                                                };
+                                                let (cr, _) = test(&chained, &mut seen, &mut explored, &mut vm_stack);
+                                                if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
+                                                if explored > max_candidates { break; }
+                                            }
+                                        }
+                                    }
+                                }
+                                if explored > max_candidates { break; }
+                            }
+                            'arity2_par: for comp2 in components.iter() {
+                                if comp2.arity != 2 || comp2.builtin.is_none() { continue; }
+                                if comp2.ret_type != target && comp2.ret_type != TYPE_ANY { continue; }
+                                let bn2 = comp2.builtin.as_ref().unwrap();
                                 let pool_len = all_end;
                                 let new_len = new_entries.len();
                                 for ji in 0..(pool_len + new_len) {
                                     let p = if ji < pool_len { &pool[ji] } else { &new_entries[ji - pool_len] };
-                                    // (comp3 composed pool_entry)
-                                    if (composed.ret_type == comp3.param_types[0] || comp3.param_types[0] == TYPE_ANY)
-                                        && (p.ret_type == comp3.param_types[1] || comp3.param_types[1] == TYPE_ANY) {
-                                        let mut cn = composed.nodes.clone();
+                                    if (entry.ret_type == comp2.param_types[0] || comp2.param_types[0] == TYPE_ANY)
+                                        && (p.ret_type == comp2.param_types[1] || comp2.param_types[1] == TYPE_ANY) {
+                                        let mut cn = entry.nodes.clone();
                                         let off = cn.len();
                                         for nd in &p.nodes { cn.push(remap_node(nd, off)); }
                                         let fi = cn.len();
-                                        cn.push(Node::Symbol(crate::intern::intern(bn3)));
+                                        cn.push(Node::Symbol(crate::intern::intern(bn2)));
                                         let api = cn.len();
-                                        cn.push(Node::App(vec![fi, composed.root, p.root + off]));
-                                        let chained = SynthPool {
-                                            nodes: cn, root: api, ret_type: comp3.ret_type,
-                                            priority: comp3.priority + composed.priority + p.priority,
+                                        cn.push(Node::App(vec![fi, entry.root, p.root + off]));
+                                        let composed = SynthPool {
+                                            nodes: cn, root: api, ret_type: comp2.ret_type,
+                                            priority: comp2.priority + entry.priority + p.priority,
                                         };
-                                        let (cr, _) = test(&chained, &mut seen, &mut explored, &mut vm_stack);
+                                        let (cr, _) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
                                         if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
-                                        if explored > max_candidates { break; }
+                                        if explored > max_candidates { break 'arity2_par; }
                                     }
-                                    // (comp3 pool_entry composed)
-                                    if (p.ret_type == comp3.param_types[0] || comp3.param_types[0] == TYPE_ANY)
-                                        && (composed.ret_type == comp3.param_types[1] || comp3.param_types[1] == TYPE_ANY) {
+                                    if (p.ret_type == comp2.param_types[0] || comp2.param_types[0] == TYPE_ANY)
+                                        && (entry.ret_type == comp2.param_types[1] || comp2.param_types[1] == TYPE_ANY) {
                                         let mut cn = p.nodes.clone();
                                         let off = cn.len();
-                                        for nd in &composed.nodes { cn.push(remap_node(nd, off)); }
+                                        for nd in &entry.nodes { cn.push(remap_node(nd, off)); }
                                         let fi = cn.len();
-                                        cn.push(Node::Symbol(crate::intern::intern(bn3)));
+                                        cn.push(Node::Symbol(crate::intern::intern(bn2)));
                                         let api = cn.len();
-                                        cn.push(Node::App(vec![fi, p.root, composed.root + off]));
-                                        let chained = SynthPool {
-                                            nodes: cn, root: api, ret_type: comp3.ret_type,
-                                            priority: comp3.priority + p.priority + composed.priority,
+                                        cn.push(Node::App(vec![fi, p.root, entry.root + off]));
+                                        let composed = SynthPool {
+                                            nodes: cn, root: api, ret_type: comp2.ret_type,
+                                            priority: comp2.priority + p.priority + entry.priority,
                                         };
-                                        let (cr, _) = test(&chained, &mut seen, &mut explored, &mut vm_stack);
+                                        let (cr, _) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
                                         if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
-                                        if explored > max_candidates { break; }
+                                        if explored > max_candidates { break 'arity2_par; }
                                     }
                                 }
                             }
                         }
-                        if explored > max_candidates { break; }
                     }
-                    // Arity-2 probe: try (comp entry other) and (comp other entry)
-                    // for pool entries AND new entries from this depth.
-                    'arity2: for comp2 in components.iter() {
-                        if comp2.arity != 2 || comp2.builtin.is_none() { continue; }
-                        if comp2.ret_type != target && comp2.ret_type != TYPE_ANY { continue; }
-                        let bn2 = comp2.builtin.as_ref().unwrap();
-                        // Collect all available entries: pool + new_entries so far
-                        let pool_len = all_end;
-                        let new_len = new_entries.len();
-                        for ji in 0..(pool_len + new_len) {
-                            let p = if ji < pool_len { &pool[ji] } else { &new_entries[ji - pool_len] };
-                            // Case 1: (comp entry pool[pi])
-                            if (entry.ret_type == comp2.param_types[0] || comp2.param_types[0] == TYPE_ANY)
-                                && (p.ret_type == comp2.param_types[1] || comp2.param_types[1] == TYPE_ANY) {
-                                let mut cn = entry.nodes.clone();
-                                let off = cn.len();
-                                for nd in &p.nodes { cn.push(remap_node(nd, off)); }
-                                let fi = cn.len();
-                                cn.push(Node::Symbol(crate::intern::intern(bn2)));
-                                let api = cn.len();
-                                cn.push(Node::App(vec![fi, entry.root, p.root + off]));
-                                let composed = SynthPool {
-                                    nodes: cn, root: api, ret_type: comp2.ret_type,
-                                    priority: comp2.priority + entry.priority + p.priority,
-                                };
-                                let (cr, _) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
-                                if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
-                                if explored > max_candidates { break 'arity2; }
-                            }
-                            // Case 2: (comp pool[pi] entry)
-                            if (p.ret_type == comp2.param_types[0] || comp2.param_types[0] == TYPE_ANY)
-                                && (entry.ret_type == comp2.param_types[1] || comp2.param_types[1] == TYPE_ANY) {
-                                let mut cn = p.nodes.clone();
-                                let off = cn.len();
-                                for nd in &entry.nodes { cn.push(remap_node(nd, off)); }
-                                let fi = cn.len();
-                                cn.push(Node::Symbol(crate::intern::intern(bn2)));
-                                let api = cn.len();
-                                cn.push(Node::App(vec![fi, p.root, entry.root + off]));
-                                let composed = SynthPool {
-                                    nodes: cn, root: api, ret_type: comp2.ret_type,
-                                    priority: comp2.priority + p.priority + entry.priority,
-                                };
-                                let (cr, _) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
-                                if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
-                                if explored > max_candidates { break 'arity2; }
-                            }
-                        }
-                    }
-                }
-            }
 
-            if explored > max_candidates {
-                return SynthResult { found: false, nodes: None, root: None, candidates_explored: explored };
+                    if explored > max_candidates {
+                        return SynthResult { found: false, nodes: None, root: None, candidates_explored: explored };
+                    }
+                    if pool.len() + new_entries.len() < MAX_POOL
+                        && useful_types.contains(&entry.ret_type)
+                    {
+                        let mut adjusted_entry = entry;
+                        if match_frac == 0.0 {
+                            if let Some(target) = target_output_type {
+                                if adjusted_entry.ret_type == target {
+                                    adjusted_entry.priority += rl_coeffs.cold_penalty;
+                                }
+                            }
+                        } else if match_frac > 0.0 {
+                            adjusted_entry.priority += match_frac * rl_coeffs.warm_bonus;
+                        }
+                        new_entries.push(adjusted_entry);
+                    }
+                }
             }
-            if pool.len() + new_entries.len() < MAX_POOL
-                && useful_types.contains(&entry.ret_type)
-            {
-                // Bayesian pruning: deprioritize pool entries that matched
-                // 0 examples when their return type matches the target.
-                // These are unlikely to be useful building blocks.
-                let mut adjusted_entry = entry;
-                if match_frac == 0.0 {
+        } else {
+            // ── Sequential fallback ──────────────────────────────────────
+            for desc in &pending {
+                let entry = materialize(desc, &pool, components);
+
+                // Record candidate in snapshot before testing
+                if let Some(ref mut snap) = snapshot {
+                    let comp = &components[desc.comp_idx];
+                    let bn = comp.builtin.as_ref().unwrap();
+                    let arg_psum = desc.score - comp.priority;
+                    snap.push(CandidateRecord {
+                        comp_name: bn.clone(),
+                        arg_priority_sum: arg_psum,
+                    });
+                }
+
+                let (result, match_frac) = test(&entry, &mut seen, &mut explored, &mut vm_stack);
+
+                // RL reward: track best partial match per component
+                if match_frac >= 0.0 {
+                    let best = comp_best_match.entry(desc.comp_idx).or_insert(0.0);
+                    if match_frac > *best { *best = match_frac; }
+                }
+
+                if let Some((sn, sr)) = result {
+                    return SynthResult::success(sn, sr, explored);
+                }
+
+                // ── Early depth extension probes ────────────────────────
+                {
                     if let Some(target) = target_output_type {
-                        if adjusted_entry.ret_type == target {
-                            adjusted_entry.priority += rl_coeffs.cold_penalty;
+                        for comp2 in components.iter() {
+                            if comp2.arity != 1 || comp2.builtin.is_none() { continue; }
+                            let returns_target = comp2.ret_type == target || comp2.ret_type == TYPE_ANY;
+                            let returns_useful = useful_types.contains(&comp2.ret_type);
+                            if !returns_target && !returns_useful { continue; }
+                            if entry.ret_type != comp2.param_types[0] && comp2.param_types[0] != TYPE_ANY && entry.ret_type != TYPE_ANY {
+                                continue;
+                            }
+                            let bn2 = comp2.builtin.as_ref().unwrap();
+                            let composed = if bn2.starts_with("map_") {
+                                let macro_name = &bn2[4..];
+                                let mut cn = entry.nodes.clone();
+                                let map_sym = cn.len();
+                                cn.push(Node::Symbol(crate::intern::intern("map")));
+                                let fn_sym = cn.len();
+                                cn.push(Node::Symbol(crate::intern::intern(macro_name)));
+                                let api = cn.len();
+                                cn.push(Node::App(vec![map_sym, fn_sym, entry.root]));
+                                SynthPool {
+                                    nodes: cn, root: api,
+                                    ret_type: comp2.ret_type,
+                                    priority: comp2.priority + entry.priority,
+                                }
+                            } else if bn2.starts_with("reduce_") {
+                                let fn_name = &bn2[7..];
+                                let mut cn = entry.nodes.clone();
+                                let reduce_sym = cn.len();
+                                cn.push(Node::Symbol(crate::intern::intern("reduce")));
+                                let fn_sym = cn.len();
+                                cn.push(Node::Symbol(crate::intern::intern(fn_name)));
+                                let api = cn.len();
+                                cn.push(Node::App(vec![reduce_sym, fn_sym, entry.root]));
+                                SynthPool {
+                                    nodes: cn, root: api,
+                                    ret_type: comp2.ret_type,
+                                    priority: comp2.priority + entry.priority,
+                                }
+                            } else {
+                                let mut cn = entry.nodes.clone();
+                                let fi = cn.len();
+                                cn.push(Node::Symbol(crate::intern::intern(bn2)));
+                                let api = cn.len();
+                                cn.push(Node::App(vec![fi, entry.root]));
+                                SynthPool {
+                                    nodes: cn, root: api,
+                                    ret_type: comp2.ret_type,
+                                    priority: comp2.priority + entry.priority,
+                                }
+                            };
+                            let (cresult, _cfrac) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
+                            if let Some((sn, sr)) = cresult {
+                                return SynthResult::success(sn, sr, explored);
+                            }
+                            if _depth >= 2 && composed.ret_type != target && useful_types.contains(&composed.ret_type) {
+                                for comp3 in components.iter() {
+                                    if comp3.arity != 2 || comp3.builtin.is_none() { continue; }
+                                    if comp3.ret_type != target && comp3.ret_type != TYPE_ANY { continue; }
+                                    let bn3 = comp3.builtin.as_ref().unwrap();
+                                    let pool_len = all_end;
+                                    let new_len = new_entries.len();
+                                    for ji in 0..(pool_len + new_len) {
+                                        let p = if ji < pool_len { &pool[ji] } else { &new_entries[ji - pool_len] };
+                                        if (composed.ret_type == comp3.param_types[0] || comp3.param_types[0] == TYPE_ANY)
+                                            && (p.ret_type == comp3.param_types[1] || comp3.param_types[1] == TYPE_ANY) {
+                                            let mut cn = composed.nodes.clone();
+                                            let off = cn.len();
+                                            for nd in &p.nodes { cn.push(remap_node(nd, off)); }
+                                            let fi = cn.len();
+                                            cn.push(Node::Symbol(crate::intern::intern(bn3)));
+                                            let api = cn.len();
+                                            cn.push(Node::App(vec![fi, composed.root, p.root + off]));
+                                            let chained = SynthPool {
+                                                nodes: cn, root: api, ret_type: comp3.ret_type,
+                                                priority: comp3.priority + composed.priority + p.priority,
+                                            };
+                                            let (cr, _) = test(&chained, &mut seen, &mut explored, &mut vm_stack);
+                                            if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
+                                            if explored > max_candidates { break; }
+                                        }
+                                        if (p.ret_type == comp3.param_types[0] || comp3.param_types[0] == TYPE_ANY)
+                                            && (composed.ret_type == comp3.param_types[1] || comp3.param_types[1] == TYPE_ANY) {
+                                            let mut cn = p.nodes.clone();
+                                            let off = cn.len();
+                                            for nd in &composed.nodes { cn.push(remap_node(nd, off)); }
+                                            let fi = cn.len();
+                                            cn.push(Node::Symbol(crate::intern::intern(bn3)));
+                                            let api = cn.len();
+                                            cn.push(Node::App(vec![fi, p.root, composed.root + off]));
+                                            let chained = SynthPool {
+                                                nodes: cn, root: api, ret_type: comp3.ret_type,
+                                                priority: comp3.priority + p.priority + composed.priority,
+                                            };
+                                            let (cr, _) = test(&chained, &mut seen, &mut explored, &mut vm_stack);
+                                            if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
+                                            if explored > max_candidates { break; }
+                                        }
+                                    }
+                                }
+                            }
+                            if explored > max_candidates { break; }
+                        }
+                        'arity2: for comp2 in components.iter() {
+                            if comp2.arity != 2 || comp2.builtin.is_none() { continue; }
+                            if comp2.ret_type != target && comp2.ret_type != TYPE_ANY { continue; }
+                            let bn2 = comp2.builtin.as_ref().unwrap();
+                            let pool_len = all_end;
+                            let new_len = new_entries.len();
+                            for ji in 0..(pool_len + new_len) {
+                                let p = if ji < pool_len { &pool[ji] } else { &new_entries[ji - pool_len] };
+                                if (entry.ret_type == comp2.param_types[0] || comp2.param_types[0] == TYPE_ANY)
+                                    && (p.ret_type == comp2.param_types[1] || comp2.param_types[1] == TYPE_ANY) {
+                                    let mut cn = entry.nodes.clone();
+                                    let off = cn.len();
+                                    for nd in &p.nodes { cn.push(remap_node(nd, off)); }
+                                    let fi = cn.len();
+                                    cn.push(Node::Symbol(crate::intern::intern(bn2)));
+                                    let api = cn.len();
+                                    cn.push(Node::App(vec![fi, entry.root, p.root + off]));
+                                    let composed = SynthPool {
+                                        nodes: cn, root: api, ret_type: comp2.ret_type,
+                                        priority: comp2.priority + entry.priority + p.priority,
+                                    };
+                                    let (cr, _) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
+                                    if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
+                                    if explored > max_candidates { break 'arity2; }
+                                }
+                                if (p.ret_type == comp2.param_types[0] || comp2.param_types[0] == TYPE_ANY)
+                                    && (entry.ret_type == comp2.param_types[1] || comp2.param_types[1] == TYPE_ANY) {
+                                    let mut cn = p.nodes.clone();
+                                    let off = cn.len();
+                                    for nd in &entry.nodes { cn.push(remap_node(nd, off)); }
+                                    let fi = cn.len();
+                                    cn.push(Node::Symbol(crate::intern::intern(bn2)));
+                                    let api = cn.len();
+                                    cn.push(Node::App(vec![fi, p.root, entry.root + off]));
+                                    let composed = SynthPool {
+                                        nodes: cn, root: api, ret_type: comp2.ret_type,
+                                        priority: comp2.priority + p.priority + entry.priority,
+                                    };
+                                    let (cr, _) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
+                                    if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
+                                    if explored > max_candidates { break 'arity2; }
+                                }
+                            }
                         }
                     }
-                } else if match_frac > 0.0 {
-                    adjusted_entry.priority += match_frac * rl_coeffs.warm_bonus;
                 }
-                new_entries.push(adjusted_entry);
+
+                if explored > max_candidates {
+                    return SynthResult { found: false, nodes: None, root: None, candidates_explored: explored };
+                }
+                if pool.len() + new_entries.len() < MAX_POOL
+                    && useful_types.contains(&entry.ret_type)
+                {
+                    let mut adjusted_entry = entry;
+                    if match_frac == 0.0 {
+                        if let Some(target) = target_output_type {
+                            if adjusted_entry.ret_type == target {
+                                adjusted_entry.priority += rl_coeffs.cold_penalty;
+                            }
+                        }
+                    } else if match_frac > 0.0 {
+                        adjusted_entry.priority += match_frac * rl_coeffs.warm_bonus;
+                    }
+                    new_entries.push(adjusted_entry);
+                }
             }
         }
 
         // ── RL priority update: boost components with partial matches ──
         // Components whose candidates got partial matches are "warm" —
         // their depth-(N+1) compositions should be tried earlier.
-        // This is applied by adjusting pending descriptor scores at the
-        // next iteration via the pool entry priorities (which flow into
-        // arg_priority_sum in the score calculation).
+        if rl_coeffs.comp_warm_bonus != 0.0 {
+            for (&ci, &best_match) in &comp_best_match {
+                if best_match > 0.0 {
+                    comp_priority_boost[ci] += best_match * rl_coeffs.comp_warm_bonus;
+                }
+            }
+            comp_best_match.clear();
+        }
 
         // ── If-expression generation (when enabled) ─────────────────
 
@@ -1977,204 +2327,173 @@ pub fn default_synth_components_opts(
     include_grid: bool,
 ) -> Vec<SynthComponent> {
     let mut comps = vec![
-        SynthComponent { name: "x".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 100.0 },
-        SynthComponent { name: "0".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "1".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "2".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "3".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "4".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "5".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "6".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "7".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "10".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "-1".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
+        SynthComponent { name: "x".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 100.0, usage_count: 0.0 },
+        SynthComponent { name: "0".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "1".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "2".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "3".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "4".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "5".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "6".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "7".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "10".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "-1".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
         // String constants — common characters for formal language tasks
-        SynthComponent { name: "a".into(), builtin: None, arity: 0, ret_type: 1, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "b".into(), builtin: None, arity: 0, ret_type: 1, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "(".into(), builtin: None, arity: 0, ret_type: 1, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: ")".into(), builtin: None, arity: 0, ret_type: 1, param_types: vec![], priority: 0.0 },
+        SynthComponent { name: "a".into(), builtin: None, arity: 0, ret_type: 1, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "b".into(), builtin: None, arity: 0, ret_type: 1, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "(".into(), builtin: None, arity: 0, ret_type: 1, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: ")".into(), builtin: None, arity: 0, ret_type: 1, param_types: vec![], priority: 0.0, usage_count: 0.0 },
     ];
 
     // Unary num->num
     for name in &["abs", "negate"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 1, ret_type: 0, param_types: vec![0], priority: 0.0,
-        });
+            arity: 1, ret_type: 0, param_types: vec![0], priority: 0.0, usage_count: 0.0 });
     }
 
     // Binary num->num->num
     for name in &["add", "subtract", "multiply", "min", "max", "modulo"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 2, ret_type: 0, param_types: vec![0, 0], priority: 0.0,
-        });
+            arity: 2, ret_type: 0, param_types: vec![0, 0], priority: 0.0, usage_count: 0.0 });
     }
 
     // String ops: unary str->str
     for name in &["string-upper", "string-lower", "string-reverse", "string-trim"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 1, ret_type: 1, param_types: vec![1], priority: 0.0,
-        });
+            arity: 1, ret_type: 1, param_types: vec![1], priority: 0.0, usage_count: 0.0 });
     }
 
     // string-length: str->num
     comps.push(SynthComponent {
         name: "string-length".into(), builtin: Some("string-length".into()),
-        arity: 1, ret_type: 0, param_types: vec![1], priority: 0.0,
-    });
+        arity: 1, ret_type: 0, param_types: vec![1], priority: 0.0, usage_count: 0.0 });
 
     // string-nth: (str, num) -> str (get character at index)
     comps.push(SynthComponent {
         name: "string-nth".into(), builtin: Some("string-nth".into()),
-        arity: 2, ret_type: 1, param_types: vec![1, 0], priority: 0.0,
-    });
+        arity: 2, ret_type: 1, param_types: vec![1, 0], priority: 0.0, usage_count: 0.0 });
 
     // char-code: str -> num (character to ASCII code)
     comps.push(SynthComponent {
         name: "char-code".into(), builtin: Some("char-code".into()),
-        arity: 1, ret_type: 0, param_types: vec![1], priority: 0.0,
-    });
+        arity: 1, ret_type: 0, param_types: vec![1], priority: 0.0, usage_count: 0.0 });
 
     // code-char: num -> str (ASCII code to character)
     comps.push(SynthComponent {
         name: "code-char".into(), builtin: Some("code-char".into()),
-        arity: 1, ret_type: 1, param_types: vec![0], priority: 0.0,
-    });
+        arity: 1, ret_type: 1, param_types: vec![0], priority: 0.0, usage_count: 0.0 });
 
     // count-char: (str, str) -> num (count occurrences)
     comps.push(SynthComponent {
         name: "count-char".into(), builtin: Some("count-char".into()),
-        arity: 2, ret_type: 0, param_types: vec![1, 1], priority: 0.0,
-    });
+        arity: 2, ret_type: 0, param_types: vec![1, 1], priority: 0.0, usage_count: 0.0 });
 
     // string-replace: (str, str, str) -> str
     comps.push(SynthComponent {
         name: "string-replace".into(), builtin: Some("string-replace".into()),
-        arity: 3, ret_type: 1, param_types: vec![1, 1, 1], priority: 0.0,
-    });
+        arity: 3, ret_type: 1, param_types: vec![1, 1, 1], priority: 0.0, usage_count: 0.0 });
 
     // concat: (str, str) -> str
     comps.push(SynthComponent {
         name: "concat".into(), builtin: Some("concat".into()),
-        arity: 2, ret_type: 1, param_types: vec![1, 1], priority: 0.0,
-    });
+        arity: 2, ret_type: 1, param_types: vec![1, 1], priority: 0.0, usage_count: 0.0 });
 
     // string-starts-with: (str, str) -> bool
     comps.push(SynthComponent {
         name: "string-starts-with".into(), builtin: Some("string-starts-with".into()),
-        arity: 2, ret_type: 2, param_types: vec![1, 1], priority: 0.0,
-    });
+        arity: 2, ret_type: 2, param_types: vec![1, 1], priority: 0.0, usage_count: 0.0 });
 
     // string-ends-with: (str, str) -> bool
     comps.push(SynthComponent {
         name: "string-ends-with".into(), builtin: Some("string-ends-with".into()),
-        arity: 2, ret_type: 2, param_types: vec![1, 1], priority: 0.0,
-    });
+        arity: 2, ret_type: 2, param_types: vec![1, 1], priority: 0.0, usage_count: 0.0 });
 
     // dispatch: (str, any) -> any — look up macro by name, apply to arg
     // Enables instruction-following: (dispatch (first_word x) (last_word x))
     comps.push(SynthComponent {
         name: "dispatch".into(), builtin: Some("dispatch".into()),
-        arity: 2, ret_type: TYPE_ANY, param_types: vec![TYPE_STR, TYPE_ANY], priority: 15.0,
-    });
+        arity: 2, ret_type: TYPE_ANY, param_types: vec![TYPE_STR, TYPE_ANY], priority: 15.0, usage_count: 0.0 });
 
     // Comparison operators: num->num->bool (for if-expression conditions)
     for name in &["<", ">", "<=", ">=", "=", "!="] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 2, ret_type: 2, param_types: vec![0, 0], priority: 0.0,
-        });
+            arity: 2, ret_type: 2, param_types: vec![0, 0], priority: 0.0, usage_count: 0.0 });
     }
 
     // Unary num->bool predicates
     for name in &["even", "odd"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 1, ret_type: 2, param_types: vec![0], priority: 0.0,
-        });
+            arity: 1, ret_type: 2, param_types: vec![0], priority: 0.0, usage_count: 0.0 });
     }
 
     // Boolean logic: bool->bool, (bool,bool)->bool
     comps.push(SynthComponent {
         name: "not".into(), builtin: Some("not".into()),
-        arity: 1, ret_type: 2, param_types: vec![2], priority: 0.0,
-    });
+        arity: 1, ret_type: 2, param_types: vec![2], priority: 0.0, usage_count: 0.0 });
     comps.push(SynthComponent {
         name: "and".into(), builtin: Some("and".into()),
-        arity: 2, ret_type: 2, param_types: vec![2, 2], priority: 0.0,
-    });
+        arity: 2, ret_type: 2, param_types: vec![2, 2], priority: 0.0, usage_count: 0.0 });
     comps.push(SynthComponent {
         name: "or".into(), builtin: Some("or".into()),
-        arity: 2, ret_type: 2, param_types: vec![2, 2], priority: 0.0,
-    });
+        arity: 2, ret_type: 2, param_types: vec![2, 2], priority: 0.0, usage_count: 0.0 });
 
     // List operations
     comps.push(SynthComponent {
         name: "string-split".into(), builtin: Some("string-split".into()),
-        arity: 2, ret_type: TYPE_LIST, param_types: vec![TYPE_STR, TYPE_STR], priority: 10.0,
-    });
+        arity: 2, ret_type: TYPE_LIST, param_types: vec![TYPE_STR, TYPE_STR], priority: 10.0, usage_count: 0.0 });
     comps.push(SynthComponent {
         name: "string-join".into(), builtin: Some("string-join".into()),
-        arity: 2, ret_type: TYPE_STR, param_types: vec![TYPE_LIST, TYPE_STR], priority: 10.0,
-    });
+        arity: 2, ret_type: TYPE_STR, param_types: vec![TYPE_LIST, TYPE_STR], priority: 10.0, usage_count: 0.0 });
     comps.push(SynthComponent {
         name: "head".into(), builtin: Some("head".into()),
-        arity: 1, ret_type: TYPE_ANY, param_types: vec![TYPE_LIST], priority: 0.0,
-    });
+        arity: 1, ret_type: TYPE_ANY, param_types: vec![TYPE_LIST], priority: 0.0, usage_count: 0.0 });
     comps.push(SynthComponent {
         name: "tail".into(), builtin: Some("tail".into()),
-        arity: 1, ret_type: TYPE_LIST, param_types: vec![TYPE_LIST], priority: 0.0,
-    });
+        arity: 1, ret_type: TYPE_LIST, param_types: vec![TYPE_LIST], priority: 0.0, usage_count: 0.0 });
     comps.push(SynthComponent {
         name: "nth".into(), builtin: Some("nth".into()),
-        arity: 2, ret_type: TYPE_ANY, param_types: vec![TYPE_LIST, TYPE_NUM], priority: 0.0,
-    });
+        arity: 2, ret_type: TYPE_ANY, param_types: vec![TYPE_LIST, TYPE_NUM], priority: 0.0, usage_count: 0.0 });
     comps.push(SynthComponent {
         name: "list-length".into(), builtin: Some("length".into()),
-        arity: 1, ret_type: TYPE_NUM, param_types: vec![TYPE_LIST], priority: 0.0,
-    });
+        arity: 1, ret_type: TYPE_NUM, param_types: vec![TYPE_LIST], priority: 0.0, usage_count: 0.0 });
     comps.push(SynthComponent {
         name: "list-reverse".into(), builtin: Some("reverse".into()),
-        arity: 1, ret_type: TYPE_LIST, param_types: vec![TYPE_LIST], priority: 0.0,
-    });
+        arity: 1, ret_type: TYPE_LIST, param_types: vec![TYPE_LIST], priority: 0.0, usage_count: 0.0 });
 
     // string-chars: str -> list (split string into character list)
     comps.push(SynthComponent {
         name: "string-chars".into(), builtin: Some("string-chars".into()),
-        arity: 1, ret_type: TYPE_LIST, param_types: vec![TYPE_STR], priority: 5.0,
-    });
+        arity: 1, ret_type: TYPE_LIST, param_types: vec![TYPE_STR], priority: 5.0, usage_count: 0.0 });
 
     // string-take: (str, num) -> str (first N characters)
     comps.push(SynthComponent {
         name: "string-take".into(), builtin: Some("string-take".into()),
-        arity: 2, ret_type: TYPE_STR, param_types: vec![TYPE_STR, TYPE_NUM], priority: 5.0,
-    });
+        arity: 2, ret_type: TYPE_STR, param_types: vec![TYPE_STR, TYPE_NUM], priority: 5.0, usage_count: 0.0 });
 
     // string-drop: (str, num) -> str (everything after first N characters)
     comps.push(SynthComponent {
         name: "string-drop".into(), builtin: Some("string-drop".into()),
-        arity: 2, ret_type: TYPE_STR, param_types: vec![TYPE_STR, TYPE_NUM], priority: 5.0,
-    });
+        arity: 2, ret_type: TYPE_STR, param_types: vec![TYPE_STR, TYPE_NUM], priority: 5.0, usage_count: 0.0 });
 
     // divide: (num, num) -> num
     comps.push(SynthComponent {
         name: "divide".into(), builtin: Some("divide".into()),
-        arity: 2, ret_type: TYPE_NUM, param_types: vec![TYPE_NUM, TYPE_NUM], priority: 0.0,
-    });
+        arity: 2, ret_type: TYPE_NUM, param_types: vec![TYPE_NUM, TYPE_NUM], priority: 0.0, usage_count: 0.0 });
 
     // floor: num -> num
     comps.push(SynthComponent {
         name: "floor".into(), builtin: Some("floor".into()),
-        arity: 1, ret_type: TYPE_NUM, param_types: vec![TYPE_NUM], priority: 0.0,
-    });
+        arity: 1, ret_type: TYPE_NUM, param_types: vec![TYPE_NUM], priority: 0.0, usage_count: 0.0 });
 
     // string-slice: (str, num, num) -> str
     comps.push(SynthComponent {
         name: "string-slice".into(), builtin: Some("string-slice".into()),
-        arity: 3, ret_type: TYPE_STR, param_types: vec![TYPE_STR, TYPE_NUM, TYPE_NUM], priority: 5.0,
-    });
+        arity: 3, ret_type: TYPE_STR, param_types: vec![TYPE_STR, TYPE_NUM, TYPE_NUM], priority: 5.0, usage_count: 0.0 });
 
     // ── Grid components (ARC-AGI) — only when grid domain is active ──
     if include_grid {
@@ -2187,8 +2506,7 @@ pub fn default_synth_components_opts(
     ] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 1, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID], priority: 0.0,
-        });
+            arity: 1, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID], priority: 0.0, usage_count: 0.0 });
     }
     // Grid → Num analysis
     for name in &[
@@ -2197,15 +2515,13 @@ pub fn default_synth_components_opts(
     ] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 1, ret_type: TYPE_NUM, param_types: vec![TYPE_GRID], priority: 0.0,
-        });
+            arity: 1, ret_type: TYPE_NUM, param_types: vec![TYPE_GRID], priority: 0.0, usage_count: 0.0 });
     }
     // Grid → Bool predicates
     for name in &["grid-symmetric-h", "grid-symmetric-v", "grid-is-rectangle"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 1, ret_type: TYPE_BOOL, param_types: vec![TYPE_GRID], priority: 0.0,
-        });
+            arity: 1, ret_type: TYPE_BOOL, param_types: vec![TYPE_GRID], priority: 0.0, usage_count: 0.0 });
     }
     // Grid → List analysis
     for name in &[
@@ -2215,66 +2531,56 @@ pub fn default_synth_components_opts(
     ] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 1, ret_type: TYPE_LIST, param_types: vec![TYPE_GRID], priority: 0.0,
-        });
+            arity: 1, ret_type: TYPE_LIST, param_types: vec![TYPE_GRID], priority: 0.0, usage_count: 0.0 });
     }
     // Grid × Num → Grid
     for name in &["grid-scale", "grid-gravity", "grid-fill-enclosed"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 2, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID, TYPE_NUM], priority: 0.0,
-        });
+            arity: 2, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID, TYPE_NUM], priority: 0.0, usage_count: 0.0 });
     }
     // Grid × Num → Num
     comps.push(SynthComponent {
         name: "grid-count-color".into(), builtin: Some("grid-count-color".into()),
-        arity: 2, ret_type: TYPE_NUM, param_types: vec![TYPE_GRID, TYPE_NUM], priority: 0.0,
-    });
+        arity: 2, ret_type: TYPE_NUM, param_types: vec![TYPE_GRID, TYPE_NUM], priority: 0.0, usage_count: 0.0 });
     // Grid × Num → List
     for name in &["grid-row", "grid-col", "grid-find-color", "grid-hsplit", "grid-vsplit"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 2, ret_type: TYPE_LIST, param_types: vec![TYPE_GRID, TYPE_NUM], priority: 0.0,
-        });
+            arity: 2, ret_type: TYPE_LIST, param_types: vec![TYPE_GRID, TYPE_NUM], priority: 0.0, usage_count: 0.0 });
     }
     // Grid × Num × Num → Grid
     for name in &["grid-replace-color", "grid-tile", "grid-pad"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 3, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID, TYPE_NUM, TYPE_NUM], priority: 0.0,
-        });
+            arity: 3, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID, TYPE_NUM, TYPE_NUM], priority: 0.0, usage_count: 0.0 });
     }
     // Grid × Num × Num → Num
     for name in &["grid-get", "grid-neighbor-count"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 3, ret_type: TYPE_NUM, param_types: vec![TYPE_GRID, TYPE_NUM, TYPE_NUM], priority: 0.0,
-        });
+            arity: 3, ret_type: TYPE_NUM, param_types: vec![TYPE_GRID, TYPE_NUM, TYPE_NUM], priority: 0.0, usage_count: 0.0 });
     }
     // Grid × Grid → Grid
     for name in &["grid-hconcat", "grid-vconcat", "grid-mask", "grid-xor", "grid-and", "grid-or", "grid-overlay-center"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 2, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID, TYPE_GRID], priority: 0.0,
-        });
+            arity: 2, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID, TYPE_GRID], priority: 0.0, usage_count: 0.0 });
     }
     // Grid × Grid → Bool
     for name in &["grid-equal", "grid-dimensions-equal", "grid-objects-touching"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 2, ret_type: TYPE_BOOL, param_types: vec![TYPE_GRID, TYPE_GRID], priority: 0.0,
-        });
+            arity: 2, ret_type: TYPE_BOOL, param_types: vec![TYPE_GRID, TYPE_GRID], priority: 0.0, usage_count: 0.0 });
     }
     // Grid × Grid → List
     comps.push(SynthComponent {
         name: "grid-find-subgrid".into(), builtin: Some("grid-find-subgrid".into()),
-        arity: 2, ret_type: TYPE_LIST, param_types: vec![TYPE_GRID, TYPE_GRID], priority: 0.0,
-    });
+        arity: 2, ret_type: TYPE_LIST, param_types: vec![TYPE_GRID, TYPE_GRID], priority: 0.0, usage_count: 0.0 });
     // Grid × Num × Num × Num → Grid (flood-fill)
     comps.push(SynthComponent {
         name: "grid-flood-fill".into(), builtin: Some("grid-flood-fill".into()),
-        arity: 4, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID, TYPE_NUM, TYPE_NUM, TYPE_NUM], priority: 0.0,
-    });
+        arity: 4, ret_type: TYPE_GRID, param_types: vec![TYPE_GRID, TYPE_NUM, TYPE_NUM, TYPE_NUM], priority: 0.0, usage_count: 0.0 });
     // High-arity: draw-line-h (5), draw-line-v (5), ray (6), fill-rect (6)
     // These are available as builtins but NOT registered as synth components
     // because arity >= 5 makes them unreachable at typical search depths.
@@ -2283,8 +2589,7 @@ pub fn default_synth_components_opts(
     // Grid-make: Num × Num × Num → Grid
     comps.push(SynthComponent {
         name: "grid-make".into(), builtin: Some("grid-make".into()),
-        arity: 3, ret_type: TYPE_GRID, param_types: vec![TYPE_NUM, TYPE_NUM, TYPE_NUM], priority: 0.0,
-    });
+        arity: 3, ret_type: TYPE_GRID, param_types: vec![TYPE_NUM, TYPE_NUM, TYPE_NUM], priority: 0.0, usage_count: 0.0 });
     } // end if include_grid
 
     // Add macro components — infer types by probing with sample inputs
@@ -2296,9 +2601,21 @@ pub fn default_synth_components_opts(
             arity: params.len(),
             ret_type: inferred_ret,
             param_types: inferred_param,
-            priority: 30.0,
-        });
+            priority: 30.0, usage_count: 0.0 });
     }
+
+    // ns-get: (any, str) -> any — namespace lookup
+    comps.push(SynthComponent {
+        name: "ns-get".into(), builtin: Some("ns-get".into()),
+        arity: 2, ret_type: TYPE_ANY, param_types: vec![TYPE_ANY, TYPE_STR],
+        priority: 10.0, usage_count: 0.0 });
+
+    // ns-get-or: (any, str, any) -> any — namespace lookup with default
+    // Enables compositions like (ns-get-or vocab x "") for data-driven synthesis
+    comps.push(SynthComponent {
+        name: "ns-get-or".into(), builtin: Some("ns-get-or".into()),
+        arity: 3, ret_type: TYPE_ANY, param_types: vec![TYPE_ANY, TYPE_STR, TYPE_ANY],
+        priority: 10.0, usage_count: 0.0 });
 
     // Fused map components: for each unary macro m, register map_m(list) -> list
     // These emit (map m list) during materialization, enabling higher-order synthesis
@@ -2312,6 +2629,7 @@ pub fn default_synth_components_opts(
                 ret_type: TYPE_LIST,
                 param_types: vec![TYPE_LIST],
                 priority: 25.0,
+                usage_count: 0.0,
             });
         }
     }
@@ -2330,6 +2648,7 @@ pub fn default_synth_components_opts(
             ret_type: ret,
             param_types: vec![TYPE_LIST],
             priority: 25.0,
+            usage_count: 0.0,
         });
     }
 
@@ -2344,6 +2663,7 @@ pub fn default_synth_components_opts(
                 ret_type: inferred_ret,
                 param_types: vec![TYPE_LIST],
                 priority: 25.0,
+                usage_count: 0.0,
             });
         }
     }
@@ -3047,8 +3367,8 @@ mod tests {
     fn test_synth_finds_string_reverse() {
         let macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = vec![];
         let comps = vec![
-            SynthComponent { name: "x".into(), builtin: None, arity: 0, ret_type: TYPE_STR, param_types: vec![], priority: 100.0 },
-            SynthComponent { name: "string-reverse".into(), builtin: Some("string-reverse".into()), arity: 1, ret_type: TYPE_STR, param_types: vec![TYPE_STR], priority: 0.0 },
+            SynthComponent { name: "x".into(), builtin: None, arity: 0, ret_type: TYPE_STR, param_types: vec![], priority: 100.0, usage_count: 0.0 },
+            SynthComponent { name: "string-reverse".into(), builtin: Some("string-reverse".into()), arity: 1, ret_type: TYPE_STR, param_types: vec![TYPE_STR], priority: 0.0, usage_count: 0.0 },
         ];
         let inputs = vec![Value::Str("hello".into()), Value::Str("ab".into())];
         let expected = vec![Value::Str("olleh".into()), Value::Str("ba".into())];

@@ -452,8 +452,7 @@ fn try_constant_discovery(
             arity: 0,
             ret_type: 0,
             param_types: vec![],
-            priority: 0.0,
-        });
+            priority: 0.0, usage_count: 0.0 });
     }
 
     // Retry synthesis with augmented components

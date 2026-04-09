@@ -505,6 +505,7 @@ struct SynthComponent {
     ret_type: u8,   // 0=num, 1=str, 2=bool
     param_types: Vec<u8>,
     priority: f64,
+    usage_count: f64,
 }
 
 #[derive(Clone)]
@@ -519,46 +520,42 @@ fn default_synth_components(
     macros: &[(String, Vec<String>, Vec<Node>, usize)]
 ) -> Vec<SynthComponent> {
     let mut comps = vec![
-        SynthComponent { name: "x".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 100.0 },
-        SynthComponent { name: "0".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "1".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "2".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "3".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "4".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "5".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "6".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "7".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "10".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
-        SynthComponent { name: "-1".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0 },
+        SynthComponent { name: "x".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 100.0, usage_count: 0.0 },
+        SynthComponent { name: "0".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "1".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "2".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "3".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "4".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "5".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "6".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "7".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "10".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
+        SynthComponent { name: "-1".into(), builtin: None, arity: 0, ret_type: 0, param_types: vec![], priority: 0.0, usage_count: 0.0 },
     ];
 
     // Unary num->num
     for name in &["abs", "negate"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 1, ret_type: 0, param_types: vec![0], priority: 0.0,
-        });
+            arity: 1, ret_type: 0, param_types: vec![0], priority: 0.0, usage_count: 0.0 });
     }
 
     // Binary num->num->num
     for name in &["add", "subtract", "multiply", "min", "max", "modulo"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 2, ret_type: 0, param_types: vec![0, 0], priority: 0.0,
-        });
+            arity: 2, ret_type: 0, param_types: vec![0, 0], priority: 0.0, usage_count: 0.0 });
     }
 
     // String ops
     for name in &["string-upper", "string-lower", "string-reverse", "string-trim"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 1, ret_type: 1, param_types: vec![1], priority: 0.0,
-        });
+            arity: 1, ret_type: 1, param_types: vec![1], priority: 0.0, usage_count: 0.0 });
     }
     comps.push(SynthComponent {
         name: "string-length".into(), builtin: Some("string-length".into()),
-        arity: 1, ret_type: 0, param_types: vec![1], priority: 0.0,
-    });
+        arity: 1, ret_type: 0, param_types: vec![1], priority: 0.0, usage_count: 0.0 });
 
     // Grid unary transforms: Grid → Grid
     for name in &[
@@ -567,8 +564,7 @@ fn default_synth_components(
     ] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 1, ret_type: 4, param_types: vec![4], priority: 0.0,
-        });
+            arity: 1, ret_type: 4, param_types: vec![4], priority: 0.0, usage_count: 0.0 });
     }
     // Grid → Num analysis
     for name in &[
@@ -577,15 +573,13 @@ fn default_synth_components(
     ] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 1, ret_type: 0, param_types: vec![4], priority: 0.0,
-        });
+            arity: 1, ret_type: 0, param_types: vec![4], priority: 0.0, usage_count: 0.0 });
     }
     // Grid → Bool predicates
     for name in &["grid-symmetric-h", "grid-symmetric-v"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 1, ret_type: 2, param_types: vec![4], priority: 0.0,
-        });
+            arity: 1, ret_type: 2, param_types: vec![4], priority: 0.0, usage_count: 0.0 });
     }
     // Grid → List analysis
     for name in &[
@@ -594,74 +588,62 @@ fn default_synth_components(
     ] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 1, ret_type: 3, param_types: vec![4], priority: 0.0,
-        });
+            arity: 1, ret_type: 3, param_types: vec![4], priority: 0.0, usage_count: 0.0 });
     }
     // Grid × Num → Grid
     comps.push(SynthComponent {
         name: "grid-scale".into(), builtin: Some("grid-scale".into()),
-        arity: 2, ret_type: 4, param_types: vec![4, 0], priority: 0.0,
-    });
+        arity: 2, ret_type: 4, param_types: vec![4, 0], priority: 0.0, usage_count: 0.0 });
     // Grid × Num → Num
     comps.push(SynthComponent {
         name: "grid-count-color".into(), builtin: Some("grid-count-color".into()),
-        arity: 2, ret_type: 0, param_types: vec![4, 0], priority: 0.0,
-    });
+        arity: 2, ret_type: 0, param_types: vec![4, 0], priority: 0.0, usage_count: 0.0 });
     // Grid × Num → List
     for name in &["grid-row", "grid-col", "grid-find-color"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 2, ret_type: 3, param_types: vec![4, 0], priority: 0.0,
-        });
+            arity: 2, ret_type: 3, param_types: vec![4, 0], priority: 0.0, usage_count: 0.0 });
     }
     // Grid × Num × Num → Grid (replace-color)
     comps.push(SynthComponent {
         name: "grid-replace-color".into(), builtin: Some("grid-replace-color".into()),
-        arity: 3, ret_type: 4, param_types: vec![4, 0, 0], priority: 0.0,
-    });
+        arity: 3, ret_type: 4, param_types: vec![4, 0, 0], priority: 0.0, usage_count: 0.0 });
     // Grid × Num × Num → Num (get)
     comps.push(SynthComponent {
         name: "grid-get".into(), builtin: Some("grid-get".into()),
-        arity: 3, ret_type: 0, param_types: vec![4, 0, 0], priority: 0.0,
-    });
+        arity: 3, ret_type: 0, param_types: vec![4, 0, 0], priority: 0.0, usage_count: 0.0 });
     // Grid × Grid → Grid
     for name in &["grid-hconcat", "grid-vconcat", "grid-mask"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 2, ret_type: 4, param_types: vec![4, 4], priority: 0.0,
-        });
+            arity: 2, ret_type: 4, param_types: vec![4, 4], priority: 0.0, usage_count: 0.0 });
     }
     // Grid × Grid → Bool
     for name in &["grid-equal", "grid-dimensions-equal"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 2, ret_type: 2, param_types: vec![4, 4], priority: 0.0,
-        });
+            arity: 2, ret_type: 2, param_types: vec![4, 4], priority: 0.0, usage_count: 0.0 });
     }
     // Grid × Num → List (split)
     for name in &["grid-hsplit", "grid-vsplit"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 2, ret_type: 3, param_types: vec![4, 0], priority: 0.0,
-        });
+            arity: 2, ret_type: 3, param_types: vec![4, 0], priority: 0.0, usage_count: 0.0 });
     }
     // Grid → List (quarter)
     comps.push(SynthComponent {
         name: "grid-quarter".into(), builtin: Some("grid-quarter".into()),
-        arity: 1, ret_type: 3, param_types: vec![4], priority: 0.0,
-    });
+        arity: 1, ret_type: 3, param_types: vec![4], priority: 0.0, usage_count: 0.0 });
     // Grid × Num × Num → Grid (tile, pad)
     for name in &["grid-tile", "grid-pad"] {
         comps.push(SynthComponent {
             name: name.to_string(), builtin: Some(name.to_string()),
-            arity: 3, ret_type: 4, param_types: vec![4, 0, 0], priority: 0.0,
-        });
+            arity: 3, ret_type: 4, param_types: vec![4, 0, 0], priority: 0.0, usage_count: 0.0 });
     }
     // Grid-make: Num × Num × Num → Grid
     comps.push(SynthComponent {
         name: "grid-make".into(), builtin: Some("grid-make".into()),
-        arity: 3, ret_type: 4, param_types: vec![0, 0, 0], priority: 0.0,
-    });
+        arity: 3, ret_type: 4, param_types: vec![0, 0, 0], priority: 0.0, usage_count: 0.0 });
 
     // Add macro components
     for (name, params, _, _) in macros {
@@ -671,8 +653,7 @@ fn default_synth_components(
             arity: params.len(),
             ret_type: 0, // assume num for now
             param_types: vec![0; params.len()],
-            priority: 30.0,
-        });
+            priority: 30.0, usage_count: 0.0 });
     }
 
     comps
@@ -1024,15 +1005,22 @@ fn cmd_curriculum(args: &[String]) {
                 if let Value::Num(n) = val { current_rl_coeffs.warm_bonus = n; }
             }
         }
+        if mname == "__selph_rl_comp_warm__" {
+            if let Ok(val) = eval::eval(&mnodes_rc, *mroot, &mut eval::make_default_env()) {
+                if let Value::Num(n) = val { current_rl_coeffs.comp_warm_bonus = n; }
+            }
+        }
     }
-    if current_rl_coeffs.cold_penalty != -50.0 || current_rl_coeffs.warm_bonus != 30.0 {
-        eprintln!("  Loaded RL coefficients: cold={:.1}, warm={:.1}",
-            current_rl_coeffs.cold_penalty, current_rl_coeffs.warm_bonus);
+    if current_rl_coeffs.cold_penalty != -50.0 || current_rl_coeffs.warm_bonus != 30.0
+        || current_rl_coeffs.comp_warm_bonus != 15.0
+    {
+        eprintln!("  Loaded RL coefficients: cold={:.1}, warm={:.1}, comp_warm={:.1}",
+            current_rl_coeffs.cold_penalty, current_rl_coeffs.warm_bonus,
+            current_rl_coeffs.comp_warm_bonus);
     }
 
     // Abstraction extraction state
     let mut solved_programs: Vec<(Vec<Node>, usize)> = Vec::new();
-
 
     for (name, task_depth, inputs, expected) in &tasks {
         // Use the task-specified depth. The CLI --depth is only a fallback
@@ -1097,19 +1085,26 @@ fn cmd_curriculum(args: &[String]) {
             // raw input (e.g. num→num macros used as intermediate compositions).
         }
 
-        // Apply learned priorities from previous solves
+        // Populate usage_count from priority accumulation history
         for comp in &mut synth_comps {
-            if let Some(&learned) = priorities.get(&comp.name) {
-                comp.priority += learned;
-            }
+            comp.usage_count = priorities.get(&comp.name)
+                .map(|&v| v / learn_rate)
+                .unwrap_or(0.0);
         }
 
         // Apply loaded heuristic if present — replaces static priority with
-        // task-dependent scoring. Otherwise fall back to sorting by learned priority.
+        // task-dependent scoring (heuristic can read usage-count).
+        // Otherwise fall back to learned priority accumulation + sorting.
         if let Some(ref h) = heuristic {
             let task_ctx = meta::TaskContext::from_examples(inputs, expected);
             synth_comps = meta::apply_heuristic(h, &synth_comps, &task_ctx);
         } else {
+            // No heuristic: apply hard-coded priority accumulation
+            for comp in &mut synth_comps {
+                if let Some(&learned) = priorities.get(&comp.name) {
+                    comp.priority += learned;
+                }
+            }
             synth_comps.sort_by(|a, b| b.priority.partial_cmp(&a.priority)
                 .unwrap_or(std::cmp::Ordering::Equal));
         }
@@ -1128,10 +1123,12 @@ fn cmd_curriculum(args: &[String]) {
         };
 
         let num_components = synth_comps.len();
+        let all_comp_names: Vec<String> = synth_comps.iter().map(|c| c.name.clone()).collect();
         let mut task_solving_strategy: Option<String> = None;
         let mut task_total_candidates: usize = 0;
         let mut task_components_used: Vec<String> = Vec::new();
         let start = std::time::Instant::now();
+
         let filter_ref: Option<&dyn Fn(&synth::SynthComponent, usize) -> bool> =
             depth_filter.as_ref().map(|f| f.as_ref());
         let snap_ref: Option<&mut Vec<synth::CandidateRecord>> = None;
@@ -1140,8 +1137,8 @@ fn cmd_curriculum(args: &[String]) {
             depth, default_budget, true,
             val_pairs.as_deref(), &extra_bindings, filter_ref, snap_ref,
             current_rl_coeffs);
-        let elapsed = start.elapsed();
         total_candidates += sr.candidates_explored;
+        let elapsed = start.elapsed();
 
         if sr.found {
                 let source = node_to_source(sr.nodes.as_ref().unwrap(), sr.root.unwrap());
@@ -1492,6 +1489,7 @@ fn cmd_curriculum(args: &[String]) {
                 total_wall_time_ms: task_elapsed.as_secs_f64() * 1000.0,
                 components_used: task_components_used,
                 components_available: num_components,
+                all_components_available: all_comp_names.clone(),
             };
             curriculum_trace.tasks.push(task_trace);
         }
@@ -1621,6 +1619,7 @@ fn cmd_curriculum(args: &[String]) {
         output.push_str("\n; --- Learned RL reward coefficients ---\n");
         output.push_str(&format!("(defmacro __selph_rl_cold__ (_) {})\n", current_rl_coeffs.cold_penalty));
         output.push_str(&format!("(defmacro __selph_rl_warm__ (_) {})\n", current_rl_coeffs.warm_bonus));
+        output.push_str(&format!("(defmacro __selph_rl_comp_warm__ (_) {})\n", current_rl_coeffs.comp_warm_bonus));
     }
 
     match fs::write(&output_path, &output) {
@@ -2257,6 +2256,7 @@ fn cmd_meta_optimize(args: &[String]) {
     let mut budget: usize = 10000;
     let mut depth: usize = 2;
     let mut synthesize_heuristic = false;
+    let mut skip_stage3 = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -2278,6 +2278,7 @@ fn cmd_meta_optimize(args: &[String]) {
                 i += 2;
             }
             "--synthesize" => { synthesize_heuristic = true; i += 1; }
+            "--skip-stage3" => { skip_stage3 = true; i += 1; }
             other => { task_files.push(other.to_string()); i += 1; }
         }
     }
@@ -2327,17 +2328,24 @@ fn cmd_meta_optimize(args: &[String]) {
     }
 
     // Build training tasks from the curriculum tasks that appear in traces
-    let trace_names: std::collections::HashSet<String> = trace_tasks.iter()
-        .map(|t| t.task_name.clone())
+    let trace_by_name: std::collections::HashMap<String, &TraceTask> = trace_tasks.iter()
+        .map(|t| (t.task_name.clone(), t))
         .collect();
 
     let training_tasks: Vec<meta::TrainingTask> = all_tasks.iter()
-        .filter(|(name, _, _, _)| trace_names.contains(name))
+        .filter(|(name, _, _, _)| trace_by_name.contains_key(name))
         .map(|(name, _, inputs, expected)| {
+            let avail = trace_by_name.get(name)
+                .and_then(|t| if t.all_components_available.is_empty() {
+                    None
+                } else {
+                    Some(t.all_components_available.iter().cloned().collect())
+                });
             meta::TrainingTask {
                 name: name.clone(),
                 inputs: inputs.clone(),
                 expected: expected.clone(),
+                available_components: avail,
             }
         })
         .collect();
@@ -2374,121 +2382,140 @@ fn cmd_meta_optimize(args: &[String]) {
     let synth_comps = synth::default_synth_components(&all_macros);
 
     // Run heuristic optimization
-    eprintln!("Evaluating 8 candidate heuristics...");
     let default_h = meta::Heuristic::default_heuristic();
 
-    // Evaluate baseline: run with default heuristic
-    let (baseline_solved, baseline_cands, baseline_results) = run_meta_eval(
-        &training_tasks, &default_h, &synth_comps, &all_macros, depth, budget);
-    eprintln!("  Baseline: {}/{} solved, {} total candidates",
-        baseline_solved, training_tasks.len(), baseline_cands);
-
-    // Try each candidate heuristic
-    let candidates = meta::build_candidate_heuristics_pub();
     let mut best_h: Option<meta::Heuristic> = None;
+    let mut best_rl: Option<synth::RlCoefficients> = None;
+    let mut baseline_solved = 0usize;
+    let mut baseline_cands = 0usize;
+
+    let mut baseline_results: Vec<(String, bool, usize)> = Vec::new();
+
+    // Skip expensive baseline synthesis when going straight to Stage 4
+    if !(skip_stage3 && synthesize_heuristic) {
+        let (bs, bc, br) = run_meta_eval(
+            &training_tasks, &default_h, &synth_comps, &all_macros, depth, budget);
+        baseline_solved = bs;
+        baseline_cands = bc;
+        baseline_results = br;
+        eprintln!("  Baseline: {}/{} solved, {} total candidates",
+            baseline_solved, training_tasks.len(), baseline_cands);
+    } else {
+        // Use trace data for baseline stats (no synthesis needed)
+        baseline_solved = trace_tasks.iter().filter(|t| t.solved).count();
+        baseline_cands = trace_tasks.iter().map(|t| t.candidates).sum();
+        eprintln!("  Baseline (from traces): {}/{} solved, {} total candidates",
+            baseline_solved, trace_tasks.len(), baseline_cands);
+    }
+
     let mut best_solved = baseline_solved;
     let mut best_cands = baseline_cands;
 
-    for h in &candidates {
-        let (h_solved, h_cands, h_results) = run_meta_eval(
-            &training_tasks, h, &synth_comps, &all_macros, depth, budget);
+    if !skip_stage3 {
+        // Try each candidate heuristic
+        eprintln!("Evaluating 8 candidate heuristics...");
+        let candidates = meta::build_candidate_heuristics_pub();
 
-        let is_better = h_solved > best_solved
-            || (h_solved == best_solved && h_solved > 0 && h_cands < best_cands);
+        for h in &candidates {
+            let (h_solved, h_cands, h_results) = run_meta_eval(
+                &training_tasks, h, &synth_comps, &all_macros, depth, budget);
 
-        let indicator = if is_better { " *** NEW BEST" } else { "" };
-        eprintln!("  {}: {}/{} solved, {} candidates{}",
-            h.name, h_solved, training_tasks.len(), h_cands, indicator);
+            let is_better = h_solved > best_solved
+                || (h_solved == best_solved && h_solved > 0 && h_cands < best_cands);
 
-        if is_better {
-            best_solved = h_solved;
-            best_cands = h_cands;
-            best_h = Some(h.clone());
+            let indicator = if is_better { " *** NEW BEST" } else { "" };
+            eprintln!("  {}: {}/{} solved, {} candidates{}",
+                h.name, h_solved, training_tasks.len(), h_cands, indicator);
 
-            // Print per-task improvements
-            for ((name, _, _), (_, base_ok, base_c)) in h_results.iter().zip(baseline_results.iter()) {
-                let (_, h_ok, h_c) = h_results.iter()
-                    .find(|(n, _, _)| n == name).unwrap();
-                if *h_c < *base_c && *base_c > 100 {
-                    eprintln!("    {} -> {} cand ({} -> {})",
-                        name, h_c, base_c, h_c);
+            if is_better {
+                best_solved = h_solved;
+                best_cands = h_cands;
+                best_h = Some(h.clone());
+
+                // Print per-task improvements
+                for ((name, _, _), (_, base_ok, base_c)) in h_results.iter().zip(baseline_results.iter()) {
+                    let (_, h_ok, h_c) = h_results.iter()
+                        .find(|(n, _, _)| n == name).unwrap();
+                    if *h_c < *base_c && *base_c > 100 {
+                        eprintln!("    {} -> {} cand ({} -> {})",
+                            name, h_c, base_c, h_c);
+                    }
                 }
             }
         }
+    } else {
+        eprintln!("  Skipping Stage 3 (8 hand-crafted heuristics)");
     }
 
-    // ── Stage 4: Synthesize heuristics via enumeration ──────────────
+    // ── Stage 4: Synthesize heuristics + tune RL coefficients ───────
     if synthesize_heuristic {
         eprintln!();
-        eprintln!("Meta-optimization Stage 4: Synthesized heuristic search");
-        eprintln!("  Running baseline with snapshot capture...");
+        eprintln!("Meta-optimization Stage 4: Unified heuristic + RL search");
 
-        let (snap_solved, snap_cands, snap_results, snapshots) =
-            run_meta_eval_with_snapshots(
-                &training_tasks, &default_h, &synth_comps, &all_macros, depth, budget);
-        eprintln!("  Captured {} snapshots from {}/{} solved tasks",
-            snapshots.len(), snap_solved, training_tasks.len());
+        // Enumerate candidate heuristic programs (bottom-up, fast)
+        eprintln!("  Enumerating heuristic programs (depth 2)...");
+        let candidates = meta::enumerate_heuristic_candidates(&synth_comps, 2, 50);
 
-        if !snapshots.is_empty() {
-            eprintln!();
-            eprintln!("  Phase A: Enumerating heuristic programs (depth 2)...");
-            let synth_candidates = meta::enumerate_heuristic_candidates(
-                &snapshots, &synth_comps, 2, 20);
+        if !candidates.is_empty() {
+            // Select fast evaluation tasks: solved tasks sorted by candidate count (easiest first)
+            let mut eval_tasks: Vec<&meta::TrainingTask> = Vec::new();
+            let mut task_costs: Vec<(&meta::TrainingTask, usize)> = training_tasks.iter()
+                .filter_map(|t| {
+                    trace_by_name.get(&t.name)
+                        .filter(|tt| tt.solved && tt.candidates < budget)
+                        .map(|tt| (t, tt.candidates))
+                })
+                .collect();
+            task_costs.sort_by_key(|&(_, c)| c);
+            // Take up to 15 easiest solved tasks for fast evaluation
+            for (t, _) in task_costs.iter().take(15) {
+                eval_tasks.push(t);
+            }
+            let eval_task_vec: Vec<meta::TrainingTask> = eval_tasks.iter()
+                .map(|t| (*t).clone())
+                .collect();
 
-            if !synth_candidates.is_empty() {
+            eprintln!("  Selected {} fast tasks for evaluation", eval_task_vec.len());
+
+            // RL coefficient grid to search
+            let rl_grid: Vec<(f64, f64, f64)> = vec![
+                (-50.0, 30.0, 15.0),   // current default
+                (-50.0, 30.0, 0.0),    // no comp_warm
+                (-25.0, 15.0, 15.0),   // milder
+                (-100.0, 50.0, 25.0),  // more aggressive
+                (0.0, 0.0, 0.0),       // no RL at all
+            ];
+
+            let eval_budget = budget.min(5000);
+            if let Some((s4_best, s4_rl, s4_solved, s4_cands)) =
+                meta::evaluate_heuristic_configs(
+                    &candidates, &rl_grid, &eval_task_vec,
+                    &synth_comps, &all_macros, depth, eval_budget,
+                )
+            {
                 eprintln!();
-                eprintln!("  Phase B: Validating top candidates with actual synthesis...");
-                let phase_b_budget = budget.min(5000); // cap Phase B budget
-                if let Some((synth_best, synth_solved, synth_total)) =
-                    meta::validate_heuristic_candidates(
-                        &synth_candidates,
-                        &training_tasks,
-                        &synth_comps,
-                        &all_macros,
-                        &snap_results,
-                        depth,
-                        phase_b_budget,
-                        10,
-                    )
-                {
-                    eprintln!();
-                    eprintln!("  Stage 4 best: {}/{} solved (hard subset), {} candidates",
-                        synth_solved, 15.min(training_tasks.len()), synth_total);
-                    eprintln!("  Source: {}", synth_best.source);
+                eprintln!("  Stage 4 winner: {}/{} solved, {} candidates",
+                    s4_solved, eval_task_vec.len(), s4_cands);
+                eprintln!("  Heuristic: {}", s4_best.source);
+                eprintln!("  RL coefficients: cold={:.1}, warm={:.1}, comp_warm={:.1}",
+                    s4_rl.cold_penalty, s4_rl.warm_bonus, s4_rl.comp_warm_bonus);
 
-                    // Compare with Stage 3 winner: run Stage 4 winner on full task set
-                    let (s4_full_solved, s4_full_cands, _) = run_meta_eval(
-                        &training_tasks, &synth_best, &synth_comps, &all_macros, depth, budget);
+                // Compare with Stage 3/baseline on full task set
+                let s4_better = s4_solved > best_solved
+                    || (s4_solved == best_solved && s4_cands < best_cands);
 
-                    let s4_better = s4_full_solved > best_solved
-                        || (s4_full_solved == best_solved && s4_full_cands < best_cands);
-
-                    if s4_better {
-                        eprintln!();
-                        eprintln!("  *** Stage 4 heuristic beats Stage 3! ***");
-                        eprintln!("  Stage 4: {}/{} solved, {} candidates",
-                            s4_full_solved, training_tasks.len(), s4_full_cands);
-                        if let Some(ref h3) = best_h {
-                            eprintln!("  Stage 3: {}/{} solved, {} candidates (\"{}\")",
-                                best_solved, training_tasks.len(), best_cands, h3.name);
-                        }
-                        best_h = Some(synth_best);
-                        best_solved = s4_full_solved;
-                        best_cands = s4_full_cands;
-                    } else {
-                        eprintln!();
-                        eprintln!("  Stage 4 full eval: {}/{} solved, {} candidates",
-                            s4_full_solved, training_tasks.len(), s4_full_cands);
-                        eprintln!("  Stage 3 winner still better — keeping it.");
-                    }
-                } else {
-                    eprintln!("  Phase B: no valid candidates passed validation.");
+                if s4_better {
+                    best_h = Some(s4_best);
+                    best_solved = s4_solved;
+                    best_cands = s4_cands;
+                    // Store winning RL coefficients for output
+                    best_rl = Some(s4_rl);
                 }
             } else {
-                eprintln!("  Phase A: no candidates enumerated (snapshots may be too small).");
+                eprintln!("  No valid configs found.");
             }
         } else {
-            eprintln!("  No snapshots captured — cannot run Stage 4.");
+            eprintln!("  No candidates enumerated.");
         }
     }
 
@@ -2505,11 +2532,18 @@ fn cmd_meta_optimize(args: &[String]) {
         eprintln!();
         eprintln!("To use: save as heuristic.selph and pass via --heuristic");
 
-        // Output the heuristic as a SELPH file
+        // Output the heuristic + RL config as a SELPH file
         println!("; Meta-optimized heuristic: \"{}\"", h.name);
         println!("; Trained on {} tasks from chained curriculum", training_tasks.len());
         println!("; Speedup: {:.1}x ({} -> {} candidates)", speedup, baseline_cands, best_cands);
         println!("{}", h.source);
+        if let Some(ref rl) = best_rl {
+            println!();
+            println!("; Meta-optimized RL coefficients");
+            println!("(defmacro __selph_rl_cold__ (_) {})", rl.cold_penalty);
+            println!("(defmacro __selph_rl_warm__ (_) {})", rl.warm_bonus);
+            println!("(defmacro __selph_rl_comp_warm__ (_) {})", rl.comp_warm_bonus);
+        }
     } else {
         eprintln!("No heuristic improved on the baseline.");
         eprintln!("The default priority ordering is already near-optimal for this task suite.");
@@ -2523,6 +2557,7 @@ struct TraceTask {
     solved: bool,
     strategy: Option<String>,
     components_used: Vec<String>,
+    all_components_available: Vec<String>,
 }
 
 /// Parse trace JSON manually (no serde dependency).
@@ -2576,6 +2611,24 @@ fn parse_trace_json(json: &str) -> Vec<TraceTask> {
             }
         }
 
+        // Find all_components_available
+        let mut all_components_available = Vec::new();
+        if let Some(ac_start) = json[abs_start..].find("\"all_components_available\"") {
+            let arr_start = abs_start + ac_start;
+            if let Some(bracket) = json[arr_start..].find('[') {
+                let arr_region_start = arr_start + bracket;
+                if let Some(bracket_end) = json[arr_region_start..].find(']') {
+                    let arr = &json[arr_region_start..arr_region_start + bracket_end];
+                    for part in arr.split('"') {
+                        let trimmed = part.trim().trim_matches(|c| c == ',' || c == '[' || c == ']' || c == ' ');
+                        if !trimmed.is_empty() {
+                            all_components_available.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
         if !name.is_empty() {
             tasks.push(TraceTask {
                 task_name: name,
@@ -2583,6 +2636,7 @@ fn parse_trace_json(json: &str) -> Vec<TraceTask> {
                 solved,
                 strategy,
                 components_used,
+                all_components_available,
             });
         }
 
@@ -2638,7 +2692,13 @@ fn run_meta_eval(
 
     for task in tasks {
         let ctx = meta::TaskContext::from_examples(&task.inputs, &task.expected);
-        let prioritized = meta::apply_heuristic(heuristic, components, &ctx);
+        // Filter components to match what was available during the chain run
+        let task_comps: Vec<synth::SynthComponent> = if let Some(ref allowed) = task.available_components {
+            components.iter().filter(|c| allowed.contains(&c.name)).cloned().collect()
+        } else {
+            components.to_vec()
+        };
+        let prioritized = meta::apply_heuristic(heuristic, &task_comps, &ctx);
 
         let sr = synth::synthesize(
             &prioritized,
@@ -2675,7 +2735,13 @@ fn run_meta_eval_with_snapshots(
 
     for task in tasks {
         let ctx = meta::TaskContext::from_examples(&task.inputs, &task.expected);
-        let prioritized = meta::apply_heuristic(heuristic, components, &ctx);
+        // Filter components to match what was available during the chain run
+        let task_comps: Vec<synth::SynthComponent> = if let Some(ref allowed) = task.available_components {
+            components.iter().filter(|c| allowed.contains(&c.name)).cloned().collect()
+        } else {
+            components.to_vec()
+        };
+        let prioritized = meta::apply_heuristic(heuristic, &task_comps, &ctx);
 
         let mut records: Vec<synth::CandidateRecord> = Vec::new();
         let sr = synth::synthesize_full(

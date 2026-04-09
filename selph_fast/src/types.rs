@@ -62,6 +62,27 @@ pub fn env_define(env: &mut Env, name: Sym, val: Value) {
     }
 }
 
+// SAFETY: Value contains Rc<[Node]> and Rc<RefCell<...>> in Closure/RustMacro
+// variants, which are !Send and !Sync. However, during parallel synthesis
+// evaluation, shared references (&[Value]) to inputs/expected only contain
+// Num/Str/Bool/List/Grid variants — never Closure or RustMacro. The parallel
+// code gates on values_are_sync_safe() and falls back to sequential if any
+// Rc-containing variant is present.
+unsafe impl Send for Value {}
+unsafe impl Sync for Value {}
+
+/// Check that a slice of Values contains no Rc-bearing variants,
+/// making it safe to share across threads.
+pub fn values_are_sync_safe(values: &[Value]) -> bool {
+    values.iter().all(|v| match v {
+        Value::Closure(..) | Value::RustMacro(..) => false,
+        Value::List(items) => values_are_sync_safe(items),
+        Value::Alt(items) => values_are_sync_safe(items),
+        Value::Namespace(map) => values_are_sync_safe(&map.values().cloned().collect::<Vec<_>>()),
+        _ => true,
+    })
+}
+
 /// Source-code representation of a node tree.
 pub fn node_to_source(nodes: &[Node], idx: usize) -> String {
     match &nodes[idx] {

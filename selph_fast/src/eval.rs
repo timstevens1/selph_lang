@@ -1217,6 +1217,96 @@ thread_local! {
     static BUILTIN_DISPATCH: std::collections::HashMap<Sym, BuiltinFn> = build_dispatch_table();
 }
 
+/// Convert a Value to its SELPH source representation.
+fn value_to_source(v: &Value) -> String {
+    match v {
+        Value::Num(n) => {
+            if *n == n.floor() && n.abs() < 1e15 { format!("{}", *n as i64) }
+            else { format!("{}", n) }
+        }
+        Value::Str(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+        Value::Bool(b) => if *b { "true".into() } else { "false".into() },
+        Value::Nil => "nil".into(),
+        Value::List(items) => {
+            let inner: Vec<String> = items.iter().map(|i| value_to_source(i)).collect();
+            format!("(list {})", inner.join(" "))
+        }
+        _ => format!("{:?}", v),
+    }
+}
+
+/// Extract macro tuples and data bindings from a library value.
+/// Handles: namespace of functions (recursive for tree structure),
+/// source strings, and lists of source strings.
+/// Data namespaces (non-function values) are collected as trees for extra_bindings.
+fn extract_library_macros(
+    val: &Value,
+    prefix: &str,
+    macros_out: &mut Vec<(String, Vec<String>, Vec<Node>, usize)>,
+    data_out: &mut Vec<(String, Value)>,
+) {
+    match val {
+        Value::Namespace(map) => {
+            for (key, v) in map {
+                let child_name = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}/{}", prefix, key)
+                };
+                match v {
+                    Value::RustMacro(params, nodes, root) => {
+                        macros_out.push((
+                            child_name,
+                            params.iter().map(|s| resolve(*s)).collect(),
+                            nodes.as_ref().to_vec(),
+                            *root,
+                        ));
+                    }
+                    Value::Namespace(sub) => {
+                        // If sub-namespace has any functions, recurse for macros
+                        let has_functions = sub.values().any(|sv|
+                            matches!(sv, Value::RustMacro(..) | Value::Closure(..)));
+                        if has_functions {
+                            extract_library_macros(v, &child_name, macros_out, data_out);
+                        } else {
+                            // Pure data namespace — register as a named binding
+                            data_out.push((child_name, v.clone()));
+                        }
+                    }
+                    _ => {} // skip non-function, non-namespace values at this level
+                }
+            }
+        }
+        Value::Str(src) => {
+            // Parse source string for defmacro forms
+            if let Ok((nodes_vec, roots)) = crate::parser::parse_file(src) {
+                for &root in &roots {
+                    if let Node::App(children) = &nodes_vec[root] {
+                        if children.len() == 4 {
+                            if let Node::Symbol(mname) = &nodes_vec[children[1]] {
+                                if let Node::App(param_indices) = &nodes_vec[children[2]] {
+                                    let params: Vec<String> = param_indices.iter()
+                                        .filter_map(|&i| {
+                                            if let Node::Symbol(s) = &nodes_vec[i] { Some(resolve(*s)) }
+                                            else { None }
+                                        }).collect();
+                                    macros_out.push((resolve(*mname), params, nodes_vec.clone(), children[3]));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Value::List(items) => {
+            for item in items {
+                extract_library_macros(item, prefix, macros_out, data_out);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn apply_builtin(name: Sym, args: &[Value]) -> Result<Value, String> {
     // Fast path: direct fn pointer dispatch (O(1) hash lookup, no string allocation)
     if let Some(result) = BUILTIN_DISPATCH.with(|d| d.get(&name).map(|f| f(args))) {
@@ -1294,6 +1384,72 @@ fn apply_builtin_slow(name: Sym, args: &[Value]) -> Result<Value, String> {
             for &r in &roots { last = eval(&nodes_rc, r, &mut env)?; }
             Ok(last)
         }
+        "test-spec" => {
+            // (test-spec candidate spec)
+            // candidate: a function (lambda)
+            // spec: list of (input expected) pairs
+            // Returns: match fraction (0.0 to 1.0)
+            if args.len() != 2 {
+                return Err("test-spec: expected 2 arguments (candidate, spec)".into());
+            }
+            let candidate = &args[0];
+            let pairs = match &args[1] {
+                Value::List(l) => l,
+                _ => return Err("test-spec: spec must be a list of (input expected) pairs".into()),
+            };
+            if pairs.is_empty() {
+                return Ok(Value::Num(0.0));
+            }
+            let empty = empty_nodes();
+            let mut matches = 0usize;
+            let total = pairs.len();
+            for pair in pairs {
+                let (input, expected_val) = match pair {
+                    Value::List(p) if p.len() == 2 => (&p[0], &p[1]),
+                    _ => return Err("test-spec: each spec entry must be (input expected)".into()),
+                };
+                let mut env = make_default_env();
+                match apply(candidate, &[input.clone()], &empty, &mut env) {
+                    Ok(result) => {
+                        if crate::synth::vals_equal(&result, expected_val) {
+                            matches += 1;
+                        }
+                    }
+                    Err(_) => {} // eval error = no match
+                }
+            }
+            Ok(Value::Num(matches as f64 / total as f64))
+        }
+        "memorize" => {
+            // (memorize spec)
+            // spec: list of (input expected) pairs
+            // Returns: a namespace mapping inputs to outputs (data as library)
+            // Returns nil if inputs are not all strings
+            if args.len() != 1 {
+                return Err("memorize: expected 1 argument (spec)".into());
+            }
+            let pairs = match &args[0] {
+                Value::List(l) => l,
+                _ => return Err("memorize: argument must be a list of (input expected) pairs".into()),
+            };
+            if pairs.is_empty() {
+                return Ok(Value::Nil);
+            }
+            let mut map = std::collections::HashMap::new();
+            for pair in pairs {
+                match pair {
+                    Value::List(p) if p.len() == 2 => {
+                        if let Value::Str(key) = &p[0] {
+                            map.insert(key.clone(), p[1].clone());
+                        } else {
+                            return Ok(Value::Nil); // non-string input, can't memorize
+                        }
+                    }
+                    _ => return Err("memorize: each spec entry must be (input expected)".into()),
+                }
+            }
+            Ok(Value::Namespace(map))
+        }
         "synthesize" => {
             if args.len() != 1 {
                 return Err("synthesize: expected 1 argument (namespace)".into());
@@ -1325,10 +1481,19 @@ fn apply_builtin_slow(name: Sym, args: &[Value]) -> Result<Value, String> {
             let max_candidates = ns.get("max-candidates")
                 .and_then(|v| if let Value::Num(n) = v { Some(*n as usize) } else { None })
                 .unwrap_or(10000);
-            let macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = Vec::new();
 
-            // Extract optional trees
-            let trees = extract_trees_from_ns(ns);
+            // Extract library macros and data from "library" field.
+            // Accepts: namespace of functions, source string, or list of source strings.
+            // Data namespaces become extra_bindings (available as depth-0 atoms in synthesis).
+            let mut macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = Vec::new();
+            let mut lib_data: Vec<(String, Value)> = Vec::new();
+            if let Some(lib_val) = ns.get("library") {
+                extract_library_macros(lib_val, "", &mut macros, &mut lib_data);
+            }
+
+            // Extract optional trees (legacy) and merge with library data
+            let mut trees = extract_trees_from_ns(ns);
+            trees.extend(lib_data);
             let (components, extra_bindings) = crate::synth::default_synth_components_with_trees(&macros, &trees);
             let sr = crate::synth::synthesize_with_validation(
                 &components, &inputs, &expected, &macros,
@@ -1604,7 +1769,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "ns-get", "ns-put", "ns-keys", "ns-values", "ns-merge",
     "ns-size", "ns-flatten", "ns?", "ns-empty",
     "ns-get-or", "ns-has",
-    "synthesize", "synthesize-optimize",
+    "synthesize", "synthesize-optimize", "test-spec", "memorize",
     "eval-source", "eval-in", "type-of",
     "number?", "string?", "bool?", "list?", "nil?", "function?",
     "apply", "error",

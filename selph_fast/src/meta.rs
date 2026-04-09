@@ -74,6 +74,16 @@ pub struct TaskContext {
     pub output_type: u8,
     /// Number of input/output examples.
     pub num_examples: usize,
+    /// Average string length of inputs (0.0 for non-strings).
+    pub avg_input_len: f64,
+    /// Fraction of string inputs containing spaces (0.0 for non-strings).
+    pub has_spaces: f64,
+    /// Max numeric value in inputs (0.0 for non-numbers).
+    pub max_num_value: f64,
+    /// 1.0 if all outputs are booleans, 0.0 otherwise.
+    pub output_is_bool: f64,
+    /// Count of distinct output values.
+    pub num_distinct_outputs: f64,
 }
 
 impl TaskContext {
@@ -89,10 +99,58 @@ impl TaskContext {
         } else {
             value_type_tag(&expected[0])
         };
+
+        // Compute rich features from actual example content
+        let mut total_str_len: f64 = 0.0;
+        let mut str_count: usize = 0;
+        let mut space_count: usize = 0;
+        let mut max_num: f64 = 0.0;
+        let mut has_num = false;
+        for inp in inputs {
+            match inp {
+                Value::Str(s) => {
+                    total_str_len += s.len() as f64;
+                    str_count += 1;
+                    if s.contains(' ') { space_count += 1; }
+                }
+                Value::Num(n) => {
+                    if !has_num || *n > max_num { max_num = *n; }
+                    has_num = true;
+                }
+                Value::List(items) => {
+                    for item in items {
+                        if let Value::Num(n) = item {
+                            if !has_num || *n > max_num { max_num = *n; }
+                            has_num = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let avg_input_len = if str_count > 0 { total_str_len / str_count as f64 } else { 0.0 };
+        let has_spaces = if str_count > 0 { space_count as f64 / str_count as f64 } else { 0.0 };
+        let max_num_value = if has_num { max_num } else { 0.0 };
+
+        let output_is_bool = if !expected.is_empty()
+            && expected.iter().all(|v| matches!(v, Value::Bool(_)))
+        { 1.0 } else { 0.0 };
+
+        let mut distinct: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for v in expected {
+            distinct.insert(crate::synth::val_hash(v));
+        }
+        let num_distinct_outputs = distinct.len() as f64;
+
         TaskContext {
             input_type,
             output_type,
             num_examples: inputs.len(),
+            avg_input_len,
+            has_spaces,
+            max_num_value,
+            output_is_bool,
+            num_distinct_outputs,
         }
     }
 
@@ -100,18 +158,14 @@ impl TaskContext {
     /// heuristic programs.
     pub fn to_namespace(&self) -> Value {
         let mut map = std::collections::HashMap::new();
-        map.insert(
-            "input-type".to_string(),
-            Value::Num(self.input_type as f64),
-        );
-        map.insert(
-            "output-type".to_string(),
-            Value::Num(self.output_type as f64),
-        );
-        map.insert(
-            "num-examples".to_string(),
-            Value::Num(self.num_examples as f64),
-        );
+        map.insert("input-type".to_string(), Value::Num(self.input_type as f64));
+        map.insert("output-type".to_string(), Value::Num(self.output_type as f64));
+        map.insert("num-examples".to_string(), Value::Num(self.num_examples as f64));
+        map.insert("avg-input-len".to_string(), Value::Num(self.avg_input_len));
+        map.insert("has-spaces".to_string(), Value::Num(self.has_spaces));
+        map.insert("max-num-value".to_string(), Value::Num(self.max_num_value));
+        map.insert("output-is-bool".to_string(), Value::Num(self.output_is_bool));
+        map.insert("num-distinct-outputs".to_string(), Value::Num(self.num_distinct_outputs));
         Value::Namespace(map)
     }
 }
@@ -124,22 +178,19 @@ fn component_to_namespace(comp: &SynthComponent, task_ctx: &TaskContext) -> Valu
     map.insert("arity".to_string(), Value::Num(comp.arity as f64));
     map.insert("ret-type".to_string(), Value::Num(comp.ret_type as f64));
     map.insert("priority".to_string(), Value::Num(comp.priority));
+    map.insert("usage-count".to_string(), Value::Num(comp.usage_count));
     // Flatten first param type (0 if no params)
     let first_param = comp.param_types.first().copied().unwrap_or(0) as f64;
     map.insert("first-param-type".to_string(), Value::Num(first_param));
     // Include task context fields directly so the heuristic can use them
-    map.insert(
-        "input-type".to_string(),
-        Value::Num(task_ctx.input_type as f64),
-    );
-    map.insert(
-        "output-type".to_string(),
-        Value::Num(task_ctx.output_type as f64),
-    );
-    map.insert(
-        "num-examples".to_string(),
-        Value::Num(task_ctx.num_examples as f64),
-    );
+    map.insert("input-type".to_string(), Value::Num(task_ctx.input_type as f64));
+    map.insert("output-type".to_string(), Value::Num(task_ctx.output_type as f64));
+    map.insert("num-examples".to_string(), Value::Num(task_ctx.num_examples as f64));
+    map.insert("avg-input-len".to_string(), Value::Num(task_ctx.avg_input_len));
+    map.insert("has-spaces".to_string(), Value::Num(task_ctx.has_spaces));
+    map.insert("max-num-value".to_string(), Value::Num(task_ctx.max_num_value));
+    map.insert("output-is-bool".to_string(), Value::Num(task_ctx.output_is_bool));
+    map.insert("num-distinct-outputs".to_string(), Value::Num(task_ctx.num_distinct_outputs));
     Value::Namespace(map)
 }
 
@@ -213,6 +264,8 @@ pub struct TrainingTask {
     pub name: String,
     pub inputs: Vec<Value>,
     pub expected: Vec<Value>,
+    /// If set, restrict synthesis to only these component names.
+    pub available_components: Option<std::collections::HashSet<String>>,
 }
 
 /// Result of a meta-curriculum step.
@@ -716,6 +769,9 @@ pub fn update_rl_coefficients(
 const CTX_FIELDS: &[&str] = &[
     "priority", "arity", "ret-type", "first-param-type",
     "input-type", "output-type", "num-examples",
+    "avg-input-len", "has-spaces", "max-num-value",
+    "output-is-bool", "num-distinct-outputs",
+    "usage-count",
 ];
 
 /// Numeric constants available as depth-0 atoms.
@@ -743,6 +799,12 @@ fn extract_field(field: &str, comp: &SynthComponent, ctx: &TaskContext) -> f64 {
         "input-type" => ctx.input_type as f64,
         "output-type" => ctx.output_type as f64,
         "num-examples" => ctx.num_examples as f64,
+        "avg-input-len" => ctx.avg_input_len,
+        "has-spaces" => ctx.has_spaces,
+        "max-num-value" => ctx.max_num_value,
+        "output-is-bool" => ctx.output_is_bool,
+        "num-distinct-outputs" => ctx.num_distinct_outputs,
+        "usage-count" => comp.usage_count,
         _ => 0.0,
     }
 }
@@ -839,23 +901,34 @@ fn replace_field_token(source: &str, field: &str, replacement: &str) -> String {
     result
 }
 
-/// Phase A: Enumerate heuristic program bodies bottom-up and score by rank.
+/// Enumerate heuristic program bodies bottom-up via behavior-deduped composition.
 ///
-/// Returns candidates sorted by avg rank (best first), up to `max_results`.
+/// Returns up to `max_results` diverse candidates. No rank scoring — direct
+/// synthesis evaluation in `evaluate_heuristic_configs` determines quality.
 pub fn enumerate_heuristic_candidates(
-    snapshots: &[PoolSnapshot],
     components: &[SynthComponent],
     max_depth: usize,
     max_results: usize,
-) -> Vec<(Heuristic, f64)> {
-    if snapshots.is_empty() || components.is_empty() {
+) -> Vec<Heuristic> {
+    if components.is_empty() {
         return Vec::new();
     }
 
-    // Compute behavior vector length: sum of candidate counts across snapshots
-    // For efficiency, we evaluate per (snapshot_idx, component_idx) = fixed-size
-    // behavior vector using the components list directly.
-    let behavior_len = snapshots.len() * components.len();
+    // Behavior vectors for deduplication: evaluate each expression across
+    // (synthetic_task_context, component) pairs. We use a few synthetic task
+    // contexts to ensure task-level features produce diverse behaviors.
+    let synthetic_contexts = vec![
+        TaskContext { input_type: TYPE_NUM, output_type: TYPE_NUM, num_examples: 3,
+            avg_input_len: 0.0, has_spaces: 0.0, max_num_value: 10.0,
+            output_is_bool: 0.0, num_distinct_outputs: 3.0 },
+        TaskContext { input_type: TYPE_STR, output_type: TYPE_STR, num_examples: 5,
+            avg_input_len: 8.0, has_spaces: 0.6, max_num_value: 0.0,
+            output_is_bool: 0.0, num_distinct_outputs: 5.0 },
+        TaskContext { input_type: TYPE_STR, output_type: 2, num_examples: 8,
+            avg_input_len: 4.0, has_spaces: 0.0, max_num_value: 0.0,
+            output_is_bool: 1.0, num_distinct_outputs: 2.0 },
+    ];
+    let behavior_len = synthetic_contexts.len() * components.len();
 
     // Build depth-0 pool: field atoms + constants
     let mut pool: Vec<HeuristicPoolEntry> = Vec::new();
@@ -864,9 +937,9 @@ pub fn enumerate_heuristic_candidates(
     // Field atoms
     for &field in CTX_FIELDS {
         let mut behavior = Vec::with_capacity(behavior_len);
-        for snap in snapshots {
+        for ctx in &synthetic_contexts {
             for comp in components {
-                behavior.push(extract_field(field, comp, &snap.task_context));
+                behavior.push(extract_field(field, comp, ctx));
             }
         }
         let key = behavior_key(&behavior);
@@ -902,8 +975,13 @@ pub fn enumerate_heuristic_candidates(
     // Build deeper depths
     let binary_num_ops: &[&str] = &["add", "subtract", "multiply", "min", "max"];
     let comparison_ops: &[&str] = &["=", "<", ">"];
+    const MAX_HEURISTIC_POOL: usize = 2000;
 
     for _depth in 1..=max_depth {
+        // Cap pool size to prevent combinatorial explosion at deeper depths
+        if pool.len() > MAX_HEURISTIC_POOL {
+            pool.truncate(MAX_HEURISTIC_POOL);
+        }
         let pool_len = pool.len();
         let mut new_entries: Vec<HeuristicPoolEntry> = Vec::new();
 
@@ -1028,118 +1106,107 @@ pub fn enumerate_heuristic_candidates(
         );
     }
 
-    // Score each numeric (non-bool) entry by average rank.
-    //
-    // Instead of calling evaluate_heuristic_by_rank (which runs the SELPH
-    // evaluator), we compute rank directly from behavior vectors. For each
-    // snapshot, a candidate heuristic assigns a score to each component via
-    // its behavior vector. The "rank" is the position of the solution's
-    // component after re-sorting by heuristic score.
-
-    // Pre-compute: for each snapshot, the solution component name (last candidate)
-    // and the behavior vector offset.
-    let num_comps = components.len();
-    struct SnapshotInfo {
-        solution_comp: String,
-        offset: usize, // start index in behavior vectors
-    }
-    let snap_infos: Vec<SnapshotInfo> = snapshots
-        .iter()
-        .enumerate()
-        .filter_map(|(si, snap)| {
-            if snap.candidates.is_empty() { return None; }
-            let sol = snap.candidates.last().unwrap();
-            Some(SnapshotInfo {
-                solution_comp: sol.comp_name.clone(),
-                offset: si * num_comps,
-            })
-        })
-        .collect();
-
-    // For each pool entry, compute its average rank across snapshots.
-    let mut scored: Vec<(usize, f64)> = Vec::new();
-    for (idx, entry) in pool.iter().enumerate() {
+    // Select diverse non-bool candidates by behavior. No rank scoring —
+    // rank is broken for task-level features. Instead we select by diversity
+    // (dedup already applied via behavior_key) and let direct synthesis
+    // evaluation in Phase B determine quality.
+    let mut results = Vec::with_capacity(max_results);
+    for entry in &pool {
         if entry.is_bool { continue; }
-
-        let mut total_rank = 0usize;
-        let mut count = 0usize;
-
-        for info in &snap_infos {
-            // Extract this entry's scores for all components in this snapshot
-            let scores: Vec<(usize, f64)> = (0..num_comps)
-                .map(|ci| (ci, entry.behavior[info.offset + ci]))
-                .collect();
-
-            // Find solution component index
-            let sol_idx = components.iter().position(|c| c.name == info.solution_comp);
-            let sol_idx = match sol_idx {
-                Some(i) => i,
-                None => continue,
-            };
-
-            let sol_score = scores[sol_idx].1;
-
-            // Rank = 1 + number of components scored higher than solution
-            let rank = 1 + scores.iter()
-                .filter(|&&(ci, s)| ci != sol_idx && s > sol_score)
-                .count();
-
-            total_rank += rank;
-            count += 1;
-        }
-
-        if count > 0 {
-            scored.push((idx, total_rank as f64 / count as f64));
-        }
-    }
-
-    // Sort by rank (lower = better)
-    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Compute baseline rank for reporting
-    let baseline_rank = if !snap_infos.is_empty() {
-        // Baseline uses component.priority directly
-        let pri_idx = CTX_FIELDS.iter().position(|&f| f == "priority").unwrap_or(0);
-        if pri_idx < pool.len() && !pool[pri_idx].is_bool {
-            let mut total = 0usize;
-            let mut cnt = 0usize;
-            for info in &snap_infos {
-                let sol_idx = components.iter().position(|c| c.name == info.solution_comp);
-                if let Some(si) = sol_idx {
-                    let sol_score = pool[pri_idx].behavior[info.offset + si];
-                    let rank = 1 + (0..num_comps)
-                        .filter(|&ci| ci != si && pool[pri_idx].behavior[info.offset + ci] > sol_score)
-                        .count();
-                    total += rank;
-                    cnt += 1;
-                }
-            }
-            if cnt > 0 { total as f64 / cnt as f64 } else { f64::MAX }
-        } else {
-            f64::MAX
-        }
-    } else {
-        f64::MAX
-    };
-
-    // Take top results
-    let n = max_results.min(scored.len());
-    let mut results = Vec::with_capacity(n);
-    for &(idx, rank) in &scored[..n] {
-        let lambda_src = wrap_as_lambda(&pool[idx].source);
+        let lambda_src = wrap_as_lambda(&entry.source);
         if let Some(h) = Heuristic::from_source("synth-candidate", &lambda_src) {
-            results.push((h, rank));
+            results.push(h);
         }
+        if results.len() >= max_results { break; }
     }
 
-    if !results.is_empty() {
-        eprintln!(
-            "  [stage4] Phase A: {} candidates enumerated, best rank {:.1} (baseline {:.1})",
-            pool.len(), results[0].1, baseline_rank,
-        );
-    }
+    eprintln!(
+        "  [stage4] Enumerated {} unique programs, selected {} candidates",
+        pool.len(), results.len(),
+    );
 
     results
+}
+
+/// Evaluate heuristic × RL coefficient configs by running actual synthesis.
+///
+/// Tests each (heuristic, rl_triple) pair on a fast subset of tasks.
+/// Returns the best config: (heuristic, rl_coeffs, solved_count, total_candidates).
+pub fn evaluate_heuristic_configs(
+    candidates: &[Heuristic],
+    rl_grid: &[(f64, f64, f64)],
+    tasks: &[TrainingTask],
+    components: &[SynthComponent],
+    macros: &[(String, Vec<String>, Vec<Node>, usize)],
+    max_depth: usize,
+    budget: usize,
+) -> Option<(Heuristic, RlCoefficients, usize, usize)> {
+    if candidates.is_empty() || tasks.is_empty() {
+        return None;
+    }
+
+    // Include default heuristic as a candidate
+    let default_h = Heuristic::default_heuristic();
+
+    let total_configs = (candidates.len() + 1) * rl_grid.len();
+    eprintln!("  [stage4] Evaluating {} configs ({} heuristics × {} RL triples) on {} tasks",
+        total_configs, candidates.len() + 1, rl_grid.len(), tasks.len());
+
+    let mut best: Option<(Heuristic, RlCoefficients, usize, usize)> = None;
+
+    let all_heuristics: Vec<&Heuristic> = std::iter::once(&default_h)
+        .chain(candidates.iter())
+        .collect();
+
+    for heuristic in &all_heuristics {
+        for &(cold, warm, comp_warm) in rl_grid {
+            let rl = RlCoefficients { cold_penalty: cold, warm_bonus: warm, comp_warm_bonus: comp_warm };
+            let mut solved = 0usize;
+            let mut total_cands = 0usize;
+
+            for task in tasks {
+                let ctx = TaskContext::from_examples(&task.inputs, &task.expected);
+                let task_comps: Vec<SynthComponent> = if let Some(ref allowed) = task.available_components {
+                    components.iter().filter(|c| allowed.contains(&c.name)).cloned().collect()
+                } else {
+                    components.to_vec()
+                };
+                let prioritized = apply_heuristic(heuristic, &task_comps, &ctx);
+
+                let sr = crate::synth::synthesize_full(
+                    &prioritized,
+                    &task.inputs,
+                    &task.expected,
+                    macros,
+                    max_depth,
+                    budget,
+                    true,
+                    None,
+                    &[],
+                    None,
+                    None,
+                    rl,
+                );
+
+                if sr.found { solved += 1; }
+                total_cands += sr.candidates_explored;
+            }
+
+            let is_better = match &best {
+                None => true,
+                Some((_, _, bs, bc)) => solved > *bs || (solved == *bs && total_cands < *bc),
+            };
+
+            if is_better {
+                eprintln!("    {}: {}/{} solved, {} cand (rl: {:.0}/{:.0}/{:.0}) *** NEW BEST",
+                    &heuristic.source[..60.min(heuristic.source.len())],
+                    solved, tasks.len(), total_cands, cold, warm, comp_warm);
+                best = Some(((*heuristic).clone(), rl, solved, total_cands));
+            }
+        }
+    }
+
+    best
 }
 
 /// Phase B: Validate top-K heuristic candidates with actual synthesis.
@@ -1242,48 +1309,42 @@ mod tests {
                 arity: 0,
                 ret_type: TYPE_NUM,
                 param_types: vec![],
-                priority: 100.0,
-            },
+                priority: 100.0, usage_count: 0.0 },
             SynthComponent {
                 name: "0".into(),
                 builtin: None,
                 arity: 0,
                 ret_type: TYPE_NUM,
                 param_types: vec![],
-                priority: 0.0,
-            },
+                priority: 0.0, usage_count: 0.0 },
             SynthComponent {
                 name: "1".into(),
                 builtin: None,
                 arity: 0,
                 ret_type: TYPE_NUM,
                 param_types: vec![],
-                priority: 0.0,
-            },
+                priority: 0.0, usage_count: 0.0 },
             SynthComponent {
                 name: "add".into(),
                 builtin: Some("add".into()),
                 arity: 2,
                 ret_type: TYPE_NUM,
                 param_types: vec![TYPE_NUM, TYPE_NUM],
-                priority: 0.0,
-            },
+                priority: 0.0, usage_count: 0.0 },
             SynthComponent {
                 name: "multiply".into(),
                 builtin: Some("multiply".into()),
                 arity: 2,
                 ret_type: TYPE_NUM,
                 param_types: vec![TYPE_NUM, TYPE_NUM],
-                priority: 0.0,
-            },
+                priority: 0.0, usage_count: 0.0 },
             SynthComponent {
                 name: "string-upper".into(),
                 builtin: Some("string-upper".into()),
                 arity: 1,
                 ret_type: TYPE_STR,
                 param_types: vec![TYPE_STR],
-                priority: 0.0,
-            },
+                priority: 0.0, usage_count: 0.0 },
         ]
     }
 
@@ -1292,6 +1353,11 @@ mod tests {
             input_type: TYPE_NUM,
             output_type: TYPE_NUM,
             num_examples: 3,
+            avg_input_len: 0.0,
+            has_spaces: 0.0,
+            max_num_value: 10.0,
+            output_is_bool: 0.0,
+            num_distinct_outputs: 3.0,
         }
     }
 
@@ -1300,6 +1366,11 @@ mod tests {
             input_type: TYPE_STR,
             output_type: TYPE_STR,
             num_examples: 3,
+            avg_input_len: 5.0,
+            has_spaces: 0.0,
+            max_num_value: 0.0,
+            output_is_bool: 0.0,
+            num_distinct_outputs: 3.0,
         }
     }
 
@@ -1524,6 +1595,7 @@ mod tests {
             name: "identity".into(),
             inputs: vec![Value::Num(1.0), Value::Num(2.0), Value::Num(3.0)],
             expected: vec![Value::Num(1.0), Value::Num(2.0), Value::Num(3.0)],
+            available_components: None,
         };
         let macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = vec![];
         let comps = simple_components();
@@ -1543,6 +1615,7 @@ mod tests {
             name: "cube".into(),
             inputs: vec![Value::Num(2.0), Value::Num(3.0)],
             expected: vec![Value::Num(8.0), Value::Num(27.0)],
+            available_components: None,
         };
         let macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = vec![];
         let comps = simple_components();
@@ -1565,11 +1638,13 @@ mod tests {
                 name: "id1".into(),
                 inputs: vec![Value::Num(1.0), Value::Num(5.0)],
                 expected: vec![Value::Num(1.0), Value::Num(5.0)],
+                available_components: None,
             },
             TrainingTask {
                 name: "add1".into(),
                 inputs: vec![Value::Num(1.0), Value::Num(5.0)],
                 expected: vec![Value::Num(2.0), Value::Num(6.0)],
+                available_components: None,
             },
         ];
         let macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = vec![];
@@ -1602,6 +1677,7 @@ mod tests {
             name: "t".into(),
             inputs: vec![Value::Num(1.0)],
             expected: vec![Value::Num(1.0)],
+            available_components: None,
         }];
         let macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = vec![];
         let result = synthesize_heuristic(&tasks, &[], &macros, 4);
@@ -1616,11 +1692,13 @@ mod tests {
                 name: "double".into(),
                 inputs: vec![Value::Num(1.0), Value::Num(3.0), Value::Num(5.0)],
                 expected: vec![Value::Num(2.0), Value::Num(6.0), Value::Num(10.0)],
+                available_components: None,
             },
             TrainingTask {
                 name: "id".into(),
                 inputs: vec![Value::Num(7.0), Value::Num(0.0)],
                 expected: vec![Value::Num(7.0), Value::Num(0.0)],
+                available_components: None,
             },
         ];
         let macros: Vec<(String, Vec<String>, Vec<Node>, usize)> = vec![];
@@ -1777,8 +1855,7 @@ mod tests {
             arity: 2,
             ret_type: TYPE_NUM,
             param_types: vec![TYPE_NUM, TYPE_NUM],
-            priority: 42.0,
-        };
+            priority: 42.0, usage_count: 0.0 };
         let ctx = num_task_context();
         assert_eq!(extract_field("priority", &comp, &ctx), 42.0);
         assert_eq!(extract_field("arity", &comp, &ctx), 2.0);
@@ -1825,53 +1902,27 @@ mod tests {
 
     #[test]
     fn test_enumerate_heuristic_candidates_smoke() {
-        let snapshot = make_test_snapshot();
         let comps = simple_components();
-        let results = enumerate_heuristic_candidates(&[snapshot], &comps, 1, 10);
+        let results = enumerate_heuristic_candidates(&comps, 1, 10);
         assert!(!results.is_empty(), "should find at least one candidate");
-        // Each result should parse as a valid heuristic
-        for (h, rank) in &results {
+        for h in &results {
             assert!(!h.source.is_empty());
-            assert!(rank.is_finite());
         }
     }
 
     #[test]
-    fn test_enumerate_empty_snapshots() {
-        let comps = simple_components();
-        let results = enumerate_heuristic_candidates(&[], &comps, 1, 10);
+    fn test_enumerate_empty_components() {
+        let results = enumerate_heuristic_candidates(&[], 1, 10);
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_enumerate_finds_type_match_pattern() {
-        // With a snapshot where the solution component returns NUM and the task
-        // output is NUM, the enumerator should discover that ret-type==output-type
-        // is a useful signal.
-        let snapshot = PoolSnapshot {
-            task_name: "test".into(),
-            task_context: num_task_context(),
-            candidates: vec![
-                CandidateRecord { comp_name: "string-upper".into(), arg_priority_sum: 100.0 },
-                CandidateRecord { comp_name: "string-upper".into(), arg_priority_sum: 90.0 },
-                CandidateRecord { comp_name: "string-upper".into(), arg_priority_sum: 80.0 },
-                CandidateRecord { comp_name: "add".into(), arg_priority_sum: 50.0 }, // solution (last)
-            ],
-            depth0_count: 0,
-        };
         let comps = simple_components();
-        let results = enumerate_heuristic_candidates(&[snapshot.clone()], &comps, 2, 20);
-
-        // The best candidates should improve on baseline (which would rank the
-        // solution at position 4 since string-upper entries have higher arg_priority_sum)
+        let results = enumerate_heuristic_candidates(&comps, 2, 20);
+        // Should find candidates referencing component fields like ret-type
         assert!(!results.is_empty());
-        // Verify the top result improves ranking
-        let baseline_h = Heuristic::default_heuristic();
-        let baseline_rank = evaluate_heuristic_by_rank(&[snapshot.clone()], &baseline_h, &comps);
-        assert!(
-            results[0].1 <= baseline_rank,
-            "best synthesized ({:.1}) should be <= baseline ({:.1})",
-            results[0].1, baseline_rank,
-        );
+        let has_ret_type = results.iter().any(|h| h.source.contains("ret-type"));
+        assert!(has_ret_type, "should find candidates using ret-type");
     }
 }

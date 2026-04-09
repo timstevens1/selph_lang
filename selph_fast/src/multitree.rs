@@ -18,7 +18,7 @@ use crate::eval;
 use crate::synth::{
     SynthComponent, SynthResult, synthesize_with_validation,
     default_synth_components_with_trees,
-    value_type_tag, TYPE_NUM, TYPE_STR, TYPE_BOOL,
+    value_type_tag, TYPE_NUM, TYPE_STR, TYPE_BOOL, TYPE_ANY,
 };
 
 // ── Extract components from a Namespace ──────────────────────────────
@@ -42,6 +42,22 @@ pub fn extract_components_from_namespace(
     max_depth: usize,
 ) -> Vec<SynthComponent> {
     let mut components = Vec::new();
+
+    // Register the namespace itself as a depth-0 atom so synthesis can
+    // compose (ns-get <namespace> key) for data-driven lookups.
+    if matches!(ns, Value::Namespace(_)) && !tree_name.is_empty() {
+        env_define(env, intern(tree_name), ns.clone());
+        components.push(SynthComponent {
+            name: tree_name.to_string(),
+            builtin: Some(tree_name.to_string()),
+            arity: 0,
+            ret_type: TYPE_ANY,
+            param_types: vec![],
+            priority: 10.0,
+            usage_count: 0.0,
+        });
+    }
+
     extract_recursive(ns, tree_name, prefix, env, &mut components, 0, max_depth);
     components
 }
@@ -83,6 +99,19 @@ fn extract_recursive(
 
         match val {
             Value::Namespace(_) => {
+                // Register the namespace itself as a depth-0 atom so
+                // synthesis can compose (ns-get ns_name key) etc.
+                env_define(env, intern(&full_name), val.clone());
+                components.push(SynthComponent {
+                    name: full_name.clone(),
+                    builtin: Some(full_name.clone()),
+                    arity: 0,
+                    ret_type: TYPE_ANY,
+                    param_types: vec![],
+                    priority: 0.0,
+                    usage_count: 0.0,
+                });
+                // Also recurse to extract individual entries
                 extract_recursive(
                     val, tree_name, &path_str, env, components,
                     depth + 1, max_depth,
@@ -100,8 +129,7 @@ fn extract_recursive(
                         arity: param_types.len(),
                         ret_type,
                         param_types,
-                        priority: 0.0,
-                    });
+                        priority: 0.0, usage_count: 0.0 });
                 }
             }
             Value::Num(n) => {
@@ -119,8 +147,7 @@ fn extract_recursive(
                     arity: 0,
                     ret_type: TYPE_NUM,
                     param_types: vec![],
-                    priority: 0.0,
-                });
+                    priority: 0.0, usage_count: 0.0 });
             }
             Value::Str(s) => {
                 components.push(SynthComponent {
@@ -129,8 +156,7 @@ fn extract_recursive(
                     arity: 0,
                     ret_type: TYPE_STR,
                     param_types: vec![],
-                    priority: 0.0,
-                });
+                    priority: 0.0, usage_count: 0.0 });
             }
             Value::Bool(b) => {
                 components.push(SynthComponent {
@@ -140,10 +166,26 @@ fn extract_recursive(
                     ret_type: TYPE_BOOL,
                     param_types: vec![],
                     priority: 0.0,
+                    usage_count: 0.0,
                 });
             }
             _ => {
-                // Skip non-extractable values (Nil, List, RustMacro, etc.)
+                // For any other value (including nested data namespaces at leaf level),
+                // register as a named binding so synthesis can reference it.
+                // This enables compositions like (ns-get-or data_ns x default).
+                if !matches!(val, Value::Nil) {
+                    env_define(env, intern(&full_name), val.clone());
+                    let ret_type = value_type_tag(val);
+                    components.push(SynthComponent {
+                        name: full_name.clone(),
+                        builtin: Some(full_name),
+                        arity: 0,
+                        ret_type,
+                        param_types: vec![],
+                        priority: 0.0,
+                        usage_count: 0.0,
+                    });
+                }
             }
         }
     }
@@ -273,8 +315,7 @@ pub fn multi_synthesize(
             arity: 0,
             ret_type: TYPE_NUM,
             param_types: vec![],
-            priority: 100.0,
-        }];
+            priority: 100.0, usage_count: 0.0 }];
         for (name, ns_val) in trees {
             let tree_comps = extract_components_from_namespace(
                 ns_val, name, "", &mut env, 5,
