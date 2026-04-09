@@ -9,7 +9,7 @@
 ; halve: integer division by 2
 ; Expected: (floor (divide x 2))
 (task "halve" 2
-  (2 1) (4 2) (6 3) (8 4)
+  (0 0) (1 0) (2 1) (4 2) (6 3) (8 4)
   (10 5) (3 1) (5 2) (7 3))
 
 ; third: integer division by 3

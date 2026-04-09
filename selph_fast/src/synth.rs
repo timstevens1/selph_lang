@@ -969,7 +969,9 @@ pub fn synthesize_full(
     let test = |entry: &SynthPool,
                 seen: &mut HashSet<Vec<u64>>,
                 explored: &mut usize,
-                vm_stack: &mut Vec<Value>|
+                vm_stack: &mut Vec<Value>,
+                insert_seen: bool,
+                force_tree_walker: bool|
         -> (Option<(Vec<Node>, usize)>, f64)
     {
         // Type gate: skip evaluation if the candidate's return type
@@ -991,6 +993,8 @@ pub fn synthesize_full(
         let mut evaluated = 0usize;
 
         // Try VM compilation — if it succeeds, use fast path for all examples
+        let mut vm_failed = force_tree_walker;
+        if !force_tree_walker {
         if let Ok(chunk) = crate::vm::compile(&entry.nodes, entry.root, &vm_ctx) {
             // ── VM fast path: no env creation, no tree walking ──
             for (inp, exp) in inputs.iter().zip(expected.iter()) {
@@ -1000,10 +1004,19 @@ pub fn synthesize_full(
                         evaluated += 1;
                         if vals_equal(&a, exp) { matches += 1; }
                     }
-                    Err(_) => break,
+                    Err(_) => { vm_failed = true; break; }
                 }
             }
         } else {
+            vm_failed = true;
+        }
+        } // end if !force_tree_walker
+        // Fall back to tree-walker if VM failed or force_tree_walker requested.
+        let need_fallback = vm_failed;
+        if need_fallback {
+            beh.clear();
+            matches = 0;
+            evaluated = 0;
             // ── Tree-walker fallback for unsupported constructs ──
             let mut ln = entry.nodes.clone();
             let lr = ln.len();
@@ -1046,8 +1059,10 @@ pub fn synthesize_full(
         // Observational equivalence dedup
         if !beh.is_empty() {
             if seen.contains(&beh) {
-                return (None, -1.0);
+                // Return -2.0 to indicate "deduplicated" (distinct from -1.0 type skip)
+                return (None, -2.0);
             }
+            // Always insert — both main candidates and probes contribute to dedup
             seen.insert(beh);
         }
 
@@ -1209,7 +1224,7 @@ pub fn synthesize_full(
         if explored >= max_candidates {
             return SynthResult { found: false, nodes: None, root: None, candidates_explored: explored };
         }
-        let (result, score) = test(e, &mut seen, &mut explored, &mut vm_stack);
+        let (result, score) = test(e, &mut seen, &mut explored, &mut vm_stack, true, false);
         pool_scores.push(score);
         if let Some((n, r)) = result {
             return SynthResult::success(n, r, explored);
@@ -1459,11 +1474,36 @@ pub fn synthesize_full(
                         });
                     }
 
+                    let mut entry_was_skipped = false;
                     let match_frac = match eval {
-                        EvalResult::Skipped => { continue; }
+                        EvalResult::Skipped => {
+                            // Type-mismatched candidates can't be solutions, but their
+                            // probes might compose them into target-typed results.
+                            // Only run probes when ret_type is in useful_types.
+                            if useful_types.contains(&entry.ret_type) {
+                                // Force tree-walker only for macros that call OTHER macros
+                                // (VM may miscompile such chains). Simple macros calling
+                                // builtins are VM-safe.
+                                let comp_name = &components[comp_idx].name;
+                                let is_builtin = crate::eval::BUILTIN_NAMES.contains(&comp_name.as_str());
+                                entry_was_skipped = if is_builtin {
+                                    false
+                                } else {
+                                    // Check if this macro's body references other macros
+                                    macro_env.iter().any(|(mn, _, _, _)| {
+                                        mn != comp_name && entry.nodes.iter().any(|n| {
+                                            if let Node::Symbol(s) = n { resolve(*s) == *mn } else { false }
+                                        })
+                                    })
+                                };
+                                0.0_f64 // fall through to probes
+                            } else {
+                                continue;
+                            }
+                        }
                         EvalResult::NeedsTreeWalker => {
                             // Fall back to sequential test() for this candidate
-                            let (result, mf) = test(&entry, &mut seen, &mut explored, &mut vm_stack);
+                            let (result, mf) = test(&entry, &mut seen, &mut explored, &mut vm_stack, true, false);
                             if mf >= 0.0 {
                                 let best = comp_best_match.entry(comp_idx).or_insert(0.0);
                                 if mf > *best { *best = mf; }
@@ -1484,10 +1524,18 @@ pub fn synthesize_full(
                             } else { 0.0 };
 
                             // Observational equivalence dedup
-                            if !beh.is_empty() {
-                                if seen.contains(&beh) { continue; }
-                                seen.insert(beh);
-                            }
+                            let was_deduped = if !beh.is_empty() {
+                                if seen.contains(&beh) {
+                                    true  // skip eval but still run probes below
+                                } else {
+                                    seen.insert(beh);
+                                    false
+                                }
+                            } else { false };
+
+                            if was_deduped {
+                                0.0  // fall through to probes (including arity-2)
+                            } else {
 
                             // RL reward
                             if mf >= 0.0 {
@@ -1516,6 +1564,7 @@ pub fn synthesize_full(
                             } else {
                                 mf
                             }
+                            } // end if !was_deduped
                         }
                     };
 
@@ -1571,7 +1620,7 @@ pub fn synthesize_full(
                                         priority: comp2.priority + entry.priority,
                                     }
                                 };
-                                let (cresult, _cfrac) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
+                                let (cresult, _cfrac) = test(&composed, &mut seen, &mut explored, &mut vm_stack, false, entry_was_skipped);
                                 if let Some((sn, sr)) = cresult {
                                     return SynthResult::success(sn, sr, explored);
                                 }
@@ -1597,7 +1646,7 @@ pub fn synthesize_full(
                                                     nodes: cn, root: api, ret_type: comp3.ret_type,
                                                     priority: comp3.priority + composed.priority + p.priority,
                                                 };
-                                                let (cr, _) = test(&chained, &mut seen, &mut explored, &mut vm_stack);
+                                                let (cr, _) = test(&chained, &mut seen, &mut explored, &mut vm_stack, false, entry_was_skipped);
                                                 if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
                                                 if explored > max_candidates { break; }
                                             }
@@ -1614,7 +1663,7 @@ pub fn synthesize_full(
                                                     nodes: cn, root: api, ret_type: comp3.ret_type,
                                                     priority: comp3.priority + p.priority + composed.priority,
                                                 };
-                                                let (cr, _) = test(&chained, &mut seen, &mut explored, &mut vm_stack);
+                                                let (cr, _) = test(&chained, &mut seen, &mut explored, &mut vm_stack, false, entry_was_skipped);
                                                 if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
                                                 if explored > max_candidates { break; }
                                             }
@@ -1644,7 +1693,7 @@ pub fn synthesize_full(
                                             nodes: cn, root: api, ret_type: comp2.ret_type,
                                             priority: comp2.priority + entry.priority + p.priority,
                                         };
-                                        let (cr, _) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
+                                        let (cr, _) = test(&composed, &mut seen, &mut explored, &mut vm_stack, false, entry_was_skipped);
                                         if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
                                         if explored > max_candidates { break 'arity2_par; }
                                     }
@@ -1661,7 +1710,7 @@ pub fn synthesize_full(
                                             nodes: cn, root: api, ret_type: comp2.ret_type,
                                             priority: comp2.priority + p.priority + entry.priority,
                                         };
-                                        let (cr, _) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
+                                        let (cr, _) = test(&composed, &mut seen, &mut explored, &mut vm_stack, false, entry_was_skipped);
                                         if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
                                         if explored > max_candidates { break 'arity2_par; }
                                     }
@@ -1706,7 +1755,7 @@ pub fn synthesize_full(
                     });
                 }
 
-                let (result, match_frac) = test(&entry, &mut seen, &mut explored, &mut vm_stack);
+                let (result, match_frac) = test(&entry, &mut seen, &mut explored, &mut vm_stack, true, false);
 
                 // RL reward: track best partial match per component
                 if match_frac >= 0.0 {
@@ -1770,7 +1819,7 @@ pub fn synthesize_full(
                                     priority: comp2.priority + entry.priority,
                                 }
                             };
-                            let (cresult, _cfrac) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
+                            let (cresult, _cfrac) = test(&composed, &mut seen, &mut explored, &mut vm_stack, false, false);
                             if let Some((sn, sr)) = cresult {
                                 return SynthResult::success(sn, sr, explored);
                             }
@@ -1796,7 +1845,7 @@ pub fn synthesize_full(
                                                 nodes: cn, root: api, ret_type: comp3.ret_type,
                                                 priority: comp3.priority + composed.priority + p.priority,
                                             };
-                                            let (cr, _) = test(&chained, &mut seen, &mut explored, &mut vm_stack);
+                                            let (cr, _) = test(&chained, &mut seen, &mut explored, &mut vm_stack, false, false);
                                             if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
                                             if explored > max_candidates { break; }
                                         }
@@ -1813,7 +1862,7 @@ pub fn synthesize_full(
                                                 nodes: cn, root: api, ret_type: comp3.ret_type,
                                                 priority: comp3.priority + p.priority + composed.priority,
                                             };
-                                            let (cr, _) = test(&chained, &mut seen, &mut explored, &mut vm_stack);
+                                            let (cr, _) = test(&chained, &mut seen, &mut explored, &mut vm_stack, false, false);
                                             if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
                                             if explored > max_candidates { break; }
                                         }
@@ -1843,7 +1892,7 @@ pub fn synthesize_full(
                                         nodes: cn, root: api, ret_type: comp2.ret_type,
                                         priority: comp2.priority + entry.priority + p.priority,
                                     };
-                                    let (cr, _) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
+                                    let (cr, _) = test(&composed, &mut seen, &mut explored, &mut vm_stack, false, false);
                                     if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
                                     if explored > max_candidates { break 'arity2; }
                                 }
@@ -1860,7 +1909,7 @@ pub fn synthesize_full(
                                         nodes: cn, root: api, ret_type: comp2.ret_type,
                                         priority: comp2.priority + p.priority + entry.priority,
                                     };
-                                    let (cr, _) = test(&composed, &mut seen, &mut explored, &mut vm_stack);
+                                    let (cr, _) = test(&composed, &mut seen, &mut explored, &mut vm_stack, false, false);
                                     if let Some((sn, sr)) = cr { return SynthResult::success(sn, sr, explored); }
                                     if explored > max_candidates { break 'arity2; }
                                 }
@@ -1910,7 +1959,7 @@ pub fn synthesize_full(
                 inputs, expected, &macro_env, extra_bindings,
             );
             for e in if_entries {
-                let (result, _) = test(&e, &mut seen, &mut explored, &mut vm_stack);
+                let (result, _) = test(&e, &mut seen, &mut explored, &mut vm_stack, true, false);
                 if let Some((sn, sr)) = result {
                     return SynthResult::success(sn, sr, explored);
                 }
@@ -2239,6 +2288,7 @@ fn infer_macro_types(
     params: &[String],
     mnodes: &[Node],
     mroot: usize,
+    all_macros: &[(String, Vec<String>, Vec<Node>, usize)],
 ) -> (Vec<u8>, u8) {
     // Default: all-numeric
     let default_params = vec![TYPE_NUM; params.len()];
@@ -2247,6 +2297,10 @@ fn infer_macro_types(
     if params.is_empty() {
         // Zero-arity macro: evaluate it directly to find return type
         let mut env = eval::make_default_env();
+        for (mn, mp, mm, mr) in all_macros {
+            env_define(&mut env, intern(mn),
+                Value::RustMacro(mp.iter().map(|s| intern(s)).collect(), Rc::from(mm.clone()), *mr));
+        }
         let mnodes_rc: Rc<[Node]> = mnodes.to_vec().into();
         if let Ok(val) = eval::eval(&mnodes_rc, mroot, &mut env) {
             return (vec![], value_type_tag(&val));
@@ -2269,6 +2323,11 @@ fn infer_macro_types(
     let mnodes_rc: Rc<[Node]> = mnodes.to_vec().into();
     let try_call = |args: &[Value]| -> Option<Value> {
         let mut env = eval::make_default_env();
+        // Include other macros so cross-macro calls resolve
+        for (mn, mp, mm, mr) in all_macros {
+            env_define(&mut env, intern(mn),
+                Value::RustMacro(mp.iter().map(|s| intern(s)).collect(), Rc::from(mm.clone()), *mr));
+        }
         let val = Value::RustMacro(
             params.iter().map(|s| intern(s)).collect(),
             mnodes_rc.clone(),
@@ -2594,7 +2653,7 @@ pub fn default_synth_components_opts(
 
     // Add macro components — infer types by probing with sample inputs
     for (mname, params, mnodes, mroot) in macros {
-        let (inferred_param, inferred_ret) = infer_macro_types(mname, params, mnodes, *mroot);
+        let (inferred_param, inferred_ret) = infer_macro_types(mname, params, mnodes, *mroot, macros);
         comps.push(SynthComponent {
             name: mname.clone(),
             builtin: Some(mname.clone()),
@@ -2655,7 +2714,7 @@ pub fn default_synth_components_opts(
     // Fused reduce components for binary macros: reduce_m(list) -> inferred_ret
     for (mname, params, mnodes, mroot) in macros {
         if params.len() == 2 {
-            let (_, inferred_ret) = infer_macro_types(mname, params, mnodes, *mroot);
+            let (_, inferred_ret) = infer_macro_types(mname, params, mnodes, *mroot, macros);
             comps.push(SynthComponent {
                 name: format!("reduce_{}", mname),
                 builtin: Some(format!("reduce_{}", mname)),
