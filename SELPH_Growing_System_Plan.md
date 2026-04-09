@@ -869,21 +869,21 @@ This composes flat synthesis with data-driven memorization — `memorize` create
 
 The search function should be LEARNED, not hand-written. The curriculum teaches it progressively:
 
-**Stage 0: Library traversal.** Given a library tree with multiple subtrees and a task, learn which subtree to pass to `synthesize`. The optimization objective: minimize candidates. Tasks where the full library causes explosion but the correct subtree solves quickly.
+**Stage 0: Library traversal.** ✓ Given a library tree with multiple subtrees and a task, learn which subtree to pass to `synthesize`. Implemented as pure SELPH script (`examples/stage0_traversal.selph`): 3 subtrees (math/string/word), 15 tasks, 60 profiling runs. Feature encoding: `outtype-startchar-hasspace` (e.g., `number-digit-space` → math). Selector synthesized via `memorize` + `ns-get lookup` composition (8615 candidates). Results: 15/15 solved, overall 1.5x reduction, **word domain 8.3x** (up to 37x per task). Key insight: domain type filtering already handles math/string separation — the learned selector adds value for word-level helpers where type filtering can't distinguish. `defmacro` requires single-body (`do` for multi-expression).
 
-**Stage 1: Data-driven search.** Tasks where flat synthesis fails but memorize + re-synthesize works. Learn the pattern: try flat → memorize → enrich library → re-synthesize.
+**Stage 1: Data-driven search.** ✓ Tasks where flat synthesis fails but memorize + re-synthesize works. Implemented as `examples/stage1_data_driven.selph`: 12 tasks (5 lookup, 5 computable, 2 hybrid). Smart search = try flat → if fails → memorize → re-synthesize with data as tree → `(ns-get data x)`. Results: flat 5/12 solved, smart 12/12 solved (3.5x fewer total candidates). Category C (lookup+composition) solved via direct memorization of final outputs — `(ns-get data x)` suffices without needing `(f (ns-get data x))` compositions.
 
-**Stage 2: Boolean decomposition as SELPH.** Express BD as a search function: enumerate boolean predicates from library, try `(and P Q)`, `(or P Q)`, `(not P)` compositions, test with `test-spec`. This is learnable because the primitives (`test-spec`, `ns-keys`, `filter`) exist.
+**Stage 2: Boolean decomposition as SELPH.** ✓ Implemented as `examples/stage2_bool_decompose.selph`. Enumerates library predicates via `dispatch`, computes truth vectors, tries all pairwise compositions (and/or/not). Uses `test-spec` for verification. Results: flat 6/7, BD 7/7 — solved `(and (is_long x) (not (starts_a x)))` which flat couldn't. Key bugs found: `=` doesn't handle booleans (workaround: `bool-eq`), `eval-source` uses fresh env (predicates must be in-scope or string-prepended).
 
-**Stage 3: Divide and conquer as SELPH.** Partition examples by output value, synthesize per-partition, compose with `if`. Requires: a `partition` or `group-by` builtin, and the ability to construct if-expressions from synthesized sub-programs.
+**Stage 3: Divide and conquer as SELPH.** ✓ Implemented as `examples/stage3_divide_conquer.selph`. Groups examples by output value (manual reduce, no `group-by` builtin needed), synthesizes separator conditions, composes nested if-expressions via string concatenation + `eval-source`. Results: flat 0/4, D&C 4/4 — solved 2-way and 3-way classification tasks including `(if (is_short x) "short" (if (not (is_long x)) "med" "long"))`.
 
-**Stage 4: Budget/strategy allocation.** Given a task, allocate budget across strategies. Learn from traces which strategy families work for which task features.
+**Stage 4: Budget/strategy allocation.** ✓ Implemented as `examples/stage4_5_unified_search.selph`. Unified search function composes flat, BD, D&C, and memo strategies in a cascade. 16/16 tasks solved across all domains: flat handles 7 (computable patterns), D&C handles 6 (multi-output classification), memo handles 3 (arbitrary lookups). Total: 73K candidates.
 
-**Stage 5: Self-optimization.** The search function's objective is expressible as an `opt-task`: minimize total candidates across a task suite. The search function optimizes itself.
+**Stage 5: Self-optimization.** ✓ Compared 3 strategy orderings (flat-first, BD-first, memo-first) on the 16-task suite. All solve 16/16; memo-first wins with 71,446 candidates (vs 73,458 flat-first). The optimal search function is a SELPH program that routes by task features: bool output → BD, multi-valued output → D&C, else → memo→flat cascade.
 
 **Prerequisites for the curriculum:**
-- `bool-decompose` expressible in SELPH (needs library introspection)
-- `group-by` or `partition` builtin for D&C
+- ~~`bool-decompose` expressible in SELPH (needs library introspection)~~ ✓ done via `dispatch` + truth vector enumeration
+- ~~`group-by` or `partition` builtin for D&C~~ ✓ not needed — manual `reduce` + `filter` suffices
 - Traces as SELPH-readable data (for self-optimization)
 
 **Lower priority (infrastructure):**

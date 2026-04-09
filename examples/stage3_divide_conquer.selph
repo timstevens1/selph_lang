@@ -1,0 +1,218 @@
+; ============================================================================
+; Stage 3: Divide and Conquer as SELPH
+; ============================================================================
+;
+; D&C algorithm expressed as a SELPH search function:
+; 1. Group examples by output value
+; 2. If only 1 group → synthesize a single expression
+; 3. If 2+ groups → synthesize a boolean condition separating first group
+; 4. Recursively build nested if-expressions
+; 5. Verify with test-spec
+;
+; Run: selph eval examples/stage3_divide_conquer.selph
+; ============================================================================
+
+; ============================================================================
+; Tasks: multi-output (not boolean) requiring if-expressions
+; ============================================================================
+
+; Classify by length: short/long
+(define len-class-spec (list
+  (list "hi" "short") (list "go" "short") (list "me" "short") (list "a" "short")
+  (list "hello" "long") (list "world" "long") (list "apple" "long") (list "great" "long")))
+
+; Classify by first letter: vowel → "v", consonant → "c"
+(define vowel-class-spec (list
+  (list "apple" "v") (list "egg" "v") (list "ice" "v") (list "owl" "v")
+  (list "banana" "c") (list "cat" "c") (list "dog" "c") (list "fish" "c")))
+
+; Three-way classification: short/medium/long
+(define tri-class-spec (list
+  (list "a" "short") (list "hi" "short") (list "go" "short")
+  (list "cat" "med") (list "dog" "med") (list "run" "med")
+  (list "hello" "long") (list "world" "long") (list "apple" "long")))
+
+; Numeric output based on properties
+; length < 3 → 0, starts with 'a' → 1, else → 2
+(define num-class-spec (list
+  (list "hi" 0) (list "go" 0) (list "me" 0)
+  (list "apple" 1) (list "ant" 1) (list "arch" 1)
+  (list "hello" 2) (list "world" 2) (list "test" 2)))
+
+; Boolean equality helper (= doesn't handle bools)
+(defmacro bool-eq (a b) (if a b (not b)))
+
+; ============================================================================
+; D&C helper library (predicates for conditions)
+; ============================================================================
+
+(define dc-lib "(defmacro is_short (s) (< (string-length s) 3))
+(defmacro is_long (s) (> (string-length s) 3))
+(defmacro is_med (s) (= (string-length s) 3))
+(defmacro starts_a (s) (string-starts-with s \"a\"))
+(defmacro starts_b (s) (string-starts-with s \"b\"))
+(defmacro has_a (s) (string-contains s \"a\"))
+(defmacro is_vowel_start (s) (or (string-starts-with s \"a\") (or (string-starts-with s \"e\") (or (string-starts-with s \"i\") (or (string-starts-with s \"o\") (string-starts-with s \"u\"))))))")
+
+; Define predicates in current env (for eval-source constructed lambdas)
+(defmacro is_short (s) (< (string-length s) 3))
+(defmacro is_long (s) (> (string-length s) 3))
+(defmacro is_med (s) (= (string-length s) 3))
+(defmacro starts_a (s) (string-starts-with s "a"))
+(defmacro starts_b (s) (string-starts-with s "b"))
+(defmacro has_a (s) (string-contains s "a"))
+(defmacro is_vowel_start (s) (or (string-starts-with s "a") (or (string-starts-with s "e") (or (string-starts-with s "i") (or (string-starts-with s "o") (string-starts-with s "u"))))))
+
+; ============================================================================
+; D&C algorithm
+; ============================================================================
+
+(define dc-depth 2)
+(define dc-budget 10000)
+
+(defmacro make-result (found source candidates)
+  (ns-put (ns-put (ns-put (ns-empty) "found" found) "source" source) "candidates" candidates))
+
+; Get unique output values from a spec
+(defmacro unique-outputs (spec)
+  (reduce (lambda (acc pair)
+    (do
+      (define out (head (tail pair)))
+      (if (contains acc out) acc (append acc (list out)))))
+    spec
+    (list)))
+
+; Group spec by output value: returns list of (output, sub-spec) pairs
+(defmacro group-by-output (spec)
+  (do
+    (define outputs (unique-outputs spec))
+    (map (lambda (out)
+      (list out (filter (lambda (pair)
+        (do
+          (define pout (head (tail pair)))
+          ; Handle both string and numeric equality
+          (if (number? out)
+            (if (number? pout) (= out pout) false)
+            (if (string? out)
+              (if (string? pout) (= out pout) false)
+              (bool-eq out pout)))))
+        spec)))
+      outputs)))
+
+; Synthesize a condition that's true for group inputs, false for rest
+(defmacro find-separator (group-inputs rest-inputs budget)
+  (do
+    (define bool-spec (append
+      (map (lambda (x) (list x true)) group-inputs)
+      (map (lambda (x) (list x false)) rest-inputs)))
+    (synthesize (ns-put (ns-put (ns-put (ns-put (ns-empty)
+      "spec" bool-spec)
+      "max-depth" dc-depth)
+      "max-candidates" budget)
+      "library" dc-lib))))
+
+; Build a nested if-expression from groups
+; groups: list of (output, sub-spec) pairs
+; Returns: (found, source, candidates)
+(defmacro build-if-tree (groups all-inputs)
+  (if (= (length groups) 1)
+    ; Base case: single group — return its output value
+    (do
+      (define out (head (head groups)))
+      (define out-src (if (number? out) (to-string out) (concat "\"" out "\"")))
+      (make-result true (concat "(lambda (x) " out-src ")") 0))
+    ; Recursive case: find condition separating first group from rest
+    (do
+      (define first-group (head groups))
+      (define rest-groups (tail groups))
+      (define first-out (head first-group))
+      (define first-spec (head (tail first-group)))
+      (define first-inputs (map head first-spec))
+      (define rest-inputs (map head (reduce (lambda (acc g) (append acc (head (tail g))))
+        rest-groups (list))))
+      ; Synthesize separator condition
+      (define sep (find-separator first-inputs rest-inputs dc-budget))
+      (if (not (ns-get sep "found"))
+        (make-result false "" (ns-get sep "candidates"))
+        ; Build: (if condition first-output (recurse rest))
+        (do
+          (define cond-body (string-slice (ns-get sep "source")
+            (string-length "(lambda (x) ")
+            (subtract (string-length (ns-get sep "source")) 1)))
+          (define first-out-src (if (number? first-out)
+            (to-string first-out)
+            (concat "\"" first-out "\"")))
+          ; Recurse for else branch
+          (define else-result (build-if-tree rest-groups all-inputs))
+          (if (not (ns-get else-result "found"))
+            else-result
+            (do
+              (define else-body (string-slice (ns-get else-result "source")
+                (string-length "(lambda (x) ")
+                (subtract (string-length (ns-get else-result "source")) 1)))
+              (define full-src (concat "(lambda (x) (if " cond-body " " first-out-src " " else-body "))"))
+              (define total-cands (add (ns-get sep "candidates") (ns-get else-result "candidates")))
+              (make-result true full-src total-cands))))))))
+
+; D&C search function
+(defmacro dc-search (spec)
+  (do
+    ; Step 1: try flat synthesis first
+    (define flat (synthesize (ns-put (ns-put (ns-put (ns-put (ns-empty)
+      "spec" spec) "max-depth" dc-depth) "max-candidates" dc-budget) "library" dc-lib)))
+    (if (ns-get flat "found")
+      flat
+      ; Step 2: group by output and build if-tree
+      (do
+        (define groups (group-by-output spec))
+        (define all-inputs (map head spec))
+        (define dc-result (build-if-tree groups all-inputs))
+        (if (ns-get dc-result "found")
+          ; Verify: prepend library defs so eval-source can resolve predicates
+          (do
+            (define full-src (concat dc-lib " " (ns-get dc-result "source")))
+            (define fn (eval-source full-src))
+            (if (= (test-spec fn spec) 1)
+              dc-result
+              (make-result false "" (ns-get dc-result "candidates"))))
+          dc-result)))))
+
+; ============================================================================
+; Profile
+; ============================================================================
+
+(print "========================================")
+(print "Stage 3: Divide & Conquer as SELPH")
+(print "========================================")
+(print "")
+
+(defmacro profile-dc (task-name spec)
+  (do
+    (define r-flat (synthesize (ns-put (ns-put (ns-put (ns-put (ns-empty)
+      "spec" spec) "max-depth" dc-depth) "max-candidates" dc-budget) "library" dc-lib)))
+    (define r-dc (dc-search spec))
+    (print (concat task-name ":"))
+    (print (concat "  flat: " (if (ns-get r-flat "found")
+      (concat (to-string (ns-get r-flat "candidates")) " cand  " (ns-get r-flat "source"))
+      (concat (to-string (ns-get r-flat "candidates")) " FAILED"))))
+    (print (concat "  D&C:  " (if (ns-get r-dc "found")
+      (concat (to-string (ns-get r-dc "candidates")) " cand  " (ns-get r-dc "source"))
+      (concat (to-string (ns-get r-dc "candidates")) " FAILED"))))
+    (list task-name (ns-get r-flat "found") (ns-get r-dc "found"))))
+
+(define p1 (profile-dc "len_class"    len-class-spec))
+(define p2 (profile-dc "vowel_class"  vowel-class-spec))
+(define p3 (profile-dc "tri_class"    tri-class-spec))
+(define p4 (profile-dc "num_class"    num-class-spec))
+
+(print "")
+(print "========================================")
+(print "Summary")
+(print "========================================")
+(define all (list p1 p2 p3 p4))
+(define flat-solved (length (filter (lambda (r) (head (tail r))) all)))
+(define dc-solved   (length (filter (lambda (r) (nth r 2)) all)))
+(print (concat "Flat+lib:  " (to-string flat-solved) "/4 solved"))
+(print (concat "D&C:       " (to-string dc-solved) "/4 solved"))
+(print "")
+(print "Stage 3 complete.")

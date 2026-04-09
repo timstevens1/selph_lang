@@ -317,6 +317,7 @@ fn build_dispatch_table() -> std::collections::HashMap<Sym, BuiltinFn> {
     m.insert(intern("="), |args| match (&args[0], &args[1]) {
         (Value::Num(a), Value::Num(b)) => Ok(Value::Bool(a == b)),
         (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a == b)),
+        (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a == b)),
         _ => Ok(Value::Bool(false)),
     });
     m.insert(intern("not"), |args| match &args[0] { Value::Bool(b) => Ok(Value::Bool(!*b)), _ => Err("not: expected bool".into()) });

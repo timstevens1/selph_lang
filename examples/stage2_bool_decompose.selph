@@ -1,0 +1,246 @@
+; ============================================================================
+; Stage 2: Boolean Decomposition as SELPH
+; ============================================================================
+;
+; Implements the BD algorithm as a SELPH program:
+; 1. Try flat synthesis with predicate library
+; 2. If fails, evaluate each library predicate on all inputs
+; 3. Try each predicate (and its negation) as the solution
+; 4. Try all pairs: (and P Q), (or P Q), (and P (not Q)), etc.
+; 5. Verify with test-spec
+;
+; Run: selph eval examples/stage2_bool_decompose.selph
+; ============================================================================
+
+; ============================================================================
+; Predicate library
+; ============================================================================
+
+(define pred-lib "(defmacro starts_a (s) (string-starts-with s \"a\"))
+(defmacro starts_b (s) (string-starts-with s \"b\"))
+(defmacro starts_c (s) (string-starts-with s \"c\"))
+(defmacro starts_d (s) (string-starts-with s \"d\"))
+(defmacro ends_a (s) (string-ends-with s \"a\"))
+(defmacro ends_e (s) (string-ends-with s \"e\"))
+(defmacro ends_g (s) (string-ends-with s \"g\"))
+(defmacro ends_t (s) (string-ends-with s \"t\"))
+(defmacro has_a (s) (string-contains s \"a\"))
+(defmacro has_e (s) (string-contains s \"e\"))
+(defmacro is_short (s) (< (string-length s) 3))
+(defmacro is_long (s) (> (string-length s) 3))
+(defmacro is_len1 (s) (= (string-length s) 1))")
+
+; Define predicates in the current environment (for BD enumeration)
+(defmacro starts_a (s) (string-starts-with s "a"))
+(defmacro starts_b (s) (string-starts-with s "b"))
+(defmacro starts_c (s) (string-starts-with s "c"))
+(defmacro starts_d (s) (string-starts-with s "d"))
+(defmacro ends_a (s) (string-ends-with s "a"))
+(defmacro ends_e (s) (string-ends-with s "e"))
+(defmacro ends_g (s) (string-ends-with s "g"))
+(defmacro ends_t (s) (string-ends-with s "t"))
+(defmacro has_a (s) (string-contains s "a"))
+(defmacro has_e (s) (string-contains s "e"))
+(defmacro is_short (s) (< (string-length s) 3))
+(defmacro is_long (s) (> (string-length s) 3))
+(defmacro is_len1 (s) (= (string-length s) 1))
+
+; Predicate names (must match the library)
+(define pred-names (list
+  "starts_a" "starts_b" "starts_c" "starts_d"
+  "ends_a" "ends_e" "ends_g" "ends_t"
+  "has_a" "has_e" "is_short" "is_long" "is_len1"))
+
+; ============================================================================
+; Tasks
+; ============================================================================
+
+; Easy: single predicate
+(define starts-a-spec (list
+  (list "apple" true) (list "ant" true) (list "arm" true) (list "ace" true)
+  (list "banana" false) (list "cat" false) (list "dog" false) (list "fish" false)))
+
+(define is-long-spec (list
+  (list "hello" true) (list "world" true) (list "test" true) (list "abcd" true)
+  (list "hi" false) (list "go" false) (list "a" false) (list "me" false)))
+
+(define has-a-spec (list
+  (list "cat" true) (list "bag" true) (list "art" true) (list "map" true)
+  (list "dog" false) (list "men" false) (list "sit" false) (list "run" false)))
+
+; Medium: and/or
+(define a-and-long-spec (list
+  (list "apple" true) (list "atom" true) (list "arch" true) (list "also" true)
+  (list "at" false) (list "a" false) (list "banana" false) (list "cat" false)))
+
+(define b-or-g-spec (list
+  (list "bag" true) (list "big" true) (list "boy" true) (list "dog" true)
+  (list "cat" false) (list "sun" false) (list "map" false) (list "pen" false)))
+
+; Hard: and-not, or compositions
+(define long-no-a-spec (list
+  (list "hello" true) (list "world" true) (list "fish" true) (list "test" true)
+  (list "apple" false) (list "atom" false) (list "hi" false) (list "go" false)))
+
+(define a-or-single-spec (list
+  (list "cat" true) (list "a" true) (list "bag" true) (list "x" true)
+  (list "dog" false) (list "men" false) (list "sit" false) (list "run" false)))
+
+; ============================================================================
+; Helpers
+; ============================================================================
+
+(defmacro make-result (found source candidates)
+  (ns-put (ns-put (ns-put (ns-empty) "found" found) "source" source) "candidates" candidates))
+
+(define bd-depth 2)
+(define bd-budget 10000)
+
+(defmacro synth-with-lib (spec budget)
+  (synthesize (ns-put (ns-put (ns-put (ns-put (ns-empty)
+    "spec" spec) "max-depth" bd-depth) "max-candidates" budget) "library" pred-lib)))
+
+; ============================================================================
+; BD algorithm: enumerate predicates, try compositions
+; ============================================================================
+
+; Evaluate a predicate (by name) on a list of inputs via dispatch
+; Returns truth vector as a list of booleans
+(defmacro eval-pred-on-inputs (pred-name inputs)
+  (map (lambda (x) (dispatch pred-name x)) inputs))
+
+; Boolean equality (= doesn't handle bools)
+(defmacro bool-eq (a b) (if a b (not b)))
+
+; Check if a truth vector matches expected outputs
+(defmacro matches-expected (truth-vec expected)
+  (= (length (filter (lambda (pair) (bool-eq (head pair) (head (tail pair))))
+    (zip truth-vec expected)))
+    (length expected)))
+
+; BD: enumerate all predicates and pairwise compositions
+(defmacro bd-enumerate (spec)
+  (do
+    (define inputs   (map head spec))
+    (define expected (map (lambda (p) (head (tail p))) spec))
+
+    ; Evaluate all predicates on all inputs
+    (define pred-vecs (map (lambda (name)
+      (list name (eval-pred-on-inputs name inputs)))
+      pred-names))
+
+    ; Step 1: check single predicates and their negations
+    (define single-match (reduce (lambda (best pv)
+      (if (ns-get best "found") best
+        (do
+          (define name (head pv))
+          (define vec (head (tail pv)))
+          (define neg-vec (map not vec))
+          (if (matches-expected vec expected)
+            (make-result true (concat "(lambda (x) (" name " x))") 0)
+            (if (matches-expected neg-vec expected)
+              (make-result true (concat "(lambda (x) (not (" name " x)))") 0)
+              best)))))
+      pred-vecs
+      (make-result false "" 0)))
+
+    (if (ns-get single-match "found")
+      single-match
+      ; Step 2: check pairwise compositions
+      (do
+        (define pair-match (reduce (lambda (best pv-i)
+          (if (ns-get best "found") best
+            (reduce (lambda (best2 pv-j)
+              (if (ns-get best2 "found") best2
+                (if (= (head pv-i) (head pv-j)) best2
+                  (do
+                    (define ni (head pv-i))
+                    (define nj (head pv-j))
+                    (define vi (head (tail pv-i)))
+                    (define vj (head (tail pv-j)))
+                    ; Try (and P Q)
+                    (define and-vec (map (lambda (pair) (and (head pair) (head (tail pair)))) (zip vi vj)))
+                    (if (matches-expected and-vec expected)
+                      (make-result true (concat "(lambda (x) (and (" ni " x) (" nj " x)))") 0)
+                      ; Try (or P Q)
+                      (do
+                        (define or-vec (map (lambda (pair) (or (head pair) (head (tail pair)))) (zip vi vj)))
+                        (if (matches-expected or-vec expected)
+                          (make-result true (concat "(lambda (x) (or (" ni " x) (" nj " x)))") 0)
+                          ; Try (and P (not Q))
+                          (do
+                            (define and-not-vec (map (lambda (pair) (and (head pair) (not (head (tail pair))))) (zip vi vj)))
+                            (if (matches-expected and-not-vec expected)
+                              (make-result true (concat "(lambda (x) (and (" ni " x) (not (" nj " x))))") 0)
+                              ; Try (or P (not Q))
+                              (do
+                                (define or-not-vec (map (lambda (pair) (or (head pair) (not (head (tail pair))))) (zip vi vj)))
+                                (if (matches-expected or-not-vec expected)
+                                  (make-result true (concat "(lambda (x) (or (" ni " x) (not (" nj " x))))") 0)
+                                  best2)))))))))))
+              pred-vecs
+              best)))
+          pred-vecs
+          (make-result false "" 0)))
+        pair-match))))
+
+; Full BD search: flat synthesis first, then enumerate
+(defmacro bool-decompose-search (spec)
+  (do
+    (define flat (synth-with-lib spec bd-budget))
+    (if (ns-get flat "found")
+      flat
+      (do
+        (define bd-result (bd-enumerate spec))
+        (if (ns-get bd-result "found")
+          bd-result
+          flat)))))
+
+; ============================================================================
+; Profile
+; ============================================================================
+
+(print "========================================")
+(print "Stage 2: Boolean Decomposition as SELPH")
+(print "========================================")
+(print "")
+
+(defmacro profile-bd (task-name spec)
+  (do
+    (define r-flat (synth-with-lib spec bd-budget))
+    (define r-bd   (bool-decompose-search spec))
+    (print (concat task-name ":"))
+    (print (concat "  flat: " (if (ns-get r-flat "found")
+      (concat (to-string (ns-get r-flat "candidates")) " cand  " (ns-get r-flat "source"))
+      (concat (to-string (ns-get r-flat "candidates")) " FAILED"))))
+    (print (concat "  BD:   " (if (ns-get r-bd "found")
+      (concat (to-string (ns-get r-bd "candidates")) " cand  " (ns-get r-bd "source"))
+      (concat (to-string (ns-get r-bd "candidates")) " FAILED"))))
+    (list task-name (ns-get r-flat "found") (ns-get r-bd "found"))))
+
+(print "--- Easy (single predicate) ---")
+(define p1 (profile-bd "starts_a"   starts-a-spec))
+(define p2 (profile-bd "is_long"    is-long-spec))
+(define p3 (profile-bd "has_a"      has-a-spec))
+
+(print "")
+(print "--- Medium (and/or) ---")
+(define p4 (profile-bd "a_and_long" a-and-long-spec))
+(define p5 (profile-bd "b_or_g"     b-or-g-spec))
+
+(print "")
+(print "--- Hard (and-not, or) ---")
+(define p6 (profile-bd "long_no_a"    long-no-a-spec))
+(define p7 (profile-bd "a_or_single"  a-or-single-spec))
+
+(print "")
+(print "========================================")
+(print "Summary")
+(print "========================================")
+(define all (list p1 p2 p3 p4 p5 p6 p7))
+(define flat-solved (length (filter (lambda (r) (head (tail r))) all)))
+(define bd-solved   (length (filter (lambda (r) (nth r 2)) all)))
+(print (concat "Flat+lib:  " (to-string flat-solved) "/7 solved"))
+(print (concat "BD:        " (to-string bd-solved) "/7 solved"))
+(print "")
+(print "Stage 2 complete.")

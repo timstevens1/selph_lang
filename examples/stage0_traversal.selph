@@ -1,0 +1,358 @@
+; ============================================================================
+; Stage 0: Library Traversal — Learn which subtree to pass to synthesize
+; ============================================================================
+;
+; Demonstrates and teaches library subtree selection:
+; 1. Defines 3 library subtrees (math, string, word)
+; 2. Profiles 15 tasks x 4 library configs
+; 3. Identifies optimal subtree per task
+; 4. Learns a selector via memorize + ns-get composition
+; 5. Validates the selector end-to-end
+;
+; Run: selph eval examples/stage0_traversal.selph
+; ============================================================================
+
+; --- Library subtrees as source strings ---
+
+(define math-lib "(defmacro idx (s) (to-number (head (string-split s \" \"))))
+(defmacro v0 (s) (to-number (head (tail (string-split s \" \")))))
+(defmacro v1 (s) (to-number (head (tail (tail (string-split s \" \"))))))
+(defmacro v2 (s) (to-number (head (tail (tail (tail (string-split s \" \")))))))
+(defmacro v3 (s) (to-number (head (tail (tail (tail (tail (string-split s \" \"))))))))")
+
+(define string-lib "(defmacro char_a (s) \"a\")
+(defmacro char_b (s) \"b\")
+(defmacro char_c (s) \"c\")
+(defmacro char_empty (s) \"\")")
+
+(define word-lib "(defmacro first_word (s) (head (string-split s \" \")))
+(defmacro last_word (s) (head (reverse (string-split s \" \"))))
+(defmacro second_word (s) (head (tail (string-split s \" \"))))
+(defmacro word_count (s) (length (string-split s \" \")))")
+
+(define full-lib (list math-lib string-lib word-lib))
+
+; ============================================================================
+; Task specs — 5 per domain
+; ============================================================================
+
+(define identity-spec (list
+  (list "4 0 1 2 3" 4) (list "5 1 2 3 4" 5)
+  (list "6 2 3 4 5" 6) (list "7 3 4 5 6" 7)))
+
+(define last-plus-1-spec (list
+  (list "4 10 11 12 13" 14) (list "5 20 21 22 23" 24)
+  (list "6 0 1 2 3" 4) (list "7 5 6 7 8" 9)))
+
+(define double-idx-spec (list
+  (list "4 0 2 4 6" 8) (list "5 2 4 6 8" 10)
+  (list "6 4 6 8 10" 12) (list "7 6 8 10 12" 14)))
+
+(define fib-spec (list
+  (list "4 1 1 2 3" 5) (list "5 1 2 3 5" 8)
+  (list "6 2 3 5 8" 13) (list "7 3 5 8 13" 21)))
+
+(define idx-plus-v0-spec (list
+  (list "4 10 11 12 13" 14) (list "5 10 11 12 13" 15)
+  (list "6 10 11 12 13" 16) (list "7 10 11 12 13" 17)))
+
+(define count-a-spec (list
+  (list "a" 1) (list "aa" 2) (list "aaa" 3) (list "aaaa" 4)
+  (list "b" 0) (list "ab" 1) (list "ba" 1) (list "aba" 2)))
+
+(define remove-a-spec (list
+  (list "a" "") (list "ab" "b") (list "aab" "b") (list "ba" "b")
+  (list "aba" "b") (list "bbb" "bbb") (list "aaa" "") (list "bab" "bb")))
+
+(define starts-a-spec (list
+  (list "a" true) (list "ab" true) (list "abc" true) (list "aaa" true)
+  (list "b" false) (list "ba" false) (list "cba" false) (list "bb" false)))
+
+(define a-to-b-spec (list
+  (list "a" "b") (list "ab" "bb") (list "aab" "bbb")
+  (list "ba" "bb") (list "aaa" "bbb") (list "bbb" "bbb")))
+
+(define str-len-spec (list
+  (list "a" 1) (list "ab" 2) (list "abc" 3) (list "abcd" 4)
+  (list "x" 1) (list "xy" 2) (list "z" 1) (list "hello" 5)))
+
+(define first-word-spec (list
+  (list "the cat" "the") (list "a dog" "a") (list "big apple" "big")
+  (list "my car" "my") (list "the book" "the") (list "red ball" "red")))
+
+(define last-word-spec (list
+  (list "the cat" "cat") (list "a dog" "dog") (list "big apple" "apple")
+  (list "my car" "car") (list "the book" "book") (list "red ball" "ball")))
+
+(define count-words-spec (list
+  (list "the cat" 2) (list "a big dog" 3) (list "hello world" 2)
+  (list "one two three" 3) (list "just me" 2) (list "the big cat" 3)))
+
+(define second-word-spec (list
+  (list "the cat" "cat") (list "a dog" "dog") (list "big apple" "apple")
+  (list "my car" "car") (list "old hat" "hat") (list "red ball" "ball")))
+
+(define upper-first-word-spec (list
+  (list "the cat" "THE") (list "a dog" "A") (list "big apple" "BIG")
+  (list "my car" "MY") (list "old hat" "OLD") (list "red ball" "RED")))
+
+; ============================================================================
+; Profiling infrastructure
+; ============================================================================
+
+(defmacro try-synth (spec lib max-depth budget)
+  (synthesize
+    (ns-put (ns-put (ns-put (ns-put (ns-empty)
+      "spec" spec)
+      "library" lib)
+      "max-depth" max-depth)
+      "max-candidates" budget)))
+
+(defmacro profile-one (spec lib-name lib max-depth budget)
+  (do
+    (define result (try-synth spec lib max-depth budget))
+    (define found (ns-get result "found"))
+    (define cands (ns-get result "candidates"))
+    (print (concat "  " lib-name ": "
+      (if found
+        (concat (to-string cands) " cand  " (ns-get result "source"))
+        (concat (to-string cands) " cand  FAILED"))))
+    (list lib-name found cands)))
+
+(defmacro profile-task (task-name spec max-depth budget)
+  (do
+    (print (concat "--- " task-name " ---"))
+    (define r-math   (profile-one spec "math"   math-lib   max-depth budget))
+    (define r-string (profile-one spec "string" string-lib max-depth budget))
+    (define r-word   (profile-one spec "word"   word-lib   max-depth budget))
+    (define r-full   (profile-one spec "full"   full-lib   max-depth budget))
+    (list task-name r-math r-string r-word r-full)))
+
+; Find best subtree: lowest candidates among those that found a solution
+(defmacro best-of (results)
+  (do
+    (define solved (filter (lambda (r) (head (tail r))) results))
+    (if (= (length solved) 0)
+      "none"
+      (head (reduce (lambda (best r)
+        (if (< (head (tail (tail r))) (head (tail (tail best))))
+          r best))
+        solved)))))
+
+; ============================================================================
+; Phase 1: Profile all tasks
+; ============================================================================
+
+(print "========================================")
+(print "Phase 1: Profiling (task x subtree)")
+(print "========================================")
+
+(define depth 2)
+(define budget 50000)
+
+(define p01 (profile-task "identity_seq"     identity-spec      depth budget))
+(define p02 (profile-task "last_plus_1"      last-plus-1-spec   depth budget))
+(define p03 (profile-task "double_idx"       double-idx-spec    depth budget))
+(define p04 (profile-task "fibonacci"        fib-spec           depth budget))
+(define p05 (profile-task "idx_plus_v0"      idx-plus-v0-spec   depth budget))
+(define p06 (profile-task "count_a"          count-a-spec       depth budget))
+(define p07 (profile-task "remove_a"         remove-a-spec      depth budget))
+(define p08 (profile-task "starts_a"         starts-a-spec      depth budget))
+(define p09 (profile-task "a_to_b"           a-to-b-spec        depth budget))
+(define p10 (profile-task "str_len"          str-len-spec       depth budget))
+(define p11 (profile-task "first_word"       first-word-spec    depth budget))
+(define p12 (profile-task "last_word"        last-word-spec     depth budget))
+(define p13 (profile-task "count_words"      count-words-spec   depth budget))
+(define p14 (profile-task "second_word"      second-word-spec   depth budget))
+(define p15 (profile-task "upper_first_word" upper-first-word-spec depth budget))
+
+; ============================================================================
+; Phase 2: Identify best subtree per task
+; ============================================================================
+
+(print "")
+(print "========================================")
+(print "Phase 2: Best subtree per task")
+(print "========================================")
+
+(defmacro report-best (task-name profile)
+  (do
+    (define best (best-of (tail profile)))
+    (print (concat "  " task-name " -> " best))
+    best))
+
+(define b01 (report-best "identity_seq"     p01))
+(define b02 (report-best "last_plus_1"      p02))
+(define b03 (report-best "double_idx"       p03))
+(define b04 (report-best "fibonacci"        p04))
+(define b05 (report-best "idx_plus_v0"      p05))
+(define b06 (report-best "count_a"          p06))
+(define b07 (report-best "remove_a"         p07))
+(define b08 (report-best "starts_a"         p08))
+(define b09 (report-best "a_to_b"           p09))
+(define b10 (report-best "str_len"          p10))
+(define b11 (report-best "first_word"       p11))
+(define b12 (report-best "last_word"        p12))
+(define b13 (report-best "count_words"      p13))
+(define b14 (report-best "second_word"      p14))
+(define b15 (report-best "upper_first_word" p15))
+
+; ============================================================================
+; Phase 3: Feature extraction & selector synthesis
+; ============================================================================
+
+(print "")
+(print "========================================")
+(print "Phase 3: Feature extraction & selector")
+(print "========================================")
+
+; Features: "outtype-startchar-hasspace"
+; - outtype: number/string/bool (from first output)
+; - startchar: digit/alpha (first char of first input)
+; - hasspace: space/nospace
+; This distinguishes math sequences ("4 0 1 2 3", digit+space)
+; from word inputs ("the cat", alpha+space) from simple strings ("abc", alpha+nospace)
+(defmacro extract-features (spec)
+  (do
+    (define first-pair (head spec))
+    (define inp (head first-pair))
+    (define out (head (tail first-pair)))
+    (define out-type (type-of out))
+    (define first-code (char-code (string-nth inp 0)))
+    (define starts-digit (if (and (>= first-code 48) (<= first-code 57)) "digit" "alpha"))
+    (define has-space (if (string-contains inp " ") "space" "nospace"))
+    (concat out-type "-" starts-digit "-" has-space)))
+
+(define f01 (extract-features identity-spec))
+(define f02 (extract-features last-plus-1-spec))
+(define f03 (extract-features double-idx-spec))
+(define f04 (extract-features fib-spec))
+(define f05 (extract-features idx-plus-v0-spec))
+(define f06 (extract-features count-a-spec))
+(define f07 (extract-features remove-a-spec))
+(define f08 (extract-features starts-a-spec))
+(define f09 (extract-features a-to-b-spec))
+(define f10 (extract-features str-len-spec))
+(define f11 (extract-features first-word-spec))
+(define f12 (extract-features last-word-spec))
+(define f13 (extract-features count-words-spec))
+(define f14 (extract-features second-word-spec))
+(define f15 (extract-features upper-first-word-spec))
+
+(print "Feature -> best subtree:")
+(print (concat "  identity_seq:     " f01 " -> " b01))
+(print (concat "  last_plus_1:      " f02 " -> " b02))
+(print (concat "  double_idx:       " f03 " -> " b03))
+(print (concat "  fibonacci:        " f04 " -> " b04))
+(print (concat "  idx_plus_v0:      " f05 " -> " b05))
+(print (concat "  count_a:          " f06 " -> " b06))
+(print (concat "  remove_a:         " f07 " -> " b07))
+(print (concat "  starts_a:         " f08 " -> " b08))
+(print (concat "  a_to_b:           " f09 " -> " b09))
+(print (concat "  str_len:          " f10 " -> " b10))
+(print (concat "  first_word:       " f11 " -> " b11))
+(print (concat "  last_word:        " f12 " -> " b12))
+(print (concat "  count_words:      " f13 " -> " b13))
+(print (concat "  second_word:      " f14 " -> " b14))
+(print (concat "  upper_first_word: " f15 " -> " b15))
+
+; Build training data for selector: (feature-string, subtree-name)
+; Use all 15 pairs — duplicates with same output are fine for memorize
+(define training-data (list
+  (list f01 b01) (list f02 b02) (list f03 b03) (list f04 b04) (list f05 b05)
+  (list f06 b06) (list f07 b07) (list f08 b08) (list f09 b09) (list f10 b10)
+  (list f11 b11) (list f12 b12) (list f13 b13) (list f14 b14) (list f15 b15)))
+
+; Create selector via memorize (builds lookup table) then synthesize ns-get
+(define lookup-table (memorize training-data))
+(print "")
+(print (concat "Lookup table keys: " (to-string (ns-keys lookup-table))))
+
+; Synthesize a function that uses the lookup table
+; The trees parameter makes the lookup namespace available as a depth-0 atom
+(print "Synthesizing selector (lookup via ns-get)...")
+(define selector-result (synthesize
+  (ns-put (ns-put (ns-put (ns-put (ns-empty)
+    "spec" training-data)
+    "max-depth" 2)
+    "max-candidates" 10000)
+    "trees" (ns-put (ns-empty) "lookup" lookup-table))))
+
+(print (concat "Selector found: " (to-string (ns-get selector-result "found"))))
+(print (concat "Selector candidates: " (to-string (ns-get selector-result "candidates"))))
+(print (concat "Selector source: " (ns-get selector-result "source")))
+
+; ============================================================================
+; Phase 4: Validate selector end-to-end
+; ============================================================================
+
+(print "")
+(print "========================================")
+(print "Phase 4: End-to-end validation")
+(print "========================================")
+
+(define subtree-map
+  (ns-put (ns-put (ns-put (ns-empty)
+    "math" math-lib)
+    "string" string-lib)
+    "word" word-lib))
+
+; Smart solve: extract features -> lookup subtree -> synthesize with it
+(defmacro smart-solve (task-name spec)
+  (do
+    (define features (extract-features spec))
+    (define chosen (ns-get-or lookup-table features "full"))
+    (define lib (ns-get-or subtree-map chosen full-lib))
+    (define result (try-synth spec lib depth budget))
+    (define found (ns-get result "found"))
+    (define cands (ns-get result "candidates"))
+    (print (concat "  " task-name ": " features " -> " chosen
+      " -> " (if found (concat (to-string cands) " cand  " (ns-get result "source")) "FAILED")))
+    (list task-name found cands)))
+
+(print "Smart solve (selector routes to best subtree):")
+(define v01 (smart-solve "identity_seq"     identity-spec))
+(define v02 (smart-solve "last_plus_1"      last-plus-1-spec))
+(define v03 (smart-solve "double_idx"       double-idx-spec))
+(define v04 (smart-solve "fibonacci"        fib-spec))
+(define v05 (smart-solve "idx_plus_v0"      idx-plus-v0-spec))
+(define v06 (smart-solve "count_a"          count-a-spec))
+(define v07 (smart-solve "remove_a"         remove-a-spec))
+(define v08 (smart-solve "starts_a"         starts-a-spec))
+(define v09 (smart-solve "a_to_b"           a-to-b-spec))
+(define v10 (smart-solve "str_len"          str-len-spec))
+(define v11 (smart-solve "first_word"       first-word-spec))
+(define v12 (smart-solve "last_word"        last-word-spec))
+(define v13 (smart-solve "count_words"      count-words-spec))
+(define v14 (smart-solve "second_word"      second-word-spec))
+(define v15 (smart-solve "upper_first_word" upper-first-word-spec))
+
+; ============================================================================
+; Phase 5: Summary comparison
+; ============================================================================
+
+(print "")
+(print "========================================")
+(print "Phase 5: Summary")
+(print "========================================")
+
+(define all-results (list v01 v02 v03 v04 v05 v06 v07 v08 v09 v10 v11 v12 v13 v14 v15))
+(define selected-total (reduce add (map (lambda (v) (head (tail (tail v)))) all-results)))
+(define selected-solved (length (filter (lambda (v) (head (tail v))) all-results)))
+
+; Compute full-library totals from Phase 1 profiles
+; Full-lib candidates are the 4th result (index 4) of each profile
+(defmacro full-cands (profile)
+  (head (tail (tail (nth profile 4)))))
+
+(define full-total (reduce add (list
+  (full-cands p01) (full-cands p02) (full-cands p03) (full-cands p04) (full-cands p05)
+  (full-cands p06) (full-cands p07) (full-cands p08) (full-cands p09) (full-cands p10)
+  (full-cands p11) (full-cands p12) (full-cands p13) (full-cands p14) (full-cands p15))))
+
+(print (concat "Full library total:     " (to-string full-total) " candidates"))
+(print (concat "Selector total:         " (to-string selected-total) " candidates"))
+(print (concat "Reduction ratio:        " (to-string (if (> selected-total 0) (/ full-total selected-total) 0)) "x"))
+(print (concat "Tasks solved (selector): " (to-string selected-solved) "/15"))
+(print "")
+(print "Stage 0 complete.")
