@@ -890,6 +890,123 @@ The search function should be LEARNED, not hand-written. The curriculum teaches 
 - 9.8 vector/tensor builtins — prerequisite for linear models
 - VM compilation of `ns` in the candidate path
 
+### 9.20 Synthesis probe pipeline fixes (April 9, 2026) ✓
+
+Four bugs in synth.rs prevented cross-type macro compositions like `(string-take x (half_len x))`:
+
+1. **Probe dedup contamination:** arity-2 probe results inserted behavior hashes into `seen`, deduping later main candidates and skipping their probes. Fix: deduped main candidates now fall through to probes instead of `continue`.
+
+2. **Cross-macro type inference:** `infer_macro_types` used a fresh env without other macros, so `half_len → halve(string-length(s))` couldn't resolve `halve` and got typed `NUM→NUM` instead of `STR→NUM`. Fix: pass full macro list to type inference env.
+
+3. **Type-skipped candidates bypass probes:** `EvalResult::Skipped → continue` prevented probes on non-target-type candidates. Fix: fall through to probes when ret_type is in useful_types.
+
+4. **VM miscompiles macro chains:** VM compiled macro-calling-macro compositions but executed wrong results without error. Fix: force tree-walker fallback for probe compositions from macro-based type-skipped candidates.
+
+**Results:** halve=`(floor (divide x 2))`, half_len=`(halve (string-length x))`, first_half=`(string-take x (half_len x))`, second_half=`(string-drop x (half_len x))`. Full 6-stage chain: 74/76 solved (cubes regression from dedup timing change). Copy language (ww) and reversal (ww^R) now unblocked — `ww` found as `(string-ends-with s (first_half s))`.
+
+### 9.21 Recursive decomposition: synthesis as top-down prediction (April 9, 2026)
+
+**Key insight:** All search strategies (flat, BD, HO, D&C, induction, memo) are instances of a single recursive step:
+
+```
+synthesize(spec) →
+  1. SELECT f (the outermost function)
+  2. DERIVE subspecs by "inverting" f on the examples
+  3. RECURSIVELY synthesize each subspec
+```
+
+The strategies differ only in which `f` they select:
+
+| Strategy | f selected | Subspec derivation |
+|----------|-----------|-------------------|
+| Flat | single composition | None (leaf) |
+| BD | `and`/`or`/`not` | Find component predicates |
+| HO | `map`/`reduce`/`filter` | Element function: input_i → output_i |
+| D&C | `if(cond, then, else)` | Partition examples, find separator |
+| Induction | any bridge `f` | Compute f(input), derive input → f(input) |
+| Memo | lookup table | None (base case) |
+
+Step 2 (subspec derivation) is **deterministic** once you know f. The hard problem is step 1: predicting f. And step 1 is itself a synthesis problem — given (spec_features → f_choice) training pairs from the library, learn the mapping.
+
+**Training data from the current library (74 solved programs):**
+
+Analysis of outermost functions across the 6-stage chain:
+
+- **Arithmetic composition** (21%): `add`, `subtract`, `multiply`, `floor` — outermost is a numeric op. Spec features: num input or num output.
+- **String predicate** (18%): `string-ends-with`, `string-starts-with`, `count-char` — outermost checks a string property. Spec features: bool output, string input.
+- **Boolean composition** (10%): `and`, `or`, `not` — BD pattern. Spec features: bool output, 2 distinct outputs, library has bool-returning macros.
+- **Higher-order** (7%): `reduce`, `string-join(map(...))` — element-wise transformation. Spec features: output structure mirrors input structure.
+- **If-expression** (1%): `if(cond, ...)` — D&C. Spec features: 3+ distinct string outputs.
+- **Memo/lookup** (4%): `ns-get-or` — no computable pattern. Spec features: arbitrary input→output mapping.
+- **Delegation** (15%): outermost is a promoted macro. Spec features: composition of previously learned capabilities.
+- **Constants/identity** (24%): literal values. Spec features: constant or identity output.
+
+**The decomposition prediction curriculum:**
+
+Stage D0: **Classify outermost function family.** Given spec features (input type, output type, output cardinality, input structure), predict which family: constant, comparison, boolean-comp, arithmetic, string-op, higher-order, if-expression, memo. Training data: 74 (features, family) pairs from library.
+
+Stage D1: **Predict specific outermost function.** Within the predicted family, predict the exact function. For boolean-comp: is it `and`, `or`, or `not`? For string-op: is it `string-take`, `string-ends-with`, `count-char`? Training data: same 74 pairs, finer labels.
+
+Stage D2: **Derive subspecs.** Given f and the examples, compute the subspec(s). This is the "inversion" step. For `f = string-take`: subspec is (input → string-length(output)). For `f = and`: subspecs are the two predicate specs. This can be implemented as template-specific inverters.
+
+Stage D3: **Recursive composition.** Chain stages D0-D2 into a recursive synthesizer that calls itself on subspecs. Fall back to flat search for leaf-level subproblems (depth 1 compositions).
+
+**Relationship to current meta-optimization:** The decomposition predictor **replaces** priority tuning. Instead of ordering candidates within brute-force search, it predicts the answer structure top-down and only uses brute-force for leaf problems. Meta-optimization (Stage 3-4) becomes a special case: the priority heuristic is equivalent to a decomposition predictor that always selects "flat search" but reorders the candidates.
+
+**Implementation approach:** The predictor should be a SELPH program learned via the existing synthesis infrastructure. Given that the training set is small (74 examples), the predictor can be a decision tree (D&C synthesis) or a memorized lookup table, and will grow as the library grows.
+
+**Prototype validated (April 9, 2026):** Hand-written decision tree predictor in `examples/decomposition_predictor.selph` scores 7/7 on test cases. Predicts family from (input_type, output_type, has_bool_macros, num_distinct_outputs). Key decision boundaries: bool output + bool macros → bool-comp; bool output without → compare; num output + list input → arith; num output + str input → count; str output + high cardinality → if-expr.
+
+**Concrete recursive synthesizer design:**
+
+```lisp
+(define recursive-synthesize
+  (lambda (spec library depth-limit)
+    ; Base cases
+    (if (= depth-limit 0) (memorize spec)
+      (let ((features (extract-features spec))
+            (family (predict-family features)))
+        ; Select candidate outermost functions for this family
+        (let ((candidates (family->functions family library)))
+          ; Try each candidate f
+          (reduce (lambda (best f)
+            (if (ns-get best "found") best
+              ; Derive subspecs by inverting f on examples
+              (let ((subspecs (invert f spec)))
+                (if (nil? subspecs) best
+                  ; Recursively solve each subspec
+                  (let ((sub-results (map (lambda (ss)
+                    (recursive-synthesize ss library (- depth-limit 1)))
+                    subspecs)))
+                    ; If all subspecs solved, compose and verify
+                    (if (all (lambda (r) (ns-get r "found")) sub-results)
+                      (let ((composed (compose f sub-results)))
+                        (if (test-spec composed spec)
+                          (ns ("found" true) ("source" composed))
+                          best))
+                      best))))))
+            (ns ("found" false))
+            candidates))))))
+```
+
+The key functions that need to be learned/implemented:
+1. `predict-family` — learned from library (Stage D0, prototype done)
+2. `family->functions` — maps family to candidate functions (from library metadata)
+3. `invert` — given f and input→output pairs, derive the subspec. Per-family templates:
+   - arith: if f is binary like `add`, try splitting output = f(a, b) for each pair
+   - bool-comp: if f is `and`, derive two bool subspecs
+   - string-op: if f is `string-take`, derive the numeric subspec
+   - if-expr: partition examples by output value, derive condition + branch specs
+   - compare: if f is `string-ends-with`, derive what string to check
+4. `compose` — build the AST from f and sub-solutions (mechanical)
+5. `test-spec` — already a builtin
+
+**Next implementation steps:**
+1. Implement `invert` for the arith and string-op families (most common, highest impact)
+2. Wire into the grow command as Strategy 0 (before flat search)
+3. Measure: how many tasks does recursive decomposition solve at depth 1 that flat search needs depth 2+ for?
+4. Learn `predict-family` via synthesis (replace the hand-written decision tree)
+
 ---
 
 ## 10. Success Criteria

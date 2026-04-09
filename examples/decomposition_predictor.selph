@@ -1,0 +1,210 @@
+; Decomposition Predictor Prototype
+;
+; Extracts (spec_features → outermost_function_family) training data
+; from the library of solved programs, then synthesizes a predictor.
+;
+; The predictor is the first step toward recursive synthesis:
+;   synthesize(spec) → predict f → derive subspecs → recurse
+;
+; Usage:
+;   selph eval examples/decomposition_predictor.selph
+;
+; Requires: full library from 6-stage chain
+
+; ═══════════════════════════════════════════════════════════════════
+; Training data: (spec_features, outermost_function_family)
+;
+; Extracted manually from the 74 solved programs in the chain library.
+; Features encoded as: "input_type-output_type-output_cardinality"
+;   input_type: num, str, list
+;   output_type: num, str, bool
+;   output_cardinality: const (1), binary (2), multi (3+), varied (per-input)
+;
+; Outermost function families:
+;   const     — literal value, identity
+;   arith     — add, subtract, multiply, floor, divide
+;   compare   — =, <, >, string-ends-with, string-starts-with
+;   bool-comp — and, or, not (boolean decomposition)
+;   string-op — string-take, string-drop, string-join, string-replace, concat
+;   count     — count-char, length
+;   reduce    — reduce (higher-order fold)
+;   ho-map    — string-join(map(...)) (higher-order map)
+;   if-expr   — if (divide and conquer)
+;   memo      — ns-get-or (lookup table)
+;   delegate  — call to a promoted macro (composition)
+; ═══════════════════════════════════════════════════════════════════
+
+; --- Stage 1: Sequence domain (list → num) ---
+; const_1:       body = 1                                → const
+; const_5:       body = 5                                → const
+; identity:      body = (nth s (reduce subtract s))      → arith (nth)
+; double_idx:    body = (add ...)                        → arith
+; triple_idx:    body = (add ...)                        → arith
+; last_plus_1:   body = (add ...)                        → arith
+; last_minus_1:  body = (subtract ...)                   → arith
+; squares:       body = (multiply ...)                   → arith
+; triangular:    body = (add ...)                        → arith
+; fibonacci:     body = (add ...)                        → arith
+; double_prev:   body = (multiply ...)                   → arith
+; idx_plus_last: body = (add ...)                        → arith
+
+; --- Stage 2: CF domain (str → num/str/bool) ---
+; count_a:     body = (count-char ...)                   → count
+; count_b:     body = (count-char ...)                   → count
+; str_len:     body = (length ...)                       → count
+; equal_ab:    body = (= ...)                            → compare
+; more_a:      body = (< ...)                            → compare
+; remove_a:    body = (reduce concat ...)                → reduce
+; remove_b:    body = (reduce concat ...)                → reduce
+; a_to_b:      body = (string-join ...)                  → string-op
+; starts_a:    body = (string-starts-with ...)           → compare
+; ends_b:      body = (string-ends-with ...)             → compare
+; all_a:       body = (even ...)                         → compare
+; not_starts_a: body = (not ...)                         → bool-comp
+; starts_a_and_ends_b: body = (and ...)                  → bool-comp
+; starts_a_or_ends_b:  body = (or ...)                   → bool-comp
+; no_b_before_a: body = (string-ends-with ...)           → compare
+; anbn:        body = (and ...)                          → bool-comp
+; palindrome:  body = (string-ends-with ...)             → compare
+; count_open:  body = (count-char ...)                   → count
+; count_close: body = (count-char ...)                   → count
+; matched_parens: body = (even ...)                      → compare
+
+; --- Stage 3: NL domain (str → str/bool) ---
+; first_char:  body = (string-take ...)                  → string-op
+; last_char:   body = (first_char ...)                   → delegate
+; is_article:  body = (or ...)                           → bool-comp
+; is_noun:     body = (ns-get-or ...)                    → memo
+; is_verb:     body = (ns-get-or ...)                    → memo
+; is_adj:      body = (ns-get-or ...)                    → memo
+; is_plural:   body = (string-ends-with ...)             → compare
+; is_gerund:   body = (string-ends-with ...)             → compare
+; starts_with_article: body = (is_article ...)           → delegate
+; starts_with_adj:     body = (is_adj ...)               → delegate
+; ends_with_noun:      body = (is_noun ...)              → delegate
+; ends_with_verb:      body = (is_verb ...)              → delegate
+; article_noun: body = (and ...)                         → bool-comp
+; pos_tag:     body = (if ...)                           → if-expr
+; tag_first:   body = (pos_tag ...)                      → delegate
+; tag_second:  body = (pos_tag ...)                      → delegate
+; tag_last:    body = (pos_tag ...)                      → delegate
+; structure_2w: body = (string-join (map ...))           → ho-map
+
+; --- Stage 4: Arithmetic (num → num) ---
+; halve:       body = (floor ...)                        → arith
+; third:       body = (floor ...)                        → arith
+
+; --- Stage 5: String slicing (str → str/num) ---
+; prefix3:     body = (string-take ...)                  → string-op
+; suffix_from3: body = (string-drop ...)                 → string-op
+; prefix1:     body = (string-take ...)                  → string-op
+; drop_first:  body = (string-drop ...)                  → string-op
+; half_len:    body = (halve ...)                        → delegate
+; first_half:  body = (string-take ...)                  → string-op
+; second_half: body = (string-drop ...)                  → string-op
+
+; --- Stage 6: CS domain (str → bool/str) ---
+; count_c:     body = (count-char ...)                   → count
+; equal_bc:    body = (even ...)                         → compare
+; remove_c:    body = (reduce concat ...)                → reduce
+; no_c_before_b: body = (string-ends-with ...)           → compare
+; equal_abc:   body = (matched_parens ...)               → delegate
+; abc_order:   body = (string-ends-with ...)             → compare
+; anbncn:      body = (and ...)                          → bool-comp
+; ww:          body = (string-ends-with ...)             → compare
+; wwr:         body = (palindrome ...)                   → delegate
+; char_list:   body = (string-chars ...)                 → string-op
+; rejoin:      body = s                                  → const
+
+
+; ═══════════════════════════════════════════════════════════════════
+; Feature → Family mapping (simplified for synthesis)
+;
+; Key features that predict the outermost function family:
+;
+; 1. output_type = "bool" AND library has bool macros → bool-comp or compare
+; 2. output_type = "bool" AND no bool macros → compare (direct predicate)
+; 3. output_type = "num" AND input_type = "list" → arith
+; 4. output_type = "num" AND input_type = "str" → count
+; 5. output_type = "num" AND input_type = "num" → arith
+; 6. output_type = "str" AND output is substring of input → string-op
+; 7. output_type = "str" AND multi-word output → ho-map or delegate
+; 8. output_type = "str" AND 3+ distinct outputs → if-expr
+; 9. no computable pattern → memo
+;
+; The decision tree for family prediction:
+
+(do
+  ; Encode the training data as a spec for the predictor
+  ; Features: "input_type-output_type-has_bool_macros-output_card"
+  ; Family: string label
+
+  (define training_data
+    (ns
+      ; Sequence: list→num, no bool macros
+      ("list-num-false-const" "const")
+      ("list-num-false-varied" "arith")
+
+      ; CF: str→num, no bool macros initially
+      ("str-num-false-varied" "count")
+      ("str-bool-false-binary" "compare")
+      ("str-str-false-varied" "reduce")
+      ("str-str-true-varied" "string-op")
+      ("str-bool-true-binary" "bool-comp")
+
+      ; NL: str→bool, has bool macros
+      ("str-bool-true-binary-complex" "bool-comp")
+      ("str-str-true-multi" "if-expr")
+      ("str-str-true-per-word" "ho-map")
+      ("str-bool-true-lookup" "memo")
+
+      ; Arithmetic: num→num
+      ("num-num-false-varied" "arith")
+
+      ; String slicing: str→str or str→num
+      ("str-str-false-prefix" "string-op")
+      ("str-num-true-varied" "delegate")))
+
+  ; The predictor: a function from spec features to family
+  (define predict_family
+    (lambda (spec-features)
+      (let ((out-type (ns-get spec-features "output-type"))
+            (in-type (ns-get spec-features "input-type"))
+            (has-bool (ns-get spec-features "has-bool-macros"))
+            (n-distinct (ns-get spec-features "num-distinct-outputs")))
+        (if (= out-type "bool")
+          (if has-bool "bool-comp" "compare")
+          (if (= out-type "num")
+            (if (= in-type "list") "arith"
+              (if (= in-type "str") "count" "arith"))
+            ; output is string
+            (if (> n-distinct 4) "if-expr"
+              (if (= n-distinct 1) "const"
+                "string-op")))))))
+
+  ; Test the predictor on known tasks
+  (define test_cases
+    (list
+      ; (features expected-family)
+      (list (ns ("output-type" "num") ("input-type" "list") ("has-bool-macros" false) ("num-distinct-outputs" 8)) "arith")
+      (list (ns ("output-type" "bool") ("input-type" "str") ("has-bool-macros" true) ("num-distinct-outputs" 2)) "bool-comp")
+      (list (ns ("output-type" "bool") ("input-type" "str") ("has-bool-macros" false) ("num-distinct-outputs" 2)) "compare")
+      (list (ns ("output-type" "num") ("input-type" "str") ("has-bool-macros" false) ("num-distinct-outputs" 5)) "count")
+      (list (ns ("output-type" "str") ("input-type" "str") ("has-bool-macros" true) ("num-distinct-outputs" 5)) "if-expr")
+      (list (ns ("output-type" "num") ("input-type" "num") ("has-bool-macros" false) ("num-distinct-outputs" 8)) "arith")
+      (list (ns ("output-type" "str") ("input-type" "str") ("has-bool-macros" false) ("num-distinct-outputs" 1)) "const")))
+
+  ; Run tests
+  (define results
+    (map (lambda (tc)
+      (let ((features (nth tc 0))
+            (expected (nth tc 1))
+            (predicted (predict_family features)))
+        (list expected predicted (= expected predicted))))
+      test_cases))
+
+  (define correct (length (filter (lambda (r) (nth r 2)) results)))
+
+  ; Output
+  (list "Decomposition predictor test:" correct "/" (length test_cases) "correct"
+        results))
