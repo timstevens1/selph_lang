@@ -833,8 +833,60 @@ With 55-task chained curriculum validated and meta-optimization Stage 3 complete
 - ~~`dispatch` builtin~~ ✓ — Special form in eval that looks up a macro by name (string) and applies it. Registered as arity-2 synth component (STR, ANY) → ANY. Enables instruction-following: `(dispatch (first_word x) (last_word x))` found in 1574 cand with clean macros. See §9.18.
 - ~~Instruction-following curriculum~~ ✓ (partial) — Three files: `instruction_ops.selph` (pure operations), `instruction_dispatch.selph` (dispatch tasks), `instruction_tasks.selph` (combined). Two-stage pipeline validated. Dispatch works with simple macros but complex promoted macros (e.g., `string-join(reverse(string-chars x), "")`) fail in dispatch env due to incomplete macro propagation. See §9.18.
 
+**Completed (April 8, 2026 — meta-learning session):**
+
+- ~~Meta-learning unification~~ ✓ — Search builtins for SELPH-programmable search functions:
+  - `test-spec` builtin: `(test-spec candidate spec) → match-fraction` — test any candidate function against a spec
+  - `memorize` builtin: `(memorize spec) → namespace` — returns data as a namespace (not a lambda), composable in the library tree
+  - `synthesize` extended: accepts library as namespace tree, source string, or list. Data namespaces automatically become depth-0 synthesis atoms.
+  - `ns-get` and `ns-get-or` registered as synthesis components — enables `(ns-get vocab x)` compositions
+  - Namespace values emitted as Symbol nodes for env resolution (was String literal — the root cause of data-driven synthesis failure)
+  - Libraries as first-class namespace trees with subtree selection: `(ns-get library "math")` selects a sub-library
+
+- ~~Domain isolation in meta-opt~~ ✓ — `all_components_available` recorded in traces, per-task component filtering during meta-opt evaluation. Seq tasks see 67 components instead of 171.
+
+- ~~Input awareness~~ ✓ — 5 new TaskContext fields: `avg-input-len`, `has-spaces`, `max-num-value`, `output-is-bool`, `num-distinct-outputs`. CTX_FIELDS expanded from 7 to 13 (including `usage-count`).
+
+- ~~Online learning~~ ✓ — `comp_priority_boost` vector updated between depths from `comp_best_match`. New `comp_warm_bonus` RL coefficient (default 15.0).
+
+- ~~`usage-count` in heuristic context~~ ✓ — SynthComponent tracks how many prior tasks used it. Heuristic can learn `(add priority (multiply usage-count K))` instead of hard-coded +50. Priority accumulation skipped when heuristic is loaded.
+
+- ~~`--skip-stage3` flag~~ ✓ — Skip hand-crafted heuristic evaluation, go straight to Stage 4. Baseline stats from traces (no synthesis needed).
+
+**Key result: search function as a SELPH program.** A working search function in SELPH that orchestrates synthesis + memorization:
+```lisp
+(lambda (spec library)
+  (let ((r (synthesize (ns ("spec" spec) ("library" library) ("max-candidates" 5000)))))
+    (if (ns-get r "found") r
+      (let ((data (memorize spec))
+            (enriched (ns-put library "data" data))
+            (r2 (synthesize (ns ("spec" spec) ("library" enriched) ("max-candidates" 10000)))))
+        r2))))
+```
+This composes flat synthesis with data-driven memorization — `memorize` creates a data namespace, adds it to the library, and synthesis finds `(ns-get data x)` in 4331 candidates.
+
+### 9.19 Search function curriculum (next steps)
+
+The search function should be LEARNED, not hand-written. The curriculum teaches it progressively:
+
+**Stage 0: Library traversal.** Given a library tree with multiple subtrees and a task, learn which subtree to pass to `synthesize`. The optimization objective: minimize candidates. Tasks where the full library causes explosion but the correct subtree solves quickly.
+
+**Stage 1: Data-driven search.** Tasks where flat synthesis fails but memorize + re-synthesize works. Learn the pattern: try flat → memorize → enrich library → re-synthesize.
+
+**Stage 2: Boolean decomposition as SELPH.** Express BD as a search function: enumerate boolean predicates from library, try `(and P Q)`, `(or P Q)`, `(not P)` compositions, test with `test-spec`. This is learnable because the primitives (`test-spec`, `ns-keys`, `filter`) exist.
+
+**Stage 3: Divide and conquer as SELPH.** Partition examples by output value, synthesize per-partition, compose with `if`. Requires: a `partition` or `group-by` builtin, and the ability to construct if-expressions from synthesized sub-programs.
+
+**Stage 4: Budget/strategy allocation.** Given a task, allocate budget across strategies. Learn from traces which strategy families work for which task features.
+
+**Stage 5: Self-optimization.** The search function's objective is expressible as an `opt-task`: minimize total candidates across a task suite. The search function optimizes itself.
+
+**Prerequisites for the curriculum:**
+- `bool-decompose` expressible in SELPH (needs library introspection)
+- `group-by` or `partition` builtin for D&C
+- Traces as SELPH-readable data (for self-optimization)
+
 **Lower priority (infrastructure):**
-- Fix the `synthesize` builtin's `:library` extraction for defmacro-captured macros
 - 9.8 vector/tensor builtins — prerequisite for linear models
 - VM compilation of `ns` in the candidate path
 
