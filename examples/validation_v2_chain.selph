@@ -30,13 +30,24 @@
 ;  10. Induction strategy: two-step pipeline solved by probing for an
 ;      intermediate value sequence and sub-synthesizing each half.
 ;
+;  11. RD strategy: family-prediction + outermost-function inversion.
+;      Solves `x → x*(x+1)` with max-depth=1: flat alone can't construct
+;      the depth-2 expression `(add x (multiply x x))` (or its multiply
+;      equivalent) at that depth, but RD's binary-arithmetic inversion
+;      derives a depth-1 sub-spec (k = output - input) and sub-synthesizes
+;      `(multiply x x)` at depth 1, then composes the outer add for free.
+;  12. RD via library bridge: solves `(string-upper (wrap x))` where `wrap`
+;      is a unary library function. RD's library-decomposition phase
+;      probes each unary library function as an inner bridge, then
+;      sub-synthesizes the outer `string-upper` against the bridged
+;      intermediates.
+;
 ; What it does NOT cover (deferred work):
 ;
-;   - RD strategy (Flat + BD + HO + D&C + Induction + Memo are
-;     wired up so far).
 ;   - synthesize-optimize (still stubbed).
 ;   - The legacy `library` ns field (eval_v2 uses env auto-discovery).
 ;   - Auto-extraction of literal constants from examples.
+;   - Learned RD predictor (hand-coded family decision tree only).
 ;
 ; Each task line prints:
 ;   PASS <name>  via <strategy>  cand=<n>  source=<...>
@@ -245,6 +256,50 @@
   ("max-candidates" 5000))))
 
 (check-task "len-minus-2" true "IN" t-in)
+
+; ── Task 11: RD — binary arithmetic inversion ──────────────────────
+;
+; Target: x → x * (x + 1). At max-depth=1, flat can only enumerate
+; depth-1 compositions: `(multiply x x)`, `(add x k)`, etc. None of
+; these match the spec — the answer is a depth-2 expression. RD's
+; arithmetic family inversion derives a sub-spec by inverting `add`
+; (k = output - input = [1, 4, 9, 16, 25] = x²) and sub-synthesizes
+; `(multiply x x)` at depth 1, then composes
+; `(lambda (x) (add x (multiply x x)))` — a depth-2 expression — for free.
+
+(define t-rd-arith (synthesize (ns
+  ("spec" (list
+    (list 1 2)
+    (list 2 6)
+    (list 3 12)
+    (list 4 20)
+    (list 5 30)))
+  ("max-depth" 1)
+  ("max-candidates" 5000))))
+
+(check-task "rd-mul-succ" true "RD" t-rd-arith)
+
+; ── Task 12: RD — library function as bridge ───────────────────────
+;
+; Define `wrap` (a unary library function with no primitive equivalent)
+; and ask for `(string-upper (wrap x))`. With max-depth=1, neither flat
+; alone nor RD's binary-arithmetic inversion can reach the answer:
+; flat depth-1 candidates are atomic (`(wrap x)`, `(string-upper x)`,
+; `(concat x x)`, etc.) and none match. RD's library-decomposition phase
+; probes `wrap` as an inner bridge, computes intermediates `["[hi]",
+; "[abc]", "[world]"]`, sub-synthesizes the outer `string-upper`, and
+; substitutes the bridge into the body to produce `(lambda (x)
+; (string-upper (wrap x)))`.
+
+(define t-rd-bridge (synthesize (ns
+  ("spec" (list
+    (list "hi"    "[HI]")
+    (list "abc"   "[ABC]")
+    (list "world" "[WORLD]")))
+  ("max-depth" 1)
+  ("max-candidates" 5000))))
+
+(check-task "rd-bridge-wrap" true "RD" t-rd-bridge)
 
 (print "")
 (print "validation complete")

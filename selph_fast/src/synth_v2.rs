@@ -1062,18 +1062,19 @@ pub fn default_skip_set() -> HashSet<Sym> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
     Flat,
+    RecursiveDecomposition,
     BoolDecomp,
     HigherOrder,
     DivideConquer,
     Induction,
     Memo,
-    // Future: RecursiveDecomposition.
 }
 
 impl Strategy {
     pub fn name(&self) -> &'static str {
         match self {
             Strategy::Flat => "Flat",
+            Strategy::RecursiveDecomposition => "RD",
             Strategy::BoolDecomp => "BD",
             Strategy::HigherOrder => "HO",
             Strategy::DivideConquer => "D&C",
@@ -2725,6 +2726,1709 @@ fn induce_compose_steps(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Recursive Decomposition (§9.27.6)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Top-down family prediction → outermost-function inversion → recursive
+// sub-synthesis. The legacy entry point is `recursive_decompose.rs::
+// try_recursive_decomposition`. This is the synth_v2 port: same algorithm,
+// retyped against types_v2/eval_v2 and the env-as-library convention.
+//
+// Differences from the legacy module:
+//
+//   1. **The `macros` parameter is gone.** Library functions live in
+//      `env` as `Value::Function` entries. Where the legacy code walked
+//      a `Vec<(name, params, nodes, root)>`, the v2 port walks
+//      `env.top_scope()` filtered to `Value::Function` with the right arity.
+//
+//   2. **Builtin invocation goes through env + eval_v2::apply.** The legacy
+//      code calls `eval::apply_builtin(intern(name), args)` directly. The
+//      v2 port does `env.lookup(intern(name))` to get a `Value::Builtin(_)`
+//      and `eval_v2::apply` to invoke it. Same semantics, fewer special cases.
+//
+//   3. **Int vs Num is now distinct.** Inversion helpers that the legacy
+//      module produced as `Value::Num(f64)` now check whether the result
+//      is integral and produce `Value::Int(_)` when it is. This matches
+//      the synth_v2 component catalog (which is biased toward Int) so
+//      sub-synthesis can find Int literals in the atom pool.
+//
+//   4. **Map/filter/if delegate to existing v2 strategies.** The legacy
+//      RD module includes its own list-map, split-map-join, list-filter,
+//      and divide-and-conquer paths. synth_v2 has `higher_order_decompose`
+//      and `divide_and_conquer` already. Where the legacy `try_single_function`
+//      branches into one of these families, the v2 port routes to the
+//      existing strategy and returns its result tagged as RD.
+//
+//   5. **`LearnedPredictor` is dropped.** Family prediction uses only the
+//      hand-coded decision tree. The learned-predictor scaffolding requires
+//      parser + SELPH-script integration through the new core, which is
+//      its own future work.
+//
+// What stays the same:
+//   - Family classification from spec features (input/output type, distinct
+//     output count, has-bool-library probe, output-is-substring probe)
+//   - Per-family candidate function lists
+//   - Inversion helpers for binary/unary arithmetic, string-take/drop,
+//     concat, count-char, and unary string ops
+//   - Generic binary inversion via constant probing
+//   - Library-function decomposition (f∘m_lib and m_lib∘g paths)
+//   - Recursive sub-synthesis (RD's main contribution: find a sub-spec
+//     that's easier to synthesize than the original)
+
+/// Function families used by RD's outermost-function prediction. The
+/// family determines which inversion helpers and candidate functions
+/// `rd_try_single_function` will attempt.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RdFamily {
+    Constant,
+    Arithmetic,
+    Compare,
+    BoolComp,
+    StringOp,
+    Count,
+    HigherOrder,
+    IfExpr,
+}
+
+/// Compact summary of a synthesis spec used by RD for family prediction.
+struct RdSpecFeatures {
+    /// "int", "num", "str", "list", or "unknown" — type of the first input.
+    input_type: &'static str,
+    /// "int", "num", "str", "bool", or "unknown" — uniform output type.
+    output_type: &'static str,
+    /// Number of distinct expected outputs (capped by caller).
+    num_distinct_outputs: usize,
+    /// True if any unary library function in env returns Bool on inputs[0].
+    has_bool_lib: bool,
+    /// True if every output is a substring of its corresponding input.
+    /// Strong signal for string-take / string-drop / string-replace.
+    output_is_substring: bool,
+}
+
+/// A derived sub-synthesis problem produced by inverting an outermost
+/// function on the original examples.
+struct RdSubSpec {
+    inputs: Vec<Value>,
+    expected: Vec<Value>,
+}
+
+/// Internal RD result type. Mirrors the legacy `RecursiveDecompResult`
+/// but uses synth_v2 conventions (Vec<Node> + root index).
+struct RdResult {
+    found: bool,
+    nodes: Vec<Node>,
+    root: usize,
+    candidates_explored: usize,
+}
+
+impl RdResult {
+    fn empty() -> Self {
+        Self { found: false, nodes: Vec::new(), root: 0, candidates_explored: 0 }
+    }
+}
+
+/// Default RD recursion depth (how many levels of decomposition to try
+/// before forcing flat sub-synthesis).
+const RD_DEFAULT_DEPTH: usize = 2;
+
+// ── Numeric helpers ────────────────────────────────────────────────────────
+
+/// Extract a numeric value as f64 regardless of Int vs Num variant.
+fn rd_to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Num(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// Wrap a derived numeric value, preferring `Int` when integral. The
+/// preference for Int matches synth_v2's biased catalog: Int literals
+/// are in the atom pool and the subtype rule lets them flow into Num
+/// slots. Non-integral values go to Num.
+fn rd_num_value(n: f64) -> Value {
+    if n.is_finite() && (n - n.round()).abs() < 1e-9 && n.abs() < (i64::MAX as f64) {
+        Value::Int(n.round() as i64)
+    } else {
+        Value::Num(n)
+    }
+}
+
+// ── Spec features and family prediction ────────────────────────────────────
+
+/// Extract spec features for family prediction. Probes env for unary
+/// library functions returning Bool to compute `has_bool_lib`.
+fn rd_extract_features(
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+) -> RdSpecFeatures {
+    let input_type = match inputs.first() {
+        Some(Value::Int(_)) => "int",
+        Some(Value::Num(_)) => "num",
+        Some(Value::Str(_)) => "str",
+        Some(Value::List(_)) => "list",
+        _ => "unknown",
+    };
+    let output_type = if expected.iter().all(|v| matches!(v, Value::Bool(_))) {
+        "bool"
+    } else if expected.iter().all(|v| matches!(v, Value::Int(_))) {
+        "int"
+    } else if expected.iter().all(|v| matches!(v, Value::Int(_) | Value::Num(_))) {
+        "num"
+    } else if expected.iter().all(|v| matches!(v, Value::Str(_))) {
+        "str"
+    } else {
+        "unknown"
+    };
+
+    let mut keys: Vec<u64> = expected.iter().map(val_hash).collect();
+    keys.sort();
+    keys.dedup();
+    let num_distinct_outputs = keys.len();
+
+    // Probe library functions for has_bool_lib. Walk env's top scope and
+    // try each unary Function on inputs[0]; if any returns a Bool, set
+    // the flag. Builtins live in the bottom scope and are skipped.
+    let has_bool_lib = if let Some(first_input) = inputs.first() {
+        let entries: Vec<Value> = {
+            let scope = env.top_scope();
+            scope
+                .values()
+                .filter(|v| matches!(v, Value::Function(fd) if fd.params.len() == 1))
+                .cloned()
+                .collect()
+        };
+        entries.iter().any(|fv| {
+            matches!(
+                eval_v2::apply(fv, std::slice::from_ref(first_input), env),
+                Ok(Value::Bool(_))
+            )
+        })
+    } else {
+        false
+    };
+
+    let output_is_substring = input_type == "str"
+        && output_type == "str"
+        && inputs.iter().zip(expected.iter()).all(|(i, e)| {
+            if let (Value::Str(si), Value::Str(se)) = (i, e) {
+                si.as_ref().contains(se.as_ref())
+            } else {
+                false
+            }
+        });
+
+    RdSpecFeatures {
+        input_type,
+        output_type,
+        num_distinct_outputs,
+        has_bool_lib,
+        output_is_substring,
+    }
+}
+
+/// Hand-coded family prediction. Decision tree from the legacy
+/// `predict_family` — same logic, with the int/num split exposed.
+fn rd_predict_family(features: &RdSpecFeatures) -> RdFamily {
+    if features.output_type == "bool" {
+        if features.has_bool_lib {
+            RdFamily::BoolComp
+        } else {
+            RdFamily::Compare
+        }
+    } else if features.output_type == "num" || features.output_type == "int" {
+        if features.input_type == "list" {
+            RdFamily::Arithmetic
+        } else if features.input_type == "str" {
+            RdFamily::Count
+        } else {
+            RdFamily::Arithmetic
+        }
+    } else if features.output_type == "str" {
+        if features.output_is_substring {
+            RdFamily::StringOp
+        } else if features.num_distinct_outputs > 4 {
+            RdFamily::IfExpr
+        } else if features.num_distinct_outputs == 1 {
+            RdFamily::Constant
+        } else {
+            RdFamily::StringOp
+        }
+    } else {
+        RdFamily::Arithmetic
+    }
+}
+
+/// Per-family list of candidate outermost function names.
+fn rd_family_candidates(family: RdFamily, features: &RdSpecFeatures) -> Vec<&'static str> {
+    match family {
+        RdFamily::Arithmetic => {
+            vec!["add", "subtract", "multiply", "negate", "abs", "divide", "modulo"]
+        }
+        RdFamily::Count => vec!["string-length", "count-char"],
+        RdFamily::Compare => vec![
+            "string-ends-with",
+            "string-starts-with",
+            "even",
+            "odd",
+        ],
+        RdFamily::BoolComp => vec!["and", "or", "not"],
+        RdFamily::StringOp => {
+            if features.output_is_substring {
+                vec![
+                    "string-take",
+                    "string-drop",
+                    "string-replace",
+                    "string-upper",
+                    "string-lower",
+                    "string-reverse",
+                    "string-trim",
+                    "concat",
+                ]
+            } else {
+                vec![
+                    "concat",
+                    "string-replace",
+                    "string-upper",
+                    "string-lower",
+                    "string-reverse",
+                    "string-trim",
+                    "string-take",
+                    "string-drop",
+                ]
+            }
+        }
+        RdFamily::Constant => vec![],
+        RdFamily::HigherOrder => vec!["map", "filter"],
+        RdFamily::IfExpr => vec!["if"],
+    }
+}
+
+/// Secondary family candidates to try after the primary family fails.
+/// Catches cross-family solutions (e.g. predicted arithmetic but actual
+/// solution involves string-length).
+fn rd_secondary_candidates(primary: RdFamily, features: &RdSpecFeatures) -> Vec<&'static str> {
+    match primary {
+        RdFamily::Arithmetic if features.input_type == "str" => {
+            vec!["string-length", "count-char"]
+        }
+        RdFamily::StringOp => vec!["string-length"],
+        _ => vec![],
+    }
+}
+
+// ── Inversion helpers ──────────────────────────────────────────────────────
+
+/// Invert `f(input, k) = output` for binary arithmetic. Returns the
+/// per-example k values as a sub-spec for synthesis.
+fn rd_invert_binary_arith(
+    fn_name: &str,
+    inputs: &[Value],
+    expected: &[Value],
+) -> Option<RdSubSpec> {
+    let nums_in: Vec<f64> = inputs.iter().filter_map(rd_to_f64).collect();
+    let nums_out: Vec<f64> = expected.iter().filter_map(rd_to_f64).collect();
+    if nums_in.len() != inputs.len() || nums_out.len() != expected.len() {
+        return None;
+    }
+    let derived: Option<Vec<f64>> = match fn_name {
+        "add" => Some(
+            nums_in
+                .iter()
+                .zip(nums_out.iter())
+                .map(|(i, o)| o - i)
+                .collect(),
+        ),
+        "subtract" => Some(
+            nums_in
+                .iter()
+                .zip(nums_out.iter())
+                .map(|(i, o)| i - o)
+                .collect(),
+        ),
+        "multiply" => nums_in
+            .iter()
+            .zip(nums_out.iter())
+            .map(|(i, o)| if *i != 0.0 { Some(o / i) } else { None })
+            .collect(),
+        "divide" => nums_in
+            .iter()
+            .zip(nums_out.iter())
+            .map(|(i, o)| if *o != 0.0 { Some(i / o) } else { None })
+            .collect(),
+        _ => return None,
+    };
+    let k_values = derived?;
+    Some(RdSubSpec {
+        inputs: inputs.to_vec(),
+        expected: k_values.into_iter().map(rd_num_value).collect(),
+    })
+}
+
+/// Invert `f(k, input) = output` (reversed arg order) for binary arithmetic.
+fn rd_invert_binary_arith_reversed(
+    fn_name: &str,
+    inputs: &[Value],
+    expected: &[Value],
+) -> Option<RdSubSpec> {
+    let nums_in: Vec<f64> = inputs.iter().filter_map(rd_to_f64).collect();
+    let nums_out: Vec<f64> = expected.iter().filter_map(rd_to_f64).collect();
+    if nums_in.len() != inputs.len() || nums_out.len() != expected.len() {
+        return None;
+    }
+    let derived: Option<Vec<f64>> = match fn_name {
+        "add" => Some(
+            nums_in
+                .iter()
+                .zip(nums_out.iter())
+                .map(|(i, o)| o - i)
+                .collect(),
+        ),
+        "subtract" => Some(
+            nums_in
+                .iter()
+                .zip(nums_out.iter())
+                .map(|(i, o)| o + i)
+                .collect(),
+        ),
+        "multiply" => nums_in
+            .iter()
+            .zip(nums_out.iter())
+            .map(|(i, o)| if *i != 0.0 { Some(o / i) } else { None })
+            .collect(),
+        "divide" => Some(
+            nums_in
+                .iter()
+                .zip(nums_out.iter())
+                .map(|(i, o)| o * i)
+                .collect(),
+        ),
+        _ => return None,
+    };
+    let k_values = derived?;
+    Some(RdSubSpec {
+        inputs: inputs.to_vec(),
+        expected: k_values.into_iter().map(rd_num_value).collect(),
+    })
+}
+
+/// Invert `f(g(x)) = output` for unary arithmetic where the inverse is
+/// well-defined (negate). Functions like abs/floor/ceil are ambiguous
+/// and not inverted here.
+fn rd_invert_unary_arith(
+    fn_name: &str,
+    inputs: &[Value],
+    expected: &[Value],
+) -> Option<RdSubSpec> {
+    let nums_out: Vec<f64> = expected.iter().filter_map(rd_to_f64).collect();
+    if nums_out.len() != expected.len() {
+        return None;
+    }
+    let sub_expected: Vec<f64> = match fn_name {
+        "negate" => nums_out.iter().map(|o| -o).collect(),
+        _ => return None,
+    };
+    Some(RdSubSpec {
+        inputs: inputs.to_vec(),
+        expected: sub_expected.into_iter().map(rd_num_value).collect(),
+    })
+}
+
+/// Invert `(string-take input k) = output` — k is the length of output
+/// when output is a prefix of input.
+fn rd_invert_string_take(inputs: &[Value], expected: &[Value]) -> Option<RdSubSpec> {
+    let mut k_values = Vec::new();
+    for (inp, out) in inputs.iter().zip(expected.iter()) {
+        if let (Value::Str(si), Value::Str(so)) = (inp, out) {
+            if si.as_ref().starts_with(so.as_ref()) {
+                k_values.push(Value::Int(so.chars().count() as i64));
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(RdSubSpec {
+        inputs: inputs.to_vec(),
+        expected: k_values,
+    })
+}
+
+/// Invert `(string-drop input k) = output` — k is len(input) - len(output)
+/// when output is a suffix of input.
+fn rd_invert_string_drop(inputs: &[Value], expected: &[Value]) -> Option<RdSubSpec> {
+    let mut k_values = Vec::new();
+    for (inp, out) in inputs.iter().zip(expected.iter()) {
+        if let (Value::Str(si), Value::Str(so)) = (inp, out) {
+            if si.as_ref().ends_with(so.as_ref()) {
+                let drop_n = si.chars().count() - so.chars().count();
+                k_values.push(Value::Int(drop_n as i64));
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(RdSubSpec {
+        inputs: inputs.to_vec(),
+        expected: k_values,
+    })
+}
+
+/// Invert `concat`: try both `(concat input k)` and `(concat k input)`.
+/// Returns a list of (subspec, reversed) pairs.
+fn rd_invert_concat(inputs: &[Value], expected: &[Value]) -> Vec<(RdSubSpec, bool)> {
+    let mut results = Vec::new();
+
+    // (concat input suffix) — derive suffix
+    let mut suffixes = Vec::new();
+    let mut valid = true;
+    for (inp, out) in inputs.iter().zip(expected.iter()) {
+        if let (Value::Str(si), Value::Str(so)) = (inp, out) {
+            if so.as_ref().starts_with(si.as_ref()) {
+                suffixes.push(Value::str(&so.as_ref()[si.as_ref().len()..]));
+            } else {
+                valid = false;
+                break;
+            }
+        } else {
+            valid = false;
+            break;
+        }
+    }
+    if valid && !suffixes.is_empty() {
+        results.push((
+            RdSubSpec { inputs: inputs.to_vec(), expected: suffixes },
+            false,
+        ));
+    }
+
+    // (concat prefix input) — derive prefix
+    let mut prefixes = Vec::new();
+    valid = true;
+    for (inp, out) in inputs.iter().zip(expected.iter()) {
+        if let (Value::Str(si), Value::Str(so)) = (inp, out) {
+            if so.as_ref().ends_with(si.as_ref()) {
+                let prefix_len = so.as_ref().len() - si.as_ref().len();
+                prefixes.push(Value::str(&so.as_ref()[..prefix_len]));
+            } else {
+                valid = false;
+                break;
+            }
+        } else {
+            valid = false;
+            break;
+        }
+    }
+    if valid && !prefixes.is_empty() {
+        results.push((
+            RdSubSpec { inputs: inputs.to_vec(), expected: prefixes },
+            true,
+        ));
+    }
+
+    results
+}
+
+/// Invert `(count-char input ch) = output` — find a character ch that
+/// counts to the expected value in every input.
+fn rd_invert_count_char(inputs: &[Value], expected: &[Value]) -> Option<RdSubSpec> {
+    let chars_to_try: Vec<char> = {
+        let mut chars: Vec<char> = Vec::new();
+        for inp in inputs {
+            if let Value::Str(s) = inp {
+                for c in s.chars() {
+                    if !chars.contains(&c) {
+                        chars.push(c);
+                    }
+                }
+            }
+        }
+        chars
+    };
+    for ch in &chars_to_try {
+        let ch_str = ch.to_string();
+        let matches = inputs.iter().zip(expected.iter()).all(|(inp, out)| {
+            let count = if let Value::Str(s) = inp {
+                s.matches(&ch_str[..]).count() as i64
+            } else {
+                return false;
+            };
+            match out {
+                Value::Int(n) => *n == count,
+                Value::Num(n) => *n == count as f64,
+                _ => false,
+            }
+        });
+        if matches {
+            return Some(RdSubSpec {
+                inputs: inputs.to_vec(),
+                expected: vec![Value::str(&ch_str); inputs.len()],
+            });
+        }
+    }
+    None
+}
+
+/// Invert unary string ops by computing the algebraic inverse on each
+/// expected output, then verifying via builtin invocation.
+fn rd_invert_unary_string(
+    fn_name: &str,
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+) -> Option<RdSubSpec> {
+    let sub_expected: Vec<Value> = expected
+        .iter()
+        .filter_map(|v| match v {
+            Value::Str(s) => match fn_name {
+                "string-upper" => Some(Value::str(&s.to_lowercase())),
+                "string-lower" => Some(Value::str(&s.to_uppercase())),
+                "string-reverse" => Some(Value::str(&s.chars().rev().collect::<String>())),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    if sub_expected.len() != expected.len() {
+        return None;
+    }
+    let f = env.lookup(intern(fn_name))?;
+    for (sub, exp) in sub_expected.iter().zip(expected.iter()) {
+        match eval_v2::apply(&f, std::slice::from_ref(sub), env) {
+            Ok(ref v) if eval_v2::values_equal(v, exp) => {}
+            _ => return None,
+        }
+    }
+    Some(RdSubSpec {
+        inputs: inputs.to_vec(),
+        expected: sub_expected,
+    })
+}
+
+// ── Composition helpers ────────────────────────────────────────────────────
+
+/// Extract the body index from a sub-solution. Sub-syntheses return
+/// `(lambda (x) body)` — we want just `body` so the outer composition
+/// can wrap its own lambda.
+fn rd_extract_body(nodes: &[Node], sub_root: usize) -> usize {
+    match &nodes[sub_root] {
+        Node::Lambda(_, body) => *body,
+        _ => sub_root,
+    }
+}
+
+/// Build `(lambda (x) (f sub_body))` for unary `f`.
+fn rd_compose_unary(
+    fn_name: &str,
+    sub_nodes: &[Node],
+    sub_root: usize,
+) -> (Vec<Node>, usize) {
+    let mut nodes: Vec<Node> = Vec::new();
+    let _x_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("x")));
+    let sub_offset = nodes.len();
+    for nd in sub_nodes {
+        nodes.push(remap_node(nd, sub_offset));
+    }
+    let sub_body = rd_extract_body(&nodes, sub_root + sub_offset);
+    let f_idx = nodes.len();
+    nodes.push(Node::Symbol(intern(fn_name)));
+    let app_idx = nodes.len();
+    nodes.push(Node::App(vec![f_idx, sub_body]));
+    let lambda_idx = nodes.len();
+    nodes.push(Node::Lambda(vec![intern("x")], app_idx));
+    (nodes, lambda_idx)
+}
+
+/// Build `(lambda (x) (f x sub_body))` for binary `f`.
+fn rd_compose_binary_input_first(
+    fn_name: &str,
+    sub_nodes: &[Node],
+    sub_root: usize,
+) -> (Vec<Node>, usize) {
+    let mut nodes: Vec<Node> = Vec::new();
+    let x_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("x")));
+    let sub_offset = nodes.len();
+    for nd in sub_nodes {
+        nodes.push(remap_node(nd, sub_offset));
+    }
+    let sub_body = rd_extract_body(&nodes, sub_root + sub_offset);
+    let f_idx = nodes.len();
+    nodes.push(Node::Symbol(intern(fn_name)));
+    let app_idx = nodes.len();
+    nodes.push(Node::App(vec![f_idx, x_idx, sub_body]));
+    let lambda_idx = nodes.len();
+    nodes.push(Node::Lambda(vec![intern("x")], app_idx));
+    (nodes, lambda_idx)
+}
+
+/// Build `(lambda (x) (f sub_body x))` for binary `f`.
+fn rd_compose_binary_input_second(
+    fn_name: &str,
+    sub_nodes: &[Node],
+    sub_root: usize,
+) -> (Vec<Node>, usize) {
+    let mut nodes: Vec<Node> = Vec::new();
+    let x_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("x")));
+    let sub_offset = nodes.len();
+    for nd in sub_nodes {
+        nodes.push(remap_node(nd, sub_offset));
+    }
+    let sub_body = rd_extract_body(&nodes, sub_root + sub_offset);
+    let f_idx = nodes.len();
+    nodes.push(Node::Symbol(intern(fn_name)));
+    let app_idx = nodes.len();
+    nodes.push(Node::App(vec![f_idx, sub_body, x_idx]));
+    let lambda_idx = nodes.len();
+    nodes.push(Node::Lambda(vec![intern("x")], app_idx));
+    (nodes, lambda_idx)
+}
+
+// ── Generic constant probing ───────────────────────────────────────────────
+
+/// Generate candidate constant values for inversion probing — small
+/// integers, numeric features of inputs/outputs, character substrings,
+/// and common delimiters.
+fn rd_generate_candidates(inputs: &[Value], expected: &[Value]) -> Vec<Value> {
+    let mut candidates: Vec<Value> = Vec::new();
+    let mut seen_ints: HashSet<i64> = HashSet::new();
+    let mut seen_strs: HashSet<String> = HashSet::new();
+
+    let mut push_int = |n: i64, candidates: &mut Vec<Value>, seen: &mut HashSet<i64>| {
+        if seen.insert(n) {
+            candidates.push(Value::Int(n));
+        }
+    };
+
+    // Small integers 0..=10 plus -1.
+    for i in -1..=10i64 {
+        push_int(i, &mut candidates, &mut seen_ints);
+    }
+
+    for vals in [inputs, expected] {
+        for v in vals {
+            match v {
+                Value::Int(n) => {
+                    push_int(*n, &mut candidates, &mut seen_ints);
+                    push_int(n.abs(), &mut candidates, &mut seen_ints);
+                }
+                Value::Num(n) => {
+                    if let Some(i) = (*n as i64).checked_abs() {
+                        let _ = i;
+                    }
+                    push_int(*n as i64, &mut candidates, &mut seen_ints);
+                }
+                Value::Str(s) => {
+                    let len = s.chars().count() as i64;
+                    push_int(len, &mut candidates, &mut seen_ints);
+                    for ch in s.chars() {
+                        let cs = ch.to_string();
+                        if seen_strs.insert(cs.clone()) {
+                            candidates.push(Value::str(&cs));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Pairwise numeric differences
+    for (inp, exp) in inputs.iter().zip(expected.iter()) {
+        if let (Some(a), Some(b)) = (rd_to_f64(inp), rd_to_f64(exp)) {
+            push_int((b - a) as i64, &mut candidates, &mut seen_ints);
+            push_int((a - b) as i64, &mut candidates, &mut seen_ints);
+        }
+    }
+
+    // String prefixes/suffixes from inputs (length up to 10).
+    for v in inputs {
+        if let Value::Str(s) = v {
+            let s_ref = s.as_ref();
+            for len in 1..=s_ref.len().min(10) {
+                let prefix = &s_ref[..len.min(s_ref.len())];
+                if seen_strs.insert(prefix.to_string()) {
+                    candidates.push(Value::str(prefix));
+                }
+                if s_ref.len() >= len {
+                    let suffix = &s_ref[s_ref.len() - len..];
+                    if seen_strs.insert(suffix.to_string()) {
+                        candidates.push(Value::str(suffix));
+                    }
+                }
+            }
+        }
+    }
+
+    candidates.push(Value::Bool(true));
+    candidates.push(Value::Bool(false));
+
+    for s in &[" ", ",", "-", ".", "/", ":", ";", "_", "|", ""] {
+        if seen_strs.insert(s.to_string()) {
+            candidates.push(Value::str(s));
+        }
+    }
+
+    candidates
+}
+
+/// Invoke a function (builtin or library) by Sym via env+apply. Returns
+/// `None` on lookup failure or evaluation error.
+fn rd_eval_function(name: Sym, args: &[Value], env: &Env) -> Option<Value> {
+    let f = env.lookup(name)?;
+    eval_v2::apply(&f, args, env).ok()
+}
+
+/// Convert a runtime Value into a literal `Node`. Used by RD when
+/// emitting a constant `k` directly into the composition tree. Returns
+/// `None` for non-literal value variants.
+fn rd_value_to_node(v: &Value) -> Option<Node> {
+    match v {
+        Value::Int(n) => Some(Node::Int(*n)),
+        Value::Num(n) => Some(Node::Num(*n)),
+        Value::Str(s) => Some(Node::Str(s.as_ref().to_string())),
+        Value::Bool(b) => Some(Node::Bool(*b)),
+        _ => None,
+    }
+}
+
+// ── Sub-synthesis ──────────────────────────────────────────────────────────
+
+/// Recursive sub-synthesis: at depth > 0, try RD on the sub-spec first
+/// (smaller budget); fall through to flat. At depth 0, flat only.
+fn rd_sub_synthesize(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+    rd_depth: usize,
+) -> SynthResult {
+    if rd_depth > 0 && inputs.len() >= 2 {
+        let rd_budget = max_candidates / 3;
+        let rd = rd_recursive(
+            components,
+            inputs,
+            expected,
+            env,
+            universe,
+            max_depth,
+            rd_budget,
+            rd_depth - 1,
+        );
+        if rd.found {
+            return SynthResult {
+                found: true,
+                nodes: Some(rd.nodes),
+                root: Some(rd.root),
+                candidates_explored: rd.candidates_explored,
+            };
+        }
+        let remaining = max_candidates.saturating_sub(rd.candidates_explored);
+        let sr = synthesize(components, inputs, expected, env, universe, max_depth, remaining);
+        return SynthResult {
+            candidates_explored: sr.candidates_explored + rd.candidates_explored,
+            ..sr
+        };
+    }
+    synthesize(components, inputs, expected, env, universe, max_depth, max_candidates)
+}
+
+// ── Per-function dispatch ──────────────────────────────────────────────────
+
+/// Try a single outermost function: invert → sub-synthesize → compose →
+/// verify. Returns `RdResult::empty()` with `candidates_explored > 0` if
+/// the family applied but the inversion or sub-synth failed.
+fn rd_try_single_function(
+    fn_name: &str,
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+    features: &RdSpecFeatures,
+    rd_depth: usize,
+) -> RdResult {
+    let mut result = RdResult::empty();
+
+    match fn_name {
+        // ── Unary arithmetic ──
+        "negate" if features.input_type != "list" => {
+            if let Some(subspec) = rd_invert_unary_arith(fn_name, inputs, expected) {
+                let sr = rd_sub_synthesize(
+                    components,
+                    &subspec.inputs,
+                    &subspec.expected,
+                    env,
+                    universe,
+                    max_depth,
+                    max_candidates,
+                    rd_depth,
+                );
+                result.candidates_explored += sr.candidates_explored;
+                if sr.found {
+                    let (nodes, lambda_idx) =
+                        rd_compose_unary(fn_name, &sr.nodes.unwrap(), sr.root.unwrap());
+                    if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+                        result.found = true;
+                        result.nodes = nodes;
+                        result.root = lambda_idx;
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // ── Binary arithmetic ──
+        "add" | "subtract" | "multiply" | "divide" if features.input_type != "list" => {
+            if let Some(subspec) = rd_invert_binary_arith(fn_name, inputs, expected) {
+                let sr = rd_sub_synthesize(
+                    components,
+                    &subspec.inputs,
+                    &subspec.expected,
+                    env,
+                    universe,
+                    max_depth,
+                    max_candidates / 2,
+                    rd_depth,
+                );
+                result.candidates_explored += sr.candidates_explored;
+                if sr.found {
+                    let (nodes, lambda_idx) = rd_compose_binary_input_first(
+                        fn_name,
+                        &sr.nodes.unwrap(),
+                        sr.root.unwrap(),
+                    );
+                    if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+                        result.found = true;
+                        result.nodes = nodes;
+                        result.root = lambda_idx;
+                        return result;
+                    }
+                }
+            }
+            if let Some(subspec) = rd_invert_binary_arith_reversed(fn_name, inputs, expected) {
+                let remaining = max_candidates.saturating_sub(result.candidates_explored);
+                let sr = rd_sub_synthesize(
+                    components,
+                    &subspec.inputs,
+                    &subspec.expected,
+                    env,
+                    universe,
+                    max_depth,
+                    remaining.min(max_candidates / 2),
+                    rd_depth,
+                );
+                result.candidates_explored += sr.candidates_explored;
+                if sr.found {
+                    let (nodes, lambda_idx) = rd_compose_binary_input_second(
+                        fn_name,
+                        &sr.nodes.unwrap(),
+                        sr.root.unwrap(),
+                    );
+                    if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+                        result.found = true;
+                        result.nodes = nodes;
+                        result.root = lambda_idx;
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // ── String slicing ──
+        "string-take" => {
+            if let Some(subspec) = rd_invert_string_take(inputs, expected) {
+                let sr = rd_sub_synthesize(
+                    components,
+                    &subspec.inputs,
+                    &subspec.expected,
+                    env,
+                    universe,
+                    max_depth,
+                    max_candidates,
+                    rd_depth,
+                );
+                result.candidates_explored += sr.candidates_explored;
+                if sr.found {
+                    let (nodes, lambda_idx) = rd_compose_binary_input_first(
+                        "string-take",
+                        &sr.nodes.unwrap(),
+                        sr.root.unwrap(),
+                    );
+                    if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+                        result.found = true;
+                        result.nodes = nodes;
+                        result.root = lambda_idx;
+                        return result;
+                    }
+                }
+            }
+        }
+        "string-drop" => {
+            if let Some(subspec) = rd_invert_string_drop(inputs, expected) {
+                let sr = rd_sub_synthesize(
+                    components,
+                    &subspec.inputs,
+                    &subspec.expected,
+                    env,
+                    universe,
+                    max_depth,
+                    max_candidates,
+                    rd_depth,
+                );
+                result.candidates_explored += sr.candidates_explored;
+                if sr.found {
+                    let (nodes, lambda_idx) = rd_compose_binary_input_first(
+                        "string-drop",
+                        &sr.nodes.unwrap(),
+                        sr.root.unwrap(),
+                    );
+                    if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+                        result.found = true;
+                        result.nodes = nodes;
+                        result.root = lambda_idx;
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // ── Concat (try both orderings) ──
+        "concat" => {
+            for (subspec, reversed) in rd_invert_concat(inputs, expected) {
+                let remaining = max_candidates.saturating_sub(result.candidates_explored);
+                if remaining == 0 {
+                    break;
+                }
+                let sr = rd_sub_synthesize(
+                    components,
+                    &subspec.inputs,
+                    &subspec.expected,
+                    env,
+                    universe,
+                    max_depth,
+                    remaining / 2,
+                    rd_depth,
+                );
+                result.candidates_explored += sr.candidates_explored;
+                if sr.found {
+                    let sub_nodes = sr.nodes.unwrap();
+                    let sub_root = sr.root.unwrap();
+                    let (nodes, lambda_idx) = if reversed {
+                        rd_compose_binary_input_second("concat", &sub_nodes, sub_root)
+                    } else {
+                        rd_compose_binary_input_first("concat", &sub_nodes, sub_root)
+                    };
+                    if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+                        result.found = true;
+                        result.nodes = nodes;
+                        result.root = lambda_idx;
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // ── Unary string ops ──
+        "string-upper" | "string-lower" | "string-reverse" | "string-trim" => {
+            // Direct application check.
+            if let Some(f) = env.lookup(intern(fn_name)) {
+                let direct = inputs.iter().zip(expected.iter()).all(|(inp, exp)| {
+                    matches!(
+                        eval_v2::apply(&f, std::slice::from_ref(inp), env),
+                        Ok(ref v) if eval_v2::values_equal(v, exp)
+                    )
+                });
+                if direct {
+                    let mut nodes: Vec<Node> = Vec::new();
+                    let x_idx = nodes.len();
+                    nodes.push(Node::Symbol(intern("x")));
+                    let f_idx = nodes.len();
+                    nodes.push(Node::Symbol(intern(fn_name)));
+                    let app_idx = nodes.len();
+                    nodes.push(Node::App(vec![f_idx, x_idx]));
+                    let lambda_idx = nodes.len();
+                    nodes.push(Node::Lambda(vec![intern("x")], app_idx));
+                    result.found = true;
+                    result.nodes = nodes;
+                    result.root = lambda_idx;
+                    return result;
+                }
+            }
+            if let Some(subspec) = rd_invert_unary_string(fn_name, inputs, expected, env) {
+                let sr = rd_sub_synthesize(
+                    components,
+                    &subspec.inputs,
+                    &subspec.expected,
+                    env,
+                    universe,
+                    max_depth,
+                    max_candidates,
+                    rd_depth,
+                );
+                result.candidates_explored += sr.candidates_explored;
+                if sr.found {
+                    let (nodes, lambda_idx) =
+                        rd_compose_unary(fn_name, &sr.nodes.unwrap(), sr.root.unwrap());
+                    if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+                        result.found = true;
+                        result.nodes = nodes;
+                        result.root = lambda_idx;
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // ── Count functions ──
+        "string-length" => {
+            if features.input_type == "str"
+                && (features.output_type == "int" || features.output_type == "num")
+            {
+                if let Some(f) = env.lookup(intern("string-length")) {
+                    let direct = inputs.iter().zip(expected.iter()).all(|(inp, exp)| {
+                        matches!(
+                            eval_v2::apply(&f, std::slice::from_ref(inp), env),
+                            Ok(ref v) if eval_v2::values_equal(v, exp)
+                        )
+                    });
+                    if direct {
+                        let mut nodes: Vec<Node> = Vec::new();
+                        let x_idx = nodes.len();
+                        nodes.push(Node::Symbol(intern("x")));
+                        let f_idx = nodes.len();
+                        nodes.push(Node::Symbol(intern("string-length")));
+                        let app_idx = nodes.len();
+                        nodes.push(Node::App(vec![f_idx, x_idx]));
+                        let lambda_idx = nodes.len();
+                        nodes.push(Node::Lambda(vec![intern("x")], app_idx));
+                        result.found = true;
+                        result.nodes = nodes;
+                        result.root = lambda_idx;
+                        return result;
+                    }
+                }
+            }
+        }
+
+        "count-char" => {
+            if let Some(subspec) = rd_invert_count_char(inputs, expected) {
+                if let Some(Value::Str(ch)) = subspec.expected.first().cloned() {
+                    let mut nodes: Vec<Node> = Vec::new();
+                    let x_idx = nodes.len();
+                    nodes.push(Node::Symbol(intern("x")));
+                    let ch_idx = nodes.len();
+                    nodes.push(Node::Str(ch.as_ref().to_string()));
+                    let f_idx = nodes.len();
+                    nodes.push(Node::Symbol(intern("count-char")));
+                    let app_idx = nodes.len();
+                    nodes.push(Node::App(vec![f_idx, x_idx, ch_idx]));
+                    let lambda_idx = nodes.len();
+                    nodes.push(Node::Lambda(vec![intern("x")], app_idx));
+                    if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+                        result.found = true;
+                        result.nodes = nodes;
+                        result.root = lambda_idx;
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // ── Predicates / comparators (direct application only) ──
+        "string-ends-with" | "string-starts-with" | "even" | "odd" => {
+            // Try (lambda (x) (f x k)) for each candidate constant k.
+            if let Some(f) = env.lookup(intern(fn_name)) {
+                let cands = rd_generate_candidates(inputs, expected);
+                let arity = match fn_name {
+                    "even" | "odd" => 1,
+                    _ => 2,
+                };
+                if arity == 1 {
+                    let direct = inputs.iter().zip(expected.iter()).all(|(inp, exp)| {
+                        matches!(
+                            eval_v2::apply(&f, std::slice::from_ref(inp), env),
+                            Ok(ref v) if eval_v2::values_equal(v, exp)
+                        )
+                    });
+                    if direct {
+                        let mut nodes: Vec<Node> = Vec::new();
+                        let x_idx = nodes.len();
+                        nodes.push(Node::Symbol(intern("x")));
+                        let f_idx = nodes.len();
+                        nodes.push(Node::Symbol(intern(fn_name)));
+                        let app_idx = nodes.len();
+                        nodes.push(Node::App(vec![f_idx, x_idx]));
+                        let lambda_idx = nodes.len();
+                        nodes.push(Node::Lambda(vec![intern("x")], app_idx));
+                        result.found = true;
+                        result.nodes = nodes;
+                        result.root = lambda_idx;
+                        return result;
+                    }
+                } else {
+                    for k in &cands {
+                        let all_match =
+                            inputs.iter().zip(expected.iter()).all(|(inp, exp)| {
+                                matches!(
+                                    eval_v2::apply(&f, &[inp.clone(), k.clone()], env),
+                                    Ok(ref v) if eval_v2::values_equal(v, exp)
+                                )
+                            });
+                        if all_match {
+                            let k_node = match rd_value_to_node(k) {
+                                Some(n) => n,
+                                None => continue,
+                            };
+                            let mut nodes: Vec<Node> = Vec::new();
+                            let x_idx = nodes.len();
+                            nodes.push(Node::Symbol(intern("x")));
+                            let k_idx = nodes.len();
+                            nodes.push(k_node);
+                            let f_idx = nodes.len();
+                            nodes.push(Node::Symbol(intern(fn_name)));
+                            let app_idx = nodes.len();
+                            nodes.push(Node::App(vec![f_idx, x_idx, k_idx]));
+                            let lambda_idx = nodes.len();
+                            nodes.push(Node::Lambda(vec![intern("x")], app_idx));
+                            result.found = true;
+                            result.nodes = nodes;
+                            result.root = lambda_idx;
+                            return result;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Boolean composition: BD already handles it ──
+        "and" | "or" | "not" => {}
+
+        // ── Higher-order: delegate to existing v2 strategy ──
+        "map" | "filter" => {
+            if let Some((nodes, root, ho_explored)) = higher_order_decompose(
+                components,
+                inputs,
+                expected,
+                env,
+                universe,
+                max_depth,
+                max_candidates,
+            ) {
+                result.candidates_explored += ho_explored;
+                result.found = true;
+                result.nodes = nodes;
+                result.root = root;
+                return result;
+            }
+        }
+
+        // ── If-expression: delegate to D&C ──
+        "if" => {
+            if let Some((nodes, root, dc_explored)) = divide_and_conquer(
+                components,
+                inputs,
+                expected,
+                env,
+                universe,
+                max_depth,
+                max_candidates,
+            ) {
+                result.candidates_explored += dc_explored;
+                result.found = true;
+                result.nodes = nodes;
+                result.root = root;
+                return result;
+            }
+        }
+
+        // ── Generic fallback: constant probing for any binary function ──
+        _ => {
+            let gen_r = rd_try_generic_binary_inversion(
+                fn_name,
+                components,
+                inputs,
+                expected,
+                env,
+                universe,
+                max_depth,
+                max_candidates.saturating_sub(result.candidates_explored),
+                rd_depth,
+            );
+            result.candidates_explored += gen_r.candidates_explored;
+            if gen_r.found {
+                return RdResult {
+                    candidates_explored: result.candidates_explored,
+                    ..gen_r
+                };
+            }
+        }
+    }
+
+    result
+}
+
+/// Generic constant-probing inversion for any binary function. Tries
+/// `(f x k)` and `(f k x)` for each candidate constant. Then tries the
+/// per-example k variant: derive the k for each input and sub-synthesize
+/// the k-as-function-of-input.
+fn rd_try_generic_binary_inversion(
+    fn_name: &str,
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+    rd_depth: usize,
+) -> RdResult {
+    let mut result = RdResult::empty();
+    let f_sym = intern(fn_name);
+    if env.lookup(f_sym).is_none() {
+        return result;
+    }
+    let candidates = rd_generate_candidates(inputs, expected);
+
+    // Constant-k forward: f(input, k)
+    for k in &candidates {
+        let all_match = inputs.iter().zip(expected.iter()).all(|(inp, exp)| {
+            rd_eval_function(f_sym, &[inp.clone(), k.clone()], env)
+                .map(|v| eval_v2::values_equal(&v, exp))
+                .unwrap_or(false)
+        });
+        if all_match {
+            let k_node = match rd_value_to_node(k) {
+                Some(n) => n,
+                None => continue,
+            };
+            let mut nodes: Vec<Node> = Vec::new();
+            let x_idx = nodes.len();
+            nodes.push(Node::Symbol(intern("x")));
+            let k_idx = nodes.len();
+            nodes.push(k_node);
+            let f_idx = nodes.len();
+            nodes.push(Node::Symbol(f_sym));
+            let app_idx = nodes.len();
+            nodes.push(Node::App(vec![f_idx, x_idx, k_idx]));
+            let lambda_idx = nodes.len();
+            nodes.push(Node::Lambda(vec![intern("x")], app_idx));
+            if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+                result.found = true;
+                result.nodes = nodes;
+                result.root = lambda_idx;
+                return result;
+            }
+        }
+    }
+
+    // Constant-k reversed: f(k, input)
+    for k in &candidates {
+        let all_match = inputs.iter().zip(expected.iter()).all(|(inp, exp)| {
+            rd_eval_function(f_sym, &[k.clone(), inp.clone()], env)
+                .map(|v| eval_v2::values_equal(&v, exp))
+                .unwrap_or(false)
+        });
+        if all_match {
+            let k_node = match rd_value_to_node(k) {
+                Some(n) => n,
+                None => continue,
+            };
+            let mut nodes: Vec<Node> = Vec::new();
+            let x_idx = nodes.len();
+            nodes.push(Node::Symbol(intern("x")));
+            let k_idx = nodes.len();
+            nodes.push(k_node);
+            let f_idx = nodes.len();
+            nodes.push(Node::Symbol(f_sym));
+            let app_idx = nodes.len();
+            nodes.push(Node::App(vec![f_idx, k_idx, x_idx]));
+            let lambda_idx = nodes.len();
+            nodes.push(Node::Lambda(vec![intern("x")], app_idx));
+            if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+                result.found = true;
+                result.nodes = nodes;
+                result.root = lambda_idx;
+                return result;
+            }
+        }
+    }
+
+    // Variable-k forward: f(x, g(x)) — derive k_i per example, sub-synthesize.
+    let mut per_k: Vec<Value> = Vec::with_capacity(inputs.len());
+    let mut all_found = true;
+    for (inp, exp) in inputs.iter().zip(expected.iter()) {
+        let mut found_k = None;
+        for k in &candidates {
+            if let Some(v) = rd_eval_function(f_sym, &[inp.clone(), k.clone()], env) {
+                if eval_v2::values_equal(&v, exp) {
+                    found_k = Some(k.clone());
+                    break;
+                }
+            }
+        }
+        match found_k {
+            Some(k) => per_k.push(k),
+            None => {
+                all_found = false;
+                break;
+            }
+        }
+    }
+    if all_found && !per_k.is_empty() {
+        let all_same = per_k
+            .windows(2)
+            .all(|w| eval_v2::values_equal(&w[0], &w[1]));
+        if !all_same {
+            let sr = rd_sub_synthesize(
+                components,
+                inputs,
+                &per_k,
+                env,
+                universe,
+                max_depth,
+                max_candidates / 2,
+                rd_depth,
+            );
+            result.candidates_explored += sr.candidates_explored;
+            if sr.found {
+                let (nodes, lambda_idx) =
+                    rd_compose_binary_input_first(fn_name, &sr.nodes.unwrap(), sr.root.unwrap());
+                if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+                    result.found = true;
+                    result.nodes = nodes;
+                    result.root = lambda_idx;
+                    return result;
+                }
+            }
+        }
+    }
+
+    result
+}
+
+// ── Library function decomposition ─────────────────────────────────────────
+
+/// Walk env's top scope for unary `Value::Function` entries (skipping
+/// internal names) and return them as (sym, value) pairs. Used by RD's
+/// macro-like decomposition phases.
+fn rd_unary_lib_functions(env: &Env) -> Vec<(Sym, Value)> {
+    let scope = env.top_scope();
+    scope
+        .iter()
+        .filter_map(|(sym, val)| {
+            if let Value::Function(fd) = val {
+                if fd.params.len() == 1 {
+                    let name = crate::intern::resolve(*sym);
+                    if name.starts_with("__") {
+                        return None;
+                    }
+                    return Some((*sym, val.clone()));
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+/// Try unary library functions as bridges: for each unary function `m`,
+/// evaluate `m(input)` on all examples, then either match expected
+/// directly (`(lambda (x) (m x))`) or sub-synthesize an outer `f` such
+/// that `f(m(x)) = expected` (composed as `(lambda (x) (f (m x)))`).
+fn rd_try_library_decomposition(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+    rd_depth: usize,
+) -> RdResult {
+    let mut result = RdResult::empty();
+    let phase_budget = max_candidates / 4;
+    let sub_budget = 500usize.min(phase_budget / 4).max(50);
+
+    for (msym, mval) in rd_unary_lib_functions(env) {
+        if result.candidates_explored >= phase_budget {
+            break;
+        }
+
+        // Evaluate m(input) for every input.
+        let mut intermediates = Vec::with_capacity(inputs.len());
+        let mut valid = true;
+        for inp in inputs {
+            match eval_v2::apply(&mval, std::slice::from_ref(inp), env) {
+                Ok(v) => intermediates.push(v),
+                Err(_) => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if !valid || intermediates.len() != inputs.len() {
+            continue;
+        }
+
+        let mname = crate::intern::resolve(msym);
+
+        // Direct match: m(input) == expected
+        if intermediates
+            .iter()
+            .zip(expected.iter())
+            .all(|(a, b)| eval_v2::values_equal(a, b))
+        {
+            let mut nodes: Vec<Node> = Vec::new();
+            let x_idx = nodes.len();
+            nodes.push(Node::Symbol(intern("x")));
+            let m_idx = nodes.len();
+            nodes.push(Node::Symbol(msym));
+            let app_idx = nodes.len();
+            nodes.push(Node::App(vec![m_idx, x_idx]));
+            let lambda_idx = nodes.len();
+            nodes.push(Node::Lambda(vec![intern("x")], app_idx));
+            if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+                result.found = true;
+                result.nodes = nodes;
+                result.root = lambda_idx;
+                return result;
+            }
+        }
+
+        // Skip identity macros and constant macros (no useful bridge).
+        if intermediates
+            .iter()
+            .zip(inputs.iter())
+            .all(|(a, b)| eval_v2::values_equal(a, b))
+        {
+            continue;
+        }
+        if intermediates.len() > 1
+            && intermediates
+                .windows(2)
+                .all(|w| eval_v2::values_equal(&w[0], &w[1]))
+        {
+            continue;
+        }
+
+        // Bridge: synthesize f such that f(intermediate) = expected.
+        let remaining = max_candidates.saturating_sub(result.candidates_explored);
+        let budget = remaining.min(sub_budget);
+        if budget == 0 {
+            break;
+        }
+        let sr = rd_sub_synthesize(
+            components,
+            &intermediates,
+            expected,
+            env,
+            universe,
+            max_depth,
+            budget,
+            rd_depth,
+        );
+        result.candidates_explored += sr.candidates_explored;
+        if sr.found {
+            let f_nodes = sr.nodes.unwrap();
+            let f_root = sr.root.unwrap();
+
+            // Compose (lambda (x) ((extract f's body, substitute "x" → (m x))))
+            let mut nodes: Vec<Node> = Vec::new();
+            let x_idx = nodes.len();
+            nodes.push(Node::Symbol(intern("x")));
+            let m_sym_idx = nodes.len();
+            nodes.push(Node::Symbol(msym));
+            let m_app_idx = nodes.len();
+            nodes.push(Node::App(vec![m_sym_idx, x_idx]));
+
+            // Splice f's nodes.
+            let f_offset = nodes.len();
+            for nd in &f_nodes {
+                nodes.push(remap_node(nd, f_offset));
+            }
+            let f_root_remapped = f_root + f_offset;
+
+            // f is `(lambda (x) body)` — extract body and replace its
+            // `x` Symbol references with `m_app_idx`.
+            if let Node::Lambda(_, body_idx) = &nodes[f_root_remapped] {
+                let body_idx = *body_idx;
+                let composed_body = rd_substitute_symbol(&nodes, body_idx, intern("x"), m_app_idx);
+                let composed_body_idx = nodes.len();
+                nodes.push(composed_body);
+                let lambda_idx = nodes.len();
+                nodes.push(Node::Lambda(vec![intern("x")], composed_body_idx));
+                if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+                    result.found = true;
+                    result.nodes = nodes;
+                    result.root = lambda_idx;
+                    return result;
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Substitute references to a Symbol(target) with `replacement_idx` in
+/// the immediate children of node `idx`. Returns a NEW node value to be
+/// appended to the node list. Mirrors the legacy `substitute_symbol_idx`
+/// — only top-level child substitution; references inside deeper
+/// subtrees still resolve to the original `Symbol(x)`.
+fn rd_substitute_symbol(
+    nodes: &[Node],
+    idx: usize,
+    target: Sym,
+    replacement_idx: usize,
+) -> Node {
+    let swap = |c: usize| -> usize {
+        if let Node::Symbol(name) = &nodes[c] {
+            if *name == target {
+                return replacement_idx;
+            }
+        }
+        c
+    };
+    match &nodes[idx] {
+        Node::Symbol(name) if *name == target => Node::Symbol(*name),
+        Node::App(children) => Node::App(children.iter().map(|&c| swap(c)).collect()),
+        Node::SpecialApp(form, children) => {
+            Node::SpecialApp(*form, children.iter().map(|&c| swap(c)).collect())
+        }
+        Node::If(c, t, e) => Node::If(swap(*c), swap(*t), swap(*e)),
+        Node::Let(bindings, body) => {
+            let new_bindings: Vec<(Sym, usize)> =
+                bindings.iter().map(|(n, v)| (*n, swap(*v))).collect();
+            Node::Let(new_bindings, swap(*body))
+        }
+        Node::Lambda(params, body) => Node::Lambda(params.clone(), swap(*body)),
+        other => other.clone(),
+    }
+}
+
+// ── Top-level RD entry point ───────────────────────────────────────────────
+
+/// Internal recursive entry point with explicit depth tracking.
+fn rd_recursive(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+    rd_depth: usize,
+) -> RdResult {
+    if inputs.is_empty() || expected.is_empty() || inputs.len() != expected.len() {
+        return RdResult::empty();
+    }
+
+    let features = rd_extract_features(inputs, expected, env);
+    let family = rd_predict_family(&features);
+
+    let primary = rd_family_candidates(family, &features);
+    let secondary = rd_secondary_candidates(family, &features);
+    let all_candidates: Vec<&str> = primary.iter().copied().chain(secondary.iter().copied()).collect();
+
+    let sub_budget = (max_candidates / 2).max(1);
+    let mut total_explored: usize = 0;
+
+    // Phase 1: try predicted family (and secondary) candidates.
+    for fn_name in &all_candidates {
+        if total_explored >= max_candidates {
+            break;
+        }
+        let remaining = max_candidates.saturating_sub(total_explored);
+        let budget = remaining.min(sub_budget);
+        let r = rd_try_single_function(
+            fn_name,
+            components,
+            inputs,
+            expected,
+            env,
+            universe,
+            max_depth,
+            budget,
+            &features,
+            rd_depth,
+        );
+        total_explored += r.candidates_explored;
+        if r.found {
+            return RdResult {
+                candidates_explored: total_explored,
+                ..r
+            };
+        }
+    }
+
+    // Phase 2: try unary library functions as bridges.
+    let remaining = max_candidates.saturating_sub(total_explored);
+    if remaining > 0 {
+        let lr = rd_try_library_decomposition(
+            components,
+            inputs,
+            expected,
+            env,
+            universe,
+            max_depth,
+            remaining,
+            rd_depth,
+        );
+        total_explored += lr.candidates_explored;
+        if lr.found {
+            return RdResult {
+                candidates_explored: total_explored,
+                ..lr
+            };
+        }
+    }
+
+    RdResult {
+        candidates_explored: total_explored,
+        ..RdResult::empty()
+    }
+}
+
+/// Top-level RD strategy entry point. Returns `Some((nodes, root, candidates))`
+/// on success, `None` on failure.
+pub fn recursive_decompose(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+) -> Option<(Vec<Node>, usize, usize)> {
+    let r = rd_recursive(
+        components,
+        inputs,
+        expected,
+        env,
+        universe,
+        max_depth,
+        max_candidates,
+        RD_DEFAULT_DEPTH,
+    );
+    if r.found {
+        Some((r.nodes, r.root, r.candidates_explored))
+    } else {
+        None
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Strategy dispatcher
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -2734,26 +4438,34 @@ fn induce_compose_steps(
 /// Current order:
 ///   1. **Flat** — `synthesize` (bottom-up enumeration with type pruning,
 ///      observational dedup, and the probe-and-filter pipeline).
-///   2. **BoolDecomp** — `bool_decompose` (logical compositions of unary
+///   2. **RecursiveDecomposition** — `recursive_decompose`. Predicts the
+///      outermost function family from spec features, inverts each
+///      candidate to derive a sub-spec, and recursively sub-synthesizes.
+///      Runs after Flat (not before) so trivial tasks pay no inversion
+///      cost — Flat finds them faster. Deviates from §9.22's "Strategy 0"
+///      placement: in synth_v2 Flat is well-pruned and the cheap-to-
+///      expensive dispatcher gradient matters more than RD's conceptual
+///      role as the recursive base step.
+///   3. **BoolDecomp** — `bool_decompose` (logical compositions of unary
 ///      bool-returning library predicates). Only fires when the target
 ///      output is bool, and is O(L²) in the number of predicates.
-///   3. **HigherOrder** — `higher_order_decompose`. Tries `list-map`,
+///   4. **HigherOrder** — `higher_order_decompose`. Tries `list-map`,
 ///      `list-filter`, `split-map-join`, and `char-map-join` templates
 ///      via recursive sub-synthesis. Each template is gated on the
 ///      input/output shape so most attempts cost nothing.
-///   4. **DivideConquer** — `divide_and_conquer`. Partitions examples
+///   5. **DivideConquer** — `divide_and_conquer`. Partitions examples
 ///      by output value, sorts by mean input, and recursively builds
 ///      nested if-expressions with bool separators between groups.
 ///      Useful for piecewise / classification tasks.
-///   5. **Induction** — `induce_decomposition`. Probes a curated set
+///   6. **Induction** — `induce_decomposition`. Probes a curated set
 ///      of unary/binary builtins for an intermediate value sequence,
 ///      then sub-synthesizes input→mid and mid→expected and composes
 ///      via `(let ((x g_body)) f_body)`.
-///   6. **Memo** — `memorize_from_examples` (namespace lookup table for
+///   7. **Memo** — `memorize_from_examples` (namespace lookup table for
 ///      string-input tasks).
 ///
 /// `flat_budget` is the candidate budget for the Flat strategy and is
-/// also passed to HO/D&C/Induction sub-syntheses. BD and Memo are
+/// also passed to RD/HO/D&C/Induction sub-syntheses. BD and Memo are
 /// bounded by their own intrinsic costs and ignore it.
 pub fn synthesize_with_strategies(
     components: &[SynthComponent],
@@ -2773,7 +4485,31 @@ pub fn synthesize_with_strategies(
         return StrategyResult::from_synth(flat, Strategy::Flat);
     }
 
-    // Strategy 2: Boolean decomposition. Cheap and only applies to
+    // Strategy 2: Recursive decomposition. Top-down family prediction +
+    // outermost-function inversion. Cheap when the family doesn't apply
+    // (each helper bails fast); valuable when an arithmetic / string-op
+    // / library composition is the answer and Flat couldn't reach it
+    // within `flat_budget`.
+    if let Some((nodes, root, rd_explored)) = recursive_decompose(
+        components,
+        inputs,
+        expected,
+        env,
+        universe,
+        max_depth,
+        flat_budget,
+    ) {
+        total_explored += rd_explored;
+        return StrategyResult {
+            found: true,
+            nodes: Some(nodes),
+            root: Some(root),
+            candidates_explored: total_explored,
+            strategy: Some(Strategy::RecursiveDecomposition),
+        };
+    }
+
+    // Strategy 3: Boolean decomposition. Cheap and only applies to
     // bool-output tasks (it filters internally), so we run it before
     // Memo: it produces a structured program when it fires, whereas
     // Memo is a lookup-table fallback that is correct on training but
@@ -5399,6 +7135,203 @@ mod tests {
         let r = induce_decomposition(
             &comps, &[], &[], &env, &universe, 2, 100,
         );
+        assert!(r.is_none());
+    }
+
+    // ── Recursive Decomposition strategy tests ─────────────────────────
+    //
+    // RD predicts the outermost function from spec features, inverts it
+    // to derive a sub-spec, and recursively sub-synthesizes. The tests
+    // exercise: (a) family prediction, (b) binary-arithmetic inversion
+    // composition, (c) library-function bridge composition, and (d) the
+    // dispatcher routing for tasks Flat alone can't reach.
+
+    #[test]
+    fn rd_predicts_arithmetic_for_int_to_int_task() {
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let inputs = vec![Value::Int(1), Value::Int(2), Value::Int(3)];
+        let expected = vec![Value::Int(2), Value::Int(4), Value::Int(6)];
+        let features = rd_extract_features(&inputs, &expected, &env);
+        assert_eq!(features.input_type, "int");
+        assert_eq!(features.output_type, "int");
+        assert_eq!(rd_predict_family(&features), RdFamily::Arithmetic);
+    }
+
+    #[test]
+    fn rd_predicts_string_op_when_output_is_substring() {
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let inputs = vec![Value::str("hello"), Value::str("world")];
+        let expected = vec![Value::str("hel"), Value::str("wor")];
+        let features = rd_extract_features(&inputs, &expected, &env);
+        assert_eq!(features.input_type, "str");
+        assert_eq!(features.output_type, "str");
+        assert!(features.output_is_substring);
+        assert_eq!(rd_predict_family(&features), RdFamily::StringOp);
+    }
+
+    #[test]
+    fn rd_invert_binary_add_recovers_constant_difference() {
+        let inputs = vec![Value::Int(1), Value::Int(5), Value::Int(10)];
+        let expected = vec![Value::Int(3), Value::Int(7), Value::Int(12)];
+        let sub = rd_invert_binary_arith("add", &inputs, &expected).unwrap();
+        // k_i = output_i - input_i = 2 for all i.
+        for v in &sub.expected {
+            assert!(matches!(v, Value::Int(2)));
+        }
+    }
+
+    #[test]
+    fn rd_invert_string_take_recovers_per_example_length() {
+        let inputs = vec![
+            Value::str("hello"),
+            Value::str("worldly"),
+        ];
+        let expected = vec![Value::str("hel"), Value::str("worl")];
+        let sub = rd_invert_string_take(&inputs, &expected).unwrap();
+        assert_eq!(sub.expected.len(), 2);
+        assert!(matches!(sub.expected[0], Value::Int(3)));
+        assert!(matches!(sub.expected[1], Value::Int(4)));
+    }
+
+    #[test]
+    fn rd_solves_x_times_succ_via_arithmetic_inversion() {
+        // Target: x → x * (x + 1). At max-depth=1, flat enumerates only
+        // depth-1 expressions; the answer is depth-2. RD's binary
+        // arithmetic inversion derives a depth-1 sub-spec, sub-synthesizes
+        // `(multiply x x)`, and composes the outer `add` for free.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+        let inputs = vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+            Value::Int(5),
+        ];
+        let expected = vec![
+            Value::Int(2),
+            Value::Int(6),
+            Value::Int(12),
+            Value::Int(20),
+            Value::Int(30),
+        ];
+        let r = recursive_decompose(
+            &comps, &inputs, &expected, &env, &universe, 1, 5000,
+        );
+        let (nodes, root, _explored) = r.expect("RD should solve x*(x+1) at max-depth=1");
+        let nodes_rc: Rc<[Node]> = nodes.into();
+        let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+        for (i, e) in inputs.iter().zip(expected.iter()) {
+            let got = eval_v2::apply(&f, std::slice::from_ref(i), &env).unwrap();
+            assert!(eval_v2::values_equal(&got, e));
+        }
+    }
+
+    #[test]
+    fn rd_solves_via_library_function_bridge() {
+        // Define a unary library function `wrap = (lambda (s) (concat (concat "[" s) "]"))`,
+        // then ask RD to find `(string-upper (wrap x))` at max-depth=1.
+        // Flat alone can't reach a depth-2 expression at that depth;
+        // RD's library-decomposition phase probes `wrap` as an inner
+        // bridge and sub-synthesizes the outer `string-upper`.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+
+        // Build wrap manually as a Value::Function with captured env.
+        // Body: (concat (concat "[" s) "]")
+        let wrap_nodes: Vec<Node> = vec![
+            Node::Str("[".to_string()),                        // 0
+            Node::Symbol(intern("s")),                         // 1
+            Node::Symbol(intern("concat")),                    // 2
+            Node::App(vec![2, 0, 1]),                          // 3: (concat "[" s)
+            Node::Str("]".to_string()),                        // 4
+            Node::Symbol(intern("concat")),                    // 5
+            Node::App(vec![5, 3, 4]),                          // 6: (concat (concat "[" s) "]")
+        ];
+        let wrap_body = crate::types_v2::NodeRef {
+            nodes: Rc::from(wrap_nodes),
+            idx: 6,
+        };
+        let wrap_fn = Value::Function(Rc::new(crate::types_v2::FunctionData {
+            params: vec![intern("s")],
+            body: wrap_body,
+            captured_env: env.clone(),
+            letrec_scope: None,
+        }));
+        env.define(intern("wrap"), wrap_fn);
+
+        let comps = default_synth_components(&env, &default_skip_set());
+        let inputs = vec![
+            Value::str("hi"),
+            Value::str("abc"),
+            Value::str("world"),
+        ];
+        let expected = vec![
+            Value::str("[HI]"),
+            Value::str("[ABC]"),
+            Value::str("[WORLD]"),
+        ];
+
+        let r = recursive_decompose(
+            &comps, &inputs, &expected, &env, &universe, 1, 5000,
+        );
+        let (nodes, root, _explored) =
+            r.expect("RD should solve string-upper∘wrap via library bridge");
+        let nodes_rc: Rc<[Node]> = nodes.into();
+        let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+        for (i, e) in inputs.iter().zip(expected.iter()) {
+            let got = eval_v2::apply(&f, std::slice::from_ref(i), &env).unwrap();
+            assert!(
+                eval_v2::values_equal(&got, e),
+                "got {:?}, expected {:?}",
+                got,
+                e
+            );
+        }
+    }
+
+    #[test]
+    fn dispatcher_uses_rd_for_arithmetic_inversion_task() {
+        // Same task as `rd_solves_x_times_succ_via_arithmetic_inversion`
+        // but routed through the full strategy dispatcher. RD should
+        // win after Flat fails at max-depth=1.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+        let inputs = vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+            Value::Int(5),
+        ];
+        let expected = vec![
+            Value::Int(2),
+            Value::Int(6),
+            Value::Int(12),
+            Value::Int(20),
+            Value::Int(30),
+        ];
+        let r = synthesize_with_strategies(
+            &comps, &inputs, &expected, &env, &universe, 1, 5000,
+        );
+        assert!(r.found);
+        assert_eq!(r.strategy, Some(Strategy::RecursiveDecomposition));
+    }
+
+    #[test]
+    fn rd_returns_none_for_empty_inputs() {
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+        let r = recursive_decompose(&comps, &[], &[], &env, &universe, 2, 100);
         assert!(r.is_none());
     }
 

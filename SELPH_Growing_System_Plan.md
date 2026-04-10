@@ -1591,6 +1591,172 @@ existing dispatcher order shifts down by one when RD lands.
 
 ---
 
+### 9.28 RD strategy port: Recursive Decomposition lands (April 10, 2026)
+
+§9.27.6 — the last unported strategy. RD now lives inline in
+`selph_fast/src/synth_v2.rs` as a ~1400-line section between
+`induce_decomposition` and `synthesize_with_strategies`. With this in
+place, all five legacy strategies (BD, HO, D&C, Induction, RD) plus
+Flat and Memo are wired against the new core. Step 8 ("reload
+curricula") is unblocked.
+
+#### 9.28.1 What landed
+
+- `pub fn recursive_decompose(...) -> Option<(Vec<Node>, usize, usize)>`
+  — top-level entry, mirrors the other v2 strategy signatures.
+- `Strategy::RecursiveDecomposition` variant added; `name() = "RD"`.
+- Dispatcher updated: RD slots in **between Flat and BD** (see §9.28.2
+  for the deviation rationale).
+- `RdFamily` enum and `RdSpecFeatures` struct for family classification.
+  Same decision tree as the legacy module's `predict_family`, with the
+  Int/Num split exposed (legacy collapsed both into "num").
+- Inversion helpers: `rd_invert_binary_arith` (forward + reversed for
+  add/subtract/multiply/divide), `rd_invert_unary_arith` (negate),
+  `rd_invert_string_take`, `rd_invert_string_drop`, `rd_invert_concat`
+  (returns both orderings), `rd_invert_count_char`, `rd_invert_unary_string`.
+- Composition helpers: `rd_compose_unary`, `rd_compose_binary_input_first`,
+  `rd_compose_binary_input_second`. Verification reuses
+  `ho_verify_composed`.
+- Generic constant probing: `rd_generate_candidates` (small ints,
+  numeric features of inputs/outputs, character substrings, common
+  delimiters), `rd_eval_function`, `rd_try_generic_binary_inversion`
+  (constant-k forward, constant-k reversed, variable-k via sub-synth).
+- Library bridge phase: `rd_unary_lib_functions` walks `env.top_scope()`
+  for `Value::Function` arity-1 entries; `rd_try_library_decomposition`
+  evaluates each as a bridge intermediate, sub-synthesizes the outer
+  `f` such that `f(m(x)) = expected`, and composes via
+  `rd_substitute_symbol`.
+- Recursive sub-synthesis: `rd_sub_synthesize` decrements an explicit
+  `rd_depth` counter (default 2) before recursing; falls through to
+  flat `synthesize` at depth 0.
+- 7 new unit tests in `synth_v2::tests` covering family prediction,
+  inversion correctness, end-to-end RD on `x*(x+1)` at max-depth=1,
+  the library-bridge composition path, and dispatcher routing.
+
+#### 9.28.2 Notable design calls
+
+- **Dispatcher position: between Flat and BD, NOT Strategy 0.** The
+  §9.22/§9.27.6 design called for "RD runs before Flat." Deviating
+  here. Reason: synth_v2's Flat is well-pruned and finds trivial
+  solutions in tens of candidates. Putting RD first makes simple tasks
+  like `(lambda (x) x)` or `(add x 1)` pay RD's family-prediction +
+  inversion cost — and worse, RD's `(add x 0)` solution to identity is
+  semantically correct but uglier than Flat's `x`. The cheap-to-
+  expensive dispatcher gradient matters more than RD's conceptual role
+  as the recursive base step. Documented as a deviation in the
+  dispatcher comment. Validation chain confirmed: all 11 pre-existing
+  validation tasks still solve via their original strategies — RD
+  fires only on the new RD-specific tasks.
+
+- **`LearnedPredictor` and `learn_predictor` are dropped.** Only the
+  hand-coded family decision tree is ported. The learned-predictor
+  scaffolding requires parsing + evaluating a SELPH script through the
+  new core (the predictor is itself a SELPH program), and listing
+  `--learn-rd` as a CLI flag. That belongs with the curriculum work
+  unblocked by step 8, not the strategy port. Listed as deferred in
+  the validation chain "does not cover" section.
+
+- **Map / filter / if delegate to existing v2 strategies.** The
+  `"map" | "filter"` arms in `rd_try_single_function` call
+  `higher_order_decompose` directly. The `"if"` arm calls
+  `divide_and_conquer`. Their results are tagged as RD when fired via
+  this path. The legacy module's per-template inversion code
+  (`invert_map_list`, `invert_split_map_join`, `invert_filter`,
+  `compose_map`, `compose_split_map_join`, `compose_filter`) is NOT
+  ported — synth_v2's HO and D&C already cover that ground via
+  different but equivalent inversions. Keeps the port focused on RD's
+  unique contribution: arithmetic / string-op family inversion and
+  library-function bridges.
+
+- **The `macros` parameter is gone everywhere.** Library functions
+  live in `env.top_scope()` as `Value::Function` entries. The legacy
+  pattern `for (name, params, nodes, root) in macros { ... }` becomes
+  `for (sym, val) in rd_unary_lib_functions(env) { ... }`. Builtin
+  invocation goes through `env.lookup(intern(name)).and_then(|f|
+  eval_v2::apply(&f, args, env).ok())` instead of the legacy
+  `eval::apply_builtin(intern(name), args)`.
+
+- **Numeric inversions produce `Int` when integral.** `rd_to_f64`
+  extracts numeric values regardless of variant; `rd_num_value(n)`
+  wraps the result, preferring `Int(n.round() as i64)` when `(n -
+  n.round()).abs() < 1e-9` and falling through to `Num(n)` otherwise.
+  This matches synth_v2's Int-biased catalog: derived constants like
+  `k = 2` flow into the Int literal pool naturally, and the
+  `Int <: Num` subtype rule lets them satisfy Num slots when needed.
+  The legacy module produced `Value::Num(f64)` for everything.
+
+- **`rd_substitute_symbol` only swaps top-level child references.**
+  Mirrors the legacy `substitute_symbol_idx` exactly: walks an
+  App/SpecialApp/If/Let/Lambda's immediate children and swaps
+  `Symbol(target)` references with `replacement_idx`, but does NOT
+  recurse into nested subtrees. Intentional — references inside
+  deeper expressions still resolve to the outer lambda's `x` at eval
+  time, which is correct under lexical scoping.
+
+- **Verification reuses `ho_verify_composed`.** No separate
+  `rd_verify_composed` — the HO helper is exactly what RD needs:
+  build the lambda, eval it, apply to every example, compare via
+  `eval_v2::values_equal`.
+
+#### 9.28.3 Validation chain
+
+- **`rd-mul-succ`** (Task 11): `x → x * (x + 1)` at max-depth=1.
+  Flat alone enumerates only depth-1 expressions; the answer is
+  depth-2. RD's binary-arithmetic inversion derives `k = output -
+  input = [1, 4, 9, 16, 25] = x²`, sub-synthesizes `(multiply x x)`
+  at depth 1, and composes the outer `add` for free. Solves in
+  ~1570 candidates. Source: `(lambda (x) (add x (multiply x x)))`.
+- **`rd-bridge-wrap`** (Task 12): `x → (string-upper (wrap x))`
+  where `wrap = (lambda (s) (concat (concat "[" s) "]"))` is a unary
+  library function. At max-depth=1, neither Flat nor RD's family-
+  inversion path can reach the answer. RD's library-decomposition
+  phase probes `wrap` as an inner bridge, computes intermediates
+  `["[hi]", "[abc]", "[world]"]`, sub-synthesizes the outer
+  `string-upper`, and substitutes the bridge into the body via
+  `rd_substitute_symbol`. Solves in ~1086 candidates.
+
+The 11 pre-existing validation tasks still pass via their original
+strategies (`Flat`, `Memo`, `BD`, `HO`, `D&C`, `IN`) — RD does not
+intercept them under the new dispatcher ordering.
+
+#### 9.28.4 Test totals
+
+- Full suite: **357 passing** (up from 349 in §9.27), same 9
+  pre-existing `multitree::` baseline failures.
+- synth_v2 only: **82 passing** (up from 74) — 7 new RD tests plus
+  the existing strategy and infrastructure coverage.
+- `validation_v2_chain.selph`: **13/13 PASS** (11 baseline + 2 new
+  RD-specific tasks).
+
+#### 9.28.5 What remains for §9.24.5 step 6 onward
+
+Now that all six strategies (Flat + RD + BD + HO + D&C + Induction +
+Memo) are wired, the remaining items are:
+
+- **Step 6 cleanup:** the other consumer modules (`divide.rs`,
+  `induce.rs`, `verify.rs`, `abstraction.rs`, `multitree.rs`,
+  `stochastic.rs`, `meta.rs`, `taskgen.rs`, `trace.rs`, `decompose.rs`,
+  `library.rs`) still reference legacy `Value`/`Env`/`Node`. Mechanical
+  port work, no new design.
+- **Step 7:** delete `vm.rs` after Tier-1 hot-path fixes elsewhere
+  and the tree walker matches its perf.
+- **Step 8 finalization:** reload the full chained curricula end-to-end
+  through the new core. With every strategy in place, this is now
+  possible. The existing 55-task chained curriculum should be the
+  first target.
+- **Step 9 (§9.13):** types-as-SELPH curriculum. The hard-coded
+  `Int <: Num` rule moves into the `__types__` namespace.
+- **Learned RD predictor:** revisit when SELPH-script integration is
+  available through eval_v2. Until then, `rd_predict_family` is
+  hand-coded.
+
+#### 9.28.6 Files touched by §9.28
+
+- **Modified:** `selph_fast/src/synth_v2.rs` (~5435 → ~7368 lines incl. tests; +Strategy::RecursiveDecomposition, +pub fn recursive_decompose, +RdFamily/RdSpecFeatures/RdSubSpec/RdResult, +inversion+composition+generic+library helpers, +7 RD unit tests, dispatcher updated to insert RD between Flat and BD)
+- **Modified:** `examples/validation_v2_chain.selph` (~250 → ~305 lines; +rd-mul-succ, +rd-bridge-wrap, header/footer notes updated, "RD deferred" line removed)
+
+---
+
 ## 10. Success Criteria
 
 The growing system plan succeeds if:
