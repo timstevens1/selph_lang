@@ -2471,11 +2471,14 @@ mod tests {
 
     #[test]
     fn bucket6_synthesize_returns_not_found_when_impossible() {
-        // Int→arbitrary string with non-string inputs (Memo can't help).
+        // Single distinct output that isn't reachable from the literal
+        // pool at depth 1 (D&C bails on <2 distinct outputs, Memo bails
+        // on Int input, BD bails on non-bool output, HO bails on no
+        // list/string structure, Flat at depth 1 can't construct 23).
         let src = r#"
             (synthesize (ns
-                ("spec" (list (list 1 "foo") (list 2 "bar")))
-                ("max-depth" 2)
+                ("spec" (list (list 1 23) (list 2 23) (list 3 23)))
+                ("max-depth" 1)
                 ("max-candidates" 50)))
         "#;
         let r = run_file(src).unwrap();

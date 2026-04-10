@@ -18,11 +18,22 @@
 ;   5. Memo strategy fallback (string→Int with no relationship).
 ;   6. Negative case: a task that can't be solved by any current
 ;      strategy returns `found=false`.
+;   7. BD strategy: bool-output task whose only solution is a logical
+;      composition of unary library predicates (Flat capped at depth 1
+;      so it can't construct the composition; BD finds it in O(L²)).
+;   8. HO strategy: list→list task solved by recursively decomposing
+;      into a per-element sub-task (list-map template) that Flat sub-
+;      synthesizes and HO splices back.
+;   9. D&C strategy: 3-way classification task solved by partitioning
+;      examples by output value and recursively building nested
+;      if-expressions with Flat-synthesized separators.
+;  10. Induction strategy: two-step pipeline solved by probing for an
+;      intermediate value sequence and sub-synthesizing each half.
 ;
 ; What it does NOT cover (deferred work):
 ;
-;   - BD / HO / D&C / RD / Induction strategies (only Flat + Memo
-;     are ported in step 5).
+;   - RD strategy (Flat + BD + HO + D&C + Induction + Memo are
+;     wired up so far).
 ;   - synthesize-optimize (still stubbed).
 ;   - The legacy `library` ns field (eval_v2 uses env auto-discovery).
 ;   - Auto-extraction of literal constants from examples.
@@ -145,6 +156,95 @@
   ("max-candidates" 100))))
 
 (check-task "impossible-not-found" false "" t6)
+
+; ── Task 7: BD — bool composition over library predicates ──────────────
+;
+; Define two unary library predicates whose union is the target pattern.
+; With max-depth=1, Flat can only test atomic predicates (no composition),
+; so neither (is-3 x) nor (is-5 x) alone matches the alternating pattern
+; on inputs [1..6]. BD's O(L²) pairwise sweep finds (or (is-3 x) (is-5 x))
+; in a handful of probes.
+
+(define is-3 (lambda (n) (= n 3)))
+(define is-5 (lambda (n) (= n 5)))
+
+(define t-bd (synthesize (ns
+  ("spec" (list
+    (list 1 false)
+    (list 2 false)
+    (list 3 true)
+    (list 4 false)
+    (list 5 true)
+    (list 6 false)))
+  ("max-depth" 1)
+  ("max-candidates" 200))))
+
+(check-task "bool-decomp" true "BD" t-bd)
+
+; ── Task 8: HO — list→list via list-map decomposition ────────────────
+;
+; Each input is a list of integers, each output is the same list with
+; every element multiplied by 3. The per-element op `(multiply e 3)`
+; is a binary primitive + literal — there's no unary library function
+; that does it, so Flat can't find a fused-map component for it. To
+; reach the answer at the outer level Flat would need to synthesize
+; `(map (lambda (e) (multiply e 3)) x)`, but synth_v2 doesn't construct
+; inner lambdas. HO list-map decomposes the task into the per-element
+; sub-spec [1→3, 2→6, 3→9, ...] which Flat then solves trivially.
+
+(define t-ho (synthesize (ns
+  ("spec" (list
+    (list (list 1 2 3)  (list 3 6 9))
+    (list (list 4 5 6)  (list 12 15 18))
+    (list (list 7 0 10) (list 21 0 30))))
+  ("max-depth" 2)
+  ("max-candidates" 2000))))
+
+(check-task "list-map-mul3" true "HO" t-ho)
+
+; ── Task 9: D&C — three-way classification ──────────────────────────
+;
+; Sign of an integer: negative → "neg", zero → "zero", positive → "pos".
+; Three distinct outputs, naturally ordered by mean input. D&C
+; partitions on output value, sorts groups, finds two separators
+; (one per nesting level), and emits (if cond1 then1 (if cond2 ...)).
+; Flat can't construct nested-if expressions on its own; HO doesn't
+; apply (no list/string structure); BD needs bool output. D&C wins.
+
+(define t-dc (synthesize (ns
+  ("spec" (list
+    (list -5    "neg")
+    (list -1    "neg")
+    (list 0     "zero")
+    (list 2     "pos")
+    (list 7     "pos")))
+  ("max-depth" 2)
+  ("max-candidates" 5000))))
+
+(check-task "sign-classify" true "D&C" t-dc)
+
+; ── Task 10: Induction — two-step pipeline ──────────────────────────
+;
+; Target: x → string-length(x) - 2. With max-depth=1, Flat can't
+; construct (subtract (string-length x) 2) (depth 2). HO doesn't apply
+; (Int output, no list/string structure). BD wants bool output. D&C
+; partitions the 4 distinct outputs, but the resulting groups need
+; separators that can't be reached with the available string literals
+; and depth-1 budget. Induction probes `string-length` as the
+; intermediate, sub-synthesizes inputs→length and length→output, and
+; composes via (let ((x g_body)) f_body).
+
+(define t-in (synthesize (ns
+  ("spec" (list
+    (list "abc"   1)
+    (list "hello" 3)
+    (list "x"     -1)
+    (list "world" 3)
+    (list "ab"    0)))
+  ("max-depth" 1)
+  ("max-candidates" 5000))))
+
+(check-task "len-minus-2" true "IN" t-in)
 
 (print "")
 (print "validation complete")

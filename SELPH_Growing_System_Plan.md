@@ -1395,6 +1395,200 @@ The plan's §9.24.5 listed 9 steps. Steps 1–5 are done (the eval_v2 + synth_v2
 - **Modified:** `selph_fast/src/types_v2.rs` (added `top_scope()` immutable accessor for synth_v2's env walk)
 - **Modified:** `selph_fast/src/main.rs` (declared `synth_v2` module)
 
+### 9.27 Strategy ports: BD, HO, D&C, Induction (April 10, 2026)
+
+§9.26.3 step 8 — first slice. Four of the five deferred synthesis
+strategies are now wired into `synth_v2::synthesize_with_strategies`.
+The dispatcher pattern from §9.26 held up: every port was purely
+additive (a new `Strategy` enum variant + a new function + a try-block
+in the dispatcher). Zero changes to `eval_v2::bi_synthesize` or any
+call site. RD remains deferred — it depends on porting
+`recursive_decompose.rs` (step 6 work) and is tracked separately.
+
+#### 9.27.1 What landed
+
+Strategies are listed in dispatcher order. Each function lives in
+`synth_v2.rs` and is unit-tested in the synth_v2 test module.
+
+**1. `bool_decompose` — `Strategy::BoolDecomp`** (~280 lines incl. helpers).
+Port of legacy `main.rs::bool_decompose`. When the target output is
+all-bool, probe every unary `Named` component for bool return values
+on the task inputs, then enumerate `(not P)`, `(and P Q)`, `(or P Q)`,
+`(and P (not Q))`, and `(and (not P) Q)` for all `i ≤ j` pairs.
+Output AST uses `Node::SpecialApp(SpecialForm::And/Or, …)` because
+eval_v2 implements `and`/`or` as short-circuiting special forms (not
+builtins) — `not` stays as a `Node::App`. Probes both library functions
+and bool-returning builtins (`even`, `odd`); legacy only probed
+library macros because that's all its `macros` slice contained.
+
+**2. `higher_order_decompose` — `Strategy::HigherOrder`** (~370 lines).
+Port of legacy `decompose.rs`. Tries four templates in order:
+`list-map`, `list-filter`, `split-map-join`, `char-map-join`. Each
+template is shape-gated on the inputs/expected (cost ~zero when
+inapplicable), derives a sub-spec, and calls `synth_v2::synthesize`
+recursively to fill the inner function hole. The `(lambda (x) ...)`
+result of the sub-synthesis is spliced as the function arg of `map` /
+`filter` / etc. Per-template budget = `max_candidates / 4`.
+
+**3. `divide_and_conquer` — `Strategy::DivideConquer`** (~290 lines).
+Port of legacy `divide.rs`. Groups examples by output value, sorts
+groups by mean input (handles both Int and Num — legacy was Num-only),
+and recursively builds nested if-expressions: at each level, find a
+Bool separator that isolates the smallest-mean group, recurse on the
+rest as the else branch. Both `find_separator` and `synthesize_branch`
+reuse `synthesize` for sub-tasks; constant-output groups skip the
+sub-synth and emit a leaf literal directly. Strips lambda wrappers
+from sub-synth results by referencing `body_idx` instead of
+`lambda_idx` (the dead lambda node stays in the arena, the parent
+remap shifts it but never dereferences it).
+
+**4. `induce_decomposition` — `Strategy::Induction`** (~280 lines).
+Port of legacy `induce::try_intermediate_values` (the constant-discovery
+strategy is intentionally deferred — synth_v2's literal pool already
+covers most curriculum cases). Probes a curated set of unary builtins
+(`abs`, `negate`, `floor`, string ops, `even`, `odd`) and binary
+builtins paired with small Int constants (`add`/`subtract`/`multiply`
+× `[1, 2, -1, 5]`) on the task inputs to produce intermediate value
+sequences. For each non-degenerate intermediate, sub-synthesizes
+`mid → expected` first (cheaper failure detection), then
+`inputs → mid`. Composes via **`Node::Let` instead of legacy's
+substitution trick**: `(lambda (x) (let ((x g_body)) f_body))`.
+`g_body`'s `x` references resolve to the outer lambda parameter
+(eval_v2 evaluates let bindings in the parent scope before populating
+the new frame), then `f_body` sees the intermediate as `x`. This
+correctly handles nested-call composition that the legacy
+`substitute_x` only touched at the top level.
+
+#### 9.27.2 Dispatcher ordering and rationale
+
+```
+1. Flat          — bottom-up enumeration (default)
+2. BoolDecomp    — bool-output only, O(L²), structured
+3. HigherOrder   — list/string shape templates, recursive sub-synth
+4. DivideConquer — multi-output classification, recursive nested-if
+5. Induction     — two-step pipeline via intermediate value
+6. Memo          — string-key lookup table fallback
+```
+
+Order is "structured first, lookup last." BD/HO/D&C/Induction all
+produce structured programs that are likely to generalize; Memo only
+memorizes the training set. Within the structured group, cheaper
+gates run first (BD short-circuits on `output_type ≠ Bool`; HO and
+D&C bail on shape mismatches before any sub-synth).
+
+The doc-comment in `synth_v2::synthesize_with_strategies` is the
+authoritative reference for the current order.
+
+#### 9.27.3 Validation chain
+
+`examples/validation_v2_chain.selph` was extended from 7 tasks (the
+§9.26 baseline) to **11 tasks**, all running end-to-end through the
+bucket-6 `synthesize` builtin in `selph eval-v2`. The new tasks
+exercise each landed strategy:
+
+| Task | Strategy | Source |
+|---|---|---|
+| `identity` | Flat | `(lambda (x) x)` |
+| `increment` | Flat | `(lambda (x) (add 1 x))` |
+| `string-upper` | Flat | `(lambda (x) (string-upper x))` |
+| `x-plus-2` | Flat | `(lambda (x) (add 2 x))` |
+| `library-wrap` | Flat | `(lambda (x) (wrap x))` *(env auto-discovery)* |
+| `memo-lookup` | Memo | `(lambda (x) (ns-get-or (ns ...) x 0))` |
+| `impossible-not-found` | — | (correctly fails) |
+| **`bool-decomp`** | **BD** | `(lambda (x) (or (is-3 x) (is-5 x)))` |
+| **`list-map-mul3`** | **HO** | `(lambda (x) (map (lambda (x) (multiply 3 x)) x))` |
+| **`sign-classify`** | **D&C** | `(lambda (x) (if (< x 0) "neg" (if (< x 1) "zero" "pos")))` |
+| **`len-minus-2`** | **IN** | `(lambda (x) (let ((x (string-length x))) (subtract x 2)))` |
+
+All 11 tasks PASS. Each new task is constructed so that its target
+strategy is **the only** one that fits (max-depth tightened, custom
+library predicates defined, output shapes chosen to gate alternatives
+out). The `len-minus-2` task is the cleanest demonstration: with
+`max-depth=1`, Flat can't reach `(subtract (string-length x) 2)`
+(depth 2), HO has no list/string template for Int output, BD needs
+bool output, and D&C's separators can't be reached at depth 1 with
+the available string literals. Induction probes `string-length`,
+sub-syntheses both halves at depth 1, and composes via the Let.
+
+#### 9.27.4 Notable design calls
+
+1. **`Node::Let` for Induction composition** instead of legacy's
+`substitute_x`. The legacy version only handled direct `Symbol("x")`
+children of `App`/`If`/`Let`, missing nested cases like
+`(f (g x))` where `x` lives inside `g`. Using a let-binding gives
+correct semantics for arbitrarily nested step1/step2 bodies without
+any tree rewriting, because `eval_let` evaluates each binding in the
+parent scope before pushing the new frame. Cleaner *and* more
+general than legacy.
+
+2. **Strip lambda wrappers by reference, not by mutation.** D&C and
+Induction both need to inline a sub-synthesis result (which arrives
+as a `(lambda (x) body)`) into a parent expression. Both use the same
+trick: keep the lambda node in the arena (it's now dead code), point
+the new root at `body_idx`, and let the parent's remap pass shift the
+dead node along with everything else without dereferencing it. Saves
+having to walk the body to count reachable nodes.
+
+3. **HO sub-synthesis uses `synthesize` (not `synthesize_with_strategies`).**
+Avoids HO recursing into HO via the dispatcher. Same call shape as
+legacy. Same applies to D&C and Induction sub-syntheses.
+
+4. **Reuse `eval_v2::values_equal` and `synth_v2::val_hash` everywhere.**
+No more separate `vals_equal` / dedup functions per-strategy. The new
+core's invariants are uniform across strategies — Int vs Num is
+distinct, Nil compares correctly, etc.
+
+5. **Bias arithmetic intermediate constants to Int.** Legacy used
+`SMALL_CONSTANTS: &[f64] = &[1.0, 2.0, -1.0, 0.5]`. The Int port
+uses `[1, 2, -1, 5]` — no fractional values, since synth_v2 keeps
+Int and Num distinct and the curriculum is integer-biased. Legacy's
+0.5 is the kind of floating-point experiment that types_v2 explicitly
+makes a deliberate choice rather than a default.
+
+#### 9.27.5 Test totals
+
+After §9.27 lands, the synth_v2 + eval_v2 + supporting test count is
+**349 passing** (up from 324 in §9.26), with the same 9 pre-existing
+`multitree::` baseline failures untouched.
+
+| Strategy | New synth_v2 unit tests | New dispatcher tests |
+|---|---|---|
+| BoolDecomp | 6 | 2 |
+| HigherOrder | 7 | 1 |
+| DivideConquer | 3 | 1 |
+| Induction | 5 | 0 (covered by integration) |
+| **Total** | **21** | **4** |
+
+The dispatcher_returns_not_found_when_no_strategy_applies test was
+updated mid-port: D&C now solves the original "Int→string with
+distinct outputs" case as a 2-output classification. The replacement
+target uses a single output value that's unreachable at depth 1 from
+the literal pool — no strategy can fit, so the dispatcher correctly
+returns `not_found`. Same fix applied to
+`bucket6_synthesize_returns_not_found_when_impossible` in
+`eval_v2.rs`.
+
+#### 9.27.6 What remains (RD)
+
+`Strategy::RecursiveDecomposition` is the last unported strategy.
+Unlike the others, it can't be added as a self-contained function in
+synth_v2.rs — it depends on `recursive_decompose.rs` (~1000 lines)
+which is still typed against legacy `Value`/`Env`/`Node` and uses
+`LearnedPredictor` to classify outermost function families. Porting
+RD therefore combines step 6 (consumer module migration) with step 8
+(strategy port) in a single substantial sub-iteration.
+
+The dispatcher slot is reserved (Strategy 0 in §9.22's design — RD
+runs **before** Flat, not after) but currently not wired. This is
+intentional: RD becomes the first try, Flat the fallback, and the
+existing dispatcher order shifts down by one when RD lands.
+
+#### 9.27.7 Files touched by §9.27
+
+- **Modified:** `selph_fast/src/synth_v2.rs` (~3041 → ~5435 lines incl. tests; +bool_decompose, +higher_order_decompose, +divide_and_conquer, +induce_decomposition, +25 unit tests, dispatcher updated)
+- **Modified:** `selph_fast/src/eval_v2.rs` (1 test target updated for the post-D&C "impossible" case)
+- **Modified:** `examples/validation_v2_chain.selph` (~140 → ~250 lines; +4 strategy validation tasks)
+
 ---
 
 ## 10. Success Criteria

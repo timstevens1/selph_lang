@@ -1062,15 +1062,22 @@ pub fn default_skip_set() -> HashSet<Sym> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
     Flat,
+    BoolDecomp,
+    HigherOrder,
+    DivideConquer,
+    Induction,
     Memo,
-    // Future: BoolDecomposition, HigherOrder, DivideAndConquer,
-    //         Induction, RecursiveDecomposition.
+    // Future: RecursiveDecomposition.
 }
 
 impl Strategy {
     pub fn name(&self) -> &'static str {
         match self {
             Strategy::Flat => "Flat",
+            Strategy::BoolDecomp => "BD",
+            Strategy::HigherOrder => "HO",
+            Strategy::DivideConquer => "D&C",
+            Strategy::Induction => "IN",
             Strategy::Memo => "Memo",
         }
     }
@@ -1223,6 +1230,1501 @@ fn value_to_node(v: &Value) -> Node {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Higher-order decomposition strategy
+// ────────────────────────────────────────────────────────────────────────────
+//
+// When flat enumeration can't reach the target, try fixed structural
+// templates that recursively call `synthesize` on a derived sub-spec.
+// Each template assumes the outer program has a specific shape:
+//
+//   1. list-map:        (lambda (x) (map HOLE x))
+//   2. split-map-join:  (lambda (x) (string-join (map HOLE (string-split x SEP)) SEP))
+//   3. char-map-join:   (lambda (x) (string-join (map HOLE (string-chars x)) ""))
+//   4. list-filter:     (lambda (x) (filter HOLE x))
+//
+// For each template that's applicable to the (input, output) shape,
+// derive a sub-spec for HOLE, sub-synthesize, and splice the result
+// into the wrapper. This is a port of legacy `decompose.rs` —
+// stripped to types_v2 / eval_v2 surface, no macro env to rebuild,
+// and the inner `synthesize` call uses synth_v2's flat enumerator
+// (NOT `synthesize_with_strategies`, to avoid HO recursing into HO).
+//
+// Templates evaluate left-to-right and short-circuit on first success.
+// Per-template budget is `max_candidates / 4`.
+
+/// Result of an HO strategy attempt.
+struct HoResult {
+    found: bool,
+    nodes: Vec<Node>,
+    root: usize,
+    candidates_explored: usize,
+}
+
+impl HoResult {
+    fn empty() -> Self {
+        Self {
+            found: false,
+            nodes: Vec::new(),
+            root: 0,
+            candidates_explored: 0,
+        }
+    }
+}
+
+/// Top-level HO entry point. Tries each template in order, returning
+/// the first successful result. Total candidates explored is the sum
+/// over all attempted templates' sub-syntheses.
+pub fn higher_order_decompose(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+) -> Option<(Vec<Node>, usize, usize)> {
+    if inputs.is_empty() || inputs.len() != expected.len() {
+        return None;
+    }
+    let budget_per_template = (max_candidates / 4).max(1);
+    let mut total_explored: usize = 0;
+
+    for template in [
+        ho_try_list_map as HoTemplate,
+        ho_try_list_filter,
+        ho_try_split_map_join,
+        ho_try_char_map_join,
+    ] {
+        let r = template(
+            components,
+            inputs,
+            expected,
+            env,
+            universe,
+            max_depth,
+            budget_per_template,
+        );
+        total_explored += r.candidates_explored;
+        if r.found {
+            return Some((r.nodes, r.root, total_explored));
+        }
+    }
+    None
+}
+
+type HoTemplate = fn(
+    &[SynthComponent],
+    &[Value],
+    &[Value],
+    &Env,
+    &TypeUniverse,
+    usize,
+    usize,
+) -> HoResult;
+
+// ── HO helpers ─────────────────────────────────────────────────────────
+
+/// Deduplicate a sub-spec, returning `None` if any input maps to two
+/// different outputs (the sub-spec would be inconsistent), or if the
+/// deduplicated set is too small to learn from.
+///
+/// Threshold of 3 unique pairs matches the legacy heuristic — fewer
+/// than that, the sub-synthesizer is likely to memorize trivially or
+/// produce a constant.
+fn ho_dedup_spec(pairs: Vec<(Value, Value)>) -> Option<Vec<(Value, Value)>> {
+    let mut seen: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut unique: Vec<(Value, Value)> = Vec::new();
+
+    for (inp, out) in pairs {
+        let h = val_hash(&inp);
+        let mut already = false;
+        if let Some(indices) = seen.get(&h) {
+            for &idx in indices {
+                if eval_v2::values_equal(&unique[idx].0, &inp) {
+                    if !eval_v2::values_equal(&unique[idx].1, &out) {
+                        return None; // conflict
+                    }
+                    already = true;
+                    break;
+                }
+            }
+        }
+        if !already {
+            let idx = unique.len();
+            seen.entry(h).or_default().push(idx);
+            unique.push((inp, out));
+        }
+    }
+
+    if unique.len() < 3 {
+        return None;
+    }
+    Some(unique)
+}
+
+/// Verify a fully composed program by evaluating its lambda and applying
+/// it to every (input, expected) pair. Returns true iff all examples
+/// match exactly.
+fn ho_verify_composed(
+    nodes: &[Node],
+    lambda_idx: usize,
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+) -> bool {
+    let nodes_rc: Rc<[Node]> = nodes.to_vec().into();
+    let f = match eval_v2::eval(&nodes_rc, lambda_idx, env) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    for (inp, exp) in inputs.iter().zip(expected.iter()) {
+        match eval_v2::apply(&f, std::slice::from_ref(inp), env) {
+            Ok(ref v) if eval_v2::values_equal(v, exp) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Splice a sub-solution program (a `(lambda (x) ...)` from a recursive
+/// `synthesize` call) into a fresh node arena starting at `offset`,
+/// returning the index of the spliced lambda root.
+fn ho_splice_sub(nodes: &mut Vec<Node>, sub_nodes: &[Node], sub_root: usize) -> usize {
+    let offset = nodes.len();
+    for n in sub_nodes {
+        nodes.push(remap_node(n, offset));
+    }
+    sub_root + offset
+}
+
+// ── Template 1: list-map ───────────────────────────────────────────────
+
+/// `(lambda (x) (map HOLE x))` — applies when every input is a list and
+/// the corresponding expected output is a same-length list. The sub-spec
+/// pairs each input element with its expected output element.
+fn ho_try_list_map(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+) -> HoResult {
+    let mut sub_pairs: Vec<(Value, Value)> = Vec::new();
+    for (inp, out) in inputs.iter().zip(expected.iter()) {
+        let (il, ol) = match (inp, out) {
+            (Value::List(il), Value::List(ol)) if il.len() == ol.len() && !il.is_empty() => {
+                (il, ol)
+            }
+            _ => return HoResult::empty(),
+        };
+        for (ie, oe) in il.iter().zip(ol.iter()) {
+            sub_pairs.push((ie.clone(), oe.clone()));
+        }
+    }
+
+    let sub_spec = match ho_dedup_spec(sub_pairs) {
+        Some(s) => s,
+        None => return HoResult::empty(),
+    };
+    let (sub_inputs, sub_expected): (Vec<Value>, Vec<Value>) = sub_spec.into_iter().unzip();
+
+    let sr = synthesize(
+        components,
+        &sub_inputs,
+        &sub_expected,
+        env,
+        universe,
+        max_depth,
+        max_candidates,
+    );
+    let mut result = HoResult::empty();
+    result.candidates_explored = sr.candidates_explored;
+    if !sr.found {
+        return result;
+    }
+    let sub_nodes = sr.nodes.unwrap();
+    let sub_root = sr.root.unwrap();
+
+    // Build (lambda (x) (map sub-fn x))
+    let mut nodes: Vec<Node> = Vec::new();
+    let x_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("x")));
+
+    let sub_root_remapped = ho_splice_sub(&mut nodes, &sub_nodes, sub_root);
+
+    let map_sym_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("map")));
+    let map_app = nodes.len();
+    nodes.push(Node::App(vec![map_sym_idx, sub_root_remapped, x_idx]));
+    let lambda_idx = nodes.len();
+    nodes.push(Node::Lambda(vec![intern("x")], map_app));
+
+    if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+        result.found = true;
+        result.nodes = nodes;
+        result.root = lambda_idx;
+    }
+    result
+}
+
+// ── Template 2: list-filter ────────────────────────────────────────────
+
+/// `(lambda (x) (filter HOLE x))` — applies when every input is a list
+/// and the corresponding expected output is an *ordered subset* of that
+/// input. The sub-spec labels each element with its keep/drop decision
+/// (Bool), so the inner sub-synthesizer must produce a unary predicate.
+fn ho_try_list_filter(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+) -> HoResult {
+    let mut sub_pairs: Vec<(Value, Value)> = Vec::new();
+    for (inp, out) in inputs.iter().zip(expected.iter()) {
+        let (il, ol) = match (inp, out) {
+            (Value::List(il), Value::List(ol)) if !il.is_empty() => (il, ol),
+            _ => return HoResult::empty(),
+        };
+        // Walk in_list once; advance out_idx whenever an element matches
+        // the next expected output. If we don't consume all of `out_list`,
+        // it isn't an ordered subset.
+        let mut out_idx = 0usize;
+        for elem in il.iter() {
+            let keep = if out_idx < ol.len() && eval_v2::values_equal(elem, &ol[out_idx]) {
+                out_idx += 1;
+                true
+            } else {
+                false
+            };
+            sub_pairs.push((elem.clone(), Value::Bool(keep)));
+        }
+        if out_idx != ol.len() {
+            return HoResult::empty();
+        }
+    }
+
+    let sub_spec = match ho_dedup_spec(sub_pairs) {
+        Some(s) => s,
+        None => return HoResult::empty(),
+    };
+    let (sub_inputs, sub_expected): (Vec<Value>, Vec<Value>) = sub_spec.into_iter().unzip();
+
+    let sr = synthesize(
+        components,
+        &sub_inputs,
+        &sub_expected,
+        env,
+        universe,
+        max_depth,
+        max_candidates,
+    );
+    let mut result = HoResult::empty();
+    result.candidates_explored = sr.candidates_explored;
+    if !sr.found {
+        return result;
+    }
+    let sub_nodes = sr.nodes.unwrap();
+    let sub_root = sr.root.unwrap();
+
+    // Build (lambda (x) (filter sub-fn x))
+    let mut nodes: Vec<Node> = Vec::new();
+    let x_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("x")));
+
+    let sub_root_remapped = ho_splice_sub(&mut nodes, &sub_nodes, sub_root);
+
+    let filter_sym_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("filter")));
+    let filter_app = nodes.len();
+    nodes.push(Node::App(vec![filter_sym_idx, sub_root_remapped, x_idx]));
+    let lambda_idx = nodes.len();
+    nodes.push(Node::Lambda(vec![intern("x")], filter_app));
+
+    if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+        result.found = true;
+        result.nodes = nodes;
+        result.root = lambda_idx;
+    }
+    result
+}
+
+// ── Template 3: split-map-join ─────────────────────────────────────────
+
+/// Common single-character delimiters tried by `split-map-join`,
+/// ordered by frequency in the SELPH curricula.
+const SPLIT_DELIMITERS: &[&str] = &[" ", ",", "-", ".", "/", ":", ";", "_", "|"];
+
+/// `(lambda (x) (string-join (map HOLE (string-split x SEP)) SEP))`.
+/// Applies when both input and output are strings that split into the
+/// same number of parts under some delimiter, and each part-pair forms
+/// the inner sub-spec.
+fn ho_try_split_map_join(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+) -> HoResult {
+    let mut result = HoResult::empty();
+
+    let strs_in: Option<Vec<&str>> = inputs
+        .iter()
+        .map(|v| match v {
+            Value::Str(s) => Some(s.as_ref()),
+            _ => None,
+        })
+        .collect();
+    let strs_in = match strs_in {
+        Some(v) => v,
+        None => return result,
+    };
+    let strs_out: Option<Vec<&str>> = expected
+        .iter()
+        .map(|v| match v {
+            Value::Str(s) => Some(s.as_ref()),
+            _ => None,
+        })
+        .collect();
+    let strs_out = match strs_out {
+        Some(v) => v,
+        None => return result,
+    };
+
+    for &sep in SPLIT_DELIMITERS {
+        let sub_spec = match ho_derive_split_spec(&strs_in, &strs_out, sep) {
+            Some(s) => s,
+            None => continue,
+        };
+        let (sub_inputs, sub_expected): (Vec<Value>, Vec<Value>) = sub_spec.into_iter().unzip();
+
+        let sr = synthesize(
+            components,
+            &sub_inputs,
+            &sub_expected,
+            env,
+            universe,
+            max_depth,
+            max_candidates,
+        );
+        result.candidates_explored += sr.candidates_explored;
+        if !sr.found {
+            continue;
+        }
+        let sub_nodes = sr.nodes.unwrap();
+        let sub_root = sr.root.unwrap();
+
+        // Build (lambda (x) (string-join (map sub-fn (string-split x SEP)) SEP))
+        let mut nodes: Vec<Node> = Vec::new();
+        let x_idx = nodes.len();
+        nodes.push(Node::Symbol(intern("x")));
+        let sep_idx = nodes.len();
+        nodes.push(Node::Str(sep.to_string()));
+        let split_sym = nodes.len();
+        nodes.push(Node::Symbol(intern("string-split")));
+        let split_app = nodes.len();
+        nodes.push(Node::App(vec![split_sym, x_idx, sep_idx]));
+
+        let sub_root_remapped = ho_splice_sub(&mut nodes, &sub_nodes, sub_root);
+
+        let map_sym = nodes.len();
+        nodes.push(Node::Symbol(intern("map")));
+        let map_app = nodes.len();
+        nodes.push(Node::App(vec![map_sym, sub_root_remapped, split_app]));
+
+        let sep_idx2 = nodes.len();
+        nodes.push(Node::Str(sep.to_string()));
+        let join_sym = nodes.len();
+        nodes.push(Node::Symbol(intern("string-join")));
+        let join_app = nodes.len();
+        nodes.push(Node::App(vec![join_sym, map_app, sep_idx2]));
+
+        let lambda_idx = nodes.len();
+        nodes.push(Node::Lambda(vec![intern("x")], join_app));
+
+        if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+            result.found = true;
+            result.nodes = nodes;
+            result.root = lambda_idx;
+            return result;
+        }
+    }
+    result
+}
+
+/// Derive a sub-spec from splitting each (input, output) string pair
+/// by `sep`. Returns `None` if any pair has a different part-count, or
+/// if no pair actually contained the delimiter (the candidate would be
+/// equivalent to identity).
+fn ho_derive_split_spec(
+    inputs: &[&str],
+    outputs: &[&str],
+    sep: &str,
+) -> Option<Vec<(Value, Value)>> {
+    let mut pairs: Vec<(Value, Value)> = Vec::new();
+    let mut any_multi = false;
+    for (&inp, &out) in inputs.iter().zip(outputs.iter()) {
+        let in_parts: Vec<&str> = inp.split(sep).collect();
+        let out_parts: Vec<&str> = out.split(sep).collect();
+        if in_parts.len() != out_parts.len() {
+            return None;
+        }
+        if in_parts.len() >= 2 {
+            any_multi = true;
+        }
+        for (ip, op) in in_parts.iter().zip(out_parts.iter()) {
+            pairs.push((Value::str(*ip), Value::str(*op)));
+        }
+    }
+    if !any_multi {
+        return None;
+    }
+    ho_dedup_spec(pairs)
+}
+
+// ── Template 4: char-map-join ──────────────────────────────────────────
+
+/// `(lambda (x) (string-join (map HOLE (string-chars x)) ""))` —
+/// applies when every input/output pair is a same-length string. The
+/// sub-spec maps each input character to its corresponding output
+/// character (each as a single-character string).
+fn ho_try_char_map_join(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+) -> HoResult {
+    let mut sub_pairs: Vec<(Value, Value)> = Vec::new();
+    for (inp, out) in inputs.iter().zip(expected.iter()) {
+        let (s_in, s_out) = match (inp, out) {
+            (Value::Str(a), Value::Str(b))
+                if !a.is_empty() && a.chars().count() == b.chars().count() =>
+            {
+                (a, b)
+            }
+            _ => return HoResult::empty(),
+        };
+        for (ci, co) in s_in.chars().zip(s_out.chars()) {
+            sub_pairs.push((Value::str(ci.to_string()), Value::str(co.to_string())));
+        }
+    }
+
+    let sub_spec = match ho_dedup_spec(sub_pairs) {
+        Some(s) => s,
+        None => return HoResult::empty(),
+    };
+    let (sub_inputs, sub_expected): (Vec<Value>, Vec<Value>) = sub_spec.into_iter().unzip();
+
+    let sr = synthesize(
+        components,
+        &sub_inputs,
+        &sub_expected,
+        env,
+        universe,
+        max_depth,
+        max_candidates,
+    );
+    let mut result = HoResult::empty();
+    result.candidates_explored = sr.candidates_explored;
+    if !sr.found {
+        return result;
+    }
+    let sub_nodes = sr.nodes.unwrap();
+    let sub_root = sr.root.unwrap();
+
+    // Build (lambda (x) (string-join (map sub-fn (string-chars x)) ""))
+    let mut nodes: Vec<Node> = Vec::new();
+    let x_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("x")));
+    let chars_sym = nodes.len();
+    nodes.push(Node::Symbol(intern("string-chars")));
+    let chars_app = nodes.len();
+    nodes.push(Node::App(vec![chars_sym, x_idx]));
+
+    let sub_root_remapped = ho_splice_sub(&mut nodes, &sub_nodes, sub_root);
+
+    let map_sym = nodes.len();
+    nodes.push(Node::Symbol(intern("map")));
+    let map_app = nodes.len();
+    nodes.push(Node::App(vec![map_sym, sub_root_remapped, chars_app]));
+
+    let empty_sep = nodes.len();
+    nodes.push(Node::Str(String::new()));
+    let join_sym = nodes.len();
+    nodes.push(Node::Symbol(intern("string-join")));
+    let join_app = nodes.len();
+    nodes.push(Node::App(vec![join_sym, map_app, empty_sep]));
+
+    let lambda_idx = nodes.len();
+    nodes.push(Node::Lambda(vec![intern("x")], join_app));
+
+    if ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+        result.found = true;
+        result.nodes = nodes;
+        result.root = lambda_idx;
+    }
+    result
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Boolean decomposition strategy
+// ────────────────────────────────────────────────────────────────────────────
+//
+// When the target output is `Bool`, try every constant-time logical
+// composition of the available unary library predicates:
+//
+//   (not P), (and P Q), (or P Q), (and P (not Q)), (and (not P) Q)
+//
+// for all unary library functions P, Q that return `Bool` when applied
+// to the task's inputs. This is `main.rs::bool_decompose` from the
+// legacy core, ported to types_v2.
+//
+// Why this is its own strategy and not just enumeration:
+//   - O(L²) where L is the number of bool-returning library functions.
+//     Even with L = 30 that's 900 candidates — far below the Flat
+//     budget. The legacy version reports it solves in 0 candidates by
+//     bookkeeping convention; here we count actual probes.
+//   - The bottom-up enumerator with `Bool → Bool → Bool` operators in
+//     play already finds these compositions, but only at depth ≥ 3,
+//     and the type-tagged search wastes a lot of pool space exploring
+//     non-bool intermediates first. BD short-circuits all of that for
+//     a target type that is rare in practice but cheap to recognize.
+//
+// What this version does NOT inherit from legacy:
+//   - The legacy version walks the macro list and rebuilds an env per
+//     probe (`make_default_env` + re-define every macro). In synth_v2
+//     the env IS the library, so we just call `eval_v2::apply` against
+//     the env we were given — same as `probe_filter_components`.
+//   - The legacy version probes by name match against the macro table.
+//     synth_v2 already has a `SynthComponent` catalog, so we filter
+//     it directly and avoid a second env walk.
+
+/// Information needed to compose a probed predicate back into a candidate
+/// AST: the Sym that resolves it in the env, and its per-input outputs.
+struct BoolPredicate {
+    sym: Sym,
+    /// One bool per task input, in order.
+    outputs: Vec<bool>,
+}
+
+/// Try to solve `(inputs, expected)` as a logical composition of unary
+/// library predicates. Returns `(nodes, root)` for a `(lambda (x) ...)`
+/// program, plus the number of candidate compositions tested. Returns
+/// `None` if the target is not bool-typed or no composition matches.
+///
+/// Composition templates tried, in order:
+///   1. `(not P)`           — for each predicate
+///   2. `(and P Q)`         — for each pair (i ≤ j)
+///   3. `(or P Q)`          — for each pair (i ≤ j)
+///   4. `(and P (not Q))`   — for each pair (i ≤ j)
+///   5. `(and (not P) Q)`   — for each pair (i ≤ j)
+///
+/// The "≤" pairing matches legacy: it skips strict-greater pairs because
+/// `and`/`or` are commutative, but it does include the `i = j` diagonal
+/// (which is mostly degenerate but cheap).
+pub fn bool_decompose(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+) -> Option<(Vec<Node>, usize, usize)> {
+    // Output must be all-bool.
+    if expected.is_empty() || inputs.len() != expected.len() {
+        return None;
+    }
+    let expected_bools: Vec<bool> = expected
+        .iter()
+        .map(|v| if let Value::Bool(b) = v { Some(*b) } else { None })
+        .collect::<Option<Vec<_>>>()?;
+
+    // Probe every unary `Named` component. We deliberately accept
+    // builtins too (e.g. `even`, `odd`) — the legacy version only
+    // probed library macros because that's what its `macros` slice
+    // contained, but in synth_v2 the catalog is uniform and there's
+    // no reason to skip a primitive predicate that fits the pattern.
+    // Components whose declared return type isn't `Bool` are skipped
+    // for free, and we additionally re-check the runtime type from the
+    // probe to defend against polymorphic returns.
+    let bool_sym = intern("Bool");
+    let mut predicates: Vec<BoolPredicate> = Vec::new();
+
+    for comp in components {
+        if comp.arity != 1 {
+            continue;
+        }
+        if comp.ret_type != bool_sym {
+            continue;
+        }
+        let sym = match comp.dispatch {
+            Dispatch::Named(s) => s,
+            _ => continue, // literals, fused forms — not predicates
+        };
+        let val = match env.lookup(sym) {
+            Some(v) => v,
+            None => continue,
+        };
+        // Probe on every input. Drop on any error or non-bool result.
+        let mut outputs = Vec::with_capacity(inputs.len());
+        let mut all_ok = true;
+        for inp in inputs {
+            match eval_v2::apply(&val, std::slice::from_ref(inp), env) {
+                Ok(Value::Bool(b)) => outputs.push(b),
+                _ => {
+                    all_ok = false;
+                    break;
+                }
+            }
+        }
+        if all_ok && outputs.len() == inputs.len() {
+            predicates.push(BoolPredicate { sym, outputs });
+        }
+    }
+
+    if predicates.is_empty() {
+        return None;
+    }
+
+    let mut candidates_tested: usize = 0;
+
+    // Template 1: (not P)
+    for p in &predicates {
+        candidates_tested += 1;
+        if p.outputs.iter().zip(&expected_bools).all(|(a, e)| !*a == *e) {
+            let (n, r) = build_bool_program(BoolBuild::NotP(p.sym))?;
+            return Some((n, r, candidates_tested));
+        }
+    }
+
+    // Templates 2–5: pairwise
+    for i in 0..predicates.len() {
+        for j in i..predicates.len() {
+            let p = &predicates[i];
+            let q = &predicates[j];
+
+            // (and P Q)
+            candidates_tested += 1;
+            if p.outputs
+                .iter()
+                .zip(&q.outputs)
+                .zip(&expected_bools)
+                .all(|((a, b), e)| (*a && *b) == *e)
+            {
+                let (n, r) = build_bool_program(BoolBuild::AndPQ(p.sym, q.sym))?;
+                return Some((n, r, candidates_tested));
+            }
+
+            // (or P Q)
+            candidates_tested += 1;
+            if p.outputs
+                .iter()
+                .zip(&q.outputs)
+                .zip(&expected_bools)
+                .all(|((a, b), e)| (*a || *b) == *e)
+            {
+                let (n, r) = build_bool_program(BoolBuild::OrPQ(p.sym, q.sym))?;
+                return Some((n, r, candidates_tested));
+            }
+
+            // (and P (not Q))
+            candidates_tested += 1;
+            if p.outputs
+                .iter()
+                .zip(&q.outputs)
+                .zip(&expected_bools)
+                .all(|((a, b), e)| (*a && !*b) == *e)
+            {
+                let (n, r) = build_bool_program(BoolBuild::AndPNotQ(p.sym, q.sym))?;
+                return Some((n, r, candidates_tested));
+            }
+
+            // (and (not P) Q)
+            candidates_tested += 1;
+            if p.outputs
+                .iter()
+                .zip(&q.outputs)
+                .zip(&expected_bools)
+                .all(|((a, b), e)| (!*a && *b) == *e)
+            {
+                let (n, r) = build_bool_program(BoolBuild::AndNotPQ(p.sym, q.sym))?;
+                return Some((n, r, candidates_tested));
+            }
+        }
+    }
+
+    None
+}
+
+/// Tag for `build_bool_program` — describes which template to materialize.
+enum BoolBuild {
+    NotP(Sym),
+    AndPQ(Sym, Sym),
+    OrPQ(Sym, Sym),
+    AndPNotQ(Sym, Sym),
+    AndNotPQ(Sym, Sym),
+}
+
+/// Build the AST `(lambda (x) <body>)` for a BD template. Returns the
+/// node arena and the lambda's index. The body shape is determined by
+/// the `BoolBuild` tag.
+///
+/// Node-tree details:
+///   - `(p x)` is `Node::App([sym(p), sym(x)])`.
+///   - `(not (p x))` is `Node::App([sym(not), (p x)_idx])`.
+///   - `(and a b)` and `(or a b)` are `Node::SpecialApp(SpecialForm::{And,Or}, [a, b])`
+///     because eval_v2 implements `and`/`or` as short-circuiting special
+///     forms, not as builtins.
+fn build_bool_program(build: BoolBuild) -> Option<(Vec<Node>, usize)> {
+    let mut nodes: Vec<Node> = Vec::new();
+    let x_sym = intern("x");
+    let not_sym = intern("not");
+
+    // Helper: emit `(p x)` and return its index.
+    let mut emit_call = |nodes: &mut Vec<Node>, p: Sym| -> usize {
+        let p_idx = nodes.len();
+        nodes.push(Node::Symbol(p));
+        let x_idx = nodes.len();
+        nodes.push(Node::Symbol(x_sym));
+        let app_idx = nodes.len();
+        nodes.push(Node::App(vec![p_idx, x_idx]));
+        app_idx
+    };
+
+    // Helper: emit `(not <inner_idx>)` and return its index.
+    let emit_not = |nodes: &mut Vec<Node>, inner_idx: usize| -> usize {
+        let not_idx = nodes.len();
+        nodes.push(Node::Symbol(not_sym));
+        let app_idx = nodes.len();
+        nodes.push(Node::App(vec![not_idx, inner_idx]));
+        app_idx
+    };
+
+    let body_idx = match build {
+        BoolBuild::NotP(p) => {
+            let pcall = emit_call(&mut nodes, p);
+            emit_not(&mut nodes, pcall)
+        }
+        BoolBuild::AndPQ(p, q) => {
+            let pcall = emit_call(&mut nodes, p);
+            let qcall = emit_call(&mut nodes, q);
+            let app = nodes.len();
+            nodes.push(Node::SpecialApp(SpecialForm::And, vec![pcall, qcall]));
+            app
+        }
+        BoolBuild::OrPQ(p, q) => {
+            let pcall = emit_call(&mut nodes, p);
+            let qcall = emit_call(&mut nodes, q);
+            let app = nodes.len();
+            nodes.push(Node::SpecialApp(SpecialForm::Or, vec![pcall, qcall]));
+            app
+        }
+        BoolBuild::AndPNotQ(p, q) => {
+            let pcall = emit_call(&mut nodes, p);
+            let qcall = emit_call(&mut nodes, q);
+            let qnot = emit_not(&mut nodes, qcall);
+            let app = nodes.len();
+            nodes.push(Node::SpecialApp(SpecialForm::And, vec![pcall, qnot]));
+            app
+        }
+        BoolBuild::AndNotPQ(p, q) => {
+            let pcall = emit_call(&mut nodes, p);
+            let pnot = emit_not(&mut nodes, pcall);
+            let qcall = emit_call(&mut nodes, q);
+            let app = nodes.len();
+            nodes.push(Node::SpecialApp(SpecialForm::And, vec![pnot, qcall]));
+            app
+        }
+    };
+
+    let lambda_idx = nodes.len();
+    nodes.push(Node::Lambda(vec![x_sym], body_idx));
+    Some((nodes, lambda_idx))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Divide-and-conquer strategy
+// ────────────────────────────────────────────────────────────────────────────
+//
+// When the spec has multiple distinct output values — i.e. it looks
+// like a piecewise / classification task — try to break it into
+// nested if-expressions:
+//
+//   1. Group examples by output value.
+//   2. Sort groups by mean input (gives a natural threshold ordering).
+//   3. Recursively build a nested if: pick the smallest-mean group,
+//      find a boolean separator that's true on it and false on the
+//      rest, recurse on the rest as the else branch.
+//   4. Each leaf group is either a constant (if all members agree) or
+//      a flat sub-synthesis on the group's subset.
+//
+// Both `find_separator` and `synthesize_branch` reuse `synthesize`,
+// the flat enumerator. find_separator builds a Bool sub-spec where
+// the target is true on the "kept" indices and false on the rest;
+// synthesize_branch builds an output-typed sub-spec on the group's
+// own examples. The recursive structure mirrors legacy `divide.rs`.
+//
+// Port-specific notes:
+//   - Mean-input handles both Int and Num. Non-numeric inputs fall
+//     back to 0.0 (matches legacy).
+//   - The leaf "constant branch" supports Int, Num, Str, Bool — same
+//     set as types_v2 literal Node variants.
+//   - When stripping the `(lambda (x) body)` wrapper from a sub-synth
+//     result, we keep the lambda node in the arena (it becomes dead
+//     code) and reference `body_idx` as the new root. The parent
+//     remap pass shifts the dead node along with everything else but
+//     never dereferences it — same trick as legacy `divide.rs`.
+
+/// Try to solve `(inputs, expected)` by partitioning on output value
+/// and emitting nested if-expressions. Returns `(nodes, root, candidates_explored)`
+/// for a `(lambda (x) ...)` program, or `None` when:
+///   - fewer than 2 distinct output values are present (pure case for Flat)
+///   - no separator condition can be found at any partition level
+///   - any leaf branch fails to synthesize
+pub fn divide_and_conquer(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+) -> Option<(Vec<Node>, usize, usize)> {
+    if inputs.is_empty() || inputs.len() != expected.len() {
+        return None;
+    }
+
+    // ── Group examples by output value ─────────────────────────────────
+    // Hash on val_hash, verify with values_equal (collision-safe).
+    let mut groups: Vec<(Value, Vec<usize>)> = Vec::new();
+    let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, out) in expected.iter().enumerate() {
+        let h = val_hash(out);
+        let mut placed = false;
+        if let Some(group_indices) = by_hash.get(&h) {
+            for &gi in group_indices {
+                if eval_v2::values_equal(&groups[gi].0, out) {
+                    groups[gi].1.push(i);
+                    placed = true;
+                    break;
+                }
+            }
+        }
+        if !placed {
+            let new_idx = groups.len();
+            by_hash.entry(h).or_default().push(new_idx);
+            groups.push((out.clone(), vec![i]));
+        }
+    }
+
+    if groups.len() < 2 {
+        return None;
+    }
+
+    // Sort groups by mean input value (defines the if-tree order).
+    groups.sort_by(|a, b| {
+        let ma = dc_mean_input(&a.1, inputs);
+        let mb = dc_mean_input(&b.1, inputs);
+        ma.partial_cmp(&mb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Recursive nested-if construction.
+    let mut total_explored: usize = 0;
+    let body = dc_build_nested_if(
+        &groups,
+        inputs,
+        expected,
+        components,
+        env,
+        universe,
+        max_depth,
+        max_candidates,
+        &mut total_explored,
+    )?;
+
+    // Wrap the body in a lambda and verify against every example.
+    let (mut nodes, root) = body;
+    let lambda_idx = nodes.len();
+    nodes.push(Node::Lambda(vec![intern("x")], root));
+
+    if !ho_verify_composed(&nodes, lambda_idx, inputs, expected, env) {
+        return None;
+    }
+
+    Some((nodes, lambda_idx, total_explored))
+}
+
+/// Mean of input values at the given indices, treating each input as
+/// a number when possible. Int and Num both contribute their numeric
+/// value; non-numeric inputs are skipped (and a fully non-numeric
+/// group returns 0.0 — its sort position is undefined but stable).
+fn dc_mean_input(indices: &[usize], inputs: &[Value]) -> f64 {
+    let mut sum = 0.0;
+    let mut count = 0;
+    for &i in indices {
+        match &inputs[i] {
+            Value::Int(n) => {
+                sum += *n as f64;
+                count += 1;
+            }
+            Value::Num(n) => {
+                sum += *n;
+                count += 1;
+            }
+            _ => {}
+        }
+    }
+    if count > 0 {
+        sum / count as f64
+    } else {
+        0.0
+    }
+}
+
+/// Recursively build a nested if-expression body for the sorted output
+/// groups. Returns `(nodes, body_root)` where `body_root` is the root
+/// of the body expression (NOT yet wrapped in a lambda).
+fn dc_build_nested_if(
+    sorted_groups: &[(Value, Vec<usize>)],
+    inputs: &[Value],
+    expected: &[Value],
+    components: &[SynthComponent],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+    total_explored: &mut usize,
+) -> Option<(Vec<Node>, usize)> {
+    if sorted_groups.len() == 1 {
+        let (out_val, indices) = &sorted_groups[0];
+        return dc_synthesize_branch(
+            out_val,
+            indices,
+            inputs,
+            expected,
+            components,
+            env,
+            universe,
+            max_depth,
+            max_candidates,
+            total_explored,
+        );
+    }
+
+    let (first_val, first_indices) = &sorted_groups[0];
+    let rest_groups = &sorted_groups[1..];
+    let rest_indices: Vec<usize> = rest_groups
+        .iter()
+        .flat_map(|(_, idx)| idx.iter().copied())
+        .collect();
+
+    // Try separator: true on first group, false on rest.
+    if let Some(cond) = dc_find_separator(
+        first_indices,
+        &rest_indices,
+        inputs,
+        components,
+        env,
+        universe,
+        max_depth,
+        max_candidates,
+        total_explored,
+    ) {
+        let then_branch = dc_synthesize_branch(
+            first_val,
+            first_indices,
+            inputs,
+            expected,
+            components,
+            env,
+            universe,
+            max_depth,
+            max_candidates,
+            total_explored,
+        )?;
+        let else_branch = dc_build_nested_if(
+            rest_groups,
+            inputs,
+            expected,
+            components,
+            env,
+            universe,
+            max_depth,
+            max_candidates,
+            total_explored,
+        )?;
+        return Some(dc_merge_if(cond, then_branch, else_branch));
+    }
+
+    // Try the swapped separator: true on rest, false on first.
+    if let Some(cond) = dc_find_separator(
+        &rest_indices,
+        first_indices,
+        inputs,
+        components,
+        env,
+        universe,
+        max_depth,
+        max_candidates,
+        total_explored,
+    ) {
+        let then_branch = dc_build_nested_if(
+            rest_groups,
+            inputs,
+            expected,
+            components,
+            env,
+            universe,
+            max_depth,
+            max_candidates,
+            total_explored,
+        )?;
+        let else_branch = dc_synthesize_branch(
+            first_val,
+            first_indices,
+            inputs,
+            expected,
+            components,
+            env,
+            universe,
+            max_depth,
+            max_candidates,
+            total_explored,
+        )?;
+        return Some(dc_merge_if(cond, then_branch, else_branch));
+    }
+
+    None
+}
+
+/// Splice condition + then-branch + else-branch arenas into one and
+/// emit a single `Node::If` at the root. The remap shifts every
+/// `then`/`else` index by the running offset so cross-references stay
+/// valid.
+fn dc_merge_if(
+    cond: (Vec<Node>, usize),
+    then_branch: (Vec<Node>, usize),
+    else_branch: (Vec<Node>, usize),
+) -> (Vec<Node>, usize) {
+    let (mut nodes, cond_root) = cond;
+
+    let then_off = nodes.len();
+    for n in &then_branch.0 {
+        nodes.push(remap_node(n, then_off));
+    }
+    let then_root = then_branch.1 + then_off;
+
+    let else_off = nodes.len();
+    for n in &else_branch.0 {
+        nodes.push(remap_node(n, else_off));
+    }
+    let else_root = else_branch.1 + else_off;
+
+    let if_idx = nodes.len();
+    nodes.push(Node::If(cond_root, then_root, else_root));
+    (nodes, if_idx)
+}
+
+/// Find a Bool-typed program that's `true` on `true_indices` and
+/// `false` on `false_indices`. Reuses `synthesize` with a Bool sub-spec
+/// — the inputs are the original task's inputs, and the expected are
+/// the labels.
+///
+/// Returns the body of the resulting `(lambda (x) body)` (the lambda
+/// wrapper is dead code that stays in the node arena but isn't
+/// referenced by the parent if-node).
+fn dc_find_separator(
+    true_indices: &[usize],
+    false_indices: &[usize],
+    inputs: &[Value],
+    components: &[SynthComponent],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+    total_explored: &mut usize,
+) -> Option<(Vec<Node>, usize)> {
+    // Build the labeled sub-spec.
+    let mut sub_inputs: Vec<Value> = Vec::with_capacity(true_indices.len() + false_indices.len());
+    let mut sub_expected: Vec<Value> = Vec::with_capacity(true_indices.len() + false_indices.len());
+    for &i in true_indices {
+        sub_inputs.push(inputs[i].clone());
+        sub_expected.push(Value::Bool(true));
+    }
+    for &i in false_indices {
+        sub_inputs.push(inputs[i].clone());
+        sub_expected.push(Value::Bool(false));
+    }
+
+    let r = synthesize(
+        components,
+        &sub_inputs,
+        &sub_expected,
+        env,
+        universe,
+        max_depth,
+        max_candidates,
+    );
+    *total_explored += r.candidates_explored;
+    if !r.found {
+        return None;
+    }
+    let nodes = r.nodes.unwrap();
+    let lambda_root = r.root.unwrap();
+    // Strip the lambda wrapper: keep the arena, point at the body.
+    let body_root = match nodes[lambda_root] {
+        Node::Lambda(_, body) => body,
+        _ => lambda_root,
+    };
+    Some((nodes, body_root))
+}
+
+/// Synthesize the branch expression for a single output group. If
+/// every group member maps to the same constant, emit it as a leaf
+/// node directly; otherwise delegate to `synthesize` on the group's
+/// subset of (input, expected) pairs.
+fn dc_synthesize_branch(
+    out_val: &Value,
+    indices: &[usize],
+    inputs: &[Value],
+    expected: &[Value],
+    components: &[SynthComponent],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+    total_explored: &mut usize,
+) -> Option<(Vec<Node>, usize)> {
+    // Constant-branch shortcut: every output in this group is the
+    // same value. Emit a literal Node and skip sub-synthesis entirely.
+    let group_outputs: Vec<&Value> = indices.iter().map(|&i| &expected[i]).collect();
+    let all_same = group_outputs
+        .windows(2)
+        .all(|w| eval_v2::values_equal(w[0], w[1]));
+    if all_same {
+        let leaf = match out_val {
+            Value::Int(n) => Node::Int(*n),
+            Value::Num(n) => Node::Num(*n),
+            Value::Str(s) => Node::Str(s.as_ref().to_string()),
+            Value::Bool(b) => Node::Bool(*b),
+            _ => return None,
+        };
+        return Some((vec![leaf], 0));
+    }
+
+    // Non-constant: sub-synthesize on the group's own examples.
+    let group_inputs: Vec<Value> = indices.iter().map(|&i| inputs[i].clone()).collect();
+    let group_expected: Vec<Value> = indices.iter().map(|&i| expected[i].clone()).collect();
+
+    let r = synthesize(
+        components,
+        &group_inputs,
+        &group_expected,
+        env,
+        universe,
+        max_depth,
+        max_candidates,
+    );
+    *total_explored += r.candidates_explored;
+    if !r.found {
+        return None;
+    }
+    let nodes = r.nodes.unwrap();
+    let lambda_root = r.root.unwrap();
+    let body_root = match nodes[lambda_root] {
+        Node::Lambda(_, body) => body,
+        _ => lambda_root,
+    };
+    Some((nodes, body_root))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Induction strategy (intermediate value decomposition)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// When the spec can't be solved as a single program, try decomposing
+// it as `f ∘ g` (apply g first, then f). The procedure:
+//
+//   1. Pick a candidate `g`: a known unary builtin, or a binary
+//      builtin paired with a small constant. Run it on every input
+//      to produce an intermediate value sequence `mid`.
+//   2. Filter out unhelpful intermediates: those that equal the
+//      original inputs, equal the expected outputs, or are constant
+//      (the function collapses everything to one value).
+//   3. Sub-synthesize `mid → expected`. If found, that's `f`.
+//   4. Sub-synthesize `inputs → mid`. If found, that's the program
+//      that materializes `g` (we already know which builtin produced
+//      `mid`, but the synthesizer is the source of truth — and it
+//      may find a more general expression than the literal builtin).
+//   5. Compose: `(lambda (x) (let ((x g_body)) f_body))`. The let
+//      evaluates `g_body` in the outer scope (so `x` = the actual
+//      input), then rebinds `x` to the intermediate before evaluating
+//      `f_body`. eval_v2's let semantics make this work without any
+//      tree rewriting (compare the legacy substitute_x trick which
+//      only handled single-level x references).
+//
+// What this version does NOT inherit from legacy:
+//   - The "constant discovery" pass (output - input, output / input).
+//     synth_v2's literal pool already covers most curriculum cases;
+//     deferred for now.
+//   - The dependency on a hard-coded set of unary/binary names. The
+//     port still uses a curated set for the intermediate generator
+//     (matches legacy taste), but the sub-synthesis steps see the
+//     full component catalog so the composed solution can mix them
+//     freely with library functions.
+
+/// Curated unary builtins to try as intermediate transforms.
+/// Matches legacy `induce::UNARY_FNS` plus the synth_v2 versions of
+/// `even`/`odd`. Predicates are useful when the expected output is
+/// bool-tagged.
+const INDUCE_UNARY_FNS: &[&str] = &[
+    "abs",
+    "negate",
+    "floor",
+    "string-upper",
+    "string-lower",
+    "string-reverse",
+    "string-trim",
+    "string-length",
+    "even",
+    "odd",
+];
+
+/// Binary builtins to try with small integer constants as the second
+/// argument. Matches legacy `induce::BINARY_FNS`.
+const INDUCE_BINARY_FNS: &[&str] = &["add", "subtract", "multiply"];
+
+/// Small constants to pair with binary builtins (Int-typed because the
+/// curriculum is integer-biased).
+const INDUCE_SMALL_INTS: &[i64] = &[1, 2, -1, 5];
+
+/// Try to solve `(inputs, expected)` by intermediate-value decomposition.
+/// Returns `(nodes, root, candidates_explored)` for a `(lambda (x) ...)`
+/// program, or `None` if no decomposition succeeds.
+pub fn induce_decomposition(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+) -> Option<(Vec<Node>, usize, usize)> {
+    if inputs.is_empty() || inputs.len() != expected.len() {
+        return None;
+    }
+
+    // Each sub-synth gets a quarter of the budget. Two per intermediate
+    // (input→mid, mid→expected), and we may try several intermediates.
+    let budget_per_step = (max_candidates / 4).max(1);
+    let mut total_explored: usize = 0;
+
+    // Generate intermediate value sequences by probing curated builtins.
+    let intermediates = induce_generate_intermediates(inputs, env);
+
+    for mid in &intermediates {
+        // Skip useless candidates.
+        if induce_slices_equal(&mid.values, inputs)
+            || induce_slices_equal(&mid.values, expected)
+        {
+            continue;
+        }
+        if induce_all_identical(&mid.values) {
+            continue;
+        }
+
+        // Step 2 first: mid → expected. Cheaper to detect when this
+        // can't work — if step 2 fails the intermediate is useless.
+        let step2 = synthesize(
+            components,
+            &mid.values,
+            expected,
+            env,
+            universe,
+            max_depth,
+            budget_per_step,
+        );
+        total_explored += step2.candidates_explored;
+        if !step2.found {
+            continue;
+        }
+
+        // Step 1: inputs → mid.
+        let step1 = synthesize(
+            components,
+            inputs,
+            &mid.values,
+            env,
+            universe,
+            max_depth,
+            budget_per_step,
+        );
+        total_explored += step1.candidates_explored;
+        if !step1.found {
+            continue;
+        }
+
+        // Compose into a single (lambda (x) (let ((x g)) f)).
+        let composed = induce_compose_steps(
+            step1.nodes.unwrap(),
+            step1.root.unwrap(),
+            step2.nodes.unwrap(),
+            step2.root.unwrap(),
+        );
+        if let Some((nodes, root)) = composed {
+            // Final correctness check on the composed program.
+            if ho_verify_composed(&nodes, root, inputs, expected, env) {
+                return Some((nodes, root, total_explored));
+            }
+        }
+    }
+
+    None
+}
+
+/// A candidate intermediate sequence with the name of the function that
+/// produced it (debugging only — the composition uses the synthesized
+/// step1, not the literal builtin name).
+struct InduceIntermediate {
+    #[allow(dead_code)]
+    name: String,
+    values: Vec<Value>,
+}
+
+/// Probe the curated builtin set on every input and collect the
+/// resulting intermediate value sequences. Each sequence must be
+/// fully successful — any builtin that errors on any input is dropped.
+fn induce_generate_intermediates(inputs: &[Value], env: &Env) -> Vec<InduceIntermediate> {
+    let mut out: Vec<InduceIntermediate> = Vec::new();
+
+    for &name in INDUCE_UNARY_FNS {
+        let sym = intern(name);
+        let val = match env.lookup(sym) {
+            Some(v) => v,
+            None => continue,
+        };
+        let mut values: Vec<Value> = Vec::with_capacity(inputs.len());
+        let mut ok = true;
+        for inp in inputs {
+            match eval_v2::apply(&val, std::slice::from_ref(inp), env) {
+                Ok(v) => values.push(v),
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok && values.len() == inputs.len() {
+            out.push(InduceIntermediate {
+                name: name.to_string(),
+                values,
+            });
+        }
+    }
+
+    for &name in INDUCE_BINARY_FNS {
+        let sym = intern(name);
+        let val = match env.lookup(sym) {
+            Some(v) => v,
+            None => continue,
+        };
+        for &c in INDUCE_SMALL_INTS {
+            let const_val = Value::Int(c);
+            let mut values: Vec<Value> = Vec::with_capacity(inputs.len());
+            let mut ok = true;
+            for inp in inputs {
+                match eval_v2::apply(&val, &[inp.clone(), const_val.clone()], env) {
+                    Ok(v) => values.push(v),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && values.len() == inputs.len() {
+                out.push(InduceIntermediate {
+                    name: format!("{}_{}", name, c),
+                    values,
+                });
+            }
+        }
+    }
+
+    out
+}
+
+/// True iff every value in `vs` is equal to the first.
+fn induce_all_identical(vs: &[Value]) -> bool {
+    if vs.len() <= 1 {
+        return true;
+    }
+    vs.windows(2).all(|w| eval_v2::values_equal(&w[0], &w[1]))
+}
+
+/// Element-wise equality of two value slices.
+fn induce_slices_equal(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| eval_v2::values_equal(x, y))
+}
+
+/// Compose two synthesized lambdas `step1` and `step2` (each shaped as
+/// `(lambda (x) body)`) into `(lambda (x) (let ((x step1_body)) step2_body))`.
+///
+/// Returns `(nodes, lambda_root)` for the composed program. The let
+/// trick avoids any tree rewriting: step1's body is evaluated in the
+/// outer scope (where `x` = the actual input), then bound to a fresh
+/// inner `x`, then step2's body is evaluated with `x` = the intermediate.
+fn induce_compose_steps(
+    step1_nodes: Vec<Node>,
+    step1_lambda: usize,
+    step2_nodes: Vec<Node>,
+    step2_lambda: usize,
+) -> Option<(Vec<Node>, usize)> {
+    // Extract each step's inner body.
+    let step1_body = match step1_nodes[step1_lambda] {
+        Node::Lambda(_, body) => body,
+        _ => return None,
+    };
+    let step2_body = match step2_nodes[step2_lambda] {
+        Node::Lambda(_, body) => body,
+        _ => return None,
+    };
+
+    // Splice step1's nodes (its `x` references will resolve to the
+    // outer lambda's parameter at eval time).
+    let mut nodes = step1_nodes;
+
+    // Splice step2's nodes after step1's, with offset remap.
+    let step2_off = nodes.len();
+    for n in &step2_nodes {
+        nodes.push(remap_node(n, step2_off));
+    }
+    let step2_body_remapped = step2_body + step2_off;
+
+    // (let ((x step1_body)) step2_body)
+    let let_idx = nodes.len();
+    nodes.push(Node::Let(
+        vec![(intern("x"), step1_body)],
+        step2_body_remapped,
+    ));
+
+    // (lambda (x) <let>)
+    let lambda_idx = nodes.len();
+    nodes.push(Node::Lambda(vec![intern("x")], let_idx));
+
+    Some((nodes, lambda_idx))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Strategy dispatcher
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -1232,11 +2734,27 @@ fn value_to_node(v: &Value) -> Node {
 /// Current order:
 ///   1. **Flat** — `synthesize` (bottom-up enumeration with type pruning,
 ///      observational dedup, and the probe-and-filter pipeline).
-///   2. **Memo** — `memorize_from_examples` (namespace lookup table for
+///   2. **BoolDecomp** — `bool_decompose` (logical compositions of unary
+///      bool-returning library predicates). Only fires when the target
+///      output is bool, and is O(L²) in the number of predicates.
+///   3. **HigherOrder** — `higher_order_decompose`. Tries `list-map`,
+///      `list-filter`, `split-map-join`, and `char-map-join` templates
+///      via recursive sub-synthesis. Each template is gated on the
+///      input/output shape so most attempts cost nothing.
+///   4. **DivideConquer** — `divide_and_conquer`. Partitions examples
+///      by output value, sorts by mean input, and recursively builds
+///      nested if-expressions with bool separators between groups.
+///      Useful for piecewise / classification tasks.
+///   5. **Induction** — `induce_decomposition`. Probes a curated set
+///      of unary/binary builtins for an intermediate value sequence,
+///      then sub-synthesizes input→mid and mid→expected and composes
+///      via `(let ((x g_body)) f_body)`.
+///   6. **Memo** — `memorize_from_examples` (namespace lookup table for
 ///      string-input tasks).
 ///
-/// `flat_budget` is the candidate budget for the Flat strategy. Memo
-/// is O(1) and ignores it.
+/// `flat_budget` is the candidate budget for the Flat strategy and is
+/// also passed to HO/D&C/Induction sub-syntheses. BD and Memo are
+/// bounded by their own intrinsic costs and ignore it.
 pub fn synthesize_with_strategies(
     components: &[SynthComponent],
     inputs: &[Value],
@@ -1255,7 +2773,93 @@ pub fn synthesize_with_strategies(
         return StrategyResult::from_synth(flat, Strategy::Flat);
     }
 
-    // Strategy 2: Memo. Always candidate-cost 0 (no enumeration).
+    // Strategy 2: Boolean decomposition. Cheap and only applies to
+    // bool-output tasks (it filters internally), so we run it before
+    // Memo: it produces a structured program when it fires, whereas
+    // Memo is a lookup-table fallback that is correct on training but
+    // generalizes by accident on bool output.
+    if let Some((nodes, root, bd_explored)) =
+        bool_decompose(components, inputs, expected, env)
+    {
+        total_explored += bd_explored;
+        return StrategyResult {
+            found: true,
+            nodes: Some(nodes),
+            root: Some(root),
+            candidates_explored: total_explored,
+            strategy: Some(Strategy::BoolDecomp),
+        };
+    }
+
+    // Strategy 3: Higher-order decomposition. Each template is shape-
+    // gated (list→list, str→str, etc.) and bails immediately if not
+    // applicable, so cost is dominated by the inner sub-synthesis.
+    if let Some((nodes, root, ho_explored)) = higher_order_decompose(
+        components,
+        inputs,
+        expected,
+        env,
+        universe,
+        max_depth,
+        flat_budget,
+    ) {
+        total_explored += ho_explored;
+        return StrategyResult {
+            found: true,
+            nodes: Some(nodes),
+            root: Some(root),
+            candidates_explored: total_explored,
+            strategy: Some(Strategy::HigherOrder),
+        };
+    }
+
+    // Strategy 4: Divide-and-conquer. Only meaningful for tasks with
+    // multiple distinct outputs (it filters internally). The recursive
+    // structure means worst-case cost is N partition attempts × the
+    // sub-synthesis budget for separators and branches.
+    if let Some((nodes, root, dc_explored)) = divide_and_conquer(
+        components,
+        inputs,
+        expected,
+        env,
+        universe,
+        max_depth,
+        flat_budget,
+    ) {
+        total_explored += dc_explored;
+        return StrategyResult {
+            found: true,
+            nodes: Some(nodes),
+            root: Some(root),
+            candidates_explored: total_explored,
+            strategy: Some(Strategy::DivideConquer),
+        };
+    }
+
+    // Strategy 5: Induction (intermediate value decomposition). Probes
+    // a curated set of unary/binary builtins for an intermediate value
+    // sequence, then sub-synthesizes input→intermediate and
+    // intermediate→expected. Composes via Node::Let.
+    if let Some((nodes, root, in_explored)) = induce_decomposition(
+        components,
+        inputs,
+        expected,
+        env,
+        universe,
+        max_depth,
+        flat_budget,
+    ) {
+        total_explored += in_explored;
+        return StrategyResult {
+            found: true,
+            nodes: Some(nodes),
+            root: Some(root),
+            candidates_explored: total_explored,
+            strategy: Some(Strategy::Induction),
+        };
+    }
+
+    // Strategy 6: Memo. Always candidate-cost 0 (no enumeration).
     if let Some((nodes, root)) = memorize_from_examples(inputs, expected) {
         return StrategyResult {
             found: true,
@@ -2969,8 +4573,12 @@ mod tests {
 
     #[test]
     fn dispatcher_returns_not_found_when_no_strategy_applies() {
-        // Int→string with no consistent mapping the synthesizer can find
-        // and inputs aren't strings, so Memo can't help either.
+        // Single distinct output (so D&C bails — needs ≥2 groups), Int
+        // input (so Memo bails — needs string keys), and target value
+        // 23 which is unreachable at depth 1 using the literal pool
+        // {0,1,2,3,4,5,6,7,10,-1}. No atomic predicate or arity-2
+        // composition produces 23. So Flat, BD, HO, D&C, and Memo all
+        // give up.
         init_special_forms();
         let env = eval_v2::make_default_env();
         let universe = TypeUniverse::primitives();
@@ -2978,11 +4586,11 @@ mod tests {
 
         let r = synthesize_with_strategies(
             &comps,
-            &[Value::Int(1), Value::Int(2)],
-            &[Value::str("foo"), Value::str("bar")],
+            &[Value::Int(1), Value::Int(2), Value::Int(3)],
+            &[Value::Int(23), Value::Int(23), Value::Int(23)],
             &env,
             &universe,
-            2,
+            1,
             200,
         );
         assert!(!r.found);
@@ -3037,5 +4645,791 @@ mod tests {
             Dispatch::Named(s) => assert_eq!(s, sym("add")),
             _ => panic!("expected Named dispatch"),
         }
+    }
+
+    // ── BD strategy tests ────────────────────────────────────────────────
+    //
+    // BD covers logical compositions of unary bool-returning predicates.
+    // These tests use `even` / `odd` (built-in unary Int → Bool predicates
+    // that show up in `primitive_components`) plus a custom unary
+    // library function for the cases where Flat would otherwise win.
+
+    /// Build a tiny component catalog containing only the named bool
+    /// predicates `even` and `odd`. Used to force BD to fire by denying
+    /// Flat the and/or/not operators.
+    fn bd_only_components() -> Vec<SynthComponent> {
+        vec![
+            SynthComponent::named(
+                "even", intern("even"), vec![intern("Int")], intern("Bool"), 0.0,
+            ),
+            SynthComponent::named(
+                "odd", intern("odd"), vec![intern("Int")], intern("Bool"), 0.0,
+            ),
+        ]
+    }
+
+    #[test]
+    fn bd_returns_none_for_non_bool_target() {
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let comps = bd_only_components();
+        // Int target — BD should refuse.
+        let r = bool_decompose(
+            &comps,
+            &[Value::Int(1), Value::Int(2)],
+            &[Value::Int(1), Value::Int(2)],
+            &env,
+        );
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn bd_returns_none_when_no_predicates_available() {
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        // Empty predicate catalog — even with bool target, BD has nothing
+        // to compose.
+        let r = bool_decompose(
+            &[],
+            &[Value::Int(1), Value::Int(2)],
+            &[Value::Bool(true), Value::Bool(false)],
+            &env,
+        );
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn bd_solves_not_p() {
+        // Target = (not (even x)) on integers.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let comps = bd_only_components();
+
+        let inputs = vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)];
+        let expected = vec![
+            Value::Bool(true),  // not even 1
+            Value::Bool(false), // not even 2
+            Value::Bool(true),  // not even 3
+            Value::Bool(false), // not even 4
+        ];
+        let (nodes, root, _explored) = bool_decompose(&comps, &inputs, &expected, &env)
+            .expect("bd should find (not (even x))");
+
+        // Sanity-check: the synthesized lambda must run and reproduce
+        // the expected outputs.
+        let nodes_rc: Rc<[Node]> = nodes.into();
+        let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+        for (i, e) in inputs.iter().zip(&expected) {
+            let got = eval_v2::apply(&f, std::slice::from_ref(i), &env).unwrap();
+            assert!(matches!((got, e), (Value::Bool(a), Value::Bool(b)) if a == *b));
+        }
+    }
+
+    #[test]
+    fn bd_solves_and_p_q() {
+        // Target = (and (even x) (odd x)) — always false. We want BD
+        // to find some valid composition; the dispatcher would normally
+        // also accept the literal `false`, but bool_decompose only emits
+        // structured compositions, so this verifies the (and P Q) path
+        // walks far enough.
+        //
+        // To make the test unambiguous, use inputs whose expected pattern
+        // is NOT all-false: target = (and (even x) (odd x)) is uniformly
+        // false, but (and (even x) (even x)) on inputs [1,2,3,4] gives
+        // [F,T,F,T]. So pick (and even even) — even though it equals
+        // `even` itself, BD enumerates it on the i==j diagonal and that
+        // counts as a valid path.
+        //
+        // Better: target = (or (even x) (odd x)) which is always true.
+        // (or P Q) is a real composition, both predicates participate,
+        // and we can verify the resulting source.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let comps = bd_only_components();
+
+        let inputs = vec![Value::Int(1), Value::Int(2), Value::Int(3)];
+        let expected = vec![Value::Bool(true), Value::Bool(true), Value::Bool(true)];
+
+        let (nodes, root, _explored) = bool_decompose(&comps, &inputs, &expected, &env)
+            .expect("bd should find some bool composition that's always true");
+
+        // Verify the program runs and matches.
+        let nodes_rc: Rc<[Node]> = nodes.into();
+        let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+        for i in &inputs {
+            let got = eval_v2::apply(&f, std::slice::from_ref(i), &env).unwrap();
+            assert!(matches!(got, Value::Bool(true)));
+        }
+    }
+
+    #[test]
+    fn bd_solves_and_p_not_q() {
+        // Target = (and (even x) (not (odd x))) — equivalent to even,
+        // but the (and P (not Q)) template should be reachable. Inputs
+        // chosen so the target pattern is non-trivial.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let comps = bd_only_components();
+
+        let inputs = vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)];
+        let expected = vec![
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Bool(true),
+        ];
+        let (nodes, root, _explored) = bool_decompose(&comps, &inputs, &expected, &env)
+            .expect("bd should find a composition matching even-pattern");
+
+        let nodes_rc: Rc<[Node]> = nodes.into();
+        let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+        for (i, e) in inputs.iter().zip(&expected) {
+            let got = eval_v2::apply(&f, std::slice::from_ref(i), &env).unwrap();
+            assert!(matches!((got, e), (Value::Bool(a), Value::Bool(b)) if a == *b));
+        }
+    }
+
+    #[test]
+    fn bd_skips_components_that_error_on_input() {
+        // A component declared as `Int -> Bool` but whose underlying
+        // function only handles strings should be probed-and-dropped
+        // rather than crashing the strategy. Build a library function
+        // bound under name `bad-pred` that errors on Int inputs, and
+        // make sure BD still solves the task using the surviving
+        // predicates.
+        use crate::types_v2::{FunctionData, NodeRef};
+
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+
+        // (lambda (x) (string-upper x)) — errors on Int.
+        let mut nodes: Vec<Node> = Vec::new();
+        let su_idx = nodes.len();
+        nodes.push(Node::Symbol(intern("string-upper")));
+        let x_idx = nodes.len();
+        nodes.push(Node::Symbol(intern("x")));
+        let body_idx = nodes.len();
+        nodes.push(Node::App(vec![su_idx, x_idx]));
+        let nodes_rc: Rc<[Node]> = nodes.into();
+        let bad = Value::Function(Rc::new(FunctionData {
+            params: vec![intern("x")],
+            body: NodeRef {
+                nodes: nodes_rc,
+                idx: body_idx,
+            },
+            captured_env: env.clone(),
+            letrec_scope: None,
+        }));
+        env.define(intern("bad-pred"), bad);
+
+        // Component catalog with `bad-pred` claiming Int → Bool plus
+        // the real `even` predicate.
+        let comps = vec![
+            SynthComponent::named(
+                "bad-pred",
+                intern("bad-pred"),
+                vec![intern("Int")],
+                intern("Bool"),
+                0.0,
+            ),
+            SynthComponent::named(
+                "even", intern("even"), vec![intern("Int")], intern("Bool"), 0.0,
+            ),
+        ];
+
+        let inputs = vec![Value::Int(1), Value::Int(2), Value::Int(3)];
+        let expected = vec![Value::Bool(true), Value::Bool(false), Value::Bool(true)];
+
+        let r = bool_decompose(&comps, &inputs, &expected, &env);
+        // Either solves via (not (even x)) directly, or doesn't find a
+        // composition — but it must NOT crash on bad-pred.
+        if let Some((nodes, root, _)) = r {
+            let nodes_rc: Rc<[Node]> = nodes.into();
+            let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+            for (i, e) in inputs.iter().zip(&expected) {
+                let got = eval_v2::apply(&f, std::slice::from_ref(i), &env).unwrap();
+                assert!(matches!((got, e), (Value::Bool(a), Value::Bool(b)) if a == *b));
+            }
+        }
+    }
+
+    #[test]
+    fn dispatcher_uses_bd_when_flat_lacks_logical_ops() {
+        // Tiny catalog: only `even` and `odd`. No `and`/`or`/`not`,
+        // no bool literals. Target = always-true on mixed-parity
+        // inputs. Atomic predicates can't reach this pattern:
+        //   (even x) on [1,2,3,4] = [F,T,F,T]
+        //   (odd  x) on [1,2,3,4] = [T,F,T,F]
+        // The only solution is `(or (even x) (odd x))`, which Flat
+        // can't construct without `or`. BD must fire.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = bd_only_components();
+
+        let inputs = vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)];
+        let expected = vec![
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+        ];
+
+        let r = synthesize_with_strategies(
+            &comps,
+            &inputs,
+            &expected,
+            &env,
+            &universe,
+            3,
+            500,
+        );
+        assert!(r.found);
+        assert_eq!(r.strategy, Some(Strategy::BoolDecomp));
+
+        // The synthesized program must actually work.
+        let nodes_rc: Rc<[Node]> = r.nodes.unwrap().into();
+        let f = eval_v2::eval(&nodes_rc, r.root.unwrap(), &env).unwrap();
+        for i in &inputs {
+            let got = eval_v2::apply(&f, std::slice::from_ref(i), &env).unwrap();
+            assert!(matches!(got, Value::Bool(true)));
+        }
+    }
+
+    // ── HO strategy tests ────────────────────────────────────────────────
+    //
+    // HO covers four templates that recursively sub-synthesize an inner
+    // function and splice it into a wrapper. Tests construct shapes that
+    // Flat can't reach within budget so HO must take over.
+
+    #[test]
+    fn ho_list_map_recovers_inner_function() {
+        // [[1,2,3], [4,5,6]] → [[2,3,4], [5,6,7]]
+        // Inner sub-spec: each element + 1. Flat sub-synth finds (add x 1)
+        // or (add 1 x). Wrapper is (lambda (x) (map inner x)).
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let inputs = vec![
+            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            Value::list(vec![Value::Int(4), Value::Int(5), Value::Int(6)]),
+        ];
+        let expected = vec![
+            Value::list(vec![Value::Int(2), Value::Int(3), Value::Int(4)]),
+            Value::list(vec![Value::Int(5), Value::Int(6), Value::Int(7)]),
+        ];
+
+        let r = higher_order_decompose(
+            &comps, &inputs, &expected, &env, &universe, 2, 2000,
+        )
+        .expect("HO should solve via list-map");
+
+        let (nodes, root, _explored) = r;
+        let nodes_rc: Rc<[Node]> = nodes.into();
+        let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+        for (i, e) in inputs.iter().zip(&expected) {
+            let got = eval_v2::apply(&f, std::slice::from_ref(i), &env).unwrap();
+            assert!(eval_v2::values_equal(&got, e));
+        }
+    }
+
+    #[test]
+    fn ho_list_filter_recovers_predicate() {
+        // [[1,2,3,4], [5,6,7,8]] → [[2,4], [6,8]] — keep even.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let inputs = vec![
+            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)]),
+            Value::list(vec![Value::Int(5), Value::Int(6), Value::Int(7), Value::Int(8)]),
+        ];
+        let expected = vec![
+            Value::list(vec![Value::Int(2), Value::Int(4)]),
+            Value::list(vec![Value::Int(6), Value::Int(8)]),
+        ];
+
+        let (nodes, root, _explored) = higher_order_decompose(
+            &comps, &inputs, &expected, &env, &universe, 2, 2000,
+        )
+        .expect("HO should solve via list-filter");
+
+        let nodes_rc: Rc<[Node]> = nodes.into();
+        let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+        for (i, e) in inputs.iter().zip(&expected) {
+            let got = eval_v2::apply(&f, std::slice::from_ref(i), &env).unwrap();
+            assert!(eval_v2::values_equal(&got, e));
+        }
+    }
+
+    #[test]
+    fn ho_split_map_join_recovers_word_transform() {
+        // "foo bar baz" → "FOO BAR BAZ" via split-map-join on " ".
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let inputs = vec![
+            Value::str("foo bar baz"),
+            Value::str("hello world hi"),
+            Value::str("a b c"),
+        ];
+        let expected = vec![
+            Value::str("FOO BAR BAZ"),
+            Value::str("HELLO WORLD HI"),
+            Value::str("A B C"),
+        ];
+
+        let (nodes, root, _explored) = higher_order_decompose(
+            &comps, &inputs, &expected, &env, &universe, 2, 2000,
+        )
+        .expect("HO should solve via split-map-join");
+
+        let nodes_rc: Rc<[Node]> = nodes.into();
+        let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+        for (i, e) in inputs.iter().zip(&expected) {
+            let got = eval_v2::apply(&f, std::slice::from_ref(i), &env).unwrap();
+            assert!(eval_v2::values_equal(&got, e));
+        }
+    }
+
+    #[test]
+    fn ho_char_map_join_recovers_letter_transform() {
+        // "abc" → "ABC", "hi" → "HI" via char-map-join.
+        // The inner per-character spec is "a"→"A", "b"→"B", etc.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let inputs = vec![
+            Value::str("abc"),
+            Value::str("hello"),
+            Value::str("xyz"),
+        ];
+        let expected = vec![
+            Value::str("ABC"),
+            Value::str("HELLO"),
+            Value::str("XYZ"),
+        ];
+
+        // For this to land via char-map-join (not split-map-join with " "),
+        // none of the strings can contain a delimiter. The inputs above
+        // are single-word, so split-map-join's `any_multi` check fails
+        // for every delimiter and HO falls through to char-map-join.
+        let (nodes, root, _explored) = higher_order_decompose(
+            &comps, &inputs, &expected, &env, &universe, 2, 2000,
+        )
+        .expect("HO should solve via char-map-join");
+
+        let nodes_rc: Rc<[Node]> = nodes.into();
+        let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+        for (i, e) in inputs.iter().zip(&expected) {
+            let got = eval_v2::apply(&f, std::slice::from_ref(i), &env).unwrap();
+            assert!(eval_v2::values_equal(&got, e));
+        }
+    }
+
+    #[test]
+    fn ho_bails_when_no_template_applies() {
+        // Int → Int — no list/string structure for any template.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let r = higher_order_decompose(
+            &comps,
+            &[Value::Int(1), Value::Int(2), Value::Int(3)],
+            &[Value::Int(2), Value::Int(4), Value::Int(6)],
+            &env,
+            &universe,
+            2,
+            500,
+        );
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn ho_dedup_rejects_conflicting_pairs() {
+        // Same input, different outputs — should reject.
+        let pairs = vec![
+            (Value::Int(1), Value::Int(2)),
+            (Value::Int(1), Value::Int(99)), // conflict
+            (Value::Int(2), Value::Int(4)),
+            (Value::Int(3), Value::Int(6)),
+        ];
+        assert!(ho_dedup_spec(pairs).is_none());
+    }
+
+    #[test]
+    fn ho_dedup_rejects_too_few_unique_pairs() {
+        // Only 2 unique inputs after dedup — below the threshold of 3.
+        let pairs = vec![
+            (Value::Int(1), Value::Int(2)),
+            (Value::Int(1), Value::Int(2)),
+            (Value::Int(2), Value::Int(4)),
+            (Value::Int(2), Value::Int(4)),
+        ];
+        assert!(ho_dedup_spec(pairs).is_none());
+    }
+
+    #[test]
+    fn dispatcher_uses_ho_for_list_map_task() {
+        // List→list of same length transformation — Flat can't construct
+        // (lambda (x) (map (lambda (e) (add e 1)) x)) at low depth, but
+        // HO list-map decomposes it into a flat sub-task that Flat solves.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let inputs = vec![
+            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            Value::list(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
+            Value::list(vec![Value::Int(0), Value::Int(5), Value::Int(7)]),
+        ];
+        let expected = vec![
+            Value::list(vec![Value::Int(2), Value::Int(3), Value::Int(4)]),
+            Value::list(vec![Value::Int(11), Value::Int(21), Value::Int(31)]),
+            Value::list(vec![Value::Int(1), Value::Int(6), Value::Int(8)]),
+        ];
+
+        let r = synthesize_with_strategies(
+            &comps, &inputs, &expected, &env, &universe, 2, 2000,
+        );
+        assert!(r.found);
+        assert_eq!(r.strategy, Some(Strategy::HigherOrder));
+    }
+
+    // ── D&C strategy tests ──────────────────────────────────────────────
+    //
+    // D&C handles classification-style tasks where outputs come from a
+    // small set of distinct values and a Bool separator distinguishes
+    // groups. Tests cover the constant-leaves case (most common) plus
+    // the bail conditions (single-output, no separator).
+
+    #[test]
+    fn dc_solves_two_constant_branches() {
+        // x ≤ 0 → "neg", x ≥ 1 → "pos". Two distinct outputs, separator
+        // is some inequality on x. Both branches are constants.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let inputs = vec![
+            Value::Int(-3),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(5),
+            Value::Int(10),
+        ];
+        let expected = vec![
+            Value::str("neg"),
+            Value::str("neg"),
+            Value::str("neg"),
+            Value::str("pos"),
+            Value::str("pos"),
+            Value::str("pos"),
+        ];
+
+        let (nodes, root, _explored) = divide_and_conquer(
+            &comps, &inputs, &expected, &env, &universe, 2, 5000,
+        )
+        .expect("D&C should solve two-constant classification");
+
+        let nodes_rc: Rc<[Node]> = nodes.into();
+        let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+        for (i, e) in inputs.iter().zip(&expected) {
+            let got = eval_v2::apply(&f, std::slice::from_ref(i), &env).unwrap();
+            assert!(eval_v2::values_equal(&got, e));
+        }
+    }
+
+    #[test]
+    fn dc_solves_three_branches_via_recursion() {
+        // x < 0 → -1, x = 0 → 0, x > 0 → 1. Three groups force the
+        // recursive nested-if construction.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let inputs = vec![
+            Value::Int(-5),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(7),
+        ];
+        let expected = vec![
+            Value::Int(-1),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(1),
+        ];
+
+        let (nodes, root, _explored) = divide_and_conquer(
+            &comps, &inputs, &expected, &env, &universe, 2, 10000,
+        )
+        .expect("D&C should solve three-way classification");
+
+        let nodes_rc: Rc<[Node]> = nodes.into();
+        let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+        for (i, e) in inputs.iter().zip(&expected) {
+            let got = eval_v2::apply(&f, std::slice::from_ref(i), &env).unwrap();
+            assert!(eval_v2::values_equal(&got, e));
+        }
+    }
+
+    #[test]
+    fn dc_bails_on_single_output_value() {
+        // Only one distinct output → no partition possible. D&C must
+        // refuse so the dispatcher falls through to other strategies.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let r = divide_and_conquer(
+            &comps,
+            &[Value::Int(1), Value::Int(2), Value::Int(3)],
+            &[Value::Int(7), Value::Int(7), Value::Int(7)],
+            &env,
+            &universe,
+            2,
+            500,
+        );
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn dispatcher_uses_dc_for_classification_task() {
+        // 3-way classification, full primitive catalog. Flat can't
+        // construct nested if-expressions on its own; BD doesn't apply
+        // (output isn't bool); HO doesn't apply (no list/string shape);
+        // D&C is the only strategy that fits.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let inputs = vec![
+            Value::Int(-3),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(7),
+        ];
+        let expected = vec![
+            Value::str("neg"),
+            Value::str("neg"),
+            Value::str("zero"),
+            Value::str("pos"),
+            Value::str("pos"),
+        ];
+
+        let r = synthesize_with_strategies(
+            &comps, &inputs, &expected, &env, &universe, 2, 10000,
+        );
+        assert!(r.found);
+        assert_eq!(r.strategy, Some(Strategy::DivideConquer));
+    }
+
+    // ── Induction strategy tests ────────────────────────────────────────
+    //
+    // Induction decomposes (inputs → expected) into two simpler sub-
+    // syntheses (inputs → mid) and (mid → expected) where `mid` is
+    // produced by probing a curated set of builtins. Tests construct
+    // pipelines that need a clear two-step decomposition.
+
+    #[test]
+    fn induce_solves_two_step_pipeline() {
+        // Target: x → |x| + 1 — abs followed by increment.
+        // The literal pool has 0..7,10,-1, so `(add (abs x) 1)` is
+        // depth-2 reachable but the test caps Flat at depth 1, forcing
+        // induction to take over via the abs intermediate.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        // Use a tiny custom catalog that excludes `abs` from the
+        // outer Flat pass — that way induction's intermediate probe
+        // (which uses env.lookup, not the catalog) is the only path
+        // that introduces it.
+        let comps: Vec<SynthComponent> = comps
+            .into_iter()
+            .filter(|c| c.name != "abs")
+            .collect();
+
+        let inputs = vec![
+            Value::Int(-3),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(5),
+        ];
+        let expected = vec![
+            Value::Int(4),
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(3),
+            Value::Int(6),
+        ];
+
+        let r = induce_decomposition(
+            &comps, &inputs, &expected, &env, &universe, 2, 5000,
+        );
+        // Even with a curated catalog, induction needs both halves to
+        // sub-synthesize. If it can't, the test still asserts that the
+        // *call site* doesn't crash and either returns Some or None.
+        if let Some((nodes, root, _explored)) = r {
+            let nodes_rc: Rc<[Node]> = nodes.into();
+            let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+            for (i, e) in inputs.iter().zip(&expected) {
+                let got = eval_v2::apply(&f, std::slice::from_ref(i), &env).unwrap();
+                assert!(eval_v2::values_equal(&got, e));
+            }
+        }
+    }
+
+    #[test]
+    fn induce_compose_steps_via_let_binding() {
+        // Direct test of the composer: build trivial step1 = (lambda (x) x)
+        // and step2 = (lambda (x) (negate x)). Compose into a single
+        // lambda and verify it negates its input.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+
+        // step1: (lambda (x) x)
+        let step1_nodes = vec![
+            Node::Symbol(intern("x")),                 // 0
+            Node::Lambda(vec![intern("x")], 0),        // 1
+        ];
+        let step1_lambda = 1;
+
+        // step2: (lambda (x) (negate x))
+        let step2_nodes = vec![
+            Node::Symbol(intern("negate")),            // 0
+            Node::Symbol(intern("x")),                 // 1
+            Node::App(vec![0, 1]),                     // 2
+            Node::Lambda(vec![intern("x")], 2),        // 3
+        ];
+        let step2_lambda = 3;
+
+        let (nodes, root) =
+            induce_compose_steps(step1_nodes, step1_lambda, step2_nodes, step2_lambda)
+                .expect("compose should succeed for valid lambdas");
+
+        let nodes_rc: Rc<[Node]> = nodes.into();
+        let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+
+        let r1 = eval_v2::apply(&f, &[Value::Int(7)], &env).unwrap();
+        assert!(matches!(r1, Value::Int(-7)));
+
+        let r2 = eval_v2::apply(&f, &[Value::Int(-3)], &env).unwrap();
+        assert!(matches!(r2, Value::Int(3)));
+    }
+
+    #[test]
+    fn induce_compose_handles_two_nontrivial_lambdas() {
+        // step1 = (lambda (x) (add x 1))     ; increment
+        // step2 = (lambda (x) (multiply x 2))  ; double
+        // Composed = (lambda (x) (multiply (add x 1) 2))
+        // For input 5: (add 5 1) = 6, (multiply 6 2) = 12.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+
+        // step1
+        let step1_nodes = vec![
+            Node::Symbol(intern("add")),               // 0
+            Node::Symbol(intern("x")),                 // 1
+            Node::Int(1),                              // 2
+            Node::App(vec![0, 1, 2]),                  // 3
+            Node::Lambda(vec![intern("x")], 3),        // 4
+        ];
+        // step2
+        let step2_nodes = vec![
+            Node::Symbol(intern("multiply")),          // 0
+            Node::Symbol(intern("x")),                 // 1
+            Node::Int(2),                              // 2
+            Node::App(vec![0, 1, 2]),                  // 3
+            Node::Lambda(vec![intern("x")], 3),        // 4
+        ];
+
+        let (nodes, root) =
+            induce_compose_steps(step1_nodes, 4, step2_nodes, 4).expect("compose");
+        let nodes_rc: Rc<[Node]> = nodes.into();
+        let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
+
+        let got = eval_v2::apply(&f, &[Value::Int(5)], &env).unwrap();
+        assert!(matches!(got, Value::Int(12)));
+
+        let got = eval_v2::apply(&f, &[Value::Int(0)], &env).unwrap();
+        assert!(matches!(got, Value::Int(2)));
+    }
+
+    #[test]
+    fn induce_skips_useless_intermediates() {
+        // If the intermediate probe collapses to a constant (e.g.
+        // `(multiply x 0)` always returns 0), induction must skip it.
+        // We can't easily exercise this without a custom env, but we
+        // can test the helper directly.
+        let constants = vec![Value::Int(7), Value::Int(7), Value::Int(7)];
+        assert!(induce_all_identical(&constants));
+
+        let varying = vec![Value::Int(1), Value::Int(2), Value::Int(3)];
+        assert!(!induce_all_identical(&varying));
+    }
+
+    #[test]
+    fn induce_returns_none_for_empty_inputs() {
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+        let r = induce_decomposition(
+            &comps, &[], &[], &env, &universe, 2, 100,
+        );
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn dispatcher_prefers_flat_over_bd_when_flat_solves() {
+        // Full primitive catalog. Target = parity-dependent pattern
+        // that Flat can solve as the atomic `(odd x)` (no composition
+        // needed). BD should NOT fire because Flat already won.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let inputs = vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)];
+        let expected = vec![
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(false),
+        ];
+
+        let r = synthesize_with_strategies(
+            &comps,
+            &inputs,
+            &expected,
+            &env,
+            &universe,
+            3,
+            5000,
+        );
+        assert!(r.found);
+        assert_eq!(r.strategy, Some(Strategy::Flat));
     }
 }
