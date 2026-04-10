@@ -1,0 +1,42 @@
+; Test curriculum for generic inversion (learned inversion Stage D2)
+; Tests tasks where:
+;   1. A promoted macro is the outermost function (m(g(x)))
+;   2. Generic binary inversion finds solutions for unlisted builtins
+
+; === Stage 1: Build library helpers ===
+; These get promoted, then used as outermost in later tasks
+
+; half_len: string-length / 2
+(task "half_len" 2
+  ("abcd" 2) ("abcdef" 3) ("ab" 1) ("abcdefgh" 4) ("abcdefghij" 5))
+
+; count_a: count occurrences of "a"
+(task "count_a" 2
+  ("apple" 1) ("banana" 3) ("aaa" 3) ("hello" 0) ("abracadabra" 5))
+
+; first_two: first 2 characters
+(task "first_two" 2
+  ("hello" "he") ("world" "wo") ("abcdef" "ab") ("xyz" "xy") ("test" "te"))
+
+; === Stage 2: Tasks requiring promoted macros as outermost ===
+
+; count_a of first_two characters: count_a(first_two(x))
+; first_two("apple")="ap"→1, first_two("aardvark")="aa"→2, first_two("banana")="ba"→1
+; first_two("axiom")="ax"→1, first_two("cat")="ca"→1, first_two("opera")="op"→0
+(task "count_a_prefix" 2
+  ("apple" 1) ("aardvark" 2) ("banana" 1) ("axiom" 1) ("opera" 0) ("area" 1))
+
+; half_len of a substring: half_len(string-drop(x, 2))
+; Needs half_len as outermost, with a string-drop subspec
+(task "half_remaining" 2
+  ("xxabcdef" 3) ("xxabcdefgh" 4) ("xxab" 1) ("xxabcdefghij" 5) ("xxabcdefghijkl" 6))
+
+; === Stage 3: Generic binary inversion for builtins not in match ===
+
+; min(x, 5) — min is not in the hand-coded inversions
+(task "cap_at_5" 2
+  (3 3) (7 5) (1 1) (10 5) (5 5))
+
+; max(x, 0) — max is not in the hand-coded inversions
+(task "floor_at_0" 2
+  (3 3) (-2 0) (0 0) (10 10) (-5 0))

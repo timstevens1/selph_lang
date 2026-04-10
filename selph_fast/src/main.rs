@@ -27,6 +27,7 @@ mod meta;
 mod taskgen;
 mod vm;
 mod trace;
+mod recursive_decompose;
 mod arc;
 
 use std::env;
@@ -851,6 +852,9 @@ fn cmd_curriculum(args: &[String]) {
     let mut filter_path: Option<String> = None;
     let mut trace_path: Option<String> = None;
     let mut heuristic_path: Option<String> = None;
+    let mut enable_rd = true;
+    let mut learn_rd = false;
+    let mut rd_predictor_path: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -868,6 +872,9 @@ fn cmd_curriculum(args: &[String]) {
             "--filter" => { filter_path = args.get(i + 1).cloned(); i += 2; }
             "--trace" => { trace_path = args.get(i + 1).cloned(); i += 2; }
             "--heuristic" => { heuristic_path = args.get(i + 1).cloned(); i += 2; }
+            "--no-rd" => { enable_rd = false; i += 1; }
+            "--learn-rd" => { learn_rd = true; i += 1; }
+            "--rd-predictor" => { rd_predictor_path = args.get(i + 1).cloned(); i += 2; }
             other => { task_file = other.to_string(); i += 1; }
         }
     }
@@ -976,6 +983,24 @@ fn cmd_curriculum(args: &[String]) {
             None
         };
 
+    // Load learned RD predictor if provided
+    let rd_predictor: Option<recursive_decompose::LearnedPredictor> =
+        if let Some(ref rp) = rd_predictor_path {
+            match fs::read_to_string(rp) {
+                Ok(src) => {
+                    match recursive_decompose::LearnedPredictor::from_source(src.trim()) {
+                        Some(p) => {
+                            eprintln!("  RD predictor: {}", rp);
+                            Some(p)
+                        }
+                        None => { eprintln!("  RD predictor parse error: {}", rp); None }
+                    }
+                }
+                Err(e) => { eprintln!("  RD predictor load error: {}", e); None }
+            }
+        } else { None };
+    if learn_rd { eprintln!("  Learn RD predictor: enabled"); }
+
     eprintln!("  Output: {}", output_path);
     eprintln!();
 
@@ -985,6 +1010,9 @@ fn cmd_curriculum(args: &[String]) {
     let mut promoted_source = String::new();
     let total_start = std::time::Instant::now();
     let learn_rate = 50.0;
+
+    // Training data for RD predictor learning
+    let mut rd_training: Vec<recursive_decompose::PredictorTrainingPair> = Vec::new();
 
     // Priority map: learned from solutions, persists across tasks
     let mut priorities: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
@@ -1129,6 +1157,95 @@ fn cmd_curriculum(args: &[String]) {
         let mut task_components_used: Vec<String> = Vec::new();
         let start = std::time::Instant::now();
 
+        // Strategy 0: Recursive decomposition (top-down prediction)
+        // Try this first with a fraction of the budget — it's fast when
+        // the outermost function is predictable. Disabled with --no-rd.
+        let rd_budget = default_budget / 4;
+        let rd = if enable_rd {
+            let r = recursive_decompose::try_recursive_decomposition_with_predictor(
+                &synth_comps, train_inputs, train_expected, &all_macros,
+                depth, rd_budget, rd_predictor.as_ref(),
+            );
+            total_candidates += r.candidates_explored;
+            r
+        } else {
+            recursive_decompose::RecursiveDecompResult::empty()
+        };
+        let rd_explored = rd.candidates_explored;
+
+        if rd.found {
+            let source = node_to_source(&rd.nodes, rd.root);
+            solved += 1;
+            let elapsed = start.elapsed();
+            eprintln!("  RD  {:30}  {:6} cand  {:.3}s  {}  [{}]",
+                     name, rd_explored, elapsed.as_secs_f64(), source, rd.strategy_used);
+
+            task_solving_strategy = Some(rd.strategy_used.clone());
+            task_total_candidates = rd_explored;
+
+            let used_components = library::extract_components(&source);
+            task_components_used = used_components.clone();
+            for comp_name in &used_components {
+                let entry = priorities.entry(comp_name.clone()).or_insert(0.0);
+                *entry += learn_rate;
+            }
+
+            let body_source = extract_lambda_body(&source);
+
+            let is_trivial = {
+                let trimmed = body_source.trim();
+                if trimmed.starts_with('(') && trimmed.ends_with(')') {
+                    let inner = &trimmed[1..trimmed.len()-1];
+                    let parts: Vec<&str> = inner.split_whitespace().collect();
+                    parts.len() == 2
+                        && (parts[1] == "x" || parts[1] == "s")
+                        && all_macros.iter().any(|(mn, _, _, _)| mn == parts[0])
+                } else {
+                    false
+                }
+            };
+
+            if is_trivial {
+                eprintln!("    (skipped promotion — trivial wrapper of existing macro)");
+            } else {
+                let macro_line = format!("(defmacro {} (s) {})", name, body_source);
+                if let Ok((mnodes, mroots)) = parse_file(&macro_line) {
+                    if !mroots.is_empty() {
+                        if let Node::App(children) = &mnodes[mroots[0]] {
+                            if children.len() == 4 {
+                                if let Node::Symbol(mname) = &mnodes[children[1]] {
+                                    if let Node::App(param_indices) = &mnodes[children[2]] {
+                                        let params: Vec<String> = param_indices.iter()
+                                            .filter_map(|&i| {
+                                                if let Node::Symbol(s) = &mnodes[i] { Some(resolve(*s)) }
+                                                else { None }
+                                            }).collect();
+                                        all_macros.push((
+                                            resolve(*mname), params,
+                                            mnodes.clone(), children[3],
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                promoted_source.push_str(&format!(
+                    "\n; {} (recursive decomp: {}): found in {} candidates\n{}\n",
+                    name, rd.strategy_used, rd_explored, macro_line));
+            }
+
+            if enable_meta {
+                meta::update_rl_coefficients(
+                    &mut current_rl_coeffs, rd_explored, default_budget);
+            }
+            if enable_extract {
+                solved_programs.push((rd.nodes.clone(), rd.root));
+            }
+        } else {
+
+        // Strategy 1: Flat synthesis
         let filter_ref: Option<&dyn Fn(&synth::SynthComponent, usize) -> bool> =
             depth_filter.as_ref().map(|f| f.as_ref());
         let snap_ref: Option<&mut Vec<synth::CandidateRecord>> = None;
@@ -1474,6 +1591,7 @@ fn cmd_curriculum(args: &[String]) {
             } // end HO else
         } // end bool_decompose else
         }
+        } // end recursive decomposition else
 
         // Record trace for this task
         if trace_path.is_some() {
@@ -1492,6 +1610,25 @@ fn cmd_curriculum(args: &[String]) {
                 all_components_available: all_comp_names.clone(),
             };
             curriculum_trace.tasks.push(task_trace);
+        }
+
+        // Collect training data for RD predictor
+        if learn_rd {
+            // Find the last promoted macro for this task (if solved)
+            if let Some(last_macro) = all_macros.iter().rev()
+                .find(|(mn, _, _, _)| mn == name)
+            {
+                let (_, _, mnodes, mroot) = last_macro;
+                if let Some(outermost) = recursive_decompose::extract_outermost_function(mnodes, *mroot) {
+                    let family = recursive_decompose::classify_outermost(&outermost).to_string();
+                    let features = recursive_decompose::encode_features(
+                        train_inputs, train_expected, &all_macros);
+                    rd_training.push(recursive_decompose::PredictorTrainingPair {
+                        features,
+                        family,
+                    });
+                }
+            }
         }
 
         // Periodic abstraction extraction: every 10 solved tasks
@@ -1575,6 +1712,68 @@ fn cmd_curriculum(args: &[String]) {
     eprintln!("Total: {} candidates, {:.1}s",
              total_candidates, total_elapsed.as_secs_f64());
     eprintln!("Library grew by {} macros", solved);
+
+    // Learn RD predictor from training data if --learn-rd enabled
+    if learn_rd && rd_training.len() >= 3 {
+        eprintln!();
+        eprintln!("Learning RD predictor from {} training pairs...", rd_training.len());
+
+        // Deduplicate training pairs
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped: Vec<recursive_decompose::PredictorTrainingPair> = Vec::new();
+        for pair in &rd_training {
+            let key = format!("{}→{}", pair.features, pair.family);
+            if seen.insert(key) {
+                deduped.push(pair.clone());
+            }
+        }
+        eprintln!("  {} unique pairs after dedup", deduped.len());
+
+        // Show distribution
+        let mut family_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for pair in &deduped {
+            *family_counts.entry(pair.family.clone()).or_insert(0) += 1;
+        }
+        let mut counts: Vec<_> = family_counts.iter().collect();
+        counts.sort_by(|a, b| b.1.cmp(a.1));
+        for (family, count) in &counts {
+            eprintln!("    {}: {}", family, count);
+        }
+
+        let predictor_budget = 50000;
+        match recursive_decompose::learn_predictor(&deduped, predictor_budget) {
+            Some((nodes, root, cands)) => {
+                let source = node_to_source(&nodes, root);
+                eprintln!("  Learned predictor in {} candidates:", cands);
+                eprintln!("    {}", source);
+
+                // Save predictor to file
+                let pred_path = output_path.replace(".selph", "_rd_predictor.selph");
+                match fs::write(&pred_path, &source) {
+                    Ok(_) => eprintln!("  Saved predictor to {}", pred_path),
+                    Err(e) => eprintln!("  Error saving predictor: {}", e),
+                }
+
+                // Validate predictor on training data
+                if let Some(pred) = recursive_decompose::LearnedPredictor::from_source(&source) {
+                    let mut correct = 0;
+                    for pair in &deduped {
+                        if let Some(predicted) = pred.predict(&pair.features) {
+                            if predicted == pair.family {
+                                correct += 1;
+                            }
+                        }
+                    }
+                    eprintln!("  Validation: {}/{} correct ({:.0}%)",
+                        correct, deduped.len(),
+                        100.0 * correct as f64 / deduped.len() as f64);
+                }
+            }
+            None => {
+                eprintln!("  Failed to learn predictor (budget {})", predictor_budget);
+            }
+        }
+    }
 
     // Write trace JSON if requested
     if let Some(ref tp) = trace_path {
