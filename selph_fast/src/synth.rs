@@ -654,6 +654,12 @@ fn build_macro_env(
 pub fn make_selph_depth_filter(
     filter_val: Value,
 ) -> Box<dyn Fn(&SynthComponent, usize) -> bool> {
+    // Build the eval env and empty-nodes value once at closure construction.
+    // The filter is invoked once per (component, depth) across the entire
+    // synthesis run, so reusing the env eliminates a make_default_env build
+    // per component.
+    let env_cell = std::cell::RefCell::new(eval::make_default_env());
+    let empty_nodes: Rc<[Node]> = Vec::<Node>::new().into();
     Box::new(move |comp: &SynthComponent, depth: usize| -> bool {
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("name".to_string(), Value::Str(comp.name.clone()));
@@ -663,9 +669,8 @@ pub fn make_selph_depth_filter(
         ctx.insert("depth".to_string(), Value::Num(depth as f64));
         let ns_arg = Value::Namespace(ctx);
 
-        let empty_nodes: Rc<[Node]> = Vec::<Node>::new().into();
-        let mut env = eval::make_default_env();
-        match eval::apply(&filter_val, &[ns_arg], &empty_nodes, &mut env) {
+        let mut env = env_cell.borrow_mut();
+        match eval::apply(&filter_val, &[ns_arg], &empty_nodes, &mut *env) {
             Ok(Value::Bool(b)) => b,
             Ok(Value::Num(n)) => n >= 0.0,  // negative = exclude
             _ => true,
@@ -678,6 +683,8 @@ pub fn make_selph_depth_filter(
 pub fn make_selph_scorer(
     scorer_val: Value,
 ) -> Box<dyn Fn(&SynthComponent, usize) -> f64> {
+    let env_cell = std::cell::RefCell::new(eval::make_default_env());
+    let empty_nodes: Rc<[Node]> = Vec::<Node>::new().into();
     Box::new(move |comp: &SynthComponent, depth: usize| -> f64 {
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("name".to_string(), Value::Str(comp.name.clone()));
@@ -687,9 +694,8 @@ pub fn make_selph_scorer(
         ctx.insert("depth".to_string(), Value::Num(depth as f64));
         let ns_arg = Value::Namespace(ctx);
 
-        let empty_nodes: Rc<[Node]> = Vec::<Node>::new().into();
-        let mut env = eval::make_default_env();
-        match eval::apply(&scorer_val, &[ns_arg], &empty_nodes, &mut env) {
+        let mut env = env_cell.borrow_mut();
+        match eval::apply(&scorer_val, &[ns_arg], &empty_nodes, &mut *env) {
             Ok(Value::Num(n)) => n,
             Ok(Value::Bool(true)) => comp.priority,
             Ok(Value::Bool(false)) => -1.0, // excluded
@@ -912,6 +918,13 @@ pub fn synthesize_full(
     // macro against the first input — if it errors, exclude it.
     let scoped_components: Vec<&SynthComponent> = if !inputs.is_empty() {
         let test_input = &inputs[0];
+        // Build the probe env once and reuse across every component test.
+        let mut probe_env = eval::make_default_env();
+        for (nm, ps, mn, mr) in &macro_env {
+            env_define(&mut probe_env, intern(nm),
+                Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr));
+        }
+        let probe_empty: Rc<[Node]> = Vec::<Node>::new().into();
         scoped_components.into_iter().filter(|comp| {
             // Only probe macros (arity 1, have a builtin name that matches a macro)
             if comp.arity != 1 { return true; }
@@ -938,13 +951,7 @@ pub fn synthesize_full(
             let macro_data = macros.iter().find(|(mn, _, _, _)| mn == bn);
             if let Some((_, params, mnodes, mroot)) = macro_data {
                 let val = Value::RustMacro(params.iter().map(|s| intern(s)).collect(), Rc::from(mnodes.clone()), *mroot);
-                let empty: Rc<[Node]> = Vec::<Node>::new().into();
-                let mut env = eval::make_default_env();
-                for (nm, ps, mn, mr) in &macro_env {
-                    env_define(&mut env, intern(nm),
-                        Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr));
-                }
-                eval::apply(&val, &[test_input.clone()], &empty, &mut env).is_ok()
+                eval::apply(&val, &[test_input.clone()], &probe_empty, &mut probe_env).is_ok()
             } else {
                 true
             }
@@ -1023,18 +1030,21 @@ pub fn synthesize_full(
             ln.push(Node::Lambda(vec![intern("x")], entry.root));
             let ln_rc: Rc<[Node]> = ln.into();
 
+            // Build the env once and reuse across all (input, expected) pairs.
+            // Each iteration applies the same lambda with different inputs; the
+            // surrounding builtins, macros, and extra bindings are identical.
+            let mut env = eval::make_default_env();
+            for (nm, ps, mn, mr) in &macro_env {
+                env_define(
+                    &mut env,
+                    intern(nm),
+                    Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr),
+                );
+            }
+            for (name, val) in extra_bindings {
+                env_define(&mut env, intern(name), val.clone());
+            }
             for (inp, exp) in inputs.iter().zip(expected.iter()) {
-                let mut env = eval::make_default_env();
-                for (nm, ps, mn, mr) in &macro_env {
-                    env_define(
-                        &mut env,
-                        intern(nm),
-                        Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr),
-                    );
-                }
-                for (name, val) in extra_bindings {
-                    env_define(&mut env, intern(name), val.clone());
-                }
                 let fv = match eval::eval(&ln_rc, lr, &mut env) {
                     Ok(v) => v,
                     Err(_) => break,
@@ -1997,18 +2007,19 @@ fn validate_candidate(
     extra_bindings: &[(String, Value)],
 ) -> bool {
     let nodes_rc: Rc<[Node]> = nodes.to_vec().into();
+    // Build the env once and reuse across all validation examples.
+    let mut env = eval::make_default_env();
+    for (nm, ps, mn, mr) in macro_env {
+        env_define(
+            &mut env,
+            intern(nm),
+            Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr),
+        );
+    }
+    for (name, val) in extra_bindings {
+        env_define(&mut env, intern(name), val.clone());
+    }
     for (inp, exp) in validation_examples {
-        let mut env = eval::make_default_env();
-        for (nm, ps, mn, mr) in macro_env {
-            env_define(
-                &mut env,
-                intern(nm),
-                Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr),
-            );
-        }
-        for (name, val) in extra_bindings {
-            env_define(&mut env, intern(name), val.clone());
-        }
         let fv = match eval::eval(&nodes_rc, lambda_root, &mut env) {
             Ok(v) => v,
             Err(_) => return false,
@@ -2073,6 +2084,23 @@ fn generate_if_programs(
         return results;
     }
 
+    // Build the eval environment once and reuse it across every (pool entry,
+    // input) iteration in both the bool-condition and value-branch loops.
+    // The macros and extra bindings are identical for every evaluation; only
+    // the lambda body and input change. Rebuilding the default env per call
+    // was previously the dominant cost of D&C synthesis.
+    let mut eval_env = eval::make_default_env();
+    for (nm, ps, mn, mr) in macro_env {
+        env_define(
+            &mut eval_env,
+            intern(nm),
+            Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr),
+        );
+    }
+    for (name, val) in extra_bindings {
+        env_define(&mut eval_env, intern(name), val.clone());
+    }
+
     // Step 1: Evaluate each bool condition on all inputs to get its partition
     // partition: Vec<bool> for each input
     // Dedup by partition pattern: only keep first condition per pattern.
@@ -2089,22 +2117,11 @@ fn generate_if_programs(
         let mut valid = true;
 
         for inp in inputs {
-            let mut env = eval::make_default_env();
-            for (nm, ps, mn, mr) in macro_env {
-                env_define(
-                    &mut env,
-                    intern(nm),
-                    Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr),
-                );
-            }
-            for (name, val) in extra_bindings {
-                env_define(&mut env, intern(name), val.clone());
-            }
-            let fv = match eval::eval(&ln_rc, lr, &mut env) {
+            let fv = match eval::eval(&ln_rc, lr, &mut eval_env) {
                 Ok(v) => v,
                 Err(_) => { valid = false; break; }
             };
-            match eval::apply(&fv, &[inp.clone()], &ln_rc, &mut env) {
+            match eval::apply(&fv, &[inp.clone()], &ln_rc, &mut eval_env) {
                 Ok(Value::Bool(b)) => pattern.push(b),
                 Ok(_) => { valid = false; break; }
                 Err(_) => { valid = false; break; }
@@ -2145,22 +2162,11 @@ fn generate_if_programs(
         let mut valid = true;
 
         for inp in inputs {
-            let mut env = eval::make_default_env();
-            for (nm, ps, mn, mr) in macro_env {
-                env_define(
-                    &mut env,
-                    intern(nm),
-                    Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr),
-                );
-            }
-            for (name, val) in extra_bindings {
-                env_define(&mut env, intern(name), val.clone());
-            }
-            let fv = match eval::eval(&ln_rc, lr, &mut env) {
+            let fv = match eval::eval(&ln_rc, lr, &mut eval_env) {
                 Ok(v) => v,
                 Err(_) => { valid = false; break; }
             };
-            match eval::apply(&fv, &[inp.clone()], &ln_rc, &mut env) {
+            match eval::apply(&fv, &[inp.clone()], &ln_rc, &mut eval_env) {
                 Ok(v) => outputs.push(v),
                 Err(_) => { valid = false; break; }
             }
@@ -2321,19 +2327,23 @@ fn infer_macro_types(
     let num_args: Vec<Value> = vec![test_num.clone(); params.len()];
 
     let mnodes_rc: Rc<[Node]> = mnodes.to_vec().into();
-    let try_call = |args: &[Value]| -> Option<Value> {
+    // Build the env once and reuse for every probe call below.
+    let env_cell = std::cell::RefCell::new({
         let mut env = eval::make_default_env();
-        // Include other macros so cross-macro calls resolve
         for (mn, mp, mm, mr) in all_macros {
             env_define(&mut env, intern(mn),
                 Value::RustMacro(mp.iter().map(|s| intern(s)).collect(), Rc::from(mm.clone()), *mr));
         }
+        env
+    });
+    let try_call = |args: &[Value]| -> Option<Value> {
         let val = Value::RustMacro(
             params.iter().map(|s| intern(s)).collect(),
             mnodes_rc.clone(),
             mroot,
         );
-        eval::apply(&val, args, &mnodes_rc, &mut env).ok()
+        let mut env = env_cell.borrow_mut();
+        eval::apply(&val, args, &mnodes_rc, &mut *env).ok()
     };
 
     // Try string args
@@ -2898,16 +2908,19 @@ pub fn synthesize_optimize(
         ln.push(Node::Lambda(vec![intern("x")], entry.root));
         let ln_rc: Rc<[Node]> = ln.into();
 
+        // Build the eval env once and reuse it for both the base-example
+        // validation loop and the fitness function evaluation.
+        let mut env = eval::make_default_env();
+        for (nm, ps, mn, mr) in macro_env {
+            env_define(&mut env, intern(nm), Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr));
+        }
+        for (name, val) in extra_bindings {
+            env_define(&mut env, intern(name), val.clone());
+        }
+
         // If base examples are provided, check them first
         if !base_inputs.is_empty() {
             for (inp, exp) in base_inputs.iter().zip(base_expected.iter()) {
-                let mut env = eval::make_default_env();
-                for (nm, ps, mn, mr) in macro_env {
-                    env_define(&mut env, intern(nm), Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr));
-                }
-                for (name, val) in extra_bindings {
-                    env_define(&mut env, intern(name), val.clone());
-                }
                 let fv = match eval::eval(&ln_rc, lr, &mut env) {
                     Ok(v) => v,
                     Err(_) => return None,
@@ -2919,15 +2932,6 @@ pub fn synthesize_optimize(
                     Err(_) => return None,
                 }
             }
-        }
-
-        // Evaluate the fitness function on the candidate lambda
-        let mut env = eval::make_default_env();
-        for (nm, ps, mn, mr) in macro_env {
-            env_define(&mut env, intern(nm), Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr));
-        }
-        for (name, val) in extra_bindings {
-            env_define(&mut env, intern(name), val.clone());
         }
 
         // Evaluate the fitness function node
@@ -2967,14 +2971,15 @@ pub fn synthesize_optimize(
 
         let mut beh = Vec::new();
         if !base_inputs.is_empty() {
+            // Build the env once and reuse across all base inputs.
+            let mut env = eval::make_default_env();
+            for (nm, ps, mn, mr) in &macro_env {
+                env_define(&mut env, intern(nm), Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr));
+            }
+            for (name, val) in extra_bindings {
+                env_define(&mut env, intern(name), val.clone());
+            }
             for inp in base_inputs {
-                let mut env = eval::make_default_env();
-                for (nm, ps, mn, mr) in &macro_env {
-                    env_define(&mut env, intern(nm), Value::RustMacro(ps.iter().map(|s| intern(s)).collect(), Rc::from(mn.clone()), *mr));
-                }
-                for (name, val) in extra_bindings {
-                    env_define(&mut env, intern(name), val.clone());
-                }
                 let fv = match eval::eval(&ln_rc, lr, &mut env) {
                     Ok(v) => v,
                     Err(_) => return,

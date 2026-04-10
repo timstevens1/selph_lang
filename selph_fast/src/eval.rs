@@ -258,7 +258,7 @@ pub fn apply(fn_val: &Value, args: &[Value], _nodes: &Rc<[Node]>, env: &mut Env)
             // Use the closure's captured nodes, not the caller's nodes
             eval(closure_nodes, *body, &mut new_env)
         }
-        Value::Builtin(name) => apply_builtin(*name, args),
+        Value::Builtin(name) => apply_builtin_in_env(*name, args, Some(env)),
         Value::RustMacro(params, macro_nodes, body_root) => {
             // Push a parameter scope onto the existing env, eval, then pop.
             // The caller's env already contains the default builtins and macros,
@@ -1313,20 +1313,38 @@ pub fn apply_builtin(name: Sym, args: &[Value]) -> Result<Value, String> {
     if let Some(result) = BUILTIN_DISPATCH.with(|d| d.get(&name).map(|f| f(args))) {
         return result;
     }
-    // Slow path: builtins that call back into eval/apply
-    apply_builtin_slow(name, args)
+    // Slow path: builtins that call back into eval/apply.
+    // No caller env available — slow path will lazily build one if needed.
+    apply_builtin_in_env(name, args, None)
 }
 
-fn apply_builtin_slow(name: Sym, args: &[Value]) -> Result<Value, String> {
+/// Variant of `apply_builtin` that lets the caller pass in its own
+/// environment. Higher-order builtins (`map`, `reduce`, `filter`, `apply`,
+/// `test-spec`) reuse this env when applying user-supplied functions, which:
+///   1. Avoids rebuilding `make_default_env` per inner call.
+///   2. Lets RustMacros invoked via map/filter/reduce see other macros that
+///      live in the caller's env (otherwise the lookups would fail).
+pub fn apply_builtin_in_env(name: Sym, args: &[Value], env: Option<&mut Env>) -> Result<Value, String> {
+    if let Some(result) = BUILTIN_DISPATCH.with(|d| d.get(&name).map(|f| f(args))) {
+        return result;
+    }
+    apply_builtin_slow(name, args, env)
+}
+
+fn apply_builtin_slow(name: Sym, args: &[Value], caller_env: Option<&mut Env>) -> Result<Value, String> {
     let name_str = resolve(name);
     match name_str.as_str() {
         "map" => {
             let l = list(&args[1])?;
             let empty = empty_nodes();
-            let mut env = make_default_env();
+            let mut owned: Env;
+            let env: &mut Env = match caller_env {
+                Some(e) => e,
+                None => { owned = make_default_env(); &mut owned }
+            };
             let mut results = Vec::new();
             for item in &l {
-                results.push(apply(&args[0], &[item.clone()], &empty, &mut env)?);
+                results.push(apply(&args[0], &[item.clone()], &empty, env)?);
             }
             Ok(Value::List(results))
         }
@@ -1336,21 +1354,29 @@ fn apply_builtin_slow(name: Sym, args: &[Value]) -> Result<Value, String> {
                 return Err("reduce: empty list with no initial value".into());
             }
             let empty = empty_nodes();
-            let mut env = make_default_env();
+            let mut owned: Env;
+            let env: &mut Env = match caller_env {
+                Some(e) => e,
+                None => { owned = make_default_env(); &mut owned }
+            };
             let mut acc = if args.len() > 2 { args[2].clone() } else { l[0].clone() };
             let items = if args.len() > 2 { &l[..] } else { &l[1..] };
             for item in items {
-                acc = apply(&args[0], &[acc, item.clone()], &empty, &mut env)?;
+                acc = apply(&args[0], &[acc, item.clone()], &empty, env)?;
             }
             Ok(acc)
         }
         "filter" => {
             let l = list(&args[1])?;
             let empty = empty_nodes();
-            let mut env = make_default_env();
+            let mut owned: Env;
+            let env: &mut Env = match caller_env {
+                Some(e) => e,
+                None => { owned = make_default_env(); &mut owned }
+            };
             let mut results = Vec::new();
             for item in &l {
-                if let Value::Bool(true) = apply(&args[0], &[item.clone()], &empty, &mut env)? {
+                if let Value::Bool(true) = apply(&args[0], &[item.clone()], &empty, env)? {
                     results.push(item.clone());
                 }
             }
@@ -1360,8 +1386,12 @@ fn apply_builtin_slow(name: Sym, args: &[Value]) -> Result<Value, String> {
             let func = &args[0];
             let arg_list = list(&args[1])?;
             let empty = empty_nodes();
-            let mut env = make_default_env();
-            apply(func, &arg_list, &empty, &mut env)
+            let mut owned: Env;
+            let env: &mut Env = match caller_env {
+                Some(e) => e,
+                None => { owned = make_default_env(); &mut owned }
+            };
+            apply(func, &arg_list, &empty, env)
         }
         "eval-source" => {
             let src = string(&args[0])?;
@@ -1404,13 +1434,21 @@ fn apply_builtin_slow(name: Sym, args: &[Value]) -> Result<Value, String> {
             let empty = empty_nodes();
             let mut matches = 0usize;
             let total = pairs.len();
+            // Reuse the caller's env if available, otherwise build the default
+            // env once and reuse it across all pairs. The candidate is applied
+            // repeatedly with different inputs but the same surrounding
+            // builtins/macros — no per-pair rebuild needed.
+            let mut owned: Env;
+            let env: &mut Env = match caller_env {
+                Some(e) => e,
+                None => { owned = make_default_env(); &mut owned }
+            };
             for pair in pairs {
                 let (input, expected_val) = match pair {
                     Value::List(p) if p.len() == 2 => (&p[0], &p[1]),
                     _ => return Err("test-spec: each spec entry must be (input expected)".into()),
                 };
-                let mut env = make_default_env();
-                match apply(candidate, &[input.clone()], &empty, &mut env) {
+                match apply(candidate, &[input.clone()], &empty, env) {
                     Ok(result) => {
                         if crate::synth::vals_equal(&result, expected_val) {
                             matches += 1;

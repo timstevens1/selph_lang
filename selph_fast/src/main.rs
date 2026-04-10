@@ -29,6 +29,10 @@ mod vm;
 mod trace;
 mod recursive_decompose;
 mod arc;
+#[allow(dead_code)]
+mod types_v2;
+#[allow(dead_code)]
+mod eval_v2;
 
 use std::env;
 use std::fs;
@@ -48,6 +52,7 @@ fn main() {
 
     match args[1].as_str() {
         "eval" => cmd_eval(&args[2..]),
+        "eval-v2" => cmd_eval_v2(&args[2..]),
         "repl" => cmd_repl(),
         "parse" => cmd_parse(&args[2..]),
         "synth" => cmd_synth(&args[2..]),
@@ -131,6 +136,60 @@ fn cmd_eval(args: &[String]) {
         match eval(&nodes, *root, &mut env) {
             Ok(val) => {
                 let s = value_to_string(&val);
+                if !s.is_empty() && s != "()" {
+                    println!("{}", s);
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                return;
+            }
+        }
+    }
+}
+
+/// `selph eval-v2` — like `eval`, but runs against the new core (eval_v2 +
+/// types_v2). Used for validating the rebuild during transition. Will
+/// replace `cmd_eval` once eval_v2 is feature-complete and the consumer
+/// modules have been migrated.
+fn cmd_eval_v2(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: selph eval-v2 <file.selph> | -e \"expr\"");
+        return;
+    }
+
+    let source = if args[0] == "-e" {
+        if args.len() < 2 {
+            eprintln!("Missing expression after -e");
+            return;
+        }
+        args[1].clone()
+    } else {
+        match fs::read_to_string(&args[0]) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error reading {}: {}", args[0], e);
+                return;
+            }
+        }
+    };
+
+    // Parse using the existing parser, then convert old → new Node trees.
+    let (old_nodes, roots) = match parse_file(&source) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Parse error: {}", e);
+            return;
+        }
+    };
+    let new_nodes_vec = eval_v2::convert_tree(&old_nodes);
+    let new_nodes: Rc<[types_v2::Node]> = new_nodes_vec.into();
+
+    let env = eval_v2::make_default_env();
+    for root in &roots {
+        match eval_v2::eval(&new_nodes, *root, &env) {
+            Ok(val) => {
+                let s = eval_v2::value_to_string(&val);
                 if !s.is_empty() && s != "()" {
                     println!("{}", s);
                 }

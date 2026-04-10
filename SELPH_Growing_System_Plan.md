@@ -2,7 +2,7 @@
 
 ## From Enumerative Solver to Self-Building Architecture
 
-**Version 0.11 — April 9, 2026**
+**Version 0.12 — April 10, 2026**
 
 Based on implementation experience with the v0.1 Architecture Spec, the Rust-native migration, the April 6-7 session (decomposition via synthesis, tracing, 7.2x search optimization, namespace literals, memorization), the April 7 session that added: bytecode VM (22.9x eval speedup), `synthesize` builtin `:library`/`:priorities` support, early depth extension for compositional search, optimization curriculum with meta-optimization, NL curriculum, and chained curriculum execution, the April 7 evening session that added: unified library/tree/namespace loading, TYPE_LIST in the type system, higher-order synthesis via fused map components, 3-word sentence structures, and variable-length sentence tagging via `(string-join (map pos_tag (string-split x " ")) " ")`, and the April 7 late session that added: full 3-domain chained curriculum (55/55 tasks), trace instrumentation infrastructure (`--trace` JSON output), and meta-optimization Stage 3 — multi-task heuristic learning across the full task suite, producing the `priority-plus-type-match` heuristic (26/55 vs 21/55 baseline at budget 5000).
 
@@ -816,7 +816,7 @@ With 55-task chained curriculum validated and meta-optimization Stage 3 complete
 
 1. **Unblock `first_half` / copy language.** `(string-take x (half_len x))` is the simplest correct solution but the arity-2 early depth extension doesn't reach it within budget. Options: (a) integer decomposition fallback (try arithmetic compositions of numeric pool entries when flat synthesis fails — analogous to BD), (b) priority boosting for `string-take`/`string-drop` when target is string and numeric intermediates exist, (c) deeper scaffolding tasks.
 
-2. **Types as a SELPH program.** The type vocabulary (NUM, STR, BOOL, LIST) is currently hardcoded. Making type inference a curriculum target lets the system learn to expand its own type vocabulary. A type inference stage teaches "if `string-split` produces it, and `head` consumes it, they share a type."
+2. **Types as a SELPH program.** The type vocabulary (NUM, STR, BOOL, LIST) is currently hardcoded. Making type inference a curriculum target lets the system learn to expand its own type vocabulary. A type inference stage teaches "if `string-split` produces it, and `head` consumes it, they share a type." See §9.24.3 for the concrete plan: types as namespaces with predicates, registered in a `__types__` namespace, with the synthesizer caching Sym handles for hot-path checks.
 
 3. ~~**Deeper meta-optimization.**~~ ✓ Stage 4 implemented: `meta-opt --synthesize` enumerates heuristic programs bottom-up over ctx fields, scored via behavior-vector rank. Two-phase: Phase A (cheap rank enumeration, ~2s) + Phase B (synthesis validation on hard subset, ~3s). Needs validation on the full 55-task traces.
 
@@ -1087,7 +1087,230 @@ Key wins:
 **Next implementation steps:**
 1. Improve learned predictor: train across multiple curricula, better feature engineering
 2. Deeper recursion for 3+ level compositions (currently depth 2)
-3. Investigate other `make_default_env()` callers in `map`/`reduce`/`filter`/`test-spec` for similar wins
+3. ~~Investigate other `make_default_env()` callers in `map`/`reduce`/`filter`/`test-spec` for similar wins~~ — see §9.23
+
+### 9.23 Hot-path env hoisting and caller-env threading (April 10, 2026)
+
+Continuing from §9.22's `eval::apply` env-rebuild fix, audited every `make_default_env()` caller in `synth.rs` and `eval.rs` for the same pattern: rebuilding the default environment inside a loop or per-call when a single hoisted env would do.
+
+**Hoisted out of inner loops in `synth.rs` (six sites):**
+- The tree-walker fallback in the main `test` closure (per-input env build → per-candidate env build).
+- `validate_candidate` — env rebuilt per validation example.
+- `generate_if_programs` — D&C had two `for inp in inputs` loops (bool conditions + value branches), each rebuilding env per (pool entry, input). Hoisted to function scope so a single env is reused across both passes.
+- `eval_fitness` and `test_and_score` in `synthesize_optimize` — env rebuilt per base example.
+- The probe-and-filter `.filter()` closure — env rebuilt per probed component. Hoisted out of the closure with `let mut probe_env`.
+- `infer_macro_types` `try_call` closure — env rebuilt on each probe call. Wrapped in a `RefCell` so the closure can reuse it.
+- `make_selph_filter` and `make_selph_scorer` — these closures are called once per `(component, depth)` pair across an entire synthesis run, and were rebuilding the default env on every call. Now capture `RefCell<Env>` at construction time.
+
+**Hoisted in `eval.rs`:**
+- `test-spec` — env was rebuilt for each spec pair. Now built once before the loop.
+
+**Caller-env threading for higher-order builtins (`eval.rs`):**
+Added `apply_builtin_in_env(name, args, Some(env))` alongside the existing `apply_builtin(name, args)`. The `Value::Builtin(name)` arm in `eval::apply` now threads the caller's env into the slow path. `map`, `reduce`, `filter`, `apply`, and `test-spec` reuse the caller's env when invoked from a tree-walker context. This:
+1. Avoids rebuilding the default env per inner call (the same fix as §9.22 but for the higher-order family).
+2. Fixes a latent bug: when `map`/`filter`/`reduce` is called with a `RustMacro` whose body references *other* macros, the freshly-built default env didn't contain those other macros, so the call would fail. The hoisted-env path threads the surrounding macro environment through.
+
+**Validation:** Sequence stage standalone (13 tasks, budget 200K): baseline 72.2s → optimized 47.6s (**1.52x speedup**). 12/13 solved either way. 230 tests passing (same 9 pre-existing `multitree::tests::test_extract_*` failures, unrelated to this change).
+
+**Lesson reinforced:** the April 10 macro-apply fix, today's hoistings, and the upcoming Tier-1 changes (§9.24) are all the same pattern — a small allocation that happens in a hot loop dwarfs hundreds of lines of compiler infrastructure built to "speed things up." Audit before optimizing.
+
+### 9.24 Interpreter rebuild and types-as-SELPH (April 10, 2026)
+
+After §9.22 and §9.23, the picture is clear: the tree-walking evaluator isn't slow because tree walking is slow. It's slow because its data structures and hot paths do pathologically wasteful things that are orthogonal to the tree-vs-bytecode distinction. Each fix we land is a 1.3–1.5x speedup from removing a single allocation. The bytecode VM (22.9x speedup, ~600 lines) was a workaround for problems that lived elsewhere; after the env-rebuild fix the gap to the tree walker shrank dramatically and the VM is increasingly net-negative complexity.
+
+This subsection sketches the proposed direction: **rebuild the core interpreter (`types.rs` + `eval.rs` + small support, ~2500 lines) against new data structures, migrate consumers module-by-module, delete the VM, and bake in the substrate for the "types as SELPH program" curriculum target referenced in §9.13.**
+
+#### 9.24.1 Tier-1 hot-path fixes (the rebuild's data-structure motivation)
+
+**Value representation.** Currently `Value::Str(String)` and `Value::List(Vec<Value>)` deep-clone on every clone. Every `apply_builtin` slow-path call does `let l = list(&args[1])?` which clones the entire vector AND every nested value. For string-heavy curricula this is enormous.
+- Switch to `Value::Str(Rc<str>)` and `Value::List(Rc<[Value]>)`. Cloning becomes a refcount bump.
+- Affects nearly every consumer because almost everything threads `Value` by value, but the migration is mechanical.
+
+**Closure / Env representation.** `Lambda → Closure(..., env.clone(), ...)` deep-clones the env (a `Vec<HashMap<Sym, Value>>`) on every lambda creation; `apply` does it again on every call. The default env's ~270 entries (including the `__builtins__` introspection namespace) get copied each time. This is the same root cause as the §9.22 fix, but for closures rather than rust-macros.
+- Switch to a persistent env: `Env = Rc<Scope>` with parent pointers. Closure capture is O(1); closure call pushes one new scope via Rc. Single change probably exceeds the entire bytecode VM's contribution to runtime.
+
+**`env_lookup` linear walk.** Every `Node::Symbol(name)` walks the scope stack from top to bottom on every reference. The default env (with all builtins + macros) sits at the bottom, so common names like `add`, `string-upper`, `nth` pay full-stack-walk cost on every lookup inside any function body. HashMap default `SipHash` on `u32` Sym keys is overkill.
+- `FxHashMap<Sym, Value>` for scopes (drops SipHash).
+- Optionally: resolve symbols at parse time into `(scope_depth, slot)` indices so eval is O(1). The VM already does this for builtins via `CallBuiltin(sym, arity)`; pre-resolution would generalize it without keeping the bytecode infrastructure around.
+
+**Special-form dispatch.** `eval_inner` does `let name_str = resolve(*name); match name_str.as_str() { "define" => ..., "do" => ..., ... }` on EVERY function application. Every `(add x 1)` pays for: resolve sym → string → ~13 string-equality compares → fall through.
+- Pre-intern special-form Syms once. Compare `Sym` u32s, or use a small dense match. Eliminates a string allocation + a chain of string compares per function call — and this is per-App-node in the absolute hottest loop.
+
+**`apply_builtin_slow` does the same `resolve → string → match` pattern** — same fix.
+
+**Tier-2 wins (lower priority):**
+- `recursive_decompose.rs` has 7 more `make_default_env()` callers; same hoisting opportunities.
+- `value_to_string` in `string-join` allocates a `String` per element then joins them; should append into a single buffer.
+- `BUILTIN_DISPATCH.with(|d| d.get(&name).map(|f| f(args)))` per-call thread-local + HashMap lookup. A static perfect-hash table or dense Sym-indexed Vec lookup avoids the closure overhead.
+
+**Tier-3 (architectural):**
+- The VM is probably net-negative once Tier-1 lands. It only handles a subset of nodes (no `ns`, no closures, no `dispatch`, no `let`). Its claimed 22.9x speedup was measured against an env-rebuilding tree walker. After the §9.22 fix that gap collapsed; after Tier-1 it should collapse entirely. Bug surface from "VM compiles but executes wrong" is real (we hit it as bug #4 in §9.20). Right experiment: apply Tier-1, force `force_tree_walker` everywhere, measure. If the curriculum runs in roughly current time, delete `vm.rs`.
+- AST resolution at parse time: rewrite `Node::Symbol(Sym)` into `LocalVar(slot)`, `BuiltinRef(fn)`, `MacroRef(rc)` based on lexical scope. This is what most fast Lisps do. Combined with persistent env it gets to roughly Stalin-Scheme territory without leaving the interpreter model.
+
+#### 9.24.2 Why this is a rebuild, not a patch
+
+The reasons it makes sense to think of this as rebuilding the core rather than patching in place:
+
+1. **The data-structure changes ripple anyway.** Every `make_default_env`-rebuild site we're hoisting is also a site that would change under the new Env representation. If we patch in place, we touch each consumer twice. If we rebuild against a stable new API, we touch them once.
+2. **The semantics are well-understood.** It's a Lisp with lexical scope, defmacro, first-class namespaces, dispatch. We're transcribing, not designing. A rewrite of `types.rs` + `eval.rs` is 1–2 days of focused work.
+3. **The current code has accumulated cruft.** `dispatch` as a special form (because builtins can't see env), `ns` as a special form, two parallel evaluators (tree walker + VM), multiple env-building patterns scattered across modules. A clean version is much smaller.
+4. **It unlocks the type-system rewrite (§9.24.3) at the same moment.** The two changes share data-structure dependencies — doing them sequentially means migrating consumers twice.
+
+What stays untouched: `synth.rs`, `recursive_decompose.rs`, `induce.rs`, `divide.rs`, `verify.rs`, `abstraction.rs`, `multitree.rs`, `stochastic.rs`, `meta.rs`, `taskgen.rs`, `trace.rs`, `decompose.rs`, `library.rs` — collectively ~10K+ lines, validated by curricula. They consume `Value`/`Env`/`Node` and only need touching where the API surface changes (which is exactly the surface we're auditing for hoisting opportunities anyway).
+
+#### 9.24.3 Types as a SELPH program
+
+The current type system has a structural smell: types live in two places that mirror each other.
+- **At the value level**: closed Rust enum variants — `Num`, `Str`, `Bool`, `List`, `Grid`, `Namespace`, `Alt`.
+- **At the synthesis level**: `u8` tags `TYPE_NUM=0, TYPE_STR=1, TYPE_BOOL=2, TYPE_LIST=3, TYPE_ANY=255` plus grid tags.
+
+These are doubly-encoded — every new category requires a Rust enum variant AND a `u8` tag AND HM updates AND reachable-types updates AND probe-filter updates. That's why ARC-AGI required `Value::Grid` AND `TYPE_GRID` AND ~50 grid components AND a lazy-registration flag. The type vocabulary is calcified into Rust at two levels at once. You can't learn it; you can't extend it without recompiling; you can't even hide grid components without a Rust-level boolean.
+
+The "types as SELPH" idea is the dual of "code as SELPH data" — both are about pulling something out of Rust into the homoiconic data layer where it can be learned, transformed, and composed. **A type becomes a namespace:**
+
+```lisp
+(deftype Number
+  (predicate (lambda (v) (number? v)))
+  (parents ())
+  (priority 0))
+
+(deftype Grid
+  (predicate (lambda (v)
+    (and (list? v) (all list? v) (rectangular? v)
+         (all (lambda (row) (all int? row)) v))))
+  (parents (List))
+  (priority 50))
+```
+
+The type *namespace* (`__types__`) becomes the source of truth. The synthesizer caches Sym handles into that namespace for hot-path checks, but it's no longer a closed enum. Same shadow-cache pattern as intern (Sym shadows String) and the VM (bytecode shadows the tree).
+
+**What changes in the interpreter rebuild to support this:**
+
+1. **`Value` collapses.** `Grid`, `Alt`, possibly `Namespace` are no longer Rust variants. A grid is just `List` of `List` of `Num`; "grid-ness" is a predicate in the `Grid` type namespace. Faster cloning, smaller enum, fewer match arms, and crucially: **the Rust universe is no longer the type universe.**
+
+2. **`SynthComponent` references types by Sym, not u8.** Type-reachability becomes a graph search over Sym-keyed nodes instead of a u8 bitmap. Slightly slower per-check, much more flexible.
+
+3. **`infer_macro_types` becomes principled.** Right now it probes a macro with `Value::Str("5 1 2 3 4")` and `Value::Num(3.0)` and pattern-matches the result against the u8 enum. In the new world, it asks: "for each registered type T, does `(T.predicate (m sample))` return true?" Generalizes for free to user-defined types; the same predicate that synthesis uses is the one that learning uses.
+
+4. **`hm.rs` either dies or is rewritten.** HM over u8 tags doesn't directly apply when types are predicates. This is a real loss in one direction (no parametric polymorphism for free) and a gain in another (refinement types, runtime-checked, learnable). Most synthesis use of HM is filtering, which still works with predicates: "for the example values, does this candidate's output satisfy the target predicate?"
+
+5. **Grid stuff becomes a SELPH library.** `examples/grid.selph` defines the Grid type, the grid operations, the perceptual primitives. ARC-AGI ports from a Rust patch to a curriculum stage. The `--include-grid` flag and lazy registration disappear.
+
+#### 9.24.4 Architectural shape after the rebuild
+
+```
+Layer 0 (Rust):       Value, Env, eval, parser, intern.
+                      ~1500 lines. Stable. No types here.
+Layer 1 (SELPH):      __types__, __builtins__, primitive type defs.
+                      Loaded at startup. Replaceable.
+Layer 2 (SELPH):      Synthesis support, decomposition, heuristics,
+                      type learning. Curriculum target.
+Layer 3 (Rust):       synth.rs, recursive_decompose.rs, etc.
+                      Cached fast paths for what SELPH expresses.
+                      Optional — the system would still work without
+                      them, just slower.
+```
+
+The Rust ↔ SELPH boundary moves UP. More of the system lives as SELPH data. The Rust layer becomes a runtime + accelerator, not the source of semantic truth. This is the trajectory the plan keeps gesturing at ("the trained model = library file", "the library IS the dispatch table", "self-hosting infrastructure"). Right now those phrases are aspirational because the type system is still in Rust. After the rebuild they become literal.
+
+#### 9.24.5 Concrete next steps
+
+1. ~~**Land §9.23 benchmark.**~~ Cancelled — strategic shift to the rebuild path made the §9.23 baseline obsolete. Those env-hoisting changes are still committed (they're correct improvements to the old core, and they validated the rebuild thesis: 1.52x sequence-stage speedup from a 5-line fix), but no full-chain benchmark was needed.
+2. ~~**Sketch the new `Value` enum.**~~ ✓ See §9.25.1. `Rc<str>` / `Rc<[Value]>`, no `Grid`, no `Alt`, `Namespace` kept as a fast Map variant keyed by `Sym`. Closures and macros collapsed into a single `Function` variant per the decomposition philosophy. `Int(i64)` added as a distinct variant from `Num(f64)`.
+3. ~~**Sketch the type representation.**~~ ✓ Deferred per user direction. Types will live in a SELPH namespace tree where namespace nesting encodes the subtype hierarchy; the eventual `__types__` namespace is the source of truth and the synthesizer caches Sym handles into it. The interim shim is a `Value::type_sym()` method returning a Sym for primitive variants — minimal surface for synth migration.
+4. ~~**Rewrite `eval.rs` against the new types.**~~ ✓ See §9.25.2. `eval_v2.rs` is in place: persistent Env, special forms as a Rust enum matched in `eval_inner`, no `Grid` handling, ~75 builtins ported (arithmetic, comparison, string, list, namespace, type predicates, higher-order). Bucket-6 meta builtins (`synthesize`, `test-spec`, `memorize`, `eval-source`, `synthesize-optimize`) are stubbed pending the synth.rs migration. Wired into `selph eval-v2 <file>` and validated end-to-end against `examples/hello.selph`, `examples/heuristics.selph`, `examples/decomposition_predictor.selph` (7/7 correct).
+5. **NEXT: Migrate `synth.rs`** to Sym-typed components, calling type predicates for the probe step. Rewrite or stub `hm.rs`. Decide between (a) writing `synth_v2.rs` from scratch against the new types or (b) compatibility shim with a Value boundary conversion. Lean toward (a) for the same reason we did the rebuild — incremental approach means doing the work twice. See §9.25.3.
+6. **Migrate `recursive_decompose.rs`, `divide.rs`, `induce.rs`, `verify.rs`, etc.**, one module at a time, behind a feature flag if needed.
+7. **Delete `vm.rs`** once the new tree walker hits comparable numbers.
+8. **Reload the curricula.** They should still pass — the new type model is more flexible, not more restrictive. Grid stuff becomes a SELPH library.
+9. **Then** start the curriculum target: teach SELPH programs to predict types from spec features, learn type predicates from examples, infer types from usage. This is the §9.13 "Types as a SELPH program" item, finally on a foundation that allows it.
+
+**Decision point:** step 2 was the "is this even worth it" gate. Resolved: the new types feel obviously better. We're proceeding.
+
+**Estimated payoff:** the working hypothesis is 3–5x curriculum runtime improvement and ~30% codebase reduction (deleting VM, simplifying special forms, removing make_default_env-rebuild scaffolding, removing the Grid variant). More importantly, it sets up Phase 4 (neural generation), ARC-AGI proper, and Phase 5 (self-curriculum) on a foundation that doesn't fight the rest of the plan.
+
+### 9.25 Rebuild milestone: types_v2 and eval_v2 (April 10, 2026)
+
+Steps 2 and 4 of §9.24.5 landed in a single session. This subsection captures what was actually built so future work has a concrete reference.
+
+#### 9.25.1 `selph_fast/src/types_v2.rs` (~680 lines)
+
+The new core types live alongside `types.rs` without disturbing it. Highlights:
+
+- **`Value` enum** — 9 variants:
+  - `Int(i64)` and `Num(f64)` are distinct. Coercion rule: `Int op Int = Int` (with overflow → Num); `Int op Num = Num`. Many builtins naturally produce Int (`string-length`, `nth`, `length`, `count-char`, list lengths, etc.) and synthesis can now reason about integer-vs-float without sniffing `n == (n as i64) as f64`.
+  - `Str(Rc<str>)` and `List(Rc<[Value]>)` — cloning is a refcount bump, not a deep copy.
+  - `Ns(Rc<NsMap>)` where `NsMap = HashMap<Sym, Value>`. Sym keys drop a lot of allocation in `ns-get` paths; lookup is hashed-u32 instead of hashed-String.
+  - `Function(Rc<FunctionData>)` — collapses today's `Closure` and `RustMacro`. The data carries `params`, `body: NodeRef`, `captured_env: Env`, and an optional `letrec_scope`. The decomposition rationale: when a sub-synthesizer wants to use a function as a primitive, the captured env IS the relevant search context — no inheritance of the parent's full search environment. Capture is O(1) (Rc bump of the env node).
+  - `Builtin(Sym)`, `Bool`, `Nil`.
+  - **Gone**: `Grid`, `Alt`, distinct `Closure`/`RustMacro`. Grid becomes a SELPH library (eventually); Alt was synth-internal and lifts out of Value entirely.
+
+- **`Env`** — persistent linked list of scopes via `Rc<EnvNode>`. Cloning is one Rc bump; `push_scope` is O(1); `lookup` walks parents top-first; `define` mutates the top scope in place via `RefCell`. The bottom default scope (~75 builtin entries) is built once at startup and shared via Rc across every env — no more 270-entry HashMap copies on every lambda.
+
+- **`Node` and `SpecialForm`** — special forms become a Rust enum matched directly in `eval_inner`. No string compares, no `match name_str.as_str() { "define" => ... }` chain in the hot path. `Node` adds `Int(i64)` and `SpecialApp(SpecialForm, Vec<usize>)` variants.
+
+- **`SpecialForm` enum** — `Define`, `Do`, `Quote`, `And`, `Or`, `Try`, `EvalIn`, `Dispatch`, `Ns`. **No `Defmacro`** — the parser desugars `(defmacro name (params) body...)` to `(define name (lambda (params) (do body...)))`. This is sound because the new `Function` captures its definition-site env, which at top level contains the rest of the library — the same set of bindings the old defmacro could see at call time.
+
+- **Type substrate (placeholder)** — `Value::type_sym() -> Option<Sym>` returns the canonical primitive type Sym (`Int`, `Num`, `String`, `Bool`, `List`, `Function`, `Namespace`). Pre-interned in a thread-local for fast access. This is the minimal surface synth.rs needs to switch from `u8` tags to `Sym`-keyed types. The full type system (predicates, namespace tree, subtype hierarchy via namespace nesting) is deferred to a later milestone.
+
+- **`BuiltinTable`** — Sym-indexed `Vec<Option<BuiltinFn>>`, no thread-local HashMap, no SipHash. Lookup is `table.get(sym.0 as usize).copied().flatten()`. `BuiltinFn` signature is `fn(args: &[Value], env: &Env) -> Result<Value, String>` — env is always passed (cheap because Env is Rc-internal), eliminating the §9.23 `Option<&mut Env>` threading complexity.
+
+9 unit tests in `types_v2::tests` cover Value cloning, persistent env chains, special-form Sym dispatch, `Function`-with-captured-env, and primitive type Sym distinction.
+
+#### 9.25.2 `selph_fast/src/eval_v2.rs` (~2000 lines)
+
+The new evaluator uses `types_v2` and lives alongside `eval.rs`. Highlights:
+
+- **`eval(nodes, idx, env: &Env)`** — depth-tracked tree walker. `&Env` (not `&mut`) because Env is Rc-internal; mutation flows through `env.define(...)` via `RefCell`. Handles all Node variants including the new `SpecialApp`.
+
+- **`apply(f, args, env)`** — for `Function`, uses `fd.captured_env.push_scope(params)` (no clone, just Rc bump). For `Builtin`, dispatches via `BUILTIN_TABLE.lookup(*sym)`. The caller's env is used only for Builtin dispatch — Functions use their own captured env, which is the whole point of unifying closures and macros.
+
+- **Special-form handlers** for `Define`, `Do`, `And`, `Or`, `Try`, `Dispatch`, `Ns`. `Quote` and `EvalIn` are stubbed with TODOs (need new-Node `node_to_source` and parser-v2 respectively).
+
+- **Truthiness rule**: `is_truthy(v)` — falsy values are `Bool(false)`, `Nil`, `Int(0)`, `Num(0.0)`, empty `Str`, empty `List`. Everything else (including empty `Ns`, functions, builtins) is truthy. This matches the user's April 10 call: more aggressive than today's eval, which only treats `Bool(false)` and `Nil` as falsy.
+
+- **~75 builtins ported** across buckets 1-5 (arithmetic, comparison, string, list, namespace, type predicates). Bucket 6 (synthesize, synthesize-optimize, test-spec, memorize, eval-source) stubbed with clear errors. Bucket 7 (grid) deliberately not ported — becomes a SELPH library.
+
+- **Old-Node → new-Node converter** (`convert_tree`) — transitional shim that lets the existing parser feed eval_v2 without parser changes. Three jobs: classify integer-valued `Num` literals as `Int`, resolve App-with-special-form-symbol heads into `SpecialApp`, desugar `(defmacro name (params) body...)` into `(define name (lambda (params) (do body...)))`. Two-pass walk; appends new nodes for the desugared lambda. Throwaway code; deletes when parser.rs is updated.
+
+- **CLI integration**: `selph eval-v2 <file.selph>` runs the existing parser, applies `convert_tree`, and evaluates against eval_v2.
+
+30 tests in `eval_v2::tests` covering literals, lambda, define+call, letrec factorial, map/reduce/filter, all the new builtins, the converter, and end-to-end runs of `examples/heuristics.selph` and `examples/decomposition_predictor.selph`. All passing.
+
+**Real-file validation:**
+- `examples/hello.selph` — runs end-to-end through `selph eval-v2`, output identical to old `selph eval` except the desugared defmacro displays as `<lambda (x)>` instead of `<macro (x)>`.
+- `examples/heuristics.selph` — runs end-to-end with zero errors.
+- `examples/decomposition_predictor.selph` — returns "7 / 7 correct" (the §9.21 prototype works on the new core).
+- `examples/scoping.selph` — runs **further** than old eval. The old eval errors on `unbound: defmacro` partway through (it can't handle multi-body defmacros). eval_v2 desugars them correctly and exposes a latent bug in the file at the very end where `(reduce f init list)` is called with the wrong argument order. **This is the first concrete case where eval_v2 is strictly more capable than eval.rs on a real curriculum file.**
+
+#### 9.25.3 Bucket (b): synth.rs migration — the next step
+
+This is the big remaining piece. `synth.rs` is ~3000 lines, references the OLD Value/Env types pervasively, and is the gateway to making the bucket-6 stubs (`synthesize`, `test-spec`, `memorize`, etc.) actually work in eval_v2.
+
+**The core type-system change:** `SynthComponent { param_types: Vec<u8>, ret_type: u8, ... }` → `Vec<Sym>` and `Sym`. Type-reachability becomes a graph search over Sym-keyed nodes instead of a u8 bitmap. `infer_macro_types`'s "probe with str/num and pattern-match the result against the enum" pattern becomes "probe with sample, then for each registered primitive type Sym call `Value::type_sym()`." Generalizes for free when the full type system lands.
+
+**Two implementation options:**
+
+**Option A — Write `synth_v2.rs` from scratch** against the new types. Slimmer, more focused. Loses some battle-tested code but probably gains clarity by removing accreted scaffolding (the §9.23 hoisting, the per-strategy macro definitions, the multiple env-build patterns). Bucket-6 stubs in eval_v2 then delegate to synth_v2 functions. Lean toward this for the same reason we did the rebuild in the first place: incremental approach means doing the work twice.
+
+**Option B — Compatibility shim** at the Value boundary. eval_v2 calls into synth.rs by converting new Value ↔ old Value at the call site. Faster to land but the Sym-keyed type-system migration doesn't get the benefit, and the conversion cost is real. Probably wrong long-term.
+
+**Suggested ordering for Option A:**
+1. Define `synth_v2::SynthComponent` with `Vec<Sym>` types.
+2. Port `default_synth_components` builder, generating components from the new builtin table and registered macros.
+3. Port `synthesize_full` core loop. The §9.23 env-hoisting work informs the new design — env construction is explicit and minimal, not rebuilt per candidate.
+4. Port the probe-and-filter pipeline using `Value::type_sym()` for type identity.
+5. Port the strategy pipeline (Flat, BD, HO, D&C, Memo) one strategy at a time, validating each against representative tasks.
+6. Wire bucket-6 stubs in eval_v2 to delegate to `synth_v2`.
+7. Validate the chained curriculum end-to-end on the new core.
+
+**Decision points along the way:**
+- Does `infer_macro_types` survive, or does it get replaced by something cleaner now that types are first-class Syms?
+- Does `hm.rs` survive at all, or does the predicate-based approach replace it entirely? (Current bet: replace.)
+- Can the bucket-6 SELPH-vs-Rust question get answered as part of this work? (User note: "I have a feeling that we will want those to be defined in selph eventually, but I'm not exactly sure right now.")
+- Is `recursive_decompose.rs` migrated as part of bucket (b) or as a separate step? It depends on synth's API surface, so probably as a separate step (§9.24.5 step 6).
+
+This is a multi-day project. The pacing should be: get the core SynthComponent + synthesize_full path working against the new Value, then port one strategy at a time, validating against the existing curricula at each step.
 
 ---
 
