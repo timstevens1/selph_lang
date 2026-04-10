@@ -1312,6 +1312,89 @@ This is the big remaining piece. `synth.rs` is ~3000 lines, references the OLD V
 
 This is a multi-day project. The pacing should be: get the core SynthComponent + synthesize_full path working against the new Value, then port one strategy at a time, validating against the existing curricula at each step.
 
+### 9.26 synth_v2 milestone: bucket (b) landed (April 10, 2026)
+
+§9.25.3 steps 1–7 all landed in a single session. `selph_fast/src/synth_v2.rs` is in place (~2050 lines including tests), the bucket-6 stubs in `eval_v2` are wired through to it, and the new core can synthesize programs from inside SELPH source via the `synthesize` builtin. This subsection captures what was actually built so future work has a concrete reference.
+
+#### 9.26.1 What landed
+
+**Step 1 — `SynthComponent` and `TypeUniverse` (Sym-keyed).**
+- `SynthComponent { name, dispatch: Dispatch, arity, param_types: Vec<Sym>, ret_type: Sym, priority, usage_count }`. Types are first-class Syms keyed into the (eventual) `__types__` namespace; for now they are pre-interned primitive type Syms (`Int`, `Num`, `String`, `Bool`, `List`, `Function`, `Namespace`, `Any`).
+- `Dispatch` enum splits the legacy `Option<String> builtin` field into explicit variants: `Literal(LiteralKind)`, `Named(Sym)`, `FusedMap(Sym)`, `FusedReduce(Sym)`. Kills the `bn.starts_with("map_")` substring check the materializer used to do.
+- `TypeUniverse` is the open Sym-keyed type universe with `slot_accepts`, `slot_satisfiable`, `ret_useful`, `forward_reachable`, `backward_useful`, `reachable_for_task`. **A subtype rule (`Int <: Num`) is hard-coded** so Int values flow into Num parameter slots; this rule moves into the `__types__` namespace when the predicate-based system lands.
+- Two distinct semantics: `slot_accepts` is for runtime value flow (`Any` is a wildcard on both sides); `slot_satisfiable` and `ret_useful` are for static reachability analysis (`Any` is only a sentinel for "unconstrained slot/return"). The first version got this wrong — having `Any` in the reach set as a wildcard collapsed the universe to "everything is reachable, prune nothing." Documented in code so we don't regress it.
+
+**Step 2 — `default_synth_components` builder.**
+- `primitive_components()` returns the static catalog of ~50 builtin SELPH operations with first-class Sym types. **Arithmetic, comparators, and integer predicates are typed as `(Int, Int) → Int` / `(Int, Int) → Bool` / `Int → Bool`** — the curriculum bias. `divide` and `floor` stay typed `Num` as the explicit float entry points. The legacy `TYPE_NUM` collapsed Int and Num into one tag, so no existing curriculum depends on the distinction.
+- The polymorphic case `(α, α) → α where α ∈ {Int, Num}` is a known gap. It belongs with the predicate-based type system; not blocking step 7.
+- `library_components_from_env(env, skip)` walks the env's top scope, finds every `Value::Function` not in `skip`, and probes each one to discover its type signature. **`infer_macro_types` is dead.** The replacement is `Value::type_sym()` on the result of `eval_v2::apply` with sample inputs. New types added to the universe become probe-discoverable for free.
+- `fused_components(library)` generates `Dispatch::FusedMap(f_sym)` for unary library functions and `Dispatch::FusedReduce(f_sym)` for binary ones, plus the built-in fused-reduces.
+- `default_synth_components(env, &skip)` is the top-level builder that combines primitives + library + fused. Does not include `x` — the synthesis driver adds it per-task with the actual input type via `input_var_component(input_type)`.
+
+**Step 3 — `synthesize` core enumeration loop.**
+- Bottom-up enumeration with arity-1 and arity-2 components. Type-gated via `slot_accepts` (subtype-aware). Observational equivalence dedup via `val_hash`. Lambda-wrap-and-test via `eval_v2::eval` + `eval_v2::apply`. Returns the first matching candidate. ~430 lines vs the legacy ~1500.
+- Intentionally deferred (documented inline): parallel rayon path, VM fast path, RL reward propagation, early-extension probes, SELPH-programmable depth filter, snapshot recording, validation examples, auto-extracted constants, arity-3 components, if-expression generation. These are post-§9.25.3 refinements.
+- `infer_uniform_type_sym`, `val_hash`, `remap_node`, `materialize_atom`, `materialize_app`, `wrap_lambda`, `test_candidate` — the helpers needed by the loop.
+
+**Step 4 — Probe-and-filter pipeline.**
+- `probe_filter_components(components, env, test_input, input_type, universe)` is a free function (not buried inside `synthesize`). Drops unary library functions that error when called with the test input. Builtins are never probed (skipped via the `Value::Function` check). Multi-arg functions, fused forms, and functions with mismatched first-parameter type are passed through unchanged.
+- Wired into `synthesize` after the reachability prune and before adding the input variable.
+
+**Step 5 — Strategy dispatcher: Flat + Memo.**
+- `Strategy` enum with `Flat` and `Memo` variants. `StrategyResult` mirrors `SynthResult` but tags which strategy produced the solution.
+- `memorize_from_examples(inputs, expected)` is the legacy memorization strategy, ported to types_v2 nodes. Generates `(lambda (x) (ns-get-or (ns ("k1" v1) ...) x default))`. Differences from legacy: emits `Node::SpecialApp(SpecialForm::Ns, ...)` (eval_v2 `ns` is a special form), uses `eval_v2::values_equal` for conflict detection, distinguishes `Int(0)` from `Num(0.0)` defaults.
+- `synthesize_with_strategies(...)` is the dispatcher. Tries Flat → Memo. Returns the first successful strategy tagged. Accumulates `candidates_explored` across strategies.
+- **Explicitly deferred: BD, HO, D&C, Induction, RD.** Each is a substantial port (500–2650 legacy lines) that warrants its own focused step-5 sub-iteration. The dispatcher is set up to make adding them purely additive — register a new `Strategy` variant and add a try-block to `synthesize_with_strategies`.
+
+**Step 6 — Bucket-6 builtins wired.**
+- New: `eval_v2::node_to_source(nodes, root)` — public function rendering a Node tree as SELPH source. Handles every variant including the new `SpecialApp` and `Int`.
+- `bi_eval_source` — parses + converts + evals against the **caller's env**, so persistent defines work.
+- `bi_test_spec` — applies a candidate function to each (input, expected) pair, returns match fraction.
+- `bi_memorize` — turns a list of (input, expected) pairs into `Value::Ns` mapping input keys to expected values. **Note:** this is the legacy *data builder*, not the synth strategy `memorize_from_examples`. Same name, different artifact.
+- `bi_synthesize` — wires through `synthesize_with_strategies`. **Uses caller's env for both component discovery and synthesis** — library functions visible to the caller (defined via `(define ...)` or `(eval-source ...)`) are auto-discovered via `default_synth_components(env, &default_skip_set())`. The legacy `library` ns-field is **ignored** — that's a backward-compat break, documented in the doc comment. Returns `{found, candidates, source, strategy}`.
+- `bi_stub_synthesize_optimize` stays stubbed with a clear deferred-work message. Depends on the optimize-synthesis path which hasn't been ported.
+
+**Step 7 — End-to-end validation.**
+- `examples/validation_v2_chain.selph` — chained-curriculum validation that runs entirely inside `selph eval-v2` and exercises the bucket-6 `synthesize` through 7 distinct tasks: identity, increment, string-upper, x-plus-2, **library-wrap** (the rigorous library-reuse test), memo-lookup, impossible-not-found.
+- All 7 tasks PASS. The most important result: **`library-wrap` is solved as `(lambda (x) (wrap x))` via Flat in 16 candidates.** `wrap` is defined via top-level `(define wrap ...)`, has no primitive equivalent (the catalog has `"("` and `")"` as constants but NOT `"["` and `"]"`), and the synthesizer discovers it via `synth_v2::library_components_from_env`. **This is the chained-curriculum core capability — the env IS the library — working end-to-end through the new core.**
+- Also validated: `eval-source` round-trips a synthesized lambda back into a callable function in the env (`inc 5 = 6`, `inc 41 = 42`).
+
+**Test totals at the end of step 7:**
+- 49 synth_v2 tests, 43 eval_v2 tests, 232 other passing tests = **324 passing**.
+- 9 pre-existing `multitree::` baseline failures, untouched (legacy module).
+
+#### 9.26.2 Notable design calls and their consequences
+
+1. **`Int <: Num` subtype rule, hard-coded.** The `slot_accepts` rule is one line; the `forward_reachable` / `backward_useful` propagation needed `slot_satisfiable` and `ret_useful` helpers with stricter semantics than `slot_accepts` itself. Forced when arithmetic was retyped from `(Num, Num) → Num` to `(Int, Int) → Int` — without subtypes, `add` was getting pruned by `backward_useful` on Int targets because the legacy `TYPE_NUM` collapsing was hiding the issue. **Consequence:** simple Int-on-Num polymorphism just works; the inverse `Num <: Int` is intentionally NOT a rule (Num values aren't guaranteed integer); the polymorphic case `(α, α) → α` is still a known gap.
+
+2. **The env IS the library.** No separate `library` ns-field plumbing in `bi_synthesize`. Library functions live in the eval env and `default_synth_components` walks the top scope to find them. **Consequence:** chained curricula work via `(define helper (eval-source (ns-get prev-result "source")))` followed by `(synthesize ...)` — the next call sees `helper` automatically. Validated by the `library-wrap` task.
+
+3. **Strategy dispatcher pattern.** Adding a strategy is purely additive: register a new `Strategy` variant and add a try-block to `synthesize_with_strategies`. **Consequence:** the deferred BD/HO/D&C/RD/Induction ports can land one at a time in their own focused sub-iterations of step 5, without touching any existing call site (including the eval_v2 bucket-6 builtin).
+
+4. **Probe-and-filter is a free function, not inline.** Pulled out of `synthesize` so callers and tests can apply it independently. **Consequence:** the probe filter is one line of integration in `synthesize`, easy to substitute or extend.
+
+5. **Bias arithmetic toward Int.** Curriculum bias — the legacy curricula are overwhelmingly integer-valued, and the legacy `TYPE_NUM` collapsing meant no existing curriculum depends on the float distinction. **Consequence:** Int-on-Int tasks are clean; pure-float tasks need the deferred polymorphism.
+
+#### 9.26.3 What remains for §9.24.5 step 6 onward
+
+The plan's §9.24.5 listed 9 steps. Steps 1–5 are done (the eval_v2 + synth_v2 milestones). Step 6 onward:
+
+- **Step 6: migrate consumer modules.** `recursive_decompose.rs`, `divide.rs`, `induce.rs`, `verify.rs`, `abstraction.rs`, `multitree.rs`, `stochastic.rs`, `meta.rs`, `taskgen.rs`, `trace.rs`, `decompose.rs`, `library.rs` all still reference the OLD `Value`/`Env`/`Node` types. Each needs porting to types_v2. The §9.24.5 plan specifically calls these out as "migrate against the new API but not redesigned" — mechanical work, not new design.
+
+- **Step 7: delete `vm.rs`.** Apply Tier-1 hot-path fixes everywhere else, force tree walker, measure. If curriculum runs in roughly current time, delete the bytecode VM (~600 lines + the parser-side compile path). The §9.25.1 sketch already replaces the VM's special-form dispatch with `Node::SpecialApp` and the closure capture problem with persistent `Env`, so the VM's main contributions are obsolete.
+
+- **Step 8: reload curricula.** The deferred strategies (BD, HO, D&C, Induction, RD) need to land before the full chained curriculum can run end-to-end through the new core. Each is its own focused port; the dispatcher is ready for them.
+
+- **Step 9: types-as-SELPH curriculum.** The §9.13 / §9.24.3 target — teach SELPH programs to predict types from spec features, learn type predicates from examples, infer types from usage. The hard-coded `Int <: Num` rule moves into the `__types__` namespace as part of this work.
+
+#### 9.26.4 Files touched by §9.25.3 + §9.26
+
+- **New:** `selph_fast/src/synth_v2.rs` (~2050 lines including tests)
+- **New:** `examples/validation_v2_chain.selph` (~140 lines)
+- **Modified:** `selph_fast/src/eval_v2.rs` (added `node_to_source`, replaced four bucket-6 stubs with real implementations, added 13 bucket-6 tests)
+- **Modified:** `selph_fast/src/types_v2.rs` (added `top_scope()` immutable accessor for synth_v2's env walk)
+- **Modified:** `selph_fast/src/main.rs` (declared `synth_v2` module)
+
 ---
 
 ## 10. Success Criteria

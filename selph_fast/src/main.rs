@@ -33,6 +33,8 @@ mod arc;
 mod types_v2;
 #[allow(dead_code)]
 mod eval_v2;
+#[allow(dead_code)]
+mod synth_v2;
 
 use std::env;
 use std::fs;

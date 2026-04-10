@@ -352,6 +352,12 @@ impl Env {
     pub fn top_scope_mut(&self) -> std::cell::RefMut<'_, Scope> {
         self.inner.scope.borrow_mut()
     }
+
+    /// Immutable borrow of the top scope. Used by synth_v2 to walk the
+    /// library env and discover Function values for component generation.
+    pub fn top_scope(&self) -> std::cell::Ref<'_, Scope> {
+        self.inner.scope.borrow()
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────

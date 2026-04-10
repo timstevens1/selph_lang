@@ -108,6 +108,110 @@ pub fn value_to_string(v: &Value) -> String {
     }
 }
 
+/// Render a Node tree as a SELPH source string. Used by `synthesize`
+/// to return the source code of a found candidate, and as a debugging
+/// aid for synth_v2 output. Mirrors the legacy `node_to_source` against
+/// the new Node enum.
+pub fn node_to_source(nodes: &[Node], root: usize) -> String {
+    fn go(nodes: &[Node], idx: usize, out: &mut String) {
+        match &nodes[idx] {
+            Node::Int(n) => out.push_str(&n.to_string()),
+            Node::Num(n) => {
+                if n.is_finite() && *n == (*n as i64) as f64 {
+                    out.push_str(&format!("{}.0", *n as i64));
+                } else {
+                    out.push_str(&n.to_string());
+                }
+            }
+            Node::Str(s) => {
+                out.push('"');
+                // Escape backslashes and double quotes — no other
+                // escapes; the parser handles \\ and \" symmetrically.
+                for c in s.chars() {
+                    match c {
+                        '\\' => out.push_str("\\\\"),
+                        '"' => out.push_str("\\\""),
+                        _ => out.push(c),
+                    }
+                }
+                out.push('"');
+            }
+            Node::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Node::Symbol(s) => out.push_str(&resolve(*s)),
+            Node::App(children) => {
+                out.push('(');
+                for (i, &c) in children.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    go(nodes, c, out);
+                }
+                out.push(')');
+            }
+            Node::SpecialApp(form, children) => {
+                let head = match form {
+                    SpecialForm::Define => "define",
+                    SpecialForm::Do => "do",
+                    SpecialForm::Quote => "quote",
+                    SpecialForm::And => "and",
+                    SpecialForm::Or => "or",
+                    SpecialForm::Try => "try",
+                    SpecialForm::EvalIn => "eval-in",
+                    SpecialForm::Dispatch => "dispatch",
+                    SpecialForm::Ns => "ns",
+                };
+                out.push('(');
+                out.push_str(head);
+                for &c in children {
+                    out.push(' ');
+                    go(nodes, c, out);
+                }
+                out.push(')');
+            }
+            Node::If(cond, then_, else_) => {
+                out.push_str("(if ");
+                go(nodes, *cond, out);
+                out.push(' ');
+                go(nodes, *then_, out);
+                out.push(' ');
+                go(nodes, *else_, out);
+                out.push(')');
+            }
+            Node::Lambda(params, body) => {
+                out.push_str("(lambda (");
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    out.push_str(&resolve(*p));
+                }
+                out.push_str(") ");
+                go(nodes, *body, out);
+                out.push(')');
+            }
+            Node::Let(bindings, body) => {
+                out.push_str("(let (");
+                for (i, (n, v)) in bindings.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    out.push('(');
+                    out.push_str(&resolve(*n));
+                    out.push(' ');
+                    go(nodes, *v, out);
+                    out.push(')');
+                }
+                out.push_str(") ");
+                go(nodes, *body, out);
+                out.push(')');
+            }
+        }
+    }
+    let mut out = String::new();
+    go(nodes, root, &mut out);
+    out
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // eval_inner — the main loop
 // ────────────────────────────────────────────────────────────────────────────
@@ -497,15 +601,13 @@ fn build_builtin_table() -> BuiltinTable {
     // Errors / control
     t.register(intern("error"), bi_error);
 
-    // Bucket 6 stubs — meta operations that interact with the synthesizer.
-    // These will eventually either delegate to migrated synth.rs code OR be
-    // expressed as SELPH programs themselves (per user note). For now they
-    // return a clear error so any curriculum that needs them fails loudly.
-    t.register(intern("synthesize"), bi_stub_synthesize);
+    // Bucket 6: meta operations. Most now delegate to synth_v2; only
+    // synthesize-optimize remains stubbed pending the optimize port.
+    t.register(intern("synthesize"), bi_synthesize);
     t.register(intern("synthesize-optimize"), bi_stub_synthesize_optimize);
-    t.register(intern("test-spec"), bi_stub_test_spec);
-    t.register(intern("memorize"), bi_stub_memorize);
-    t.register(intern("eval-source"), bi_stub_eval_source);
+    t.register(intern("test-spec"), bi_test_spec);
+    t.register(intern("memorize"), bi_memorize);
+    t.register(intern("eval-source"), bi_eval_source);
 
     t
 }
@@ -1360,20 +1462,217 @@ fn bi_error(args: &[Value], _env: &Env) -> Result<Value, String> {
 //      programs can express what `synthesize` actually does.
 // Pick at the migration boundary.
 
-fn bi_stub_synthesize(_args: &[Value], _env: &Env) -> Result<Value, String> {
-    Err("synthesize: not yet implemented in eval_v2 (bucket 6 stub)".into())
+// ── Bucket 6: meta operations (real implementations) ────────────────────────
+//
+// These delegate to synth_v2 (the rebuilt synthesizer) and the parser.
+// `synthesize-optimize` is intentionally still a stub: it depends on the
+// optimize-synthesis path which hasn't been ported yet.
+
+/// `(eval-source <source-string>)` — parse and evaluate SELPH source.
+/// Uses the caller's env so any defines persist after the call. The
+/// parser still produces legacy nodes, so we route through `convert_tree`.
+fn bi_eval_source(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("eval-source: expected 1 argument (source string)".into());
+    }
+    let src = args[0].as_str()?;
+    let (old_nodes, roots) = crate::parser::parse_file(src)
+        .map_err(|e| format!("eval-source: parse error: {}", e))?;
+    if roots.is_empty() {
+        return Ok(Value::Nil);
+    }
+    let new_nodes = convert_tree(&old_nodes);
+    let nodes_rc: Rc<[Node]> = new_nodes.into();
+    let mut last = Value::Nil;
+    for &r in &roots {
+        last = eval(&nodes_rc, r, env)?;
+    }
+    Ok(last)
 }
+
+/// `(test-spec <candidate> <spec>)` — apply `candidate` to each
+/// (input, expected) pair in `spec` and return the match fraction
+/// (0.0 to 1.0). `candidate` must be a callable Value (Function or
+/// Builtin). `spec` is a list of two-element lists.
+fn bi_test_spec(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("test-spec: expected 2 arguments (candidate, spec)".into());
+    }
+    let candidate = &args[0];
+    let pairs = match &args[1] {
+        Value::List(l) => l.clone(),
+        _ => return Err("test-spec: spec must be a list of (input expected) pairs".into()),
+    };
+    if pairs.is_empty() {
+        return Ok(Value::Num(0.0));
+    }
+    let total = pairs.len();
+    let mut matches = 0usize;
+    for pair in pairs.iter() {
+        let p = match pair {
+            Value::List(p) if p.len() == 2 => p,
+            _ => return Err("test-spec: each spec entry must be (input expected)".into()),
+        };
+        let input = p[0].clone();
+        let expected_val = &p[1];
+        if let Ok(result) = apply(candidate, &[input], env) {
+            if values_equal(&result, expected_val) {
+                matches += 1;
+            }
+        }
+        // Eval errors silently count as a non-match — same as legacy.
+    }
+    Ok(Value::Num(matches as f64 / total as f64))
+}
+
+/// `(memorize <spec>)` — turn a list of (input, expected) pairs into
+/// a `Value::Ns` mapping input keys to expected values. **Note**: this
+/// is the legacy *data builder* memoize, NOT the synthesis-strategy
+/// `memorize_from_examples`. The two share a name and a motivation but
+/// produce different artifacts:
+///
+///   - `memorize` (this builtin): returns a raw namespace `Value::Ns`
+///     of `{key → val}` for downstream code to consume.
+///   - `synth_v2::memorize_from_examples`: returns a synthesized
+///     `(lambda (x) (ns-get-or ...))` program — the strategy fallback.
+///
+/// Returns `Nil` if any input isn't a string (unconvertible to a Sym
+/// key — same behaviour as the legacy builtin).
+fn bi_memorize(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("memorize: expected 1 argument (spec)".into());
+    }
+    let pairs = match &args[0] {
+        Value::List(l) => l.clone(),
+        _ => return Err("memorize: argument must be a list of (input expected) pairs".into()),
+    };
+    if pairs.is_empty() {
+        return Ok(Value::Nil);
+    }
+    let mut map = NsMap::new();
+    for pair in pairs.iter() {
+        let p = match pair {
+            Value::List(p) if p.len() == 2 => p,
+            _ => return Err("memorize: each spec entry must be (input expected)".into()),
+        };
+        let key = match &p[0] {
+            Value::Str(s) => intern(s.as_ref()),
+            _ => return Ok(Value::Nil), // non-string input — can't memorize
+        };
+        map.insert(key, p[1].clone());
+    }
+    Ok(Value::ns(map))
+}
+
+/// `(synthesize <namespace>)` — bottom-up enumerative program synthesis.
+///
+/// Expected namespace shape:
+///   - `spec`: list of two-element lists `((<input> <expected>) ...)`
+///   - `max-depth`: optional Int (default 2)
+///   - `max-candidates`: optional Int (default 10000)
+///   - `library`: **ignored** in eval_v2. Library functions visible to
+///     the caller's env (via prior `define` or `eval-source` calls) are
+///     auto-discovered and added to the component catalog.
+///
+/// Returns a namespace:
+///   - `found`: Bool — whether a solution was found
+///   - `candidates`: Int — number of candidates explored
+///   - `source`: String — the synthesized lambda's source code (empty
+///     when not found)
+///   - `strategy`: String — which strategy produced the solution
+///     (`"Flat"`, `"Memo"`, etc.), or empty string when not found
+fn bi_synthesize(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("synthesize: expected 1 argument (namespace)".into());
+    }
+    let ns = match &args[0] {
+        Value::Ns(m) => m.clone(),
+        _ => return Err("synthesize: argument must be a namespace".into()),
+    };
+
+    // Extract spec → (inputs, expected).
+    let spec_val = ns
+        .get(&intern("spec"))
+        .ok_or("synthesize: namespace must have \"spec\" field")?;
+    let pairs = match spec_val {
+        Value::List(l) => l.clone(),
+        _ => return Err("synthesize: \"spec\" must be a list of example pairs".into()),
+    };
+    let mut inputs = Vec::with_capacity(pairs.len());
+    let mut expected = Vec::with_capacity(pairs.len());
+    for pair in pairs.iter() {
+        let p = match pair {
+            Value::List(p) if p.len() == 2 => p,
+            _ => return Err("synthesize: each spec entry must be a list of [input, output]".into()),
+        };
+        inputs.push(p[0].clone());
+        expected.push(p[1].clone());
+    }
+
+    let max_depth = ns
+        .get(&intern("max-depth"))
+        .and_then(|v| match v {
+            Value::Int(n) => Some(*n as usize),
+            Value::Num(n) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(2);
+    let max_candidates = ns
+        .get(&intern("max-candidates"))
+        .and_then(|v| match v {
+            Value::Int(n) => Some(*n as usize),
+            Value::Num(n) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(10000);
+
+    // Build the component catalog from the caller's env. Library
+    // functions defined in env are auto-discovered as components.
+    let skip = crate::synth_v2::default_skip_set();
+    let components = crate::synth_v2::default_synth_components(env, &skip);
+    let universe = crate::synth_v2::TypeUniverse::primitives();
+
+    let result = crate::synth_v2::synthesize_with_strategies(
+        &components,
+        &inputs,
+        &expected,
+        env,
+        &universe,
+        max_depth,
+        max_candidates,
+    );
+
+    let source = if result.found {
+        let nodes = result.nodes.as_ref().unwrap();
+        let root = result.root.unwrap();
+        node_to_source(nodes, root)
+    } else {
+        String::new()
+    };
+    let strategy_name = result
+        .strategy
+        .map(|s| s.name().to_string())
+        .unwrap_or_default();
+
+    let mut out = NsMap::new();
+    out.insert(intern("found"), Value::Bool(result.found));
+    out.insert(intern("candidates"), Value::Int(result.candidates_explored as i64));
+    out.insert(intern("source"), Value::str(source));
+    out.insert(intern("strategy"), Value::str(strategy_name));
+    Ok(Value::ns(out))
+}
+
+/// `(synthesize-optimize <namespace>)` — fitness-driven program search.
+/// Still stubbed in eval_v2 — depends on the optimize-synthesis path
+/// which hasn't been ported. Documented as deferred work; the legacy
+/// `synth::synthesize_optimize` lives behind this name.
 fn bi_stub_synthesize_optimize(_args: &[Value], _env: &Env) -> Result<Value, String> {
-    Err("synthesize-optimize: not yet implemented in eval_v2 (bucket 6 stub)".into())
-}
-fn bi_stub_test_spec(_args: &[Value], _env: &Env) -> Result<Value, String> {
-    Err("test-spec: not yet implemented in eval_v2 (bucket 6 stub)".into())
-}
-fn bi_stub_memorize(_args: &[Value], _env: &Env) -> Result<Value, String> {
-    Err("memorize: not yet implemented in eval_v2 (bucket 6 stub)".into())
-}
-fn bi_stub_eval_source(_args: &[Value], _env: &Env) -> Result<Value, String> {
-    Err("eval-source: not yet implemented in eval_v2 (bucket 6 stub)".into())
+    Err(
+        "synthesize-optimize: not yet ported to synth_v2. \
+         Use the legacy `selph eval` runner for fitness-driven synthesis, \
+         or wait for the optimize-synthesis port (deferred work in §9.25.3)."
+            .into(),
+    )
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1999,5 +2298,237 @@ mod tests {
             }
             _ => panic!("expected list"),
         }
+    }
+
+    // ── Bucket 6 builtins (synth_v2 wiring) ───────────────────────────
+
+    /// Multi-expression file runner that threads a single env across
+    /// every top-level form, mirroring how `selph eval-v2 <file>` works.
+    fn run_file(src: &str) -> Result<Value, String> {
+        let (old_nodes, roots) =
+            crate::parser::parse_file(src).map_err(|e| format!("parse error: {}", e))?;
+        let new_nodes: Rc<[Node]> = convert_tree(&old_nodes).into();
+        let env = make_default_env();
+        let mut last = Value::Nil;
+        for &r in &roots {
+            last = eval(&new_nodes, r, &env)?;
+        }
+        Ok(last)
+    }
+
+    #[test]
+    fn node_to_source_renders_basic_forms() {
+        // Round-trip a few common forms through parse → convert → render.
+        let cases = &[
+            ("(add 2 3)", "(add 2 3)"),
+            ("(string-upper \"hi\")", "(string-upper \"hi\")"),
+            ("(lambda (x) (multiply x 2))", "(lambda (x) (multiply x 2))"),
+        ];
+        for (src, expected) in cases {
+            let (old_nodes, root) = crate::parser::parse_source(src).unwrap();
+            let new_nodes = convert_tree(&old_nodes);
+            let rendered = node_to_source(&new_nodes, root);
+            assert_eq!(&rendered, expected, "round-trip failed for {:?}", src);
+        }
+    }
+
+    #[test]
+    fn bucket6_eval_source_runs_inline_program() {
+        // (eval-source "(add 2 3)") → 5
+        let r = run_file(r#"(eval-source "(add 2 3)")"#).unwrap();
+        assert!(matches!(r, Value::Int(5)), "got {:?}", r);
+    }
+
+    #[test]
+    fn bucket6_eval_source_uses_caller_env_for_defines() {
+        // Define a function via eval-source, then call it from the
+        // outer scope. Validates that eval-source threads the caller's
+        // env, so persistent defines work.
+        let src = r#"
+            (eval-source "(define quad (lambda (x) (multiply x x)))")
+            (quad 7)
+        "#;
+        let r = run_file(src).unwrap();
+        assert!(matches!(r, Value::Int(49)), "got {:?}", r);
+    }
+
+    #[test]
+    fn bucket6_test_spec_returns_perfect_score_for_correct_function() {
+        // (test-spec (lambda (x) (multiply x x)) ((1 1) (2 4) (3 9))) → 1.0
+        let src = r#"
+            (test-spec (lambda (x) (multiply x x))
+                       (list (list 1 1) (list 2 4) (list 3 9)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Num(n) => assert!((n - 1.0).abs() < 1e-9, "expected 1.0, got {}", n),
+            _ => panic!("expected Num, got {:?}", r),
+        }
+    }
+
+    #[test]
+    fn bucket6_test_spec_returns_partial_score() {
+        // Function gets 2 of 3 right.
+        let src = r#"
+            (test-spec (lambda (x) x)
+                       (list (list 1 1) (list 2 4) (list 3 3)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Num(n) => assert!((n - 2.0/3.0).abs() < 1e-9, "expected 0.667, got {}", n),
+            _ => panic!("expected Num"),
+        }
+    }
+
+    #[test]
+    fn bucket6_memorize_builds_namespace_from_pairs() {
+        // (memorize ((alice 1) (bob 2))) → namespace
+        let src = r#"
+            (memorize (list (list "alice" 1) (list "bob" 2)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                assert_eq!(map.len(), 2);
+                assert!(matches!(map.get(&intern("alice")), Some(Value::Int(1))));
+                assert!(matches!(map.get(&intern("bob")), Some(Value::Int(2))));
+            }
+            _ => panic!("expected Ns, got {:?}", r),
+        }
+    }
+
+    #[test]
+    fn bucket6_memorize_returns_nil_for_non_string_keys() {
+        let src = r#"
+            (memorize (list (list 1 "a") (list 2 "b")))
+        "#;
+        let r = run_file(src).unwrap();
+        assert!(matches!(r, Value::Nil));
+    }
+
+    #[test]
+    fn bucket6_synthesize_solves_identity_via_flat() {
+        // Identity task — synth_v2 Flat should find (lambda (x) x) at depth 0.
+        let src = r#"
+            (synthesize (ns
+                ("spec" (list (list 1 1) (list 2 2) (list 3 3)))
+                ("max-depth" 1)
+                ("max-candidates" 200)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                assert!(matches!(map.get(&intern("found")), Some(Value::Bool(true))));
+                let source = map.get(&intern("source")).unwrap().as_str().unwrap().to_string();
+                assert_eq!(source, "(lambda (x) x)", "got source: {}", source);
+                assert!(matches!(map.get(&intern("strategy")), Some(Value::Str(s)) if s.as_ref() == "Flat"));
+            }
+            _ => panic!("expected Ns, got {:?}", r),
+        }
+    }
+
+    #[test]
+    fn bucket6_synthesize_solves_unary_string_op() {
+        // (string-upper x) on strings.
+        let src = r#"
+            (synthesize (ns
+                ("spec" (list (list "hi" "HI") (list "world" "WORLD")))
+                ("max-depth" 2)
+                ("max-candidates" 2000)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                assert!(matches!(map.get(&intern("found")), Some(Value::Bool(true))));
+                let source = map.get(&intern("source")).unwrap().as_str().unwrap().to_string();
+                assert!(source.contains("string-upper"), "got source: {}", source);
+            }
+            _ => panic!("expected Ns"),
+        }
+    }
+
+    #[test]
+    fn bucket6_synthesize_falls_through_to_memo() {
+        // String→Int with no algorithmic relationship — Flat fails,
+        // Memo wins, the result lambda contains ns-get-or.
+        let src = r#"
+            (synthesize (ns
+                ("spec" (list (list "alpha" 13) (list "beta" 99) (list "gamma" 7)))
+                ("max-depth" 1)
+                ("max-candidates" 50)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                assert!(matches!(map.get(&intern("found")), Some(Value::Bool(true))));
+                assert!(matches!(map.get(&intern("strategy")), Some(Value::Str(s)) if s.as_ref() == "Memo"));
+                let source = map.get(&intern("source")).unwrap().as_str().unwrap().to_string();
+                assert!(source.contains("ns-get-or"), "got source: {}", source);
+            }
+            _ => panic!("expected Ns"),
+        }
+    }
+
+    #[test]
+    fn bucket6_synthesize_returns_not_found_when_impossible() {
+        // Int→arbitrary string with non-string inputs (Memo can't help).
+        let src = r#"
+            (synthesize (ns
+                ("spec" (list (list 1 "foo") (list 2 "bar")))
+                ("max-depth" 2)
+                ("max-candidates" 50)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                assert!(matches!(map.get(&intern("found")), Some(Value::Bool(false))));
+                let source = map.get(&intern("source")).unwrap().as_str().unwrap().to_string();
+                assert_eq!(source, "");
+                assert!(matches!(map.get(&intern("strategy")), Some(Value::Str(s)) if s.as_ref() == ""));
+            }
+            _ => panic!("expected Ns"),
+        }
+    }
+
+    #[test]
+    fn bucket6_synthesize_uses_library_function_from_env() {
+        // Define `inc` in the env, then ask synthesize to find a
+        // program that maps x→x+1. The synthesizer should discover
+        // `inc` via env auto-discovery and use it.
+        let src = r#"
+            (define inc (lambda (n) (add n 1)))
+            (synthesize (ns
+                ("spec" (list (list 5 6) (list 10 11) (list 0 1)))
+                ("max-depth" 1)
+                ("max-candidates" 500)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                assert!(matches!(map.get(&intern("found")), Some(Value::Bool(true))));
+                let source = map.get(&intern("source")).unwrap().as_str().unwrap().to_string();
+                // Either (inc x) or (add x 1) — both correct.
+                assert!(
+                    source.contains("inc") || source.contains("add"),
+                    "expected inc or add in source, got: {}",
+                    source
+                );
+            }
+            _ => panic!("expected Ns"),
+        }
+    }
+
+    #[test]
+    fn bucket6_synthesize_optimize_still_stubbed() {
+        // synthesize-optimize is intentionally still stubbed in step 6.
+        // Verify it returns a clear error rather than silently doing
+        // the wrong thing.
+        let src = r#"
+            (synthesize-optimize (ns ("minimize" "(lambda (x) x)")))
+        "#;
+        let r = run_file(src);
+        assert!(r.is_err(), "expected error, got {:?}", r);
+        let msg = r.unwrap_err();
+        assert!(msg.contains("synthesize-optimize"), "unexpected error: {}", msg);
     }
 }

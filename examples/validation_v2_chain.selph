@@ -1,0 +1,150 @@
+; ─────────────────────────────────────────────────────────────────────────
+; synth_v2 / eval_v2 end-to-end validation curriculum
+; ─────────────────────────────────────────────────────────────────────────
+;
+; This file exercises the §9.25.3 step-7 validation: it runs entirely
+; inside `selph eval-v2`, calling the bucket-6 `synthesize` builtin from
+; SELPH source. Each task is followed by a check that turns the result
+; into a structured PASS/FAIL line.
+;
+; What it covers:
+;
+;   1. Flat strategy at depth 0 (identity).
+;   2. Flat strategy at depth 1 with a binary primitive + constant.
+;   3. Flat strategy at depth 1 with a unary string primitive.
+;   4. Library-function reuse via env auto-discovery: a previously
+;      synthesized lambda is bound with `define` and the next task
+;      finds it via `synth_v2::library_components_from_env`.
+;   5. Memo strategy fallback (string→Int with no relationship).
+;   6. Negative case: a task that can't be solved by any current
+;      strategy returns `found=false`.
+;
+; What it does NOT cover (deferred work):
+;
+;   - BD / HO / D&C / RD / Induction strategies (only Flat + Memo
+;     are ported in step 5).
+;   - synthesize-optimize (still stubbed).
+;   - The legacy `library` ns field (eval_v2 uses env auto-discovery).
+;   - Auto-extraction of literal constants from examples.
+;
+; Each task line prints:
+;   PASS <name>  via <strategy>  cand=<n>  source=<...>
+;   FAIL <name>  expected <expected>, got <actual>
+
+; ── helper: format a task result line ────────────────────────────────────
+;
+; expected-strategy can be "Flat", "Memo", or "" (any-or-none — used
+; for negative cases where we don't care which strategy gave up).
+
+(define check-task
+  (lambda (name expected-found expected-strategy result)
+    (do
+      (define got-found    (ns-get result "found"))
+      (define got-strategy (ns-get result "strategy"))
+      (define got-cand     (ns-get result "candidates"))
+      (define got-source   (ns-get result "source"))
+      (define ok-found     (= got-found expected-found))
+      (define ok-strategy
+        (or (= expected-strategy "")
+            (= got-strategy expected-strategy)))
+      (if (and ok-found ok-strategy)
+        (print (concat
+          (concat (concat "PASS " name) (concat " via " got-strategy))
+          (concat (concat "  cand=" (to-string got-cand))
+                  (concat "  src=" got-source))))
+        (print (concat
+          (concat (concat "FAIL " name) "  expected found=")
+          (concat (to-string expected-found)
+                  (concat " strategy=" expected-strategy))))))))
+
+; ── Task 1: identity (Flat depth 0) ──────────────────────────────────────
+
+(define t1 (synthesize (ns
+  ("spec" (list (list 1 1) (list 2 2) (list 3 3) (list 99 99)))
+  ("max-depth" 1)
+  ("max-candidates" 200))))
+
+(check-task "identity" true "Flat" t1)
+
+; ── Task 2: increment (Flat depth 1, binary + constant) ───────────────────
+
+(define t2 (synthesize (ns
+  ("spec" (list (list 1 2) (list 2 3) (list 3 4) (list 0 1) (list 10 11)))
+  ("max-depth" 2)
+  ("max-candidates" 2000))))
+
+(check-task "increment" true "Flat" t2)
+
+; Materialize t2's solution as a callable named `inc`. This is how the
+; chained curriculum threads learned solutions: extract the source via
+; ns-get, parse + eval via eval-source, bind the resulting lambda.
+(define inc (eval-source (ns-get t2 "source")))
+(print (concat "inc 5 = " (to-string (inc 5))))
+(print (concat "inc 41 = " (to-string (inc 41))))
+
+; ── Task 3: string-upper (Flat depth 1, unary string primitive) ──────────
+
+(define t3 (synthesize (ns
+  ("spec" (list (list "hi" "HI") (list "world" "WORLD") (list "selph" "SELPH")))
+  ("max-depth" 2)
+  ("max-candidates" 2000))))
+
+(check-task "string-upper" true "Flat" t3)
+
+; ── Task 4: x-plus-2 (sanity check for inc availability) ─────────────────
+;
+; With or without `inc` in scope, x→x+2 is solvable via primitives at
+; depth 1 as (add x 2) or (add 2 x). This task is a sanity check that
+; defining `inc` doesn't break the search; library-discovery is tested
+; more rigorously in task 5.
+
+(define t4 (synthesize (ns
+  ("spec" (list (list 1 3) (list 5 7) (list 0 2) (list 10 12)))
+  ("max-depth" 2)
+  ("max-candidates" 5000))))
+
+(check-task "x-plus-2" true "Flat" t4)
+
+; ── Task 5: library reuse — wrap-with-brackets ───────────────────────────
+;
+; Define a function with no primitive equivalent. The primitive catalog
+; carries the literal characters "(" and ")" but NOT "[" and "]", so
+; producing "[hello]" from "hello" is impossible without auto-extracted
+; constants (a deferred feature). With `wrap` defined in env, the
+; synthesizer should discover it via library_components_from_env and
+; use it as a depth-1 solution. This is the cleanest test that env
+; auto-discovery actually feeds the synth pool.
+
+(define wrap (lambda (s) (concat (concat "[" s) "]")))
+(print (concat "wrap probe: " (wrap "hello")))
+
+(define t-lib (synthesize (ns
+  ("spec" (list (list "hi" "[hi]") (list "selph" "[selph]") (list "" "[]")))
+  ("max-depth" 2)
+  ("max-candidates" 5000))))
+
+(check-task "library-wrap" true "Flat" t-lib)
+
+; ── Task 5: Memo fallback (string→Int, no algorithmic relationship) ─────
+
+(define t5 (synthesize (ns
+  ("spec" (list (list "alpha" 13) (list "beta" 99) (list "gamma" 7)))
+  ("max-depth" 1)
+  ("max-candidates" 30))))
+
+(check-task "memo-lookup" true "Memo" t5)
+
+; ── Task 6: not-found (impossible task: Int→arbitrary string) ────────────
+;
+; Inputs are Int (Memo can't help — keys must be strings) and outputs
+; are unrelated strings. Both Flat and Memo should give up.
+
+(define t6 (synthesize (ns
+  ("spec" (list (list 1 "foo") (list 2 "bar") (list 3 "baz")))
+  ("max-depth" 2)
+  ("max-candidates" 100))))
+
+(check-task "impossible-not-found" false "" t6)
+
+(print "")
+(print "validation complete")
