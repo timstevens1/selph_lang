@@ -260,20 +260,20 @@ pub fn apply(fn_val: &Value, args: &[Value], _nodes: &Rc<[Node]>, env: &mut Env)
         }
         Value::Builtin(name) => apply_builtin(*name, args),
         Value::RustMacro(params, macro_nodes, body_root) => {
-            let mut macro_env = make_default_env();
-            for scope in env.iter() {
-                for (k, v) in scope {
-                    env_define(&mut macro_env, *k, v.clone());
-                }
-            }
+            // Push a parameter scope onto the existing env, eval, then pop.
+            // The caller's env already contains the default builtins and macros,
+            // so we don't need to rebuild it from scratch (which was extremely
+            // expensive due to make_default_env's __builtins__ namespace).
             let mut scope = std::collections::HashMap::new();
             for (i, param) in params.iter().enumerate() {
                 if i < args.len() {
                     scope.insert(*param, args[i].clone());
                 }
             }
-            macro_env.push(scope);
-            eval(macro_nodes, *body_root, &mut macro_env)
+            env.push(scope);
+            let result = eval(macro_nodes, *body_root, env);
+            env.pop();
+            result
         }
         _ => Err(format!("not callable: {:?}", fn_val)),
     }

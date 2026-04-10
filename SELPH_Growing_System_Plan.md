@@ -2,7 +2,7 @@
 
 ## From Enumerative Solver to Self-Building Architecture
 
-**Version 0.10 — April 8, 2026**
+**Version 0.11 — April 9, 2026**
 
 Based on implementation experience with the v0.1 Architecture Spec, the Rust-native migration, the April 6-7 session (decomposition via synthesis, tracing, 7.2x search optimization, namespace literals, memorization), the April 7 session that added: bytecode VM (22.9x eval speedup), `synthesize` builtin `:library`/`:priorities` support, early depth extension for compositional search, optimization curriculum with meta-optimization, NL curriculum, and chained curriculum execution, the April 7 evening session that added: unified library/tree/namespace loading, TYPE_LIST in the type system, higher-order synthesis via fused map components, 3-word sentence structures, and variable-length sentence tagging via `(string-join (map pos_tag (string-split x " ")) " ")`, and the April 7 late session that added: full 3-domain chained curriculum (55/55 tasks), trace instrumentation infrastructure (`--trace` JSON output), and meta-optimization Stage 3 — multi-task heuristic learning across the full task suite, producing the `priority-plus-type-match` heuristic (26/55 vs 21/55 baseline at budget 5000).
 
@@ -1001,11 +1001,93 @@ The key functions that need to be learned/implemented:
 4. `compose` — build the AST from f and sub-solutions (mechanical)
 5. `test-spec` — already a builtin
 
+~~**Next implementation steps:**~~
+1. ~~Implement `invert` for the arith and string-op families~~ ✓
+2. ~~Wire into the grow command as Strategy 0~~ ✓
+3. ~~Measure: how many tasks does recursive decomposition solve at depth 1 that flat search needs depth 2+ for?~~ ✓
+4. ~~Learn `predict-family` via synthesis~~ ✓
+
+### 9.22 Recursive decomposition implementation (April 9, 2026)
+
+New module `recursive_decompose.rs` (~900 lines) implementing synthesis as top-down prediction. Wired into the grow command as **Strategy 0** (before flat synthesis), using 1/4 of the total budget.
+
+**Core pipeline:** predict_family → family_candidates → try_single_function (invert → sub-synthesize → compose → verify) → fallback to flat synthesis.
+
+**Family prediction:** Hand-coded decision tree classifies specs by (input_type, output_type, num_distinct_outputs, has_bool_macros, output_is_substring). Learned predictor support via `--learn-rd` (trains after grow) and `--rd-predictor <file>` (loads for use). Memo-based predictor as fallback when D&C synthesis fails on training data.
+
+**Inversion implemented for 6 families:**
+
+| Family | Inversions | Key patterns |
+|--------|-----------|--------------|
+| Arithmetic (unary) | negate | `output = -g(x)` → `g(x) = -output` |
+| Arithmetic (binary) | add, subtract, multiply, divide, pow | Both `f(x,k)` and `f(k,x)` orderings |
+| String-op | string-take, string-drop, concat, string-upper/lower/reverse | Prefix/suffix detection, character-level inversion |
+| Count | string-length, count-char | Direct application, character search |
+| Compare | string-starts-with, string-ends-with, contains, even, odd | Constant extraction from true/false examples |
+| HO | map (list + split-map-join), filter | Per-element subspec derivation |
+| IfExpr | if (D&C delegation) | Delegates to `divide::divide_and_conquer` |
+
+**Macro-aware decomposition:** `try_macro_decomposition` evaluates each unary macro on inputs, checks for direct match or useful bridge intermediate, then sub-synthesizes `f` such that `f(macro(input)) = expected`. Composes as `(lambda (x) (f (m x)))`.
+
+**Composition fix:** `extract_body` unwraps the Lambda returned by sub-synthesis so composed programs are `(string-take x (half_len x))` not `(string-take x (lambda (x) (half_len x)))`.
+
+**Guards:** Arithmetic inversion skipped for list inputs (prevents regressions on sequence tasks). `output_is_substring` overrides IfExpr classification for substring extraction tasks.
+
+**CLI flags:**
+- `--no-rd` — disable recursive decomposition
+- `--learn-rd` — after grow, collect (features, family) training pairs and synthesize a predictor
+- `--rd-predictor <file>` — load a learned predictor for family prediction
+
+**Results:**
+
+| Curriculum | Solve rate | RD contributions |
+|------------|-----------|------------------|
+| rd_test (12 tasks) | 12/12 | 12 by RD, **74 total candidates** (was 4686 flat-only) |
+| NL (22 tasks) | 22/22 | is_plural/is_gerund: 0 cand; pos_tag: 0.05s via RD(if/D&C) (was 13.8s) |
+| sequence (13 tasks) | 12/13 | No regression (cubes still unsolved) |
+| first_half/second_half | 2/2 | **11 cand each** via RD(string-take/drop) with promoted half_len |
+
+Key wins:
+- **Zero-cost solutions** for direct applications and comparison-with-constant patterns
+- **260x speedup** on pos_tag (D&C runs as Strategy 0 instead of waiting for flat to fail)
+- **64x candidate reduction** on rd_test (74 vs 4686)
+- **Semantically correct solutions** — avoids coincidental flat-search matches
+- **Macro bridge** unlocks `first_half = (string-take x (half_len x))` at 11 candidates
+
+**Completed (April 9, 2026 — recursive composition):**
+
+- ~~Recursive multi-level decomposition~~ ✓ — `recursive_sub_synthesize` tries RD recursively (depth-limited, default 2 levels) before falling back to flat synthesis. Enables multi-level top-down prediction: e.g., predict `string-upper` as outermost → invert → recursive RD predicts `string-take` for subspec → compose `(string-upper (string-take x 3))` in 4 candidates (vs 452 flat). Overall 5.8x candidate reduction on multi-level tasks (283 vs 1637). No regressions on any curriculum.
+
+**Completed (April 9, 2026 — generic inversion & macro evaluation fix):**
+
+- ~~Learn `invert` per-family from solved programs (Stage D2)~~ ✓ — Generic evaluation-based inversion replaces per-function hand-coding for new functions. Three new capabilities:
+  1. **Fixed macro evaluation bug:** `try_macro_decomposition` was silently failing because it called `eval` on macro body nodes (which have unbound parameters). Fix: construct `Value::RustMacro` directly and use `eval::apply`. This unlocks all `f(m(x))` bridge patterns.
+  2. **Generic binary inversion** (catch-all in `try_single_function`): For any binary function not in the hand-coded match, probes `f(input, k)` and `f(k, input)` with candidate constants, then sub-synthesizes variable-k patterns. Covers `min`, `max`, `slice`, `nth`, and any future builtins.
+  3. **Macro-as-outermost** (Phase 3 in `try_rd_recursive`): Precomputes intermediate table of all unary functions applied to inputs, then checks `m(g(input)) = expected` for each (macro, function) pair. Enables `count_a(first_two(x))` and similar patterns where a promoted macro is the outermost function.
+
+  Results:
+  - `half_len` found as `RD(halve∘string-length generic)` — 0 candidates (promoted macro as outermost)
+  - `count_a_prefix` found as `RD(count_a∘first_two generic)` — macro-as-outermost with macro-as-inner
+  - `shout_first` found as `RD(f∘first_word)` — newly working bridge decomposition
+  - `last_word_len` found as `RD(f∘last_word)` — newly working bridge decomposition
+  - No regressions on rd_test (12/12), sequence (12/13), rd_bridge_half (2/2), rd_bridge_test (8/8)
+
+**Completed (April 10, 2026 — eval::apply env hoisting fix):**
+
+- ~~Performance regression in macro evaluation~~ ✓ — `eval::apply` for `Value::RustMacro` was rebuilding the entire default env from scratch on every macro call (line 263), then copying the caller's env into it. Each rebuild allocated ~150 builtin entries plus a `__builtins__` introspection namespace with ~120 metadata entries (each its own HashMap with name/arity/params/returns + Vec<String>). For nested macro calls, this compounded recursively — a single curriculum task could trigger thousands of make_default_env() calls.
+
+  **Fix:** push parameter scope onto the existing env, eval, then pop. The caller's env already contains the default builtins and macros, so no rebuild is needed. The lexical scope chain is preserved more naturally too.
+
+  **Impact on full curriculum (55 tasks):** 23+ minutes → 18 minutes (54/55 solved, was incomplete in previous runs). The slowdown was entirely from environment construction, not evaluation. **No VM/bytecode tricks needed** — the interpreter just had to stop rebuilding its symbol table on every function call.
+
+  **Lesson:** Before reaching for compiler tricks, check whether the interpreter is doing avoidable work in its hot path.
+
+  Also fixed in this session: `examples/full_curriculum.selph` now uses native list inputs `(4 0 1 2 3)` instead of string-encoded `"4 0 1 2 3"`, matching `examples/sequence_tasks_list.selph` so the chained curriculum works correctly.
+
 **Next implementation steps:**
-1. Implement `invert` for the arith and string-op families (most common, highest impact)
-2. Wire into the grow command as Strategy 0 (before flat search)
-3. Measure: how many tasks does recursive decomposition solve at depth 1 that flat search needs depth 2+ for?
-4. Learn `predict-family` via synthesis (replace the hand-written decision tree)
+1. Improve learned predictor: train across multiple curricula, better feature engineering
+2. Deeper recursion for 3+ level compositions (currently depth 2)
+3. Investigate other `make_default_env()` callers in `map`/`reduce`/`filter`/`test-spec` for similar wins
 
 ---
 
@@ -1015,7 +1097,7 @@ The growing system plan succeeds if:
 
 1. **Phase 2 validation:** A learned SELPH heuristic outperforms the default ordering on held-out tasks without domain-specific engineering. **Partially met:** `priority-plus-type-match` solves 5 more tasks than baseline (26 vs 21 at budget 5000) with up to 50x speedup on individual tasks. The heuristic is domain-general (return-type matching), not domain-specific. Stage 4 (synthesized heuristic search) implemented — can now search the space of heuristic programs instead of choosing from hand-crafted templates. Remaining: validate Stage 4 on full traces and on held-out tasks from unseen domains.
 
-2. **Phase 3 validation:** A learned SELPH decomposer solves tasks that the flat solver + hand-written induction can't. **Partially met:** Template-based HO decomposition (§9.16) solves `reverse_words` via split-map-join — a compositional solution unreachable by flat synthesis. 4 templates (list-map, split-map-join, char-map-join, list-filter) fill function-typed holes via recursive sub-synthesis. Remaining: decomposition as a candidate in the search space (not a fallback), and the strategy selector as a learnable Selph program.
+2. **Phase 3 validation:** A learned SELPH decomposer solves tasks that the flat solver + hand-written induction can't. **Substantially met:** Recursive decomposition (§9.22) is now Strategy 0 — it runs *before* flat synthesis, predicts the outermost function family, inverts to derive subspecs, and recursively sub-synthesizes. All strategies (flat, BD, HO, D&C, memo) are unified under one recursive step. The family predictor can be learned via `--learn-rd`. Remaining: recursive multi-level decomposition (D3), learned inversion (D2).
 
 3. **Phase 4 validation:** A neural SELPH generator (trained on synthesis logs) proposes correct programs in fewer attempts than the enumerative solver.
 
