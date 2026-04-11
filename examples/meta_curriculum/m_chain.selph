@@ -1,0 +1,124 @@
+; ─────────────────────────────────────────────────────────────────────────
+; M-stage chain dispatcher (§9.45 integration)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Wires the M-stages M7, M8, M9, M10, M11, M12 into the synth_v2
+; multi-arg dispatcher via the existing `__decomposers__` ns hook
+; (synth_v2.rs:4750 `try_selph_decomposers`).
+;
+; This file MUST be loaded after the individual M-stage files. Each
+; provides one detect-* entry point:
+;
+;   m7  → detect-library-shape       (n-ary library reuse)
+;   m8  → detect-constant-shape      (forms 1, 2)
+;   m9  → detect-unary-scale-shape   (form 2b)
+;   m10 → detect-affine-shape        (form 3)
+;   m11 → detect-product-shape       (forms 4, 5)
+;   m12 → detect-structural-pair     (form S)
+;
+; The chain converts the synth_v2 spec format
+;   (ns ("spec" (list-of-pairs)) ("max-depth" n) ("max-candidates" n))
+; into the M-stage spec format
+;   (ns ("inputs" ...) ("outputs" ...) ("arity" ...))
+; runs each detector in cheap-to-expensive order, and returns the first
+; match in the format synth_v2 expects:
+;   (ns ("found" true) ("nodes" <Node>) ("candidates" n))
+
+; ── Spec format conversion ───────────────────────────────────────────
+
+(define m-chain-spec-from-synth
+  (lambda (synth-spec)
+    (let ((pairs (ns-get synth-spec "spec")))
+      (let ((rows  (map head pairs))
+            (outs  (map (lambda (p) (head (tail p))) pairs)))
+        (let ((arity (if (list? (head rows)) (length (head rows)) 1)))
+          (ns ("inputs"  rows)
+              ("outputs" outs)
+              ("arity"   arity)))))))
+
+; ── Result format conversion ─────────────────────────────────────────
+;
+; M-stage results carry the lambda Node under `source-node`. synth_v2's
+; dispatcher (try_selph_decomposers) looks for `nodes`. Translate.
+
+(define m-chain-mn-result-to-synth
+  (lambda (mn-result)
+    (if (ns-get mn-result "found")
+      (ns ("found" true)
+          ("nodes" (ns-get mn-result "source-node"))
+          ("candidates" 1))
+      (ns ("found" false)))))
+
+; ── The chain ────────────────────────────────────────────────────────
+;
+; Order: M8 (cheapest, single-pool scan) → M9 (unary-wrap, 7×) → M10
+; (pairwise affine, pool²) → M12 (structural pair, pool²×28) → M11
+; (product fit, pool²/³) → M7 (library reuse, only if libs exist).
+;
+; M7 last because it's only useful when the env contains user-defined
+; library functions, which is the rarer case. M11 second-to-last
+; because it's the most expensive when no separability gating is
+; applied (pool³ for form 5).
+
+; Try one detector function and either return its synth-formatted
+; result, or fall through to the next stage by calling `next-thunk`.
+(define m-chain-try-or-next
+  (lambda (detector spec next-thunk)
+    (let ((r (detector spec)))
+      (if (ns-get r "found")
+        (m-chain-mn-result-to-synth r)
+        (next-thunk)))))
+
+(define m-chain-decomposer
+  (lambda (synth-spec)
+    (let ((spec (m-chain-spec-from-synth synth-spec)))
+      (m-chain-try-or-next detect-constant-shape spec
+        (lambda ()
+          (m-chain-try-or-next detect-unary-scale-shape spec
+            (lambda ()
+              (m-chain-try-or-next detect-affine-shape spec
+                (lambda ()
+                  (m-chain-try-or-next detect-structural-pair spec
+                    (lambda ()
+                      (m-chain-try-or-next detect-product-shape spec
+                        (lambda ()
+                          (m-chain-try-or-next detect-library-shape spec
+                            (lambda () (ns ("found" false)))))))))))))))))
+
+; ── Register as the global decomposer ────────────────────────────────
+;
+; synth_v2's `try_selph_decomposers` walks `__decomposers__` and calls
+; each entry with the synth spec ns. We register one entry — the chain
+; — under a single key.
+
+(define __decomposers__
+  (ns ("m-chain" m-chain-decomposer)))
+
+; ── Bypass flag (opt-in) ─────────────────────────────────────────────
+;
+; Setting this binding tells synth_v2 to skip its own kernel-side
+; data literal seeding and the affine-fit pass, leaving the SELPH
+; chain as the sole post-enumeration fallback. Use this for the
+; §9.45.6 validation gate; leave it unset for production runs that
+; want both the kernel pass and the SELPH chain.
+
+(define __bypass_kernel_affine__ true)
+
+; ── Synth probe-skip list ────────────────────────────────────────────
+;
+; Tell synth_v2's `library_components_from_env` (synth_v2.rs:1117) to
+; SKIP every M-stage helper currently in env. Without this, every
+; call to `synthesize_args` triggers `probe_function_type` on each of
+; the ~30 M-stage recognizers, and each probe runs a full
+; `detect-*-shape` invocation on garbage input — turning a 1s task
+; into a multi-minute hang.
+;
+; Implementation: walk `(env-functions)` AT CHAIN LOAD TIME and
+; capture every function name as a string. Bind the result as
+; `__synth_skip__`. synth_v2 reads this binding and merges it into
+; the skip set. Library functions defined AFTER this binding (like
+; physics task solutions bound by grow-v2) are NOT in the snapshot
+; and remain discoverable.
+
+(define __synth_skip__
+  (ns-keys (env-functions)))

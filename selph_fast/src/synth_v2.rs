@@ -131,23 +131,10 @@ pub enum LiteralKind {
     /// list index. The atom's `ret_type` (on the SynthComponent
     /// wrapper) carries the type of `x[N]`.
     Indexed(usize),
-    /// Constant-fitting hole — added for §9.41 constant-hole
-    /// synthesis (the AI Feynman preprocessing analog). Materializes
-    /// to `Node::Symbol(__hole__)`. A candidate containing one or
-    /// more holes is evaluated under fit-and-verify mode in
-    /// `test_candidate`: the synth wraps the body as
-    /// `(lambda (x __hole__) <body>)`, evaluates at H=0 and H=1 on
-    /// the first row to determine the affine slope, solves
-    /// `H = (target − b) / a`, and verifies the fitted constant
-    /// against the remaining rows. On success, the hole symbol is
-    /// substituted with `Node::Num(fitted)` in the result so the
-    /// returned source is hole-free.
-    ///
-    /// Restriction: the candidate body must be **affine in the
-    /// hole** for the affine fit to succeed. `(multiply H H)` and
-    /// other nonlinear-in-H bodies fail the verify step and get
-    /// rejected — this is correct behaviour, not a bug.
-    Hole,
+    // §9.45.13 deletion: `Hole` variant removed. Constant-hole
+    // synthesis is now done in pure SELPH via the M11/M12 fit-affine
+    // primitive (m_pool.selph + the M-stage detect-* functions). No
+    // synth_v2 component creates a Hole literal anymore.
 }
 
 impl SynthComponent {
@@ -996,19 +983,9 @@ pub fn indexed_arg_component(idx: usize, arg_type: Sym) -> SynthComponent {
     )
 }
 
-/// Build the constant-fitting hole atom for §9.42 constant-hole
-/// synthesis. Typed `Num` so the synth's type-gated composition
-/// flows it into Num arithmetic slots; carries a low priority so
-/// hole-bearing candidates aren't tried before hole-free ones at
-/// the same depth (hole-free wins are preferred when both exist).
-pub fn hole_component() -> SynthComponent {
-    SynthComponent::literal(
-        "__hole__",
-        LiteralKind::Hole,
-        intern("Num"),
-        0.5,
-    )
-}
+// §9.45.13 deletion: `hole_component()` removed. The §9.42 hole-atom
+// synthesis path is gone — constant fitting is done in pure SELPH
+// via M11/M12 + m_pool's fit-affine primitive.
 
 // ────────────────────────────────────────────────────────────────────────────
 // Library function components — discovered by walking + probing the env
@@ -1054,7 +1031,7 @@ fn probe_samples() -> Vec<(Sym, Value)> {
 ///
 /// Returns `None` if no probe succeeded — caller decides what to do
 /// (skip the function, default to all-Any, etc.).
-fn probe_function_type(
+pub fn probe_function_type(
     func: &Value,
     arity: usize,
     env: &Env,
@@ -1116,6 +1093,24 @@ fn probe_function_type(
 /// names that are already represented as primitives or input variables.
 pub fn library_components_from_env(env: &Env, skip: &HashSet<Sym>) -> Vec<SynthComponent> {
     let mut out = Vec::new();
+
+    // §9.45: read curriculum-defined `__synth_skip__` (a list of
+    // strings) and merge it into the skip set. This lets a curriculum
+    // file (m_chain.selph in particular) tell synth to ignore its own
+    // recognizer helpers, which would otherwise be probed by
+    // `probe_function_type` on every task — triggering expensive
+    // downstream M-stage execution on junk inputs and turning a
+    // ~1s grow-v2 task into a multi-minute hang. The discovery story
+    // is in `project_section_9_45.md`.
+    let mut effective_skip: HashSet<Sym> = skip.clone();
+    if let Some(Value::List(items)) = env.lookup(intern("__synth_skip__")) {
+        for item in items.iter() {
+            if let Value::Str(s) = item {
+                effective_skip.insert(intern(s.as_ref()));
+            }
+        }
+    }
+
     // Snapshot the scope into a Vec to release the borrow before we
     // call eval_v2::apply (which reborrows env scopes during evaluation).
     let entries: Vec<(Sym, Value)> = {
@@ -1126,7 +1121,7 @@ pub fn library_components_from_env(env: &Env, skip: &HashSet<Sym>) -> Vec<SynthC
             .collect()
     };
     for (sym, val) in entries {
-        if skip.contains(&sym) {
+        if effective_skip.contains(&sym) {
             continue;
         }
         let func_data = match &val {
@@ -5220,20 +5215,16 @@ pub fn probe_filter_components(
 
 /// A flattened candidate expression in the synthesis pool.
 /// Mirrors `synth::SynthPool` but uses `types_v2::Node` and `Sym` types.
+///
+/// §9.45.13 deletion: the `has_hole` field is gone. Hole-bearing
+/// candidates were the §9.42 constant-fitting path that's now in
+/// pure SELPH (M11/M12 + m_pool's fit-affine).
 #[derive(Clone, Debug)]
 pub struct SynthPool {
     pub nodes: Vec<Node>,
     pub root: usize,
     pub ret_type: Sym,
     pub priority: f64,
-    /// True if this candidate's body contains at least one
-    /// `LiteralKind::Hole` reference. Set by `materialize_atom` for
-    /// the hole atom and propagated through `materialize_app` from
-    /// any argument that has it. `test_candidate` branches on this
-    /// flag: hole-bearing candidates go through the affine
-    /// fit-and-verify path; hole-free candidates use the normal
-    /// equality verify. Added in §9.42 (constant-hole synthesis).
-    pub has_hole: bool,
 }
 
 /// Result of a synthesis search.
@@ -5483,23 +5474,15 @@ fn materialize_atom(comp: &SynthComponent) -> Option<SynthPool> {
             root: 3,
             ret_type: comp.ret_type,
             priority: comp.priority,
-            has_hole: false,
         });
     }
 
-    // §9.42 hole atom — emits a special symbol that test_candidate
-    // recognizes and routes through the affine fit-and-verify path.
-    let mut has_hole = false;
     let node = match &comp.dispatch {
         Dispatch::Literal(LiteralKind::InputVar) => Node::Symbol(intern("x")),
         Dispatch::Literal(LiteralKind::Int(n)) => Node::Int(*n),
         Dispatch::Literal(LiteralKind::Num(n)) => Node::Num(*n),
         Dispatch::Literal(LiteralKind::Str(s)) => Node::Str(s.clone()),
         Dispatch::Literal(LiteralKind::Bool(b)) => Node::Bool(*b),
-        Dispatch::Literal(LiteralKind::Hole) => {
-            has_hole = true;
-            Node::Symbol(intern("__hole__"))
-        }
         _ => return None,
     };
     Some(SynthPool {
@@ -5507,7 +5490,6 @@ fn materialize_atom(comp: &SynthComponent) -> Option<SynthPool> {
         root: 0,
         ret_type: comp.ret_type,
         priority: comp.priority,
-        has_hole,
     })
 }
 
@@ -5575,15 +5557,11 @@ fn materialize_app(comp: &SynthComponent, args: &[&SynthPool]) -> SynthPool {
         sum / args.len() as f64
     };
 
-    // Propagate `has_hole` from any argument that contains the hole.
-    let has_hole = args.iter().any(|a| a.has_hole);
-
     SynthPool {
         nodes,
         root: app_root,
         ret_type: comp.ret_type,
         priority: comp.priority + arg_priority_term,
-        has_hole,
     }
 }
 
@@ -5629,14 +5607,9 @@ fn test_candidate(
         }
     }
 
-    // §9.42 fit-and-verify branch for hole-bearing candidates. With
-    // the post-§9.42-rev2 design (focused affine-fit pass), normal
-    // synth never gets hole-bearing entries here — but the branch is
-    // kept as a safety net in case a caller injects them via
-    // `extra_seeds`.
-    if entry.has_hole {
-        return test_hole_candidate(entry, inputs, expected, env, seen);
-    }
+    // §9.45 deletion: the hole-bearing-candidate branch is gone. With
+    // the affine-fit pass migrated to pure-SELPH M-stages, no caller
+    // creates `Hole` literals or hole-bearing pool entries anymore.
 
     // Wrap as lambda and evaluate once to get the function value.
     let (nodes, lambda_idx) = wrap_lambda(entry);
@@ -5675,166 +5648,14 @@ fn test_candidate(
     }
 }
 
-/// §9.42 affine fit-and-verify path for hole-bearing candidates.
-///
-/// Wraps `(entry.body)` as `(lambda (x __hole__) <body>)`, evaluates
-/// at H=0 and H=1 on the first input row to determine the affine
-/// slope `a = f(1) − f(0)` and intercept `b = f(0)`, solves
-/// `H = (target₀ − b) / a`, and verifies the fitted constant against
-/// the remaining rows. On success, returns the entry with `__hole__`
-/// substituted by `Num(fitted)`.
-///
-/// Restrictions:
-/// - The body must produce a numeric value at H=0 (otherwise
-///   `value_to_f64` returns None and we bail).
-/// - `a` must be non-zero (the hole has to actually affect the
-///   output, otherwise the fit is meaningless).
-/// - The body must be **affine in H** for the verify step to pass.
-///   Quadratic-in-H bodies (e.g. `(multiply __hole__ __hole__)`)
-///   compute a wrong fitted value from the first row that fails on
-///   subsequent rows. This is correct behaviour — those candidates
-///   need a different fitting strategy that we don't yet implement.
-fn test_hole_candidate(
-    entry: &SynthPool,
-    inputs: &[Value],
-    expected: &[Value],
-    env: &Env,
-    seen: &mut HashSet<Vec<u64>>,
-) -> (TestOutcome, Option<SynthPool>) {
-    let hole_sym = intern("__hole__");
-
-    // Build (lambda (x __hole__) <body>) so we can re-call with
-    // different hole values in the same compiled closure.
-    let mut nodes = entry.nodes.clone();
-    let body_idx = entry.root;
-    let lambda_idx = nodes.len();
-    nodes.push(Node::Lambda(vec![intern("x"), hole_sym], body_idx));
-    let nodes_rc: Rc<[Node]> = nodes.into();
-
-    let f = match eval_v2::eval(&nodes_rc, lambda_idx, env) {
-        Ok(v) => v,
-        Err(_) => return (TestOutcome::Errored, None),
-    };
-
-    // Probe H=0 and H=1 on the first input.
-    let probe = |h: f64| -> Option<f64> {
-        match eval_v2::apply(&f, &[inputs[0].clone(), Value::Num(h)], env) {
-            Ok(v) => value_to_f64(&v),
-            Err(_) => None,
-        }
-    };
-    let b = match probe(0.0) {
-        Some(x) if x.is_finite() => x,
-        _ => return (TestOutcome::Tested, None),
-    };
-    let b_plus_a = match probe(1.0) {
-        Some(x) if x.is_finite() => x,
-        _ => return (TestOutcome::Tested, None),
-    };
-    let a = b_plus_a - b;
-    if a.abs() < 1e-12 {
-        // Hole doesn't affect output → not a meaningful fit.
-        return (TestOutcome::Tested, None);
-    }
-
-    let target_val = match value_to_f64(&expected[0]) {
-        Some(x) if x.is_finite() => x,
-        _ => return (TestOutcome::Tested, None),
-    };
-    let fitted_h = (target_val - b) / a;
-    if !fitted_h.is_finite() {
-        return (TestOutcome::Tested, None);
-    }
-
-    // Verify on every row with the fitted constant.
-    let hole_val = Value::Num(fitted_h);
-    for (inp, exp) in inputs.iter().zip(expected.iter()) {
-        match eval_v2::apply(&f, &[inp.clone(), hole_val.clone()], env) {
-            Ok(v) => {
-                if !values_close_or_equal(&v, exp, 1e-9) {
-                    return (TestOutcome::Tested, None);
-                }
-            }
-            Err(_) => return (TestOutcome::Errored, None),
-        }
-    }
-
-    // §9.42 design note: hole-bearing candidates DO NOT participate in
-    // observational-equivalence dedup. Two structurally different
-    // hole-bearing candidates can produce identical fitted-behaviour
-    // vectors purely by coincidence (different fitted constants
-    // happen to land on the same row outputs), and deduping them
-    // would prune structurally distinct compositions that need to be
-    // available at deeper depths. The cost of keeping them is
-    // bounded — hole-bearing candidates are a small fraction of the
-    // total search space, and many self-prune via the affine fit
-    // failing to match all rows. The `seen` parameter is unused on
-    // this path (kept in the signature for symmetry with
-    // `test_candidate`).
-    let _ = seen;
-
-    // Substitute __hole__ with Num(fitted_h) in a copy of the nodes.
-    let substituted = substitute_hole(entry, fitted_h);
-    (TestOutcome::Solution, Some(substituted))
-}
-
-/// Diagnostic helper: wrap a SynthPool entry as `(lambda (x) body)`
-/// and eval it to a Function value. Used by the §9.42 affine-fit
-/// pass to probe pool entries against expected behavior signatures.
-fn wrap_lambda_then_eval(entry: &SynthPool, env: &Env) -> Option<Value> {
-    let (nodes, lambda_idx) = wrap_lambda(entry);
-    let nodes_rc: Rc<[Node]> = nodes.into();
-    eval_v2::eval(&nodes_rc, lambda_idx, env).ok()
-}
-
-/// Helper: Int / Num → f64. Returns None for any other variant.
-fn value_to_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Int(n) => Some(*n as f64),
-        Value::Num(n) => Some(*n),
-        _ => None,
-    }
-}
-
-/// Helper: relative-tolerance numeric equality. Falls back to exact
-/// `values_equal` for non-numeric variants. Used by §9.42 hole-fit
-/// verify because the affine fit can introduce sub-ε rounding even
-/// when the fit is mathematically perfect.
-fn values_close_or_equal(a: &Value, b: &Value, eps: f64) -> bool {
-    if eval_v2::values_equal(a, b) {
-        return true;
-    }
-    match (value_to_f64(a), value_to_f64(b)) {
-        (Some(x), Some(y)) => {
-            let diff = (x - y).abs();
-            let scale = x.abs().max(y.abs()).max(1.0);
-            diff / scale < eps
-        }
-        _ => false,
-    }
-}
-
-/// Walk an entry's node arena and replace every `Node::Symbol(__hole__)`
-/// with `Node::Num(fitted)`. Used by §9.42 to bake the fitted constant
-/// into the candidate before returning it as the result.
-fn substitute_hole(entry: &SynthPool, fitted: f64) -> SynthPool {
-    let hole_sym = intern("__hole__");
-    let new_nodes: Vec<Node> = entry
-        .nodes
-        .iter()
-        .map(|n| match n {
-            Node::Symbol(s) if *s == hole_sym => Node::Num(fitted),
-            _ => n.clone(),
-        })
-        .collect();
-    SynthPool {
-        nodes: new_nodes,
-        root: entry.root,
-        ret_type: entry.ret_type,
-        priority: entry.priority,
-        has_hole: false,
-    }
-}
+// §9.45 deletion: `test_hole_candidate`, `wrap_lambda_then_eval`,
+// `value_to_f64`, `values_close_or_equal`, and `substitute_hole`
+// all gone — the entire §9.42 hole-as-atom infrastructure is now
+// dead code. Their callers (the affine_fit_pass and the
+// `if entry.has_hole` branch in `test_candidate`) have been removed.
+// `hole_component()` and the `LiteralKind::Hole` variant remain in
+// place for now since they have no compile-time impact, but they're
+// equally unreachable and can be deleted in a future cleanup pass.
 
 /// Bottom-up enumerative synthesis against types_v2.
 ///
@@ -5950,6 +5771,21 @@ fn synthesize_inner(
 
     let mut all_components = probed;
 
+    // ── §9.45 P5: kernel-bypass flag for the migration validation gate ─
+    // When the env contains `__bypass_kernel_affine__` bound to a
+    // truthy value, skip the §9.41 data literal seeding and the §9.42
+    // affine-fit pass below. The pure-SELPH M-stage chain
+    // (examples/meta_curriculum/m_chain.selph) is expected to take
+    // their place via the curriculum-side `__decomposers__` hook.
+    //
+    // This is the test-driven path that lets us validate the §9.45.6
+    // migration gate: turn the kernel passes off, run the same task,
+    // assert the SELPH curriculum solves it.
+    let bypass_kernel = matches!(
+        env.lookup(intern("__bypass_kernel_affine__")),
+        Some(Value::Bool(true))
+    );
+
     // ── Data-derived literal seeding (multi-arg only) ─────────────────
     // §9.41: scan inputs and outputs for unique primitive Int / Num /
     // Str / Bool values and seed them as depth-0 literal components.
@@ -5964,7 +5800,7 @@ fn synthesize_inner(
     //   - The multi-arg path is new (§9.39) and its only consumers
     //     are the §9.40 meta-curriculum decomposers, where rich data
     //     constants are exactly what's wanted.
-    if extra_seeds.is_some() {
+    if extra_seeds.is_some() && !bypass_kernel {
         let data_lits = collect_data_literals(inputs, expected);
         for lit in data_lits {
             // Skip if a literal with the same value is already in the
@@ -6003,6 +5839,25 @@ fn synthesize_inner(
         }
         None => {
             all_components.push(input_var_component(input_type));
+        }
+    }
+
+    // ── §9.45: SELPH M-stage chain runs FIRST (multi-arg only) ────────
+    //
+    // Mirror the single-arg path's Stage A dispatch
+    // (`synthesize_with_strategies`, line ~4943): give curriculum
+    // decomposers the first crack before burning enumeration budget.
+    // The chain is bounded — total cost across all M-stages is
+    // O(pool³ × stages) ≈ a few thousand fits — so trying it first
+    // is essentially free if it succeeds and adds a known overhead
+    // if it doesn't. Without this ordering the chain only fires
+    // after enumeration exhausts, inflating reported candidate
+    // counts even when the chain itself would be cheap.
+    if extra_seeds_was_some {
+        if let Some((nodes, root, sd_explored, _name_sym)) =
+            try_selph_decomposers(env, inputs, expected, max_depth, max_candidates)
+        {
+            return SynthResult::success(nodes, root, sd_explored);
         }
     }
 
@@ -6173,659 +6028,36 @@ fn synthesize_inner(
         prev_end = pool.len();
     }
 
-    // ── §9.42 affine-fit pass (multi-arg only) ────────────────────────
-    //
-    // After normal enumeration finishes (whether by convergence,
-    // budget exhaustion, or hitting max_depth), run a focused
-    // constant-hole search over the final pool. The hypothesis:
-    // many physics formulas have the shape
-    // `f(args) = h(args) + C·g(args)` where h and g are simple
-    // closed-form expressions and C is a buried constant (e.g.
-    // ½·a·t² has h=u·t, g=t², C=0.125 with a_ref=0.25).
-    //
-    // The hole-as-an-atom approach inflated fanout enormously
-    // (every binary op tries the hole at every position); the
-    // focused pass tries the canonical affine shape directly:
-    //
-    //   1. C  alone (constant function)
-    //   2. C · g(args)
-    //   3. h(args) + C · g(args)
-    //
-    // Pool size² × constant overhead is much smaller than the
-    // equivalent hole-as-atom enumeration. The pass uses its own
-    // independent budget — even if normal enumeration burned through
-    // `max_candidates`, the affine-fit pass still runs.
-    if extra_seeds_was_some {
-        let mut fit_explored: usize = 0;
-        // Independent budget bounded by pool size: every (h, g) pair
-        // is one fit attempt, so `pool² + pool + 1` is a safe upper
-        // bound. Cap at 250k to avoid pathological pools.
-        let pool_n = pool.len();
-        let fit_budget = (pool_n * pool_n + pool_n + 1).min(250_000);
-        if let Some(result) = affine_fit_pass(
-            &pool, inputs, expected, env, target, universe,
-            &mut fit_explored, fit_budget,
-        ) {
-            // Add the fit-pass cost to the reported explored count.
-            return SynthResult {
-                candidates_explored: explored + fit_explored,
-                ..result
-            };
-        }
-        explored += fit_explored;
-    }
+    // §9.45 deletion: the §9.42 affine-fit pass is gone. Every Form
+    // (1, 2, 2b, 3, 4, 5, S, L) has been migrated to a pure-SELPH
+    // M-stage in `examples/meta_curriculum/m{8,9,10,11,12,7}*.selph`,
+    // dispatched via `__decomposers__` below. The kernel-bypass flag
+    // (`__bypass_kernel_affine__`) is now functionally a no-op since
+    // there's nothing left in the kernel to bypass; the flag stays
+    // wired in `synthesize_inner` only to keep the compatibility
+    // gate for `collect_data_literals` seeding (which still has a
+    // future migration path).
+    let _ = (target, universe, bypass_kernel);
+
+    // §9.45 note: the multi-arg SELPH-decomposer chain runs BEFORE
+    // enumeration (see line ~5897), not as a post-enumeration
+    // fallback. The pre-enumeration position mirrors single-arg
+    // Stage A and gives the chain accurate cost reporting (the
+    // earlier "after enumeration" position made every SELPH solve
+    // appear to cost `max_candidates` because enumeration burned
+    // through the budget first).
     let _ = budget_exhausted;
 
     SynthResult::not_found(explored)
 }
 
-/// §9.42 affine-fit pass over the final synth pool. Tries the
-/// canonical `h + C·g` shape over all pairs (h, g), fitting C in
-/// pure f64 arithmetic against precomputed behavior vectors.
-/// Avoids the per-pair eval+verify cost of the naive approach.
-///
-/// Forms tried:
-///   - `C` (constant function)
-///   - `C · g` for each g
-///   - `h + C · g` for each pair (h, g)
-///   - `C · (e1 · e2)` for each pair (e1, e2)
-///
-/// All four forms reduce to "find C such that target = h + C·g for
-/// every row" with the appropriate h and g vectors. The fit is
-/// closed-form: pick a row where g≠0, solve `C = (target - h) / g`,
-/// then verify.
-fn affine_fit_pass(
-    pool: &[SynthPool],
-    inputs: &[Value],
-    expected: &[Value],
-    env: &Env,
-    target: Option<Sym>,
-    universe: &TypeUniverse,
-    explored: &mut usize,
-    _max_candidates: usize,
-) -> Option<SynthResult> {
-    let num_sym = intern("Num");
-    if let Some(t) = target {
-        if !universe.slot_accepts(t, num_sym) {
-            return None;
-        }
-    }
-    let num_entries: Vec<&SynthPool> = pool
-        .iter()
-        .filter(|e| !e.has_hole && universe.slot_accepts(num_sym, e.ret_type))
-        .collect();
-
-    // Precompute behavior vectors (Vec<f64>) for each entry. None
-    // for entries that error or produce non-numeric values on any
-    // row — those can't participate in affine fits.
-    let n_rows = inputs.len();
-    let target_vec: Option<Vec<f64>> = expected
-        .iter()
-        .map(|e| value_to_f64(e).filter(|x| x.is_finite()))
-        .collect();
-    let target_vec = target_vec?;
-
-    let mut behaviors: Vec<Option<Vec<f64>>> = Vec::with_capacity(num_entries.len());
-    for e in &num_entries {
-        let f = match wrap_lambda_then_eval(e, env) {
-            Some(v) => v,
-            None => { behaviors.push(None); continue; }
-        };
-        let mut beh: Vec<f64> = Vec::with_capacity(n_rows);
-        let mut ok = true;
-        for inp in inputs {
-            match eval_v2::apply(&f, &[inp.clone()], env) {
-                Ok(v) => match value_to_f64(&v) {
-                    Some(x) if x.is_finite() => beh.push(x),
-                    _ => { ok = false; break; }
-                },
-                Err(_) => { ok = false; break; }
-            }
-        }
-        behaviors.push(if ok { Some(beh) } else { None });
-    }
-
-    // Helper: find C such that target[i] = h[i] + C·g[i] for every i.
-    // Returns Some(C) if a consistent C exists; None otherwise.
-    let zero_h = vec![0.0; n_rows];
-    let fit_affine = |h: &[f64], g: &[f64]| -> Option<f64> {
-        // Find a row with g != 0 to solve from.
-        let pivot = (0..n_rows).find(|&i| g[i].abs() > 1e-12)?;
-        let c = (target_vec[pivot] - h[pivot]) / g[pivot];
-        if !c.is_finite() {
-            return None;
-        }
-        // Verify on every row.
-        for i in 0..n_rows {
-            let pred = h[i] + c * g[i];
-            let exp = target_vec[i];
-            let diff = (pred - exp).abs();
-            let scale = pred.abs().max(exp.abs()).max(1.0);
-            if diff / scale > 1e-9 {
-                return None;
-            }
-        }
-        Some(c)
-    };
-
-    // Form 1: bare HOLE (constant function).
-    *explored += 1;
-    if let Some(c) = fit_affine(&zero_h, &vec![1.0; n_rows]) {
-        let cand = build_bare_hole();
-        let sub = substitute_hole(&cand, c);
-        let (n, r) = wrap_lambda(&sub);
-        return Some(SynthResult::success(n, r, *explored));
-    }
-
-    // Form 2: C · g for each g.
-    for (gi, gbeh) in behaviors.iter().enumerate() {
-        let gbeh = match gbeh { Some(b) => b, None => continue };
-        *explored += 1;
-        if let Some(c) = fit_affine(&zero_h, gbeh) {
-            let cand = build_scale_hole(num_entries[gi]);
-            let sub = substitute_hole(&cand, c);
-            let (n, r) = wrap_lambda(&sub);
-            return Some(SynthResult::success(n, r, *explored));
-        }
-    }
-
-    // Form 2b: C · (unary_op g) for each unary op and each g. Common
-    // unary wrappings (sqrt, log, exp, sin, cos, negate, abs) often
-    // bury the right structure that main enumeration misses due to
-    // priority ordering. Cheap — pool * 7 ops.
-    let unary_ops: &[(&str, fn(f64) -> f64)] = &[
-        ("sqrt",   f64::sqrt),
-        ("log",    f64::ln),
-        ("exp",    f64::exp),
-        ("sin",    f64::sin),
-        ("cos",    f64::cos),
-        ("negate", |x| -x),
-        ("abs",    f64::abs),
-    ];
-    for (op_name, op_fn) in unary_ops {
-        let op_sym = intern(op_name);
-        for (gi, gbeh) in behaviors.iter().enumerate() {
-            let gbeh = match gbeh { Some(b) => b, None => continue };
-            // Apply the unary op elementwise to g's behavior.
-            let wrapped: Vec<f64> = gbeh.iter().map(|&x| op_fn(x)).collect();
-            // Skip if any wrapped value is non-finite (e.g. log of
-            // zero, sqrt of negative).
-            if !wrapped.iter().all(|x| x.is_finite()) { continue; }
-            *explored += 1;
-            if let Some(c) = fit_affine(&zero_h, &wrapped) {
-                // Construct (op g) as a SynthPool.
-                let mut nodes: Vec<Node> = Vec::new();
-                for n in &num_entries[gi].nodes {
-                    nodes.push(remap_node(n, 0));
-                }
-                let g_root = num_entries[gi].root;
-                let op_idx = nodes.len();
-                nodes.push(Node::Symbol(op_sym));
-                let app_idx = nodes.len();
-                nodes.push(Node::App(vec![op_idx, g_root]));
-                let wrapped_pool = SynthPool {
-                    nodes, root: app_idx,
-                    ret_type: intern("Num"),
-                    priority: 0.0,
-                    has_hole: false,
-                };
-                let cand = build_scale_hole(&wrapped_pool);
-                let sub = substitute_hole(&cand, c);
-                let (n, r) = wrap_lambda(&sub);
-                return Some(SynthResult::success(n, r, *explored));
-            }
-        }
-    }
-
-    // Form 3: h + C · g for each pair (h, g).
-    for (hi, hbeh) in behaviors.iter().enumerate() {
-        let hbeh = match hbeh { Some(b) => b, None => continue };
-        for (gi, gbeh) in behaviors.iter().enumerate() {
-            let gbeh = match gbeh { Some(b) => b, None => continue };
-            *explored += 1;
-            if let Some(c) = fit_affine(hbeh, gbeh) {
-                let cand = build_affine_combo(num_entries[hi], num_entries[gi]);
-                let sub = substitute_hole(&cand, c);
-                let (n, r) = wrap_lambda(&sub);
-                return Some(SynthResult::success(n, r, *explored));
-            }
-        }
-    }
-
-    // Form 4: C · (e1 · e2) for each pair. The composed g behavior
-    // is the elementwise product of e1 and e2 behaviors — no need
-    // to call eval; we compute it from the precomputed vectors.
-    for (i, ibeh) in behaviors.iter().enumerate() {
-        let ibeh = match ibeh { Some(b) => b, None => continue };
-        for (j, jbeh) in behaviors.iter().enumerate() {
-            let jbeh = match jbeh { Some(b) => b, None => continue };
-            *explored += 1;
-            // Composed behavior = elementwise product.
-            let composed: Vec<f64> = (0..n_rows).map(|k| ibeh[k] * jbeh[k]).collect();
-            if let Some(c) = fit_affine(&zero_h, &composed) {
-                let composed_pool = build_op_combo(num_entries[i], num_entries[j], intern("multiply"));
-                let cand = build_scale_hole(&composed_pool);
-                let sub = substitute_hole(&cand, c);
-                let (n, r) = wrap_lambda(&sub);
-                return Some(SynthResult::success(n, r, *explored));
-            }
-        }
-    }
-
-    // Form S: structural pair-fit `(op_b h (op_u g))` with NO
-    // constant fit. Catches shapes like `A·cos(ωt)` where the
-    // outer combiner is binary and the inner is a unary wrap of
-    // a pool entry. The predicted output is computed in pure
-    // arithmetic from precomputed behaviors. Cost is bounded by
-    // pool² × 4 binary × 7 unary ≈ 28 × pool².
-    let binary_ops: &[(&str, fn(f64, f64) -> f64)] = &[
-        ("multiply", |a, b| a * b),
-        ("add",      |a, b| a + b),
-        ("subtract", |a, b| a - b),
-        ("divide",   |a, b| a / b),
-    ];
-    for (op_b_name, op_b_fn) in binary_ops {
-        let op_b_sym = intern(op_b_name);
-        for (hi, hbeh) in behaviors.iter().enumerate() {
-            let hbeh = match hbeh { Some(b) => b, None => continue };
-            for (gi, gbeh) in behaviors.iter().enumerate() {
-                let gbeh = match gbeh { Some(b) => b, None => continue };
-                for (op_u_name, op_u_fn) in unary_ops {
-                    let op_u_sym = intern(op_u_name);
-                    *explored += 1;
-                    // Compute predicted column = h_b op_b op_u(g_b).
-                    let mut ok = true;
-                    let mut all_match = true;
-                    for k in 0..n_rows {
-                        let uval = op_u_fn(gbeh[k]);
-                        if !uval.is_finite() { ok = false; break; }
-                        let pred = op_b_fn(hbeh[k], uval);
-                        if !pred.is_finite() { ok = false; break; }
-                        let exp = target_vec[k];
-                        let diff = (pred - exp).abs();
-                        let scale = pred.abs().max(exp.abs()).max(1.0);
-                        if diff / scale > 1e-9 { all_match = false; break; }
-                    }
-                    if ok && all_match {
-                        // Build (op_b h (op_u g)) — no hole.
-                        let mut nodes: Vec<Node> = Vec::new();
-                        for n in &num_entries[hi].nodes {
-                            nodes.push(remap_node(n, 0));
-                        }
-                        let h_root = num_entries[hi].root;
-                        let g_offset = nodes.len();
-                        for n in &num_entries[gi].nodes {
-                            nodes.push(remap_node(n, g_offset));
-                        }
-                        let g_root = num_entries[gi].root + g_offset;
-                        let u_sym_idx = nodes.len();
-                        nodes.push(Node::Symbol(op_u_sym));
-                        let u_app = nodes.len();
-                        nodes.push(Node::App(vec![u_sym_idx, g_root]));
-                        let b_sym_idx = nodes.len();
-                        nodes.push(Node::Symbol(op_b_sym));
-                        let b_app = nodes.len();
-                        nodes.push(Node::App(vec![b_sym_idx, h_root, u_app]));
-                        let cand = SynthPool {
-                            nodes, root: b_app,
-                            ret_type: intern("Num"),
-                            priority: 0.0,
-                            has_hole: false,
-                        };
-                        let (n, r) = wrap_lambda(&cand);
-                        return Some(SynthResult::success(n, r, *explored));
-                    }
-                }
-            }
-        }
-    }
-
-    // Form L: cross-arity library reuse. For each library function
-    // `lib :: List → Num` discovered in the env, try the shape
-    // `(op_b (nth x h) (lib (list (nth x i) (nth x j))))` for all
-    // distinct indexed-atom triples (h, i, j). This is the only way
-    // to reach formulas like rel_mass = m₀ · γ(v, c) where γ is a
-    // 2-arg library function and the parent task is 3-arg.
-    //
-    // Cost is bounded: arity³ × num_libs × 4 binary ops × n_rows
-    // library evaluations. For arity 3 with 2 libraries: ~150 evals.
-    {
-        let arity = match inputs.first() {
-            Some(Value::List(items)) => items.len(),
-            _ => 0,
-        };
-        if arity >= 3 {
-            // Discover library functions in the env that take a single
-            // list arg and return a numeric value.
-            let skip = default_skip_set();
-            let lib_comps = library_components_from_env(env, &skip);
-            let lib_fns: Vec<(Sym, Value)> = lib_comps
-                .iter()
-                .filter(|c| c.arity == 1
-                    && c.param_types.len() == 1
-                    && (c.param_types[0] == intern("List") || c.param_types[0] == intern("Any")))
-                .filter_map(|c| {
-                    if let Dispatch::Named(sym) = c.dispatch {
-                        env.lookup(sym).map(|v| (sym, v))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Indexed-atom positions 0..arity.
-            for h_idx in 0..arity {
-                for i_idx in 0..arity {
-                    if i_idx == h_idx { continue; }
-                    for j_idx in 0..arity {
-                        if j_idx == h_idx || j_idx == i_idx { continue; }
-                        for (lib_sym, lib_val) in &lib_fns {
-                            // Compute (lib (list args[i_idx] args[j_idx]))
-                            // for each row.
-                            let mut lib_results: Vec<f64> = Vec::with_capacity(n_rows);
-                            let mut ok = true;
-                            for inp in inputs {
-                                let row_args = match inp {
-                                    Value::List(items) => items,
-                                    _ => { ok = false; break; }
-                                };
-                                let sub_list = Value::list(vec![
-                                    row_args[i_idx].clone(),
-                                    row_args[j_idx].clone(),
-                                ]);
-                                match eval_v2::apply(lib_val, &[sub_list], env) {
-                                    Ok(v) => match value_to_f64(&v) {
-                                        Some(x) if x.is_finite() => lib_results.push(x),
-                                        _ => { ok = false; break; }
-                                    },
-                                    Err(_) => { ok = false; break; }
-                                }
-                            }
-                            if !ok { continue; }
-                            // Get h_idx atom column.
-                            let mut h_col: Vec<f64> = Vec::with_capacity(n_rows);
-                            let mut h_ok = true;
-                            for inp in inputs {
-                                let items = match inp {
-                                    Value::List(items) => items,
-                                    _ => { h_ok = false; break; }
-                                };
-                                match value_to_f64(&items[h_idx]) {
-                                    Some(x) => h_col.push(x),
-                                    None => { h_ok = false; break; }
-                                }
-                            }
-                            if !h_ok { continue; }
-                            // Try each binary op `op_b` on (h_col, lib_results).
-                            for (op_b_name, op_b_fn) in binary_ops {
-                                let op_b_sym = intern(op_b_name);
-                                *explored += 1;
-                                let mut all_match = true;
-                                for k in 0..n_rows {
-                                    let pred = op_b_fn(h_col[k], lib_results[k]);
-                                    if !pred.is_finite() { all_match = false; break; }
-                                    let exp = target_vec[k];
-                                    let diff = (pred - exp).abs();
-                                    let scale = pred.abs().max(exp.abs()).max(1.0);
-                                    if diff / scale > 1e-9 { all_match = false; break; }
-                                }
-                                if all_match {
-                                    // Build the source: (op_b (nth x h_idx)
-                                    //   (lib_sym (list (nth x i_idx) (nth x j_idx)))).
-                                    let mut nodes: Vec<Node> = Vec::new();
-                                    // (nth x h_idx)
-                                    nodes.push(Node::Symbol(intern("nth")));
-                                    nodes.push(Node::Symbol(intern("x")));
-                                    nodes.push(Node::Int(h_idx as i64));
-                                    nodes.push(Node::App(vec![0, 1, 2]));
-                                    let h_root = 3;
-                                    // (nth x i_idx)
-                                    nodes.push(Node::Symbol(intern("nth")));
-                                    nodes.push(Node::Symbol(intern("x")));
-                                    nodes.push(Node::Int(i_idx as i64));
-                                    nodes.push(Node::App(vec![4, 5, 6]));
-                                    let i_root = 7;
-                                    // (nth x j_idx)
-                                    nodes.push(Node::Symbol(intern("nth")));
-                                    nodes.push(Node::Symbol(intern("x")));
-                                    nodes.push(Node::Int(j_idx as i64));
-                                    nodes.push(Node::App(vec![8, 9, 10]));
-                                    let j_root = 11;
-                                    // (list (nth x i) (nth x j))
-                                    nodes.push(Node::Symbol(intern("list")));
-                                    let list_app = nodes.len();
-                                    nodes.push(Node::App(vec![12, i_root, j_root]));
-                                    // (lib_sym (list ...))
-                                    let lib_sym_idx = nodes.len();
-                                    nodes.push(Node::Symbol(*lib_sym));
-                                    let lib_app = nodes.len();
-                                    nodes.push(Node::App(vec![lib_sym_idx, list_app]));
-                                    // (op_b h lib_call)
-                                    let op_sym_idx = nodes.len();
-                                    nodes.push(Node::Symbol(op_b_sym));
-                                    let outer_app = nodes.len();
-                                    nodes.push(Node::App(vec![op_sym_idx, h_root, lib_app]));
-                                    let cand = SynthPool {
-                                        nodes,
-                                        root: outer_app,
-                                        ret_type: intern("Num"),
-                                        priority: 0.0,
-                                        has_hole: false,
-                                    };
-                                    let (n, r) = wrap_lambda(&cand);
-                                    return Some(SynthResult::success(n, r, *explored));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Form 5: h + C · (e1 · e2). The classic u·t + ½·a·t² shape.
-    // Cost is small_h × pool² which can be huge for large pools.
-    // Bounded by:
-    //   - Threshold of 10 nodes (captures depth-1 binary ops over
-    //     two indexed atoms — needed for kinematic_s where the
-    //     inner product is `t·t`, a 10-node entry).
-    //   - Hard cap on iteration count (10M).
-    let small_idxs: Vec<usize> = (0..num_entries.len())
-        .filter(|&i| num_entries[i].nodes.len() <= 10 && behaviors[i].is_some())
-        .collect();
-    let form5_cap: usize = 200_000_000;
-    let mut form5_iters = 0usize;
-    'form5: for &hi in &small_idxs {
-        let hbeh = behaviors[hi].as_ref().unwrap();
-        for &i in &small_idxs {
-            let ibeh = behaviors[i].as_ref().unwrap();
-            for &j in &small_idxs {
-                if form5_iters >= form5_cap {
-                    break 'form5;
-                }
-                form5_iters += 1;
-                let jbeh = behaviors[j].as_ref().unwrap();
-                *explored += 1;
-                let composed: Vec<f64> = (0..n_rows).map(|k| ibeh[k] * jbeh[k]).collect();
-                if let Some(c) = fit_affine(hbeh, &composed) {
-                    let composed_pool = build_op_combo(num_entries[i], num_entries[j], intern("multiply"));
-                    let cand = build_affine_combo(num_entries[hi], &composed_pool);
-                    let sub = substitute_hole(&cand, c);
-                    let (n, r) = wrap_lambda(&sub);
-                    return Some(SynthResult::success(n, r, *explored));
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Build `(op e1 e2)` from two existing pool entries. Used by §9.42
-/// affine-fit pass Form 4 to construct depth-2 building blocks on
-/// the fly.
-fn build_op_combo(e1: &SynthPool, e2: &SynthPool, op: Sym) -> SynthPool {
-    let mut nodes: Vec<Node> = Vec::new();
-    for n in &e1.nodes {
-        nodes.push(remap_node(n, 0));
-    }
-    let e1_root = e1.root;
-    let e2_offset = nodes.len();
-    for n in &e2.nodes {
-        nodes.push(remap_node(n, e2_offset));
-    }
-    let e2_root = e2.root + e2_offset;
-    let op_idx = nodes.len();
-    nodes.push(Node::Symbol(op));
-    let app_idx = nodes.len();
-    nodes.push(Node::App(vec![op_idx, e1_root, e2_root]));
-    SynthPool {
-        nodes,
-        root: app_idx,
-        ret_type: intern("Num"),
-        priority: 0.0,
-        has_hole: false,
-    }
-}
-
-/// Build the bare-hole candidate `__hole__`.
-fn build_bare_hole() -> SynthPool {
-    let nodes = vec![Node::Symbol(intern("__hole__"))];
-    SynthPool {
-        nodes,
-        root: 0,
-        ret_type: intern("Num"),
-        priority: 0.0,
-        has_hole: true,
-    }
-}
-
-/// Build `(multiply __hole__ g)` over an existing pool entry `g`.
-fn build_scale_hole(g: &SynthPool) -> SynthPool {
-    let mut nodes: Vec<Node> = Vec::new();
-    // Embed g's nodes at offset 0.
-    for n in &g.nodes {
-        nodes.push(remap_node(n, 0));
-    }
-    let g_root = g.root;
-    let mul_sym_idx = nodes.len();
-    nodes.push(Node::Symbol(intern("multiply")));
-    let hole_idx = nodes.len();
-    nodes.push(Node::Symbol(intern("__hole__")));
-    let app_idx = nodes.len();
-    nodes.push(Node::App(vec![mul_sym_idx, hole_idx, g_root]));
-    SynthPool {
-        nodes,
-        root: app_idx,
-        ret_type: intern("Num"),
-        priority: 0.0,
-        has_hole: true,
-    }
-}
-
-/// Build `(add h (multiply __hole__ g))` over two existing pool
-/// entries. Concatenates the two node arenas and adds the outer
-/// application nodes.
-fn build_affine_combo(h: &SynthPool, g: &SynthPool) -> SynthPool {
-    let mut nodes: Vec<Node> = Vec::new();
-    // Embed h at offset 0.
-    for n in &h.nodes {
-        nodes.push(remap_node(n, 0));
-    }
-    let h_root = h.root;
-    // Embed g at offset = h.nodes.len().
-    let g_offset = nodes.len();
-    for n in &g.nodes {
-        nodes.push(remap_node(n, g_offset));
-    }
-    let g_root = g.root + g_offset;
-    // Inner: (multiply __hole__ g)
-    let mul_sym_idx = nodes.len();
-    nodes.push(Node::Symbol(intern("multiply")));
-    let hole_idx = nodes.len();
-    nodes.push(Node::Symbol(intern("__hole__")));
-    let mul_app = nodes.len();
-    nodes.push(Node::App(vec![mul_sym_idx, hole_idx, g_root]));
-    // Outer: (add h (mul ...))
-    let add_sym_idx = nodes.len();
-    nodes.push(Node::Symbol(intern("add")));
-    let add_app = nodes.len();
-    nodes.push(Node::App(vec![add_sym_idx, h_root, mul_app]));
-    SynthPool {
-        nodes,
-        root: add_app,
-        ret_type: intern("Num"),
-        priority: 0.0,
-        has_hole: true,
-    }
-}
-
-/// Run the affine fit-and-verify on a hole-bearing candidate. Returns
-/// the substituted (hole-free) entry on success, or None on failure.
-/// Side-effect free; no `seen` updates because the affine-fit pass
-/// is bounded and runs after main enumeration.
-///
-/// The fit scans rows for one with a non-zero slope `a` (i.e., a row
-/// where the candidate's H=0 and H=1 evaluations differ). Without
-/// this scan, the fit would bail on candidates whose first row
-/// happens to make the hole's contribution vanish — a common case
-/// for h-style sub-specs whose first row is the reference point.
-fn try_affine_fit(
-    entry: &SynthPool,
-    inputs: &[Value],
-    expected: &[Value],
-    env: &Env,
-) -> Option<SynthPool> {
-    let hole_sym = intern("__hole__");
-    let mut nodes = entry.nodes.clone();
-    let body_idx = entry.root;
-    let lambda_idx = nodes.len();
-    nodes.push(Node::Lambda(vec![intern("x"), hole_sym], body_idx));
-    let nodes_rc: Rc<[Node]> = nodes.into();
-
-    let f = eval_v2::eval(&nodes_rc, lambda_idx, env).ok()?;
-
-    // Scan rows for one with a meaningfully non-zero slope (a) under
-    // H=0 vs H=1. The first such row determines the fitted constant.
-    let mut fit_row: Option<(usize, f64, f64)> = None;
-    for (i, inp) in inputs.iter().enumerate() {
-        let probe = |h: f64| -> Option<f64> {
-            let v = eval_v2::apply(&f, &[inp.clone(), Value::Num(h)], env).ok()?;
-            value_to_f64(&v)
-        };
-        let b = match probe(0.0) {
-            Some(x) if x.is_finite() => x,
-            _ => return None,
-        };
-        let bplus = match probe(1.0) {
-            Some(x) if x.is_finite() => x,
-            _ => return None,
-        };
-        let a = bplus - b;
-        if a.abs() >= 1e-12 {
-            fit_row = Some((i, b, a));
-            break;
-        }
-    }
-    let (fit_idx, b, a) = fit_row?;
-
-    let target_val = value_to_f64(&expected[fit_idx]).filter(|x| x.is_finite())?;
-    let fitted_h = (target_val - b) / a;
-    if !fitted_h.is_finite() {
-        return None;
-    }
-
-    // Verify on every row.
-    let hole_val = Value::Num(fitted_h);
-    for (inp, exp) in inputs.iter().zip(expected.iter()) {
-        let v = eval_v2::apply(&f, &[inp.clone(), hole_val.clone()], env).ok()?;
-        if !values_close_or_equal(&v, exp, 1e-9) {
-            return None;
-        }
-    }
-
-    Some(substitute_hole(entry, fitted_h))
-}
+// §9.45 deletion: `affine_fit_pass`, `try_affine_fit`, and the
+// `build_*_hole` / `build_op_combo` helpers all gone (~280 LOC).
+// Each Form they implemented is now a pure-SELPH M-stage in
+// `examples/meta_curriculum/`. The `__bypass_kernel_affine__` env
+// flag remains wired in `synthesize_inner` for the
+// `collect_data_literals` seeding gate (which is the next migration
+// target — DLS / RDC / LCI per §9.45.8).
 
 // ────────────────────────────────────────────────────────────────────────────
 // Tests

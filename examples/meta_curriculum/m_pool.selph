@@ -1,0 +1,386 @@
+; ─────────────────────────────────────────────────────────────────────────
+; m_pool: shared pool builder for M8-M12 (§9.45.12.2 refactor)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; The pre-§9.45.12 M-stages each built their own narrow pool, which led
+; to the per-stage pool isolation gap documented in §9.45.12: M9 had
+; base atoms, M11 had base + products, M12 had base only, and none
+; could see what the others built. The cheap fixes patched M9b/M11ext
+; per-stage but left two failures (decay_N, lorentz_gamma) that need
+; pool entries no individual stage's local builder could reach.
+;
+; This file replaces the per-stage builders with a single
+; `(make-pool spec flags)` function. Each M-stage calls it with its
+; own flag combination. New coverage extensions are now one-line flag
+; flips, not new pool-building code.
+;
+; Pool entry shape:
+;
+;   (ns ("source" Node)        ; the AST node for the expression
+;       ("col"    list-of-num) ; the behavior column over spec inputs
+;       ("kind"   string))     ; tag for diagnostics
+;
+; Flags (in the flags ns):
+;
+;   "products"     — pairwise products of base atoms (M11 needs)
+;   "unary-l1"     — single-level unary wraps over base + products
+;                    (M9, M10, M11 form 4 need)
+;   "unary-l2"     — second-level unary wraps over L1 entries
+;                    (decay_N: exp(negate(λ·t)) needs)
+;   "libs"         — library function calls over position tuples
+;                    (lorentz_gamma: lorentz_defect((v,c)) needs)
+;   "constants"    — data-extracted primitive constants from M13
+;                    (lorentz_gamma: h=1 needs)
+;
+; Defaults: all false. M-stages must opt in.
+
+; ── Spec helpers (inlined; same as M0) ───────────────────────────────
+
+(define m-pool-spec-inputs  (lambda (s) (ns-get s "inputs")))
+(define m-pool-spec-outputs (lambda (s) (ns-get s "outputs")))
+(define m-pool-spec-arity   (lambda (s) (ns-get s "arity")))
+
+; ── Numeric / finite predicates ──────────────────────────────────────
+
+(define m-pool-num? (lambda (v) (or (int? v) (num? v))))
+
+(define m-pool-finite?
+  (lambda (v)
+    (and (m-pool-num? v)
+         (and (= v v)
+              (< (abs v) 1000000000000000.0)))))
+
+(define m-pool-all-finite?
+  (lambda (col)
+    (reduce (lambda (acc v) (and acc (m-pool-finite? v))) col true)))
+
+; Boolean flag accessor: returns true iff `flags` has key bound to true.
+(define m-pool-flag?
+  (lambda (flags key)
+    (if (ns-has flags key)
+      (= (ns-get flags key) true)
+      false)))
+
+; ── Pool entry constructor ───────────────────────────────────────────
+
+(define m-pool-entry
+  (lambda (source col kind)
+    (ns ("source" source) ("col" col) ("kind" kind))))
+
+(define m-pool-entry-source (lambda (e) (ns-get e "source")))
+(define m-pool-entry-col    (lambda (e) (ns-get e "col")))
+(define m-pool-entry-kind   (lambda (e) (ns-get e "kind")))
+
+; ── Unary op catalogue (shared) ──────────────────────────────────────
+
+(define m-pool-unary-ops
+  (list
+    (list "sqrt"   (lambda (v) (sqrt v)))
+    (list "log"    (lambda (v) (log v)))
+    (list "exp"    (lambda (v) (exp v)))
+    (list "sin"    (lambda (v) (sin v)))
+    (list "cos"    (lambda (v) (cos v)))
+    (list "abs"    (lambda (v) (abs v)))
+    (list "negate" (lambda (v) (negate v)))))
+
+; ── Level 0: indexed atoms ───────────────────────────────────────────
+
+(define m-pool-l0
+  (lambda (s)
+    (let ((arity (m-pool-spec-arity s))
+          (inputs (m-pool-spec-inputs s)))
+      (map
+        (lambda (i)
+          (m-pool-entry
+            (make-app "nth" (make-symbol "x") (make-int i))
+            (map (lambda (row) (nth row i)) inputs)
+            "atom"))
+        (range arity)))))
+
+; ── Pairwise products of a list of pool entries ──────────────────────
+;
+; Ordered pairs (e1, e2) including (i, i). Mirrors M11's product
+; builder. The composed column is the elementwise product of e1's
+; and e2's columns.
+
+(define m-pool-pairwise-mul-cols
+  (lambda (a b)
+    (map (lambda (pair) (multiply (head pair) (head (tail pair))))
+         (zip a b))))
+
+(define m-pool-products
+  (lambda (entries)
+    (reduce append
+      (map
+        (lambda (e1)
+          (map
+            (lambda (e2)
+              (m-pool-entry
+                (make-app "multiply" (m-pool-entry-source e1) (m-pool-entry-source e2))
+                (m-pool-pairwise-mul-cols (m-pool-entry-col e1) (m-pool-entry-col e2))
+                "product"))
+            entries))
+        entries)
+      (list))))
+
+; ── Unary wraps of a list of pool entries ────────────────────────────
+;
+; For each entry × each unary op, build the wrapped entry. Drop wraps
+; whose column is non-finite (e.g., log of zero, sqrt of negative).
+
+(define m-pool-wrap-entry
+  (lambda (entry op-pair)
+    (let ((op-name (head op-pair))
+          (op-fn (head (tail op-pair))))
+      (let ((wrapped-col (try (map op-fn (m-pool-entry-col entry)) nil)))
+        (if (or (nil? wrapped-col) (not (m-pool-all-finite? wrapped-col)))
+          nil
+          (m-pool-entry
+            (make-app op-name (m-pool-entry-source entry))
+            wrapped-col
+            (concat "wrap-" op-name)))))))
+
+(define m-pool-unary-wraps
+  (lambda (entries)
+    (filter (lambda (e) (not (nil? e)))
+      (reduce append
+        (map (lambda (entry)
+               (map (lambda (op) (m-pool-wrap-entry entry op)) m-pool-unary-ops))
+             entries)
+        (list)))))
+
+; ── Library function calls ───────────────────────────────────────────
+;
+; For each Function in env-functions whose effective arity ≤ parent
+; arity, build a behavior column for each ordered position-tuple of
+; that arity. Returns a list of pool entries, one per (lib, tuple)
+; combination.
+;
+; Implementation note: this duplicates some of M7's logic. We could
+; share more, but for now the simpler standalone version is cleaner.
+
+(define m-pool-safe-apply
+  (lambda (f arg-list)
+    (try (apply f arg-list) nil)))
+
+(define m-pool-effective-arity
+  (lambda (lib-fn parent-inputs)
+    ; Smallest k that succeeds. Same fix as M7's effective-arity.
+    (let ((sample-row (head parent-inputs)))
+      (if (list? sample-row)
+        (let ((max-k (length sample-row)))
+          (reduce
+            (lambda (acc i)
+              (if (not (nil? acc))
+                acc
+                (let ((k (+ i 1)))
+                  (let ((sublist (slice sample-row 0 k)))
+                    (let ((res (m-pool-safe-apply lib-fn (list sublist))))
+                      (if (nil? res) nil k))))))
+            (range max-k)
+            nil))
+        nil))))
+
+(define m-pool-ordered-tuples
+  (lambda (n k)
+    (if (= k 0)
+      (list (list))
+      (let ((shorter (m-pool-ordered-tuples n (- k 1))))
+        (reduce append
+          (map
+            (lambda (tup)
+              (map
+                (lambda (i) (cons i tup))
+                (filter
+                  (lambda (i) (not (contains tup i)))
+                  (range n))))
+            shorter)
+          (list))))))
+
+(define m-pool-build-lib-call
+  (lambda (lib-name positions)
+    (let ((nth-args (map (lambda (i) (make-app "nth" (make-symbol "x") (make-int i))) positions)))
+      (let ((list-node (apply make-app (cons (make-symbol "list") nth-args))))
+        (make-app lib-name list-node)))))
+
+(define m-pool-lib-column
+  (lambda (lib-fn positions inputs)
+    (let ((cols (map
+                  (lambda (row)
+                    (let ((sub (map (lambda (p) (nth row p)) positions)))
+                      (m-pool-safe-apply lib-fn (list sub))))
+                  inputs)))
+      (if (reduce (lambda (acc v) (and acc (and (not (nil? v)) (m-pool-num? v))))
+                  cols
+                  true)
+        cols
+        nil))))
+
+; §9.45.13: read `__synth_skip__` if present and exclude those names
+; from the library catalogue. This mirrors what synth_v2's
+; `library_components_from_env` does (synth_v2.rs:1117), so the same
+; helper-filtering rule applies whether the kernel or m-pool is
+; building the catalogue. Without this, m-pool-libs would include
+; every M-stage helper function in env, which would massively bloat
+; the pool and slow things down on grow-v2 runs.
+
+(define m-pool-skip-set
+  (lambda ()
+    (try __synth_skip__ (list))))
+
+(define m-pool-in-skip?
+  (lambda (name)
+    (contains (m-pool-skip-set) name)))
+
+(define m-pool-libs
+  (lambda (s)
+    (let ((parent-arity (m-pool-spec-arity s))
+          (inputs (m-pool-spec-inputs s)))
+      (let ((lib-names
+              (filter (lambda (n) (not (m-pool-in-skip? n)))
+                      (ns-keys (env-functions)))))
+        (reduce append
+          (map
+            (lambda (name)
+              (let ((lib-fn (ns-get (env-functions) name)))
+                (let ((eff-arity (m-pool-effective-arity lib-fn inputs)))
+                  (if (or (nil? eff-arity) (> eff-arity parent-arity))
+                    (list)
+                    (let ((tuples (m-pool-ordered-tuples parent-arity eff-arity)))
+                      (filter (lambda (e) (not (nil? e)))
+                        (map
+                          (lambda (positions)
+                            (let ((col (m-pool-lib-column lib-fn positions inputs)))
+                              (if (nil? col)
+                                nil
+                                (m-pool-entry
+                                  (m-pool-build-lib-call name positions)
+                                  col
+                                  (concat "lib-" name)))))
+                          tuples)))))))
+            lib-names)
+          (list))))))
+
+; ── Constants from data atoms (via M13's extract pattern) ────────────
+;
+; Walk inputs and outputs, collect unique primitive numeric values,
+; emit them as pool entries with constant columns. The "source" is
+; a Num literal node and the "col" is a list of N copies of the
+; constant. M12 needs these to express shapes like 1/sqrt(g) where
+; the 1 is a literal.
+
+(define m-pool-unwrap-one
+  (lambda (v) (if (list? v) v (list v))))
+
+(define m-pool-concat-lists
+  (lambda (xss) (reduce append xss (list))))
+
+(define m-pool-dedup-num
+  (lambda (xs)
+    (reduce
+      (lambda (acc x)
+        (if (contains acc x) acc (append acc (list x))))
+      xs
+      (list))))
+
+; Common math constants always seeded: 0, 1, -1, 2. The kernel
+; literal pool seeded these unconditionally; data extraction alone
+; misses them when they don't appear in spec inputs/outputs (e.g.
+; lorentz_gamma's data has no exact 1, but the formula
+; `1/sqrt(1-v²/c²)` needs the constant 1 in the pool to express
+; the outer reciprocal).
+(define m-pool-baseline-constants
+  (list 0 1 (negate 1) 2))
+
+(define m-pool-constants
+  (lambda (s)
+    (let ((inputs (m-pool-spec-inputs s))
+          (outputs (m-pool-spec-outputs s))
+          (n-rows (length (m-pool-spec-inputs s))))
+      (let ((all-vals
+              (append
+                m-pool-baseline-constants
+                (m-pool-concat-lists
+                  (append
+                    (map m-pool-unwrap-one inputs)
+                    (map m-pool-unwrap-one outputs))))))
+        (let ((unique-nums (m-pool-dedup-num (filter m-pool-num? all-vals))))
+          (map
+            (lambda (n)
+              (m-pool-entry
+                (if (int? n) (make-int n) (make-num n))
+                (map (lambda (_) n) (range n-rows))
+                (concat "const-" (to-string n))))
+            unique-nums))))))
+
+; ── Top-level: make-pool ─────────────────────────────────────────────
+;
+; Build a pool with the requested levels and inclusions. The order of
+; assembly matters because L1/L2 wraps depend on what's already in
+; the pool.
+
+(define make-pool
+  (lambda (s flags)
+    (let ((base (m-pool-l0 s)))
+      ; Start with base atoms.
+      (let ((with-products
+              (if (m-pool-flag? flags "products")
+                (append base (m-pool-products base))
+                base)))
+        ; L1 unary wraps cover base + products.
+        (let ((with-unary-l1
+                (if (m-pool-flag? flags "unary-l1")
+                  (append with-products (m-pool-unary-wraps with-products))
+                  with-products)))
+          ; L2 unary wraps re-wrap entries that are themselves wraps.
+          ; Only the wrap-* entries from L1 are re-wrapped (re-wrapping
+          ; base atoms or products would just duplicate L1 entries).
+          (let ((with-unary-l2
+                  (if (m-pool-flag? flags "unary-l2")
+                    (let ((l1-wraps
+                            (filter
+                              (lambda (e)
+                                (let ((k (m-pool-entry-kind e)))
+                                  (and (>= (string-length k) 5)
+                                       (= (string-take k 5) "wrap-"))))
+                              with-unary-l1)))
+                      (append with-unary-l1 (m-pool-unary-wraps l1-wraps)))
+                    with-unary-l1)))
+            ; Library function calls (independent of L0/L1/L2).
+            (let ((with-libs
+                    (if (m-pool-flag? flags "libs")
+                      (append with-unary-l2 (m-pool-libs s))
+                      with-unary-l2)))
+              ; Constants from data atoms.
+              (let ((with-constants
+                      (if (m-pool-flag? flags "constants")
+                        (append with-libs (m-pool-constants s))
+                        with-libs)))
+                with-constants))))))))
+
+; ── Smoke test ───────────────────────────────────────────────────────
+
+(define m-pool-test-spec
+  (ns ("inputs"  (list (list 1.0 2.0) (list 3.0 4.0) (list 5.0 6.0)))
+      ("outputs" (list 5.0 25.0 61.0))
+      ("arity"   2)))
+
+(print "─── m_pool smoke test ───")
+(print (concat "  L0 only: "
+               (to-string (length (make-pool m-pool-test-spec (ns))))
+               " entries"))
+(print (concat "  +products: "
+               (to-string (length (make-pool m-pool-test-spec (ns ("products" true)))))
+               " entries"))
+(print (concat "  +unary-l1: "
+               (to-string (length (make-pool m-pool-test-spec
+                                    (ns ("products" true) ("unary-l1" true)))))
+               " entries"))
+(print (concat "  +unary-l2: "
+               (to-string (length (make-pool m-pool-test-spec
+                                    (ns ("products" true) ("unary-l1" true) ("unary-l2" true)))))
+               " entries"))
+(print (concat "  +constants: "
+               (to-string (length (make-pool m-pool-test-spec
+                                    (ns ("products" true) ("unary-l1" true) ("constants" true)))))
+               " entries"))

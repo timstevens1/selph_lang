@@ -371,6 +371,23 @@ impl Env {
     pub fn top_scope(&self) -> std::cell::Ref<'_, Scope> {
         self.inner.scope.borrow()
     }
+
+    /// Snapshot every binding visible from this env, walking the scope
+    /// chain top-first and deduplicating by Sym (top wins, matching
+    /// shadowing semantics). Used by `(env-functions)` so SELPH can
+    /// enumerate library functions regardless of which call frame the
+    /// caller happens to be in.
+    pub fn collect_bindings(&self) -> Scope {
+        let mut out: Scope = Scope::new();
+        let mut node = Some(&self.inner);
+        while let Some(n) = node {
+            for (k, v) in n.scope.borrow().iter() {
+                out.entry(*k).or_insert_with(|| v.clone());
+            }
+            node = n.parent.as_ref();
+        }
+        out
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────

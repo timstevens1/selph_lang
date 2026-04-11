@@ -1,0 +1,201 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M12: structural pair fit (Form S)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Replaces affine fit Form S (synth_v2.rs:6415–6481) per the §9.45
+; migration plan. Form S detects shapes where the outer combiner is
+; binary, the inner is a unary wrap, and there is NO constant to fit:
+;
+;   target == op_b(h, op_u(g))
+;
+; for op_b ∈ {add, sub, mul, div} and op_u ∈ {sqrt, log, exp, sin,
+; cos, abs, negate}. Examples: A·cos(ωt) (with ω embedded), m·sqrt(k),
+; v − sin(t).
+;
+; Cost: pool² × 4 binary × 7 unary = 28 · pool². For arity ≤ 5 base
+; pool that's at most 700 attempts — trivial. The shape matches via
+; pure column comparison; there's no scalar fit to solve.
+
+; ── Inlined helpers (M0 + M9) ────────────────────────────────────────
+
+(define spec-inputs    (lambda (s) (ns-get s "inputs")))
+(define spec-outputs   (lambda (s) (ns-get s "outputs")))
+(define spec-arity     (lambda (s) (ns-get s "arity")))
+(define make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+(define m12-num? (lambda (v) (or (int? v) (num? v))))
+
+(define m12-approx-eq
+  (lambda (a b)
+    (let ((diff (abs (subtract a b)))
+          (scale (max (abs a) (max (abs b) 1.0))))
+      (< (divide diff scale) 0.000000001))))
+
+(define m12-cols-approx-eq
+  (lambda (xs ys)
+    (if (= (length xs) (length ys))
+      (reduce
+        (lambda (acc pair) (and acc (m12-approx-eq (head pair) (head (tail pair)))))
+        (zip xs ys)
+        true)
+      false)))
+
+(define m12-num-target
+  (lambda (s)
+    (let ((outs (spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (m12-num? v))) outs true)
+        outs nil))))
+
+; §9.45.13 refactor: m12-finite?, m12-all-finite?, m12-unary-ops,
+; and m12-build-pool are gone — they live in m_pool.selph now as
+; m-pool-finite?, m-pool-all-finite?, m-pool-unary-ops, and the
+; flag-driven `make-pool`. The detection loop below uses the
+; m-pool-* names directly.
+
+(define m12-binary-ops
+  (list
+    (list "add"      (lambda (a b) (add a b)))
+    (list "subtract" (lambda (a b) (subtract a b)))
+    (list "multiply" (lambda (a b) (multiply a b)))
+    (list "divide"   (lambda (a b) (divide a b)))))
+
+(define m12-pool-source (lambda (e) (ns-get e "source")))
+(define m12-pool-col    (lambda (e) (ns-get e "col")))
+
+; ── Source emission ──────────────────────────────────────────────────
+
+; (lambda (x) (op_b h-source (op_u g-source)))
+(define m12-emit-form-s
+  (lambda (op-b-name h-source op-u-name g-source)
+    (make-lambda (list "x")
+      (make-app op-b-name
+        h-source
+        (make-app op-u-name g-source)))))
+
+; ── Detection ────────────────────────────────────────────────────────
+
+(define detect-structural-pair
+  (lambda (s)
+    (let ((target (m12-num-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-numeric target"))
+        ; §9.45.12.2 refactor: use the shared `make-pool` from
+        ; m_pool.selph. M12's pool now includes products, library
+        ; calls, and data-extracted constants. This is what lets
+        ; form S match `1/√(lorentz_defect((v,c)))` (lorentz_gamma):
+        ; h=1 comes from constants, g=lorentz_defect call comes
+        ; from libs, op_b=divide and op_u=sqrt match structurally.
+        (let ((pool (make-pool s
+                      (ns ("products" true)
+                          ("libs" true)
+                          ("constants" true)))))
+          (let ((result
+                  (reduce
+                    (lambda (acc op-b-pair)
+                      (if (not (nil? acc)) acc
+                        (let ((op-b-name (head op-b-pair))
+                              (op-b-fn (head (tail op-b-pair))))
+                          (reduce
+                            (lambda (acc2 h-entry)
+                              (if (not (nil? acc2)) acc2
+                                (reduce
+                                  (lambda (acc3 g-entry)
+                                    (if (not (nil? acc3)) acc3
+                                      (reduce
+                                        (lambda (acc4 op-u-pair)
+                                          (if (not (nil? acc4)) acc4
+                                            (let ((op-u-name (head op-u-pair))
+                                                  (op-u-fn (head (tail op-u-pair))))
+                                              (let ((wrapped (try
+                                                               (map op-u-fn (m12-pool-col g-entry))
+                                                               nil)))
+                                                (if (or (nil? wrapped)
+                                                        (not (m-pool-all-finite? wrapped)))
+                                                  nil
+                                                  (let ((predicted (try
+                                                                     (map (lambda (pair)
+                                                                            (op-b-fn (head pair) (head (tail pair))))
+                                                                          (zip (m12-pool-col h-entry) wrapped))
+                                                                     nil)))
+                                                    (if (or (nil? predicted)
+                                                            (not (m-pool-all-finite? predicted)))
+                                                      nil
+                                                      (if (m12-cols-approx-eq predicted target)
+                                                        (ns ("kind" "form-s")
+                                                            ("op-b" op-b-name)
+                                                            ("op-u" op-u-name)
+                                                            ("source-node"
+                                                              (m12-emit-form-s
+                                                                op-b-name
+                                                                (m12-pool-source h-entry)
+                                                                op-u-name
+                                                                (m12-pool-source g-entry))))
+                                                        nil))))))))
+                                        m-pool-unary-ops nil)))
+                                  pool nil)))
+                            pool nil))))
+                    m12-binary-ops
+                    nil)))
+            (if (nil? result)
+              (ns ("found" false) ("reason" "no shape matched"))
+              (let ((node (ns-get result "source-node")))
+                (ns-put
+                  (ns-put result "found" true)
+                  "function" (eval-node node))))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+; Test 1: f((m, k)) = m · sqrt(k). op_b=multiply, op_u=sqrt.
+(define m-sqrt-k-spec
+  (make-spec
+    (list (list 1.0 1.0) (list 2.0 4.0) (list 3.0 9.0) (list 5.0 16.0))
+    (list 1.0 4.0 9.0 20.0)
+    2))
+
+; Test 2: f((a, b)) = a + log(b). op_b=add, op_u=log.
+(define a-plus-log-b-spec
+  (make-spec
+    (list (list 0.0 2.71828182845904)
+          (list 1.0 7.38905609893065)
+          (list 2.0 20.0855369231877))
+    (list 1.0 3.0 5.0)
+    2))
+
+; Test 3: f((a, b)) = a / exp(b). op_b=divide, op_u=exp.
+(define a-div-exp-b-spec
+  (make-spec
+    (list (list 1.0 0.0) (list 2.0 1.0) (list 4.0 2.0))
+    (list 1.0 0.7357588823428847 0.5413411329464508)
+    2))
+
+(define m12-run-test
+  (lambda (label spec)
+    (do
+      (print (concat "─── " label " ───"))
+      (let ((result (detect-structural-pair spec)))
+        (if (ns-get result "found")
+          (do
+            (print (concat "  ✓ op-b=" (ns-get result "op-b")
+                           " op-u=" (ns-get result "op-u")))
+            ; NOTE: must NOT bind a name that shadows a builtin (like
+            ; `exp` for the natural exponent) in the same let as a
+            ; function value — SELPH's letrec patches every function
+            ; in the frame to see the let's bindings, and the captured
+            ; closure would then resolve `exp` to the local Int.
+            (let ((fn (ns-get result "function"))
+                  (row (head (spec-inputs spec)))
+                  (expected-val (head (spec-outputs spec))))
+              (let ((got (fn row)))
+                (print (concat "  verify: " (to-string row) " → "
+                               (to-string got)
+                               " (expected " (to-string expected-val) ")"
+                               (if (m12-approx-eq got expected-val) "  ✓" "  ✗"))))))
+          (print (concat "  ✗ not found: " (ns-get result "reason"))))))))
+
+(m12-run-test "f((m,k)) = m·sqrt(k)" m-sqrt-k-spec)
+(print "")
+(m12-run-test "f((a,b)) = a + log(b)" a-plus-log-b-spec)
+(print "")
+(m12-run-test "f((a,b)) = a / exp(b)" a-div-exp-b-spec)

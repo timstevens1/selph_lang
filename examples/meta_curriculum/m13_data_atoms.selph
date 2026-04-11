@@ -1,0 +1,167 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M13: data-atom extraction
+; ─────────────────────────────────────────────────────────────────────────
+;
+; The §9.41 kernel pass `collect_data_literals` (synth_v2.rs:5311) walks
+; a spec's inputs and outputs, collects unique primitive values
+; (Int / Num / Str / Bool), and seeds them as depth-0 literal atoms in
+; the synth pool. This is the "scan-data-for-atoms" primitive listed
+; in §9.45.2 — one of the three meta-recognition foundations.
+;
+; M13 reimplements `collect_data_literals` in pure SELPH. The output is
+; a deduplicated list of primitive values drawn from the spec's
+; inputs and outputs, with one-level list unwrapping (matching the
+; kernel pass's `scan` helper).
+;
+; Once M13 lands and validates, the kernel pass and the seeding block
+; in `synthesize_inner` (synth_v2.rs:5953-5983) become deletable per
+; the §9.45.6 migration gate.
+;
+; ── Inlined spec helpers (M0-style) ──────────────────────────────────
+
+(define spec-inputs    (lambda (s) (ns-get s "inputs")))
+(define spec-outputs   (lambda (s) (ns-get s "outputs")))
+(define spec-arity     (lambda (s) (ns-get s "arity")))
+(define make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+; ── Primitive predicate ───────────────────────────────────────────────
+;
+; The kernel pass collects Int, Num, Str, Bool — everything with a
+; LiteralKind. Lists, namespaces, functions, and nodes are skipped.
+; `primitive?` is the SELPH-side gate.
+
+(define primitive?
+  (lambda (v)
+    (or (int? v)
+        (or (num? v)
+            (or (string? v) (bool? v))))))
+
+; ── One-level unwrap ──────────────────────────────────────────────────
+;
+; The kernel `scan` helper expands a list one level: each item becomes
+; a separate visit. Non-list values are visited directly.
+;
+; `unwrap-one` returns a list of values to visit for the given input.
+
+(define unwrap-one
+  (lambda (v)
+    (if (list? v) v (list v))))
+
+; ── Dedup ─────────────────────────────────────────────────────────────
+;
+; SELPH's `contains` uses values_equal under the hood, so it works
+; uniformly across Int / Num / Str / Bool. Build the deduped list by
+; folding once: append each new element only if not already present.
+;
+; NOTE on Int/Num coercion: values_equal treats `1` (Int) and `1.0`
+; (Num) as equal, so dedup collapses them to one entry. The kernel
+; pass `collect_data_literals` keeps them distinct (HashSet<i64> for
+; Int, HashSet<u64> for Num via to_bits). For M7's downstream use
+; case (numeric fitting and binary-op constant wrapping) the value
+; is what matters; the type is implicit in the value itself, so the
+; collapse is benign. If a future consumer needs the type-tagged
+; form, this is the layer to extend.
+
+(define dedup
+  (lambda (xs)
+    (reduce
+      (lambda (acc x)
+        (if (contains acc x) acc (append acc (list x))))
+      xs
+      (list))))
+
+; ── Flatten one level over a list of rows ────────────────────────────
+;
+; `(reduce append xss (list))` collapses a list-of-lists into a single
+; list. Used to fold the unwrapped input rows into one stream.
+; Note: SELPH's reduce signature is `(reduce f list init)`, not the
+; (more common) `(reduce f init list)`.
+
+(define concat-lists
+  (lambda (xss)
+    (reduce append xss (list))))
+
+; ── Core: extract-data-atoms ─────────────────────────────────────────
+;
+; Walk the spec's inputs (each potentially a list — one-level unwrap)
+; and outputs (one-level unwrap as well), filter to primitive values,
+; and dedupe.
+;
+; Output ordering: inputs first, then outputs, in row order. The
+; kernel pass uses HashSet insertion order so the output order is
+; nondeterministic; M13's order is deterministic, which is a strict
+; improvement.
+
+(define extract-data-atoms
+  (lambda (s)
+    (let ((input-stream  (concat-lists (map unwrap-one (spec-inputs s))))
+          (output-stream (concat-lists (map unwrap-one (spec-outputs s)))))
+      (let ((all (append input-stream output-stream)))
+        (dedup (filter primitive? all))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(define show-test
+  (lambda (label spec)
+    (do
+      (print (concat "─── " label " ───"))
+      (let ((atoms (extract-data-atoms spec)))
+        (do
+          (print (concat "  count: " (to-string (length atoms))))
+          (print (concat "  atoms: " (to-string atoms))))))))
+
+; Test 1: 2-arg numeric spec (oscillator-style).
+;   inputs: (m, k) pairs; outputs: scalar
+;   atoms expected: {1, 2, 4, 0.5, 1.5} (or similar mix)
+(define osc-grid
+  (make-spec
+    (list (list 1 1) (list 1 2) (list 2 1) (list 2 2))
+    (list 1.0 0.5 2.0 1.0)
+    2))
+
+(show-test "2-arg numeric (osc-style)" osc-grid)
+
+; Test 2: kinematic_s — the §9.41 motivating example.
+;   inputs: (u, a, t) triples; outputs: u·t + ½·a·t²
+;   atoms expected: {0.5, 0.25, 1.5, 0.28125, 1.03125, ...}
+;   Critically: 0.125 is NOT present (the kernel pass had to seed it
+;   from the existing literal pool — not via data extraction).
+(define kinematic-s-grid
+  (make-spec
+    (list (list 0.5  0.25 0.5)
+          (list 0.5  0.25 1.5)
+          (list 1.5  0.25 0.5)
+          (list 1.5  0.25 1.5))
+    (list 0.28125 1.03125 0.78125 2.53125)
+    3))
+
+(show-test "kinematic_s (3-arg with constants)" kinematic-s-grid)
+
+; Test 3: string spec — verify primitive? handles String and Bool.
+(define string-spec
+  (make-spec
+    (list (list "abc") (list "def"))
+    (list "ABC" "DEF")
+    1))
+
+(show-test "single-arg string spec" string-spec)
+
+; Test 4: mixed bool/int spec.
+(define mixed-spec
+  (make-spec
+    (list (list 1 true) (list 2 false) (list 3 true))
+    (list 1 0 1)
+    2))
+
+(show-test "mixed int + bool spec" mixed-spec)
+
+; Test 5: dedup verification — repeated values must collapse.
+(define dup-spec
+  (make-spec
+    (list (list 1 1) (list 1 1) (list 1 1))
+    (list 1 1 1)
+    2))
+
+(show-test "all-duplicates spec (should collapse to (1))" dup-spec)

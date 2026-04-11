@@ -1,0 +1,572 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M7: n-ary library detection
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Replaces the §9.42 Form L kernel pass (synth_v2.rs:6483-6624) and
+; the §9.27 RD generic binary inversion (synth_v2.rs:4247-4380), per
+; the §9.45 migration plan.
+;
+; Algorithm (§9.45.4):
+;
+;   For each library function L visible in the env:
+;     Determine L's effective arity by probing.
+;     For each ordered k-tuple of positions (p₁, …, p_k) drawn from
+;       {0, …, parent_arity − 1} (k = L's effective arity, no repeats):
+;         Compute the behaviour column: L applied to the selected
+;           positions of every input row.
+;         If the column equals the target column → emit the direct
+;           call.
+;         Otherwise, for each binary op ∈ {add, sub, mul, div}:
+;           For each constant K from `extract-data-atoms`:
+;             If column op_b K matches target → emit (op_b (L …) K).
+;             If K op_b column matches target → emit (op_b K (L …)).
+;         Otherwise, for each binary op_b in {add, sub, mul, div}:
+;           If (op_b column column) matches target → emit
+;             (op_b (L …) (L …)).
+;
+; Affine-wrap shapes (`h + C·L(…)`) are deferred to M10 (M7's
+; sibling stage). Self-pair shapes are included here because they
+; cover the cheap "T squared" / "T plus T" cases that the §9.44
+; oscillator family exposed.
+;
+; Success criterion (§9.44.7): the osc_freq task — `(divide 1
+; (osc-T x))` — should solve via this stage in O(libs × ops ×
+; constants) candidates, not via affine re-derivation.
+;
+; ── Inlined helpers (M0 + M13) ───────────────────────────────────────
+
+(define spec-inputs    (lambda (s) (ns-get s "inputs")))
+(define spec-outputs   (lambda (s) (ns-get s "outputs")))
+(define spec-arity     (lambda (s) (ns-get s "arity")))
+(define make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+; Primitive predicate (from M13).
+(define m7-primitive?
+  (lambda (v)
+    (or (int? v) (num? v) (string? v) (bool? v))))
+
+; One-level unwrap (from M13).
+(define m7-unwrap-one
+  (lambda (v) (if (list? v) v (list v))))
+
+; Concat (from M13). Note: SELPH reduce is `(reduce f list init)`.
+(define m7-concat-lists
+  (lambda (xss) (reduce append xss (list))))
+
+; Dedup (from M13).
+(define m7-dedup
+  (lambda (xs)
+    (reduce
+      (lambda (acc x) (if (contains acc x) acc (append acc (list x))))
+      xs
+      (list))))
+
+; Data-atom extraction (M13's main entry point, inlined).
+(define m7-extract-atoms
+  (lambda (s)
+    (let ((in-stream  (m7-concat-lists (map m7-unwrap-one (spec-inputs s))))
+          (out-stream (m7-concat-lists (map m7-unwrap-one (spec-outputs s)))))
+      (m7-dedup (filter m7-primitive? (append in-stream out-stream))))))
+
+; ── Numeric helpers ──────────────────────────────────────────────────
+
+; Approximate equality (matches the kernel's 1e-9 tolerance).
+(define m7-approx-eq
+  (lambda (a b)
+    (let ((diff (abs (subtract a b)))
+          (scale (max (abs a) (max (abs b) 1.0))))
+      (< (divide diff scale) 0.000000001))))
+
+; Compare two numeric columns under approx equality.
+(define m7-cols-approx-eq
+  (lambda (xs ys)
+    (if (= (length xs) (length ys))
+      (reduce
+        (lambda (acc pair) (and acc (m7-approx-eq (head pair) (head (tail pair)))))
+        (zip xs ys)
+        true)
+      false)))
+
+; ── Ordered position tuple generation ────────────────────────────────
+;
+; `ordered-tuples n k` returns every ordered k-tuple of distinct
+; integers drawn from {0, …, n−1}. For (n=2, k=1) → ((0) (1)). For
+; (n=3, k=2) → ((1 0) (2 0) (0 1) (2 1) (0 2) (1 2)).
+;
+; This is the cost dominator from §9.45.4: arity!/(arity−k)! tuples
+; per library. For physics-class problems (arity ≤ 5, k_lib ≤ 3) the
+; total is small (≤ 60 per library function).
+
+(define m7-ordered-tuples
+  (lambda (n k)
+    (if (= k 0)
+      (list (list))
+      (let ((shorter (m7-ordered-tuples n (- k 1))))
+        (m7-concat-lists
+          (map
+            (lambda (tup)
+              (map
+                (lambda (i) (cons i tup))
+                (filter
+                  (lambda (i) (not (contains tup i)))
+                  (range n))))
+            shorter))))))
+
+; ── Library probing ──────────────────────────────────────────────────
+;
+; A multi-arg library function in synth_v2 land has SELPH arity 1 — it
+; takes a single list parameter and accesses positions via `nth`. The
+; "effective arity" is the length of that list.
+;
+; Probe by trying lists of length 1..parent_arity and returning the
+; smallest length that doesn't error. This is the SELPH analogue of
+; the kernel's trial-application probe.
+
+(define m7-safe-apply
+  (lambda (f arg-list)
+    (try (apply f arg-list) nil)))
+
+(define m7-effective-arity
+  (lambda (lib-fn parent-inputs)
+    ; §9.45.12.1 fix: return the SMALLEST k for which the function
+    ; succeeds, not the largest. Many synthesized library functions
+    ; (e.g., `lorentz_defect`) accept any list ≥ their true arity
+    ; because they only `nth` the prefix they care about — the
+    ; trailing elements get silently ignored. Probing largest-first
+    ; would over-report (returning parent_arity), leaving no unused
+    ; positions for h-times-lib shapes.
+    ;
+    ; Iterate k from 1 up to max-k. Return the first k that doesn't
+    ; error.
+    (let ((sample-row (head parent-inputs)))
+      (if (list? sample-row)
+        (let ((max-k (length sample-row)))
+          (reduce
+            (lambda (acc i)
+              (if (not (nil? acc))
+                acc
+                (let ((k (+ i 1)))
+                  (let ((sublist (slice sample-row 0 k)))
+                    (let ((res (m7-safe-apply lib-fn (list sublist))))
+                      (if (nil? res) nil k))))))
+            (range max-k)
+            nil))
+        nil))))
+
+; ── Behaviour columns ────────────────────────────────────────────────
+;
+; For a library function L and a position tuple T, return the column
+; vector  [L((row[t₁] for t₁ in T))  for row in inputs].  Returns nil
+; if any application errors or yields a non-numeric value.
+
+(define m7-num?
+  (lambda (v) (or (int? v) (num? v))))
+
+(define m7-behavior-column
+  (lambda (lib-fn positions inputs)
+    (let ((cols (map
+                  (lambda (row)
+                    (let ((sub (map (lambda (p) (nth row p)) positions)))
+                      (m7-safe-apply lib-fn (list sub))))
+                  inputs)))
+      (if (reduce (lambda (acc v) (and acc (and (not (nil? v)) (m7-num? v))))
+                  cols
+                  true)
+        cols
+        nil))))
+
+; Convert any spec output column into a list of numeric values, or
+; return nil if any element is non-numeric.
+(define m7-num-target-col
+  (lambda (s)
+    (let ((outs (spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (m7-num? v))) outs true)
+        outs
+        nil))))
+
+; ── Source-AST construction ──────────────────────────────────────────
+;
+; Convert a primitive value to a Node literal.
+(define m7-value-to-node
+  (lambda (v)
+    (if (int? v) (make-int v)
+      (if (num? v) (make-num v)
+        (if (string? v) (make-str v)
+          (if (bool? v) (make-bool v)
+            (error "m7-value-to-node: unsupported value")))))))
+
+; Build the Node `(nth x i)` for a given position index.
+(define m7-nth-of-x
+  (lambda (i)
+    (make-app "nth" (make-symbol "x") (make-int i))))
+
+; Build the Node `(L (list (nth x p₁) (nth x p₂) …))` for a library
+; function name and a list of positions.
+(define m7-build-lib-call
+  (lambda (lib-name positions)
+    (let ((nth-args (map m7-nth-of-x positions)))
+      (let ((list-node (apply make-app (cons (make-symbol "list") nth-args))))
+        (make-app lib-name list-node)))))
+
+; Wrap a body Node in `(lambda (x) <body>)`.
+(define m7-wrap-lambda
+  (lambda (body)
+    (make-lambda (list "x") body)))
+
+; Build the direct emission `(lambda (x) (L (list (nth x p₁) …)))`.
+(define m7-emit-direct
+  (lambda (lib-name positions)
+    (m7-wrap-lambda (m7-build-lib-call lib-name positions))))
+
+; Build `(lambda (x) (op_b (L …) K))` — library call combined with a
+; primitive constant on the right.
+(define m7-emit-op-right
+  (lambda (lib-name positions op-name k-val)
+    (m7-wrap-lambda
+      (make-app op-name
+        (m7-build-lib-call lib-name positions)
+        (m7-value-to-node k-val)))))
+
+; Build `(lambda (x) (op_b K (L …)))` — constant on the left.
+(define m7-emit-op-left
+  (lambda (lib-name positions op-name k-val)
+    (m7-wrap-lambda
+      (make-app op-name
+        (m7-value-to-node k-val)
+        (m7-build-lib-call lib-name positions)))))
+
+; Build `(lambda (x) (op_b (L …) (L …)))` — self-pair shape.
+(define m7-emit-self-pair
+  (lambda (lib-name positions op-name)
+    (m7-wrap-lambda
+      (make-app op-name
+        (m7-build-lib-call lib-name positions)
+        (m7-build-lib-call lib-name positions)))))
+
+; §9.45.12.1: scaled-wrapped-lib shape for `length_contract`-style
+; tasks where the parent has a "scaling" indexed atom outside the
+; lib's position tuple. Two variants:
+;
+;   (op_b (nth x h) (lib (positions)))
+;   (op_b (nth x h) (op_u (lib (positions))))
+;
+; The first covers `rel_mass = m₀·γ(v,c)`. The second covers
+; `length_contract = L₀·√(defect(v,c))`.
+
+(define m7-emit-h-times-lib
+  (lambda (h-idx lib-name positions op-b-name)
+    (m7-wrap-lambda
+      (make-app op-b-name
+        (m7-nth-of-x h-idx)
+        (m7-build-lib-call lib-name positions)))))
+
+(define m7-emit-h-times-wrapped-lib
+  (lambda (h-idx lib-name positions op-b-name op-u-name)
+    (m7-wrap-lambda
+      (make-app op-b-name
+        (m7-nth-of-x h-idx)
+        (make-app op-u-name (m7-build-lib-call lib-name positions))))))
+
+; ── Shape testers ────────────────────────────────────────────────────
+;
+; Each tester compares a candidate column against the target column.
+; The binary ops are computed in pure SELPH so we don't need to
+; round-trip through eval to verify.
+
+(define m7-binary-ops (list "add" "subtract" "multiply" "divide"))
+
+(define m7-apply-op
+  (lambda (op-name a b)
+    (if (= op-name "add") (add a b)
+      (if (= op-name "subtract") (subtract a b)
+        (if (= op-name "multiply") (multiply a b)
+          (if (= op-name "divide") (divide a b)
+            (error "m7-apply-op: unknown op")))))))
+
+; Try every (op, K) combination on column to see if it matches target.
+; Returns nil on no match, or an ns describing the matched shape.
+(define m7-try-op-wrap
+  (lambda (lib-name positions col target atoms)
+    (reduce
+      (lambda (acc op-name)
+        (if (not (nil? acc)) acc
+          (reduce
+            (lambda (acc2 k)
+              (if (not (nil? acc2)) acc2
+                (let ((right-col (try (map (lambda (v) (m7-apply-op op-name v k)) col) nil))
+                      (left-col  (try (map (lambda (v) (m7-apply-op op-name k v)) col) nil)))
+                  (if (and (not (nil? right-col)) (m7-cols-approx-eq right-col target))
+                    (ns ("kind" "op-right") ("op" op-name) ("k" k)
+                        ("source-node" (m7-emit-op-right lib-name positions op-name k)))
+                    (if (and (not (nil? left-col)) (m7-cols-approx-eq left-col target))
+                      (ns ("kind" "op-left") ("op" op-name) ("k" k)
+                          ("source-node" (m7-emit-op-left lib-name positions op-name k)))
+                      nil)))))
+            atoms
+            nil)))
+      m7-binary-ops
+      nil)))
+
+; Try every binary op on (col, col) to see if any matches target.
+(define m7-try-self-pair
+  (lambda (lib-name positions col target)
+    (reduce
+      (lambda (acc op-name)
+        (if (not (nil? acc)) acc
+          (let ((paired (try (map (lambda (v) (m7-apply-op op-name v v)) col) nil)))
+            (if (and (not (nil? paired)) (m7-cols-approx-eq paired target))
+              (ns ("kind" "self-pair") ("op" op-name)
+                  ("source-node" (m7-emit-self-pair lib-name positions op-name)))
+              nil))))
+      m7-binary-ops
+      nil)))
+
+; Direct match: column equals target.
+(define m7-try-direct
+  (lambda (lib-name positions col target)
+    (if (m7-cols-approx-eq col target)
+      (ns ("kind" "direct")
+          ("source-node" (m7-emit-direct lib-name positions)))
+      nil)))
+
+; §9.45.12.1: M7 scaled-wrapped-lib shape testers. For each unused
+; position h (one not in the lib's position-tuple), test:
+;
+;   (op_b (nth x h) (lib (positions)))               — h-times-lib
+;   (op_b (nth x h) (op_u (lib (positions))))        — h-times-wrapped-lib
+;
+; The first solves `rel_mass = m₀·γ(v,c)`. The second solves
+; `length_contract = L₀·√(defect(v,c))`. Both rely on the lib's
+; behavior column already being computed.
+
+(define m7-unary-ops
+  (list
+    (list "sqrt"   (lambda (v) (sqrt v)))
+    (list "log"    (lambda (v) (log v)))
+    (list "exp"    (lambda (v) (exp v)))
+    (list "sin"    (lambda (v) (sin v)))
+    (list "cos"    (lambda (v) (cos v)))
+    (list "abs"    (lambda (v) (abs v)))
+    (list "negate" (lambda (v) (negate v)))))
+
+; Compute the column of a single indexed atom across the parent's
+; input rows.
+(define m7-h-column
+  (lambda (h-idx inputs)
+    (map (lambda (row) (nth row h-idx)) inputs)))
+
+; Try the h-times-lib shape across all unused positions and binary ops.
+(define m7-try-h-times-lib
+  (lambda (lib-name positions col target inputs parent-arity)
+    (let ((unused-positions
+            (filter (lambda (p) (not (contains positions p)))
+                    (range parent-arity))))
+      (reduce
+        (lambda (acc h-idx)
+          (if (not (nil? acc)) acc
+            (let ((h-col (m7-h-column h-idx inputs)))
+              (reduce
+                (lambda (acc2 op-b-name)
+                  (if (not (nil? acc2)) acc2
+                    (let ((predicted
+                            (try (map (lambda (pair)
+                                        (m7-apply-op op-b-name (head pair) (head (tail pair))))
+                                      (zip h-col col))
+                                 nil)))
+                      (if (and (not (nil? predicted))
+                               (m7-cols-approx-eq predicted target))
+                        (ns ("kind" "h-times-lib")
+                            ("h" h-idx)
+                            ("op-b" op-b-name)
+                            ("source-node"
+                              (m7-emit-h-times-lib h-idx lib-name positions op-b-name)))
+                        nil))))
+                m7-binary-ops nil))))
+        unused-positions
+        nil))))
+
+; Try the h-times-wrapped-lib shape across all unused positions,
+; binary ops, and unary wraps.
+(define m7-try-h-times-wrapped-lib
+  (lambda (lib-name positions col target inputs parent-arity)
+    (let ((unused-positions
+            (filter (lambda (p) (not (contains positions p)))
+                    (range parent-arity))))
+      (reduce
+        (lambda (acc h-idx)
+          (if (not (nil? acc)) acc
+            (let ((h-col (m7-h-column h-idx inputs)))
+              (reduce
+                (lambda (acc2 op-u-pair)
+                  (if (not (nil? acc2)) acc2
+                    (let ((op-u-name (head op-u-pair))
+                          (op-u-fn (head (tail op-u-pair))))
+                      (let ((wrapped-col
+                              (try (map op-u-fn col) nil)))
+                        (if (nil? wrapped-col) nil
+                          (reduce
+                            (lambda (acc3 op-b-name)
+                              (if (not (nil? acc3)) acc3
+                                (let ((predicted
+                                        (try (map (lambda (pair)
+                                                    (m7-apply-op op-b-name (head pair) (head (tail pair))))
+                                                  (zip h-col wrapped-col))
+                                             nil)))
+                                  (if (and (not (nil? predicted))
+                                           (m7-cols-approx-eq predicted target))
+                                    (ns ("kind" "h-times-wrapped-lib")
+                                        ("h" h-idx)
+                                        ("op-b" op-b-name)
+                                        ("op-u" op-u-name)
+                                        ("source-node"
+                                          (m7-emit-h-times-wrapped-lib
+                                            h-idx lib-name positions op-b-name op-u-name)))
+                                    nil))))
+                            m7-binary-ops nil))))))
+                m7-unary-ops nil))))
+        unused-positions
+        nil))))
+
+; Try all five shapes for a single (lib, position-tuple). Returns the
+; first match or nil. Order is cheapest-to-most-expensive: direct,
+; op-wrap-with-constant, self-pair, h-times-lib, h-times-wrapped-lib.
+(define m7-try-shapes
+  (lambda (lib-name positions col target atoms inputs parent-arity)
+    (let ((d (m7-try-direct lib-name positions col target)))
+      (if (not (nil? d)) d
+        (let ((o (m7-try-op-wrap lib-name positions col target atoms)))
+          (if (not (nil? o)) o
+            (let ((sp (m7-try-self-pair lib-name positions col target)))
+              (if (not (nil? sp)) sp
+                (let ((hl (m7-try-h-times-lib lib-name positions col target inputs parent-arity)))
+                  (if (not (nil? hl)) hl
+                    (m7-try-h-times-wrapped-lib lib-name positions col target inputs parent-arity)))))))))))
+
+; ── Top-level: detect-library-shape ──────────────────────────────────
+;
+; Walk the library catalogue, probe each function, and try every
+; ordered position-tuple. Return the first successful match as an ns
+; with `found`, `source` (string), `function` (compiled), and
+; metadata describing the match.
+
+(define m7-try-one-lib
+  (lambda (lib-name lib-fn parent-arity inputs target atoms)
+    (let ((eff-arity (m7-effective-arity lib-fn inputs)))
+      (if (nil? eff-arity)
+        nil
+        (let ((tuples (m7-ordered-tuples parent-arity eff-arity)))
+          (reduce
+            (lambda (acc positions)
+              (if (not (nil? acc)) acc
+                (let ((col (m7-behavior-column lib-fn positions inputs)))
+                  (if (nil? col)
+                    nil
+                    (let ((shape (m7-try-shapes lib-name positions col target atoms inputs parent-arity)))
+                      (if (nil? shape)
+                        nil
+                        (ns-put
+                          (ns-put shape "lib" lib-name)
+                          "positions" positions)))))))
+            tuples
+            nil))))))
+
+(define detect-library-shape
+  (lambda (s)
+    (let ((libs (env-functions))
+          (parent-arity (spec-arity s))
+          (inputs (spec-inputs s))
+          (target (m7-num-target-col s))
+          (atoms (filter m7-num? (m7-extract-atoms s))))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-numeric target"))
+        (let ((lib-names (ns-keys libs)))
+          (let ((result
+                  (reduce
+                    (lambda (acc name)
+                      (if (not (nil? acc)) acc
+                        (let ((lib-fn (ns-get libs name)))
+                          (m7-try-one-lib name lib-fn parent-arity inputs target atoms))))
+                    lib-names
+                    nil)))
+            (if (nil? result)
+              (ns ("found" false) ("reason" "no shape matched"))
+              (let ((node (ns-get result "source-node")))
+                ; Forward all metadata fields from the matched shape
+                ; (kind, op, k, lib, positions, …) by extending the
+                ; result ns with `found` and `function`.
+                (ns-put
+                  (ns-put result "found" true)
+                  "function" (eval-node node))))))))))
+
+; ── Smoke tests + bundled physics helpers ───────────────────────────
+;
+; §9.45.13: an attempt to move these to a `m7_test.selph` companion
+; file was reverted after physics_stage6 + physics_stage7 regressed
+; (pendulum_T, osc_T, osc_freq, osc_T_sq all started failing). The
+; reason: the `osc-T` definition below isn't just a smoke-test
+; fixture — it's structurally needed by physics tasks that use
+; library reuse to solve `2π·√(m/k)`-shaped formulas. Without
+; `osc-T` in env, those tasks have no way to express the `2π`
+; constant (which isn't in m_pool's baseline constants).
+;
+; Proper fix is to move physics helpers (osc-T, etc.) into a
+; dedicated `physics_lib.selph` that grow-v2 loads as a library
+; preamble for physics curricula. That's tracked as a follow-up.
+; Until then, M7's smoke tests double as the physics library.
+
+(define osc-T
+  (lambda (x)
+    (let ((m (nth x 0)) (k (nth x 1)))
+      (multiply (multiply 2 (pi)) (sqrt (divide m k))))))
+
+; The oscillator family specs.
+(define osc-T-spec
+  (make-spec
+    (list (list 1.0 1.0) (list 4.0 1.0) (list 1.0 4.0) (list 9.0 1.0))
+    (list 6.283185307179586 12.566370614359172 3.141592653589793 18.84955592153876)
+    2))
+
+; osc_freq = 1/T → op-left with K=1, op=divide
+(define osc-freq-spec
+  (make-spec
+    (list (list 1.0 1.0) (list 4.0 1.0) (list 1.0 4.0) (list 9.0 1.0))
+    (list 0.15915494309189535 0.07957747154594767 0.3183098861837907 0.05305164769729845)
+    2))
+
+; osc_T_sq = T·T → self-pair with op=multiply
+(define osc-T-sq-spec
+  (make-spec
+    (list (list 1.0 1.0) (list 4.0 1.0) (list 1.0 4.0) (list 9.0 1.0))
+    (list 39.47841760435743 157.91367041742973 9.869604401089358 355.30575843921714)
+    2))
+
+; ── Test runner ─────────────────────────────────────────────────────
+
+(define run-m7-test
+  (lambda (label spec)
+    (do
+      (print (concat "─── " label " ───"))
+      (let ((result (detect-library-shape spec)))
+        (if (ns-get result "found")
+          (do
+            (print (concat "  ✓ found: kind=" (ns-get result "kind")
+                           " lib=" (ns-get result "lib")
+                           " positions=" (to-string (ns-get result "positions"))))
+            (let ((fn (ns-get result "function"))
+                  (row (head (spec-inputs spec)))
+                  (expected-val (head (spec-outputs spec))))
+              (let ((got (fn row)))
+                (print (concat "  verify: " (to-string row) " → "
+                               (to-string got)
+                               " (expected " (to-string expected-val) ")"
+                               (if (m7-approx-eq got expected-val) "  ✓" "  ✗"))))))
+          (do
+            (print (concat "  ✗ not found: " (ns-get result "reason")))))))))
+
+(run-m7-test "osc_T (direct match — should always succeed)" osc-T-spec)
+(print "")
+(run-m7-test "osc_freq = 1/T (op-wrap with K=1, op=divide)" osc-freq-spec)
+(print "")
+(run-m7-test "osc_T_sq = T·T (self-pair with op=multiply)" osc-T-sq-spec)

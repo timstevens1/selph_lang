@@ -1,0 +1,205 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M10: affine combination (Form 3)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Replaces affine fit Form 3 (synth_v2.rs:6380–6393) per the §9.45
+; migration plan. Form 3 fits
+;
+;   target == h(x) + C · g(x)
+;
+; for every distinct pair (h, g) in the pool. The pool here is the
+; same M9-extended pool: indexed atoms plus their unary-wrapped
+; variants. M10 reuses M8's `fit-affine` primitive directly — the
+; only new code is the pool-pair iteration and the source emission.
+
+; ── Inlined helpers (M0 + M8 + M9) ───────────────────────────────────
+
+(define spec-inputs    (lambda (s) (ns-get s "inputs")))
+(define spec-outputs   (lambda (s) (ns-get s "outputs")))
+(define spec-arity     (lambda (s) (ns-get s "arity")))
+(define make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+(define m10-num? (lambda (v) (or (int? v) (num? v))))
+
+(define m10-approx-eq
+  (lambda (a b)
+    (let ((diff (abs (subtract a b)))
+          (scale (max (abs a) (max (abs b) 1.0))))
+      (< (divide diff scale) 0.000000001))))
+
+(define m10-find-pivot
+  (lambda (col)
+    (reduce
+      (lambda (acc pair)
+        (if (>= acc 0) acc
+          (if (> (abs (head (tail pair))) 0.000000000001)
+            (head pair)
+            acc)))
+      (enumerate col)
+      -1)))
+
+(define fit-affine
+  (lambda (h-col g-col target)
+    (let ((pivot (m10-find-pivot g-col)))
+      (if (< pivot 0) nil
+        (let ((c (divide (subtract (nth target pivot) (nth h-col pivot))
+                         (nth g-col pivot))))
+          (let ((all-ok
+                  (reduce
+                    (lambda (acc i)
+                      (if acc
+                        (m10-approx-eq
+                          (add (nth h-col i) (multiply c (nth g-col i)))
+                          (nth target i))
+                        false))
+                    (range (length target))
+                    true)))
+            (if all-ok c nil)))))))
+
+(define m10-num-target
+  (lambda (s)
+    (let ((outs (spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (m10-num? v))) outs true)
+        outs nil))))
+
+; §9.45.13 refactor: M10 consumes the shared `make-pool` from
+; m_pool.selph. The pre-refactor pool was base atoms + unary wraps
+; of base atoms (no products). The closest make-pool flag combo
+; that matches this is `unary-l1` alone (without `products`).
+
+(define m10-build-extended-pool
+  (lambda (s)
+    (make-pool s (ns ("unary-l1" true)))))
+
+; ── Source emission ──────────────────────────────────────────────────
+
+(define m10-value-to-node
+  (lambda (v)
+    (if (int? v) (make-int v)
+      (if (num? v) (make-num v)
+        (error "m10-value-to-node: only Int/Num supported")))))
+
+; (lambda (x) (add h-source (multiply C g-source)))
+(define m10-emit-affine
+  (lambda (h-source c g-source)
+    (make-lambda (list "x")
+      (make-app "add"
+        h-source
+        (make-app "multiply" (m10-value-to-node c) g-source)))))
+
+; ── Detection ────────────────────────────────────────────────────────
+;
+; For every ordered pair (h, g) of pool entries, fit C such that
+; target = h + C·g. The pair iteration is O(pool²); for arity ≤ 5
+; with the unary-wrapped pool that's at most ~40² = 1600 fits per
+; spec — well below any practical budget.
+
+(define m10-pool-source (lambda (e) (ns-get e "source")))
+(define m10-pool-col    (lambda (e) (ns-get e "col")))
+
+(define detect-affine-shape
+  (lambda (s)
+    (let ((target (m10-num-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-numeric target"))
+        (let ((pool (m10-build-extended-pool s)))
+          (let ((result
+                  (reduce
+                    (lambda (acc h-entry)
+                      (if (not (nil? acc)) acc
+                        (reduce
+                          (lambda (acc2 g-entry)
+                            (if (not (nil? acc2)) acc2
+                              (let ((c (fit-affine
+                                         (m10-pool-col h-entry)
+                                         (m10-pool-col g-entry)
+                                         target)))
+                                (if (or (nil? c) (m10-approx-eq c 0))
+                                  ; Skip degenerate C=0 (would
+                                  ; reduce to the identity h, which
+                                  ; M8 already covers).
+                                  nil
+                                  (ns ("kind" "form-3")
+                                      ("h-kind" (ns-get h-entry "kind"))
+                                      ("g-kind" (ns-get g-entry "kind"))
+                                      ("c" c)
+                                      ("source-node"
+                                        (m10-emit-affine
+                                          (m10-pool-source h-entry)
+                                          c
+                                          (m10-pool-source g-entry))))))))
+                          pool
+                          nil)))
+                    pool
+                    nil)))
+            (if (nil? result)
+              (ns ("found" false) ("reason" "no shape matched"))
+              (let ((node (ns-get result "source-node")))
+                (ns-put
+                  (ns-put result "found" true)
+                  "function" (eval-node node))))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+; Test 1: f((m, k)) = m + 2·k. Pure indexed atoms.
+(define affine-int-spec
+  (make-spec
+    (list (list 1.0 1.0) (list 2.0 3.0) (list 5.0 4.0) (list 7.0 11.0))
+    (list 3.0 8.0 13.0 29.0)
+    2))
+
+; Test 2: f(x) = sqrt(x) + 1. h is the bare-constant... wait, the
+; constant has to come from somewhere. With the M10 pool we don't
+; have constants — the closest match is "h is some atom whose value
+; happens to be 1 on every row." Let me restructure: f((a, x)) = a + sqrt(x).
+(define affine-sqrt-spec
+  (make-spec
+    (list (list 1.0 1.0) (list 1.0 4.0) (list 1.0 9.0) (list 1.0 16.0))
+    (list 2.0 3.0 4.0 5.0)
+    2))
+
+; Test 3: f((u, t)) = u + 0.5·t (kinematic-like, simple case).
+(define ut-affine-spec
+  (make-spec
+    (list (list 0.5 0.5) (list 0.5 1.5) (list 1.5 0.5) (list 1.5 1.5))
+    (list 0.75 1.25 1.75 2.25)
+    2))
+
+; Test 4: should NOT find pure scale (M8 territory).
+(define pure-scale-spec
+  (make-spec
+    (list (list 1.0) (list 2.0) (list 3.0))
+    (list 3.0 6.0 9.0)
+    1))
+
+(define m10-run-test
+  (lambda (label spec)
+    (do
+      (print (concat "─── " label " ───"))
+      (let ((result (detect-affine-shape spec)))
+        (if (ns-get result "found")
+          (do
+            (print (concat "  ✓ h-kind=" (ns-get result "h-kind")
+                           " g-kind=" (ns-get result "g-kind")
+                           " c=" (to-string (ns-get result "c"))))
+            ; NOTE: avoid binding `exp` — see M12 for the letrec
+            ; footgun explanation. Use `expected-val` instead.
+            (let ((fn (ns-get result "function"))
+                  (row (head (spec-inputs spec)))
+                  (expected-val (head (spec-outputs spec))))
+              (let ((got (fn row)))
+                (print (concat "  verify: " (to-string row) " → "
+                               (to-string got)
+                               " (expected " (to-string expected-val) ")"
+                               (if (m10-approx-eq got expected-val) "  ✓" "  ✗"))))))
+          (print (concat "  ✗ not found: " (ns-get result "reason"))))))))
+
+(m10-run-test "f((m,k)) = m + 2·k" affine-int-spec)
+(print "")
+(m10-run-test "f((a,x)) = a + sqrt(x)" affine-sqrt-spec)
+(print "")
+(m10-run-test "f((u,t)) = u + 0.5·t" ut-affine-spec)
+(print "")
+(m10-run-test "f(x) = 3·x  (M8 territory — should still match via h=0·g)" pure-scale-spec)

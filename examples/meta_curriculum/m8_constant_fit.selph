@@ -1,0 +1,267 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M8: constant fit (Forms 1 and 2)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Replaces affine fit Forms 1 and 2 (synth_v2.rs:6311–6330) per the
+; §9.45 migration plan. The shapes:
+;
+;   Form 1:  target == C            (constant function)
+;   Form 2:  target == C · g(x)     (scaled atom)
+;
+; Both shapes reduce to "find C such that target[i] = h[i] + C·g[i]
+; for every i" with appropriate (h, g) vectors. M8 introduces the
+; `fit-affine` primitive — the closed-form scalar fit that every
+; later stage (M9–M12) reuses.
+;
+; The pool for M8 is the indexed-atom catalogue: `(nth x 0)`,
+; `(nth x 1)`, …, `(nth x arity−1)`. Later stages will extend the
+; pool with unary-wrapped (M9), pairwise (M10), and product (M11)
+; entries.
+
+; ── Inlined helpers (M0 + M13) ───────────────────────────────────────
+
+(define spec-inputs    (lambda (s) (ns-get s "inputs")))
+(define spec-outputs   (lambda (s) (ns-get s "outputs")))
+(define spec-arity     (lambda (s) (ns-get s "arity")))
+(define make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+(define m8-num? (lambda (v) (or (int? v) (num? v))))
+
+; Approximate equality (matches the kernel's 1e-9 tolerance).
+(define m8-approx-eq
+  (lambda (a b)
+    (let ((diff (abs (subtract a b)))
+          (scale (max (abs a) (max (abs b) 1.0))))
+      (< (divide diff scale) 0.000000001))))
+
+; Compare two columns under approx equality.
+(define m8-cols-approx-eq
+  (lambda (xs ys)
+    (if (= (length xs) (length ys))
+      (reduce
+        (lambda (acc pair) (and acc (m8-approx-eq (head pair) (head (tail pair)))))
+        (zip xs ys)
+        true)
+      false)))
+
+; ── fit-affine primitive ─────────────────────────────────────────────
+;
+; Closed-form scalar fit: given target column `t`, base column `h`,
+; and slope column `g`, find C such that t[i] = h[i] + C·g[i] for
+; every row. Returns C (Num) or nil.
+;
+; Algorithm:
+;   1. Find a "pivot" row where g[i] is non-zero (>1e-12 in absolute
+;      value). If none exists, the only solution is undefined unless
+;      h equals t exactly — handle that as a special case at the
+;      caller level.
+;   2. Solve C = (t[pivot] − h[pivot]) / g[pivot].
+;   3. Verify on every row using approx-eq. Reject if any row fails.
+;
+; This is a pure-SELPH transcription of the kernel's `fit_affine`
+; closure (synth_v2.rs:6291–6309).
+
+(define m8-find-pivot
+  (lambda (col)
+    ; Returns the index of the first row where |col[i]| > 1e-12,
+    ; or -1 if none exists. Implemented via reduce over enumerate.
+    (reduce
+      (lambda (acc pair)
+        (if (>= acc 0)
+          acc
+          (if (> (abs (head (tail pair))) 0.000000000001)
+            (head pair)
+            acc)))
+      (enumerate col)
+      -1)))
+
+(define fit-affine
+  (lambda (h-col g-col target)
+    (let ((pivot (m8-find-pivot g-col)))
+      (if (< pivot 0)
+        nil
+        (let ((c (divide (subtract (nth target pivot) (nth h-col pivot))
+                         (nth g-col pivot))))
+          ; Verify on every row.
+          (let ((all-ok
+                  (reduce
+                    (lambda (acc i)
+                      (if acc
+                        (m8-approx-eq
+                          (add (nth h-col i) (multiply c (nth g-col i)))
+                          (nth target i))
+                        false))
+                    (range (length target))
+                    true)))
+            (if all-ok c nil)))))))
+
+; Convenience wrapper: fit C such that target = C·g (no h).
+(define fit-scale
+  (lambda (g-col target)
+    (let ((zeros (map (lambda (_) 0) target)))
+      (fit-affine zeros g-col target))))
+
+; Form 1 helper: detect a constant target. Returns the constant or nil.
+(define fit-bare
+  (lambda (target)
+    (let ((ones (map (lambda (_) 1) target))
+          (zeros (map (lambda (_) 0) target))) ; unused but symmetric
+      ; target = 0 + C·1  →  C = target[0] (verified on every row)
+      (let ((_ zeros))  ; suppress unused
+        (fit-affine (map (lambda (_) 0) target) ones target)))))
+
+; ── Pool builder ─────────────────────────────────────────────────────
+;
+; §9.45.13 refactor: M8 uses the shared `make-pool` from m_pool.selph
+; with no flags (just base indexed atoms). The numeric-filter step is
+; redundant because `make-pool` only emits numeric columns from L0,
+; but we keep `m8-numeric-pool` as a defensive identity in case the
+; spec contains non-numeric inputs.
+
+(define m8-build-pool (lambda (s) (make-pool s (ns))))
+
+(define m8-pool-source (lambda (entry) (ns-get entry "source")))
+(define m8-pool-col    (lambda (entry) (ns-get entry "col")))
+
+(define m8-numeric-pool
+  (lambda (pool)
+    (filter
+      (lambda (entry)
+        (reduce
+          (lambda (acc v) (and acc (m8-num? v)))
+          (m8-pool-col entry)
+          true))
+      pool)))
+
+; ── Source-AST helpers ───────────────────────────────────────────────
+
+(define m8-value-to-node
+  (lambda (v)
+    (if (int? v) (make-int v)
+      (if (num? v) (make-num v)
+        (error "m8-value-to-node: only Int/Num supported")))))
+
+(define m8-wrap-lambda
+  (lambda (body) (make-lambda (list "x") body)))
+
+; Build `(lambda (x) C)` for the bare-constant form.
+(define m8-emit-bare
+  (lambda (c)
+    (m8-wrap-lambda (m8-value-to-node c))))
+
+; Build `(lambda (x) (multiply C g))` for the scale form.
+(define m8-emit-scale
+  (lambda (c g-source)
+    (m8-wrap-lambda
+      (make-app "multiply" (m8-value-to-node c) g-source))))
+
+; ── Main: detect-constant-shape ──────────────────────────────────────
+;
+; Try Form 1, then Form 2 over the indexed-atom pool. Return the first
+; match as an ns describing the shape, or `(found false)`.
+
+(define m8-num-target
+  (lambda (s)
+    (let ((outs (spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (m8-num? v))) outs true)
+        outs
+        nil))))
+
+(define m8-try-form-1
+  (lambda (target)
+    (let ((c (fit-bare target)))
+      (if (nil? c)
+        nil
+        (ns ("kind" "form-1") ("c" c)
+            ("source-node" (m8-emit-bare c)))))))
+
+(define m8-try-form-2
+  (lambda (pool target)
+    (reduce
+      (lambda (acc entry)
+        (if (not (nil? acc)) acc
+          (let ((c (fit-scale (m8-pool-col entry) target)))
+            (if (nil? c)
+              nil
+              (ns ("kind" "form-2") ("c" c)
+                  ("source-node" (m8-emit-scale c (m8-pool-source entry))))))))
+      pool
+      nil)))
+
+(define detect-constant-shape
+  (lambda (s)
+    (let ((target (m8-num-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-numeric target"))
+        (let ((pool (m8-numeric-pool (m8-build-pool s))))
+          (let ((r1 (m8-try-form-1 target)))
+            (let ((result (if (nil? r1)
+                            (m8-try-form-2 pool target)
+                            r1)))
+              (if (nil? result)
+                (ns ("found" false) ("reason" "no shape matched"))
+                (let ((node (ns-get result "source-node")))
+                  (ns-put
+                    (ns-put result "found" true)
+                    "function" (eval-node node)))))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+; Test 1: bare constant. f(x) = 7 for any input.
+(define const-spec
+  (make-spec
+    (list (list 1.0) (list 2.0) (list 3.0))
+    (list 7 7 7)
+    1))
+
+; Test 2: linear scale. f(x) = 3·x.
+(define scale-spec
+  (make-spec
+    (list (list 1.0) (list 2.0) (list 5.0) (list 11.0))
+    (list 3.0 6.0 15.0 33.0)
+    1))
+
+; Test 3: scale by a non-integer constant. f((m, k)) = 0.5·m.
+(define half-m-spec
+  (make-spec
+    (list (list 1.0 2.0) (list 4.0 1.0) (list 9.0 3.0))
+    (list 0.5 2.0 4.5)
+    2))
+
+; Test 4: scale picks the second indexed atom. f((m, k)) = 4·k.
+(define four-k-spec
+  (make-spec
+    (list (list 1.0 2.0) (list 4.0 1.0) (list 9.0 3.0))
+    (list 8.0 4.0 12.0)
+    2))
+
+(define m8-run-test
+  (lambda (label spec)
+    (do
+      (print (concat "─── " label " ───"))
+      (let ((result (detect-constant-shape spec)))
+        (if (ns-get result "found")
+          (do
+            (print (concat "  ✓ kind=" (ns-get result "kind")
+                           " c=" (to-string (ns-get result "c"))))
+            ; NOTE: avoid binding `exp` — see M12 for the letrec
+            ; footgun explanation. Use `expected-val` instead.
+            (let ((fn (ns-get result "function"))
+                  (row (head (spec-inputs spec)))
+                  (expected-val (head (spec-outputs spec))))
+              (let ((got (fn row)))
+                (print (concat "  verify: " (to-string row) " → "
+                               (to-string got)
+                               " (expected " (to-string expected-val) ")"
+                               (if (m8-approx-eq got expected-val) "  ✓" "  ✗"))))))
+          (print (concat "  ✗ not found: " (ns-get result "reason"))))))))
+
+(m8-run-test "bare constant f(x) = 7" const-spec)
+(print "")
+(m8-run-test "scale f(x) = 3·x" scale-spec)
+(print "")
+(m8-run-test "scale f((m,k)) = 0.5·m" half-m-spec)
+(print "")
+(m8-run-test "scale f((m,k)) = 4·k (picks index 1)" four-k-spec)

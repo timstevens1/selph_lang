@@ -1,0 +1,268 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M11: product fit (Forms 4 and 5)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Replaces affine fit Forms 4 and 5 (synth_v2.rs:6395–6413, 6626–6659)
+; per the §9.45 migration plan. The shapes:
+;
+;   Form 4:  target == C · (e₁ · e₂)            (scaled product)
+;   Form 5:  target == h + C · (e₁ · e₂)        (kinematic shape)
+;
+; M11 builds a two-level pool — base indexed atoms plus all ordered
+; pairwise products of those atoms — and runs Forms 4/5 over it. The
+; cost is O(pool²) for Form 4 and O(pool³) for Form 5, which for
+; physics-class arities (≤ 5) stays under a few thousand fits.
+;
+; §9.45.5 envisions M11 firing as a *consumer* of M6's separability
+; decomposition (h is a sub-spec result, not a global pool entry).
+; That gating is deferred until the curriculum dispatcher integration
+; in §9.45.9. The standalone M11 implemented here is the brute-force
+; baseline that works correctly without the gate, just at higher cost.
+
+; ── Inlined helpers (M0 + M8) ────────────────────────────────────────
+
+(define spec-inputs    (lambda (s) (ns-get s "inputs")))
+(define spec-outputs   (lambda (s) (ns-get s "outputs")))
+(define spec-arity     (lambda (s) (ns-get s "arity")))
+(define make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+(define m11-num? (lambda (v) (or (int? v) (num? v))))
+
+(define m11-approx-eq
+  (lambda (a b)
+    (let ((diff (abs (subtract a b)))
+          (scale (max (abs a) (max (abs b) 1.0))))
+      (< (divide diff scale) 0.000000001))))
+
+(define m11-find-pivot
+  (lambda (col)
+    (reduce
+      (lambda (acc pair)
+        (if (>= acc 0) acc
+          (if (> (abs (head (tail pair))) 0.000000000001)
+            (head pair) acc)))
+      (enumerate col)
+      -1)))
+
+(define fit-affine
+  (lambda (h-col g-col target)
+    (let ((pivot (m11-find-pivot g-col)))
+      (if (< pivot 0) nil
+        (let ((c (divide (subtract (nth target pivot) (nth h-col pivot))
+                         (nth g-col pivot))))
+          (let ((all-ok
+                  (reduce
+                    (lambda (acc i)
+                      (if acc
+                        (m11-approx-eq
+                          (add (nth h-col i) (multiply c (nth g-col i)))
+                          (nth target i))
+                        false))
+                    (range (length target))
+                    true)))
+            (if all-ok c nil)))))))
+
+(define m11-num-target
+  (lambda (s)
+    (let ((outs (spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (m11-num? v))) outs true)
+        outs nil))))
+
+(define m11-zeros
+  (lambda (target) (map (lambda (_) 0) target)))
+
+; ── Pool: base atoms + pairwise products ─────────────────────────────
+;
+; Each pool entry is an ns with `source` (Node), `col` (list), and
+; `kind` (string). Two levels:
+;   L0: indexed atoms `(nth x i)`
+;   L1: ordered pairs L0 × L0 → `(multiply (nth x i) (nth x j))`
+;
+; The composed column for an L1 entry is the elementwise product of
+; the two L0 columns. We pre-compute it once.
+
+(define m11-pool-source (lambda (e) (ns-get e "source")))
+(define m11-pool-col    (lambda (e) (ns-get e "col")))
+
+; §9.45.13 refactor: M11's private pool builders are gone. The
+; detect-product-shape function now calls `make-pool` directly with
+; appropriate flags. m11-pairwise-mul-cols is the only helper that
+; survives — try-form-4 and try-form-5 use it for on-the-fly
+; column composition (cheaper than rebuilding pool entries).
+
+(define m11-pairwise-mul-cols
+  (lambda (a b)
+    (map (lambda (pair) (multiply (head pair) (head (tail pair))))
+         (zip a b))))
+
+; ── Source emission ──────────────────────────────────────────────────
+
+(define m11-value-to-node
+  (lambda (v)
+    (if (int? v) (make-int v)
+      (if (num? v) (make-num v)
+        (error "m11-value-to-node: only Int/Num supported")))))
+
+; (lambda (x) (multiply C (multiply e1-source e2-source)))
+(define m11-emit-form-4
+  (lambda (c e1-source e2-source)
+    (make-lambda (list "x")
+      (make-app "multiply"
+        (m11-value-to-node c)
+        (make-app "multiply" e1-source e2-source)))))
+
+; (lambda (x) (add h-source (multiply C (multiply e1-source e2-source))))
+(define m11-emit-form-5
+  (lambda (h-source c e1-source e2-source)
+    (make-lambda (list "x")
+      (make-app "add"
+        h-source
+        (make-app "multiply"
+          (m11-value-to-node c)
+          (make-app "multiply" e1-source e2-source))))))
+
+; ── Detection ────────────────────────────────────────────────────────
+;
+; Form 4 first (cheaper), then Form 5. The "pool" for h in Form 5 is
+; the same extended pool as for (e₁, e₂) — products of atoms are
+; valid h candidates as well.
+
+(define m11-try-form-4
+  (lambda (extended-pool target)
+    (let ((zeros (m11-zeros target)))
+      (reduce
+        (lambda (acc e1)
+          (if (not (nil? acc)) acc
+            (reduce
+              (lambda (acc2 e2)
+                (if (not (nil? acc2)) acc2
+                  (let ((composed (m11-pairwise-mul-cols
+                                    (m11-pool-col e1)
+                                    (m11-pool-col e2))))
+                    (let ((c (fit-affine zeros composed target)))
+                      (if (nil? c) nil
+                        (ns ("kind" "form-4")
+                            ("c" c)
+                            ("source-node"
+                              (m11-emit-form-4 c
+                                (m11-pool-source e1)
+                                (m11-pool-source e2)))))))))
+              extended-pool nil)))
+        extended-pool nil))))
+
+(define m11-try-form-5
+  (lambda (extended-pool target)
+    (reduce
+      (lambda (acc h-entry)
+        (if (not (nil? acc)) acc
+          (reduce
+            (lambda (acc2 e1)
+              (if (not (nil? acc2)) acc2
+                (reduce
+                  (lambda (acc3 e2)
+                    (if (not (nil? acc3)) acc3
+                      (let ((composed (m11-pairwise-mul-cols
+                                        (m11-pool-col e1)
+                                        (m11-pool-col e2))))
+                        (let ((c (fit-affine
+                                   (m11-pool-col h-entry)
+                                   composed
+                                   target)))
+                          (if (or (nil? c) (m11-approx-eq c 0))
+                            nil
+                            (ns ("kind" "form-5")
+                                ("c" c)
+                                ("source-node"
+                                  (m11-emit-form-5
+                                    (m11-pool-source h-entry)
+                                    c
+                                    (m11-pool-source e1)
+                                    (m11-pool-source e2)))))))))
+                  extended-pool nil)))
+            extended-pool nil)))
+      extended-pool nil)))
+
+(define detect-product-shape
+  (lambda (s)
+    (let ((target (m11-num-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-numeric target"))
+        ; §9.45.12.2 refactor: use the shared `make-pool` from
+        ; m_pool.selph instead of M11's private builders. The
+        ; "extended" pool now goes one level deeper — it includes
+        ; second-level unary wraps (`unary-l2`), which lets form 4
+        ; match shapes like `N₀·exp(-λ·t)` where the second factor
+        ; is `exp(negate(product))` (decay_N). The "small" pool
+        ; stays minimal for form 5 to keep its O(pool³) cost bounded.
+        (let ((extended (make-pool s
+                          (ns ("products" true) ("unary-l1" true) ("unary-l2" true))))
+              (small (make-pool s
+                       (ns ("products" true)))))
+          (let ((r4 (m11-try-form-4 extended target)))
+            (let ((result (if (nil? r4)
+                            (m11-try-form-5 small target)
+                            r4)))
+              (if (nil? result)
+                (ns ("found" false) ("reason" "no shape matched"))
+                (let ((node (ns-get result "source-node")))
+                  (ns-put
+                    (ns-put result "found" true)
+                    "function" (eval-node node)))))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+; Test 1: f((u, t)) = 0.5 · u · t. Form 4 with C=0.5, e1=u, e2=t.
+(define half-ut-spec
+  (make-spec
+    (list (list 0.5 0.5) (list 0.5 1.5) (list 1.5 0.5) (list 1.5 1.5))
+    (list 0.125 0.375 0.375 1.125)
+    2))
+
+; Test 2: f((u, a, t)) = u·t + 0.5·a·t² — kinematic_s.
+; Requires Form 5 with h = u·t (a product entry from L1) and
+; e1·e2 = a·t² = (a·t)·t  OR  a·(t·t).
+(define kinematic-s-spec
+  (make-spec
+    (list (list 0.5  0.25 0.5)
+          (list 0.5  0.25 1.5)
+          (list 1.5  0.25 0.5)
+          (list 1.5  0.25 1.5))
+    (list 0.28125 1.03125 0.78125 2.53125)
+    3))
+
+; Test 3: f((u, t)) = u·t (no constant — should still match Form 4
+; with C=1).
+(define ut-spec
+  (make-spec
+    (list (list 1.0 1.0) (list 2.0 3.0) (list 4.0 5.0))
+    (list 1.0 6.0 20.0)
+    2))
+
+(define m11-run-test
+  (lambda (label spec)
+    (do
+      (print (concat "─── " label " ───"))
+      (let ((result (detect-product-shape spec)))
+        (if (ns-get result "found")
+          (do
+            (print (concat "  ✓ kind=" (ns-get result "kind")
+                           " c=" (to-string (ns-get result "c"))))
+            ; NOTE: avoid binding `exp` — see M12 for the letrec
+            ; footgun explanation. Use `expected-val` instead.
+            (let ((fn (ns-get result "function"))
+                  (row (head (spec-inputs spec)))
+                  (expected-val (head (spec-outputs spec))))
+              (let ((got (fn row)))
+                (print (concat "  verify: " (to-string row) " → "
+                               (to-string got)
+                               " (expected " (to-string expected-val) ")"
+                               (if (m11-approx-eq got expected-val) "  ✓" "  ✗"))))))
+          (print (concat "  ✗ not found: " (ns-get result "reason"))))))))
+
+(m11-run-test "f((u,t)) = 0.5·u·t  (Form 4)" half-ut-spec)
+(print "")
+(m11-run-test "f((u,a,t)) = u·t + 0.5·a·t²  (Form 5 — kinematic_s)" kinematic-s-spec)
+(print "")
+(m11-run-test "f((u,t)) = u·t  (Form 4 with C=1)" ut-spec)

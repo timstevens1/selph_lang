@@ -1,0 +1,194 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M9: unary-wrapped scaling (Form 2b)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Replaces affine fit Form 2b (synth_v2.rs:6332–6378) per the §9.45
+; migration plan. Form 2b extends Form 2 (`C·g`) by allowing `g` to
+; be a unary-op-wrapped pool entry:
+;
+;   target == C · op_u(g)
+;
+; for op_u in {sqrt, log, exp, sin, cos, abs, negate}. The kernel
+; pass tries every combination of (g, op_u) and runs `fit-scale` on
+; the wrapped column.
+;
+; M9's contribution: extend the pool with unary-wrapped entries
+; before running the same fit-scale loop M8 used. The shape becomes
+; one stage in the chain rather than a hardcoded list of unary
+; operators.
+
+; ── Inlined helpers (M0 + M8) ────────────────────────────────────────
+
+(define spec-inputs    (lambda (s) (ns-get s "inputs")))
+(define spec-outputs   (lambda (s) (ns-get s "outputs")))
+(define spec-arity     (lambda (s) (ns-get s "arity")))
+(define make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+(define m9-num? (lambda (v) (or (int? v) (num? v))))
+
+(define m9-approx-eq
+  (lambda (a b)
+    (let ((diff (abs (subtract a b)))
+          (scale (max (abs a) (max (abs b) 1.0))))
+      (< (divide diff scale) 0.000000001))))
+
+(define m9-find-pivot
+  (lambda (col)
+    (reduce
+      (lambda (acc pair)
+        (if (>= acc 0) acc
+          (if (> (abs (head (tail pair))) 0.000000000001)
+            (head pair)
+            acc)))
+      (enumerate col)
+      -1)))
+
+(define m9-fit-affine
+  (lambda (h-col g-col target)
+    (let ((pivot (m9-find-pivot g-col)))
+      (if (< pivot 0)
+        nil
+        (let ((c (divide (subtract (nth target pivot) (nth h-col pivot))
+                         (nth g-col pivot))))
+          (let ((all-ok
+                  (reduce
+                    (lambda (acc i)
+                      (if acc
+                        (m9-approx-eq
+                          (add (nth h-col i) (multiply c (nth g-col i)))
+                          (nth target i))
+                        false))
+                    (range (length target))
+                    true)))
+            (if all-ok c nil)))))))
+
+(define m9-fit-scale
+  (lambda (g-col target)
+    (m9-fit-affine (map (lambda (_) 0) target) g-col target)))
+
+(define m9-num-target
+  (lambda (s)
+    (let ((outs (spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (m9-num? v))) outs true)
+        outs nil))))
+
+; §9.45.13 refactor: m9-unary-ops, m9-wrap-entry, and the
+; m9-finite? helpers used to live here. They're all in m_pool.selph
+; now (m-pool-unary-ops, m-pool-wrap-entry, m-pool-finite?). Removed
+; from M9 since it consumes `make-pool` directly.
+
+; §9.45.13 refactor: M9 now consumes the shared `make-pool` from
+; m_pool.selph. The flag combination `products + unary-l1` matches
+; the pre-refactor M9 pool exactly: base atoms + pairwise products
+; + single-level unary wraps of both. The standalone smoke tests
+; still pass; physics_stage6 still gets shm_x via M11 (which has
+; a richer pool with `unary-l2`).
+
+(define m9-build-extended-pool
+  (lambda (s)
+    (make-pool s (ns ("products" true) ("unary-l1" true)))))
+
+; ── Source-AST helpers ───────────────────────────────────────────────
+
+(define m9-value-to-node
+  (lambda (v)
+    (if (int? v) (make-int v)
+      (if (num? v) (make-num v)
+        (error "m9-value-to-node: only Int/Num supported")))))
+
+(define m9-emit-scale
+  (lambda (c g-source)
+    (make-lambda (list "x")
+      (make-app "multiply" (m9-value-to-node c) g-source))))
+
+; ── Detection ────────────────────────────────────────────────────────
+;
+; Try Form 2 (scale) over the extended pool. The pool now includes
+; unary-wrapped variants automatically, so we don't need a separate
+; "Form 2b" path — the same fit-scale loop covers both.
+
+(define detect-unary-scale-shape
+  (lambda (s)
+    (let ((target (m9-num-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-numeric target"))
+        (let ((pool (m9-build-extended-pool s)))
+          (let ((result
+                  (reduce
+                    (lambda (acc entry)
+                      (if (not (nil? acc)) acc
+                        (let ((c (m9-fit-scale (ns-get entry "col") target)))
+                          (if (nil? c) nil
+                            (ns ("kind" (ns-get entry "kind"))
+                                ("c" c)
+                                ("source-node" (m9-emit-scale c (ns-get entry "source"))))))))
+                    pool
+                    nil)))
+            (if (nil? result)
+              (ns ("found" false) ("reason" "no shape matched"))
+              (let ((node (ns-get result "source-node")))
+                (ns-put
+                  (ns-put result "found" true)
+                  "function" (eval-node node))))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+; Test 1: f(x) = 2·sqrt(x). Form 2b with g=(nth x 0), op_u=sqrt, C=2.
+(define sqrt-spec
+  (make-spec
+    (list (list 1.0) (list 4.0) (list 9.0) (list 16.0))
+    (list 2.0 4.0 6.0 8.0)
+    1))
+
+; Test 2: f(x) = 5·log(x). Form 2b with op_u=log.
+(define log-spec
+  (make-spec
+    (list (list 2.71828182845904) (list 7.38905609893065)
+          (list 20.0855369231877) (list 54.598150033144236))
+    (list 5.0 10.0 15.0 20.0)
+    1))
+
+; Test 3: f((m, k)) = 3·sqrt(k). Picks the second indexed atom + sqrt wrap.
+(define sqrt-of-k-spec
+  (make-spec
+    (list (list 1.0 1.0) (list 5.0 4.0) (list 7.0 9.0) (list 11.0 16.0))
+    (list 3.0 6.0 9.0 12.0)
+    2))
+
+; Test 4: should NOT find f(x) = sqrt(x) + 1 (form 3 territory, not M9).
+(define affine-spec
+  (make-spec
+    (list (list 1.0) (list 4.0) (list 9.0))
+    (list 2.0 3.0 4.0)
+    1))
+
+(define m9-run-test
+  (lambda (label spec)
+    (do
+      (print (concat "─── " label " ───"))
+      (let ((result (detect-unary-scale-shape spec)))
+        (if (ns-get result "found")
+          (do
+            (print (concat "  ✓ kind=" (ns-get result "kind")
+                           " c=" (to-string (ns-get result "c"))))
+            ; NOTE: avoid binding `exp` — see M12 for the letrec
+            ; footgun explanation. Use `expected-val` instead.
+            (let ((fn (ns-get result "function"))
+                  (row (head (spec-inputs spec)))
+                  (expected-val (head (spec-outputs spec))))
+              (let ((got (fn row)))
+                (print (concat "  verify: " (to-string row) " → "
+                               (to-string got)
+                               " (expected " (to-string expected-val) ")"
+                               (if (m9-approx-eq got expected-val) "  ✓" "  ✗"))))))
+          (print (concat "  ✗ not found: " (ns-get result "reason"))))))))
+
+(m9-run-test "f(x) = 2·sqrt(x)" sqrt-spec)
+(print "")
+(m9-run-test "f(x) = 5·log(x)" log-spec)
+(print "")
+(m9-run-test "f((m,k)) = 3·sqrt(k)" sqrt-of-k-spec)
+(print "")
+(m9-run-test "f(x) = sqrt(x) + 1 (M10 territory — should fail)" affine-spec)
