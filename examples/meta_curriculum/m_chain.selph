@@ -51,14 +51,23 @@
 
 ; ── The chain ────────────────────────────────────────────────────────
 ;
-; Order: M8 (cheapest, single-pool scan) → M9 (unary-wrap, 7×) → M10
+; §9.47 P1: type-dispatched chain. The chain inspects the first row of
+; spec outputs to decide whether to run the numeric branch (M8 → M9 →
+; M10 → M12 → M11 → M7) or the string branch (M8s → M10s → M11s → M7).
+; Library reuse (M7) is shape-agnostic and runs in both branches; the
+; rest are domain-specialized recognizers per Path E in §9.46.4.
+;
+; Numeric ordering rationale (unchanged from §9.45):
+; M8 (cheapest, single-pool scan) → M9 (unary-wrap, 7×) → M10
 ; (pairwise affine, pool²) → M12 (structural pair, pool²×28) → M11
 ; (product fit, pool²/³) → M7 (library reuse, only if libs exist).
 ;
-; M7 last because it's only useful when the env contains user-defined
-; library functions, which is the rarer case. M11 second-to-last
-; because it's the most expensive when no separability gating is
-; applied (pool³ for form 5).
+; String ordering: M8s (constant + identity, single scan) → M10s
+; (concat pair, pool²) → M11s (string-repeat, pool²) → M7. No M9s
+; analogue is needed yet because the string unary catalog
+; (upper/lower/reverse) lives inside m_pool_string's unary-l1 flag,
+; and M10s consumes that pool — a wrap-then-concat shape gets
+; recognized by M10s without a separate unary stage.
 
 ; Try one detector function and either return its synth-formatted
 ; result, or fall through to the next stage by calling `next-thunk`.
@@ -69,21 +78,63 @@
         (m-chain-mn-result-to-synth r)
         (next-thunk)))))
 
+; ── Type detection ───────────────────────────────────────────────────
+;
+; Inspect the first output value to decide which branch handles this
+; spec. Numeric (Int/Num) → numeric chain. String → string chain.
+; Anything else (List, Bool, Grid, ...) falls through to "unknown"
+; and the chain returns (found false), letting Flat enumeration take
+; over.
+
+(define m-chain-output-kind
+  (lambda (spec)
+    (let ((outs (ns-get spec "outputs")))
+      (if (= (length outs) 0)
+        "unknown"
+        (let ((first-out (head outs)))
+          (if (or (int? first-out) (num? first-out)) "numeric"
+            (if (string? first-out) "string"
+              "unknown")))))))
+
+; ── Numeric branch ───────────────────────────────────────────────────
+
+(define m-chain-numeric
+  (lambda (spec)
+    (m-chain-try-or-next detect-constant-shape spec
+      (lambda ()
+        (m-chain-try-or-next detect-unary-scale-shape spec
+          (lambda ()
+            (m-chain-try-or-next detect-affine-shape spec
+              (lambda ()
+                (m-chain-try-or-next detect-structural-pair spec
+                  (lambda ()
+                    (m-chain-try-or-next detect-product-shape spec
+                      (lambda ()
+                        (m-chain-try-or-next detect-library-shape spec
+                          (lambda () (ns ("found" false))))))))))))))))
+
+; ── String branch ────────────────────────────────────────────────────
+
+(define m-chain-string
+  (lambda (spec)
+    (m-chain-try-or-next detect-constant-string spec
+      (lambda ()
+        (m-chain-try-or-next detect-concat-pair spec
+          (lambda ()
+            (m-chain-try-or-next detect-string-repeat spec
+              (lambda ()
+                (m-chain-try-or-next detect-library-shape spec
+                  (lambda () (ns ("found" false))))))))))))
+
+; ── Top-level dispatcher ─────────────────────────────────────────────
+
 (define m-chain-decomposer
   (lambda (synth-spec)
     (let ((spec (m-chain-spec-from-synth synth-spec)))
-      (m-chain-try-or-next detect-constant-shape spec
-        (lambda ()
-          (m-chain-try-or-next detect-unary-scale-shape spec
-            (lambda ()
-              (m-chain-try-or-next detect-affine-shape spec
-                (lambda ()
-                  (m-chain-try-or-next detect-structural-pair spec
-                    (lambda ()
-                      (m-chain-try-or-next detect-product-shape spec
-                        (lambda ()
-                          (m-chain-try-or-next detect-library-shape spec
-                            (lambda () (ns ("found" false)))))))))))))))))
+      (let ((kind (m-chain-output-kind spec)))
+        (if (= kind "numeric") (m-chain-numeric spec)
+          (if (= kind "string") (m-chain-string spec)
+            (ns ("found" false))))))))
 
 ; ── Register as the global decomposer ────────────────────────────────
 ;

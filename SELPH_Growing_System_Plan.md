@@ -7499,3 +7499,202 @@ work.
 
 The next session should pick a path before doing any more
 substrate or meta-curriculum work.
+
+### 9.47 P1: type-dependent pools — strings 9/9 via the M-chain (April 11, 2026)
+
+§9.46 closed with two open paths: D (generalize make-pool with
+featurizers) and E (per-domain pool builders). After deliberation the
+call was Path E, on the rationale that it's the lower-risk pragmatic
+answer and that Path D's design work is not justified until E proves
+inadequate. §9.47 P1 is the strings-domain instance of E: a parallel
+`make-pool-string` builder, a string detect-* family, and a
+type-dispatched `m-chain` that routes specs to the right branch based
+on output value type.
+
+#### 9.47.1 Architecture
+
+The pre-§9.47 chain hardcoded the numeric branch — every detect-*
+sat behind `m-pool-num?` gates and never saw non-numeric specs.
+§9.47 P1 splits the chain into a top-level type dispatcher plus two
+parallel branches:
+
+```
+m-chain-decomposer
+  ├── m-chain-output-kind  → "numeric" | "string" | "unknown"
+  ├── m-chain-numeric      → M8 → M9 → M10 → M12 → M11 → M7
+  └── m-chain-string       → M8s → M10s → M11s → M7
+```
+
+The dispatcher inspects the first row of `outputs` and returns one
+of three tags. Numeric outputs route to the existing branch (no
+behavior change). String outputs route to the new branch. Anything
+else (lists, bools, grids) returns `(found false)` and falls through
+to Flat enumeration. M7 (library reuse) stays domain-agnostic and
+runs in both branches — it's already shape-blind, just calling
+`(libfn args)` and checking output equality.
+
+The shared `__decomposers__` registration and the `__synth_skip__`
+snapshot are unchanged. The type dispatcher is fully invisible to
+synth_v2 — it sees the same single `m-chain` decomposer entry and
+the same skip set as before.
+
+#### 9.47.2 New files
+
+Five new files in `examples/meta_curriculum/`:
+
+| File | LOC | Purpose |
+|---|---|---|
+| `m_pool_string.selph` | ~280 | String pool builder. Same flag interface (unary-l1, unary-l2, libs, constants) as `m_pool.selph`. String-specific unary catalog (string-upper / string-lower / string-reverse). Constants flag reuses M13's `extract-data-atoms` (which already supports strings via `primitive?`). Baseline string constants `("" " ")` always seeded — the string analogue of `{0, 1, -1, 2}` for numeric. |
+| `m8s_constant_string.selph` | ~145 | Form 1: constant string output. Form 2: target equals some pool entry's column exactly (the string analogue of M8's `fit-scale` with C=1). Pool uses unary-l1 so wrap entries like `(string-upper (nth x 0))` are picked up. |
+| `m10s_concat_pair.selph` | ~190 | The `concat(h, sep, g)` recognizer. `fit-concat-pair` extracts `sep` from row 0 by slicing between `len(h_0)` and `len(out_0) − len(g_0)`, then verifies on every other row. The pair `(i, i)` is included so self-concat patterns work. |
+| `m11s_string_repeat.selph` | ~160 | The `repeat(s, length(n))` cross-type recognizer. Defines `m11s-string-repeat` as a pure-SELPH recursive helper (no `string-repeat` builtin in eval_v2). Composer emits an inline `(reduce (lambda (acc _) (concat acc s)) (range (string-length n)) "")` rather than referencing the helper, so synthesized lambdas stay self-contained. |
+| `m_chain.selph` (modified) | +50 | Type dispatcher + two branches. Numeric branch is the pre-§9.47 chain extracted into `m-chain-numeric`. String branch is new. |
+
+`run_probe.sh` updated to load the four new string files between the
+numeric M-stages and `m_chain.selph`. Load order matters: `m_pool`
+must come before any detect-* (provides `make-pool`); `m13` must
+come before `m_pool_string` (provides `extract-data-atoms`);
+`m_pool_string` must come before m8s/m10s/m11s; `m_chain` must
+come last so its `__synth_skip__` snapshot captures every M-stage
+helper from both branches.
+
+No new Rust. The substrate side is identical to post-§9.46.
+
+#### 9.47.3 Validation results
+
+All five gates pass:
+
+| Curriculum | Result | Candidates | Strategy split |
+|---|---|---|---|
+| `probe_int_control` | **5/5** | 5 | `custom:m-chain=5` |
+| `probe_strings_mchain` | **9/9** | 104 | `Flat=2, custom:m-chain=7` |
+| `physics_tasks` | **24/24** | 31,404 | `Flat=13, custom:m-chain=11` |
+| `physics_stage6` | **8/8** | 8 | `custom:m-chain=8` |
+| `physics_stage7` | **5/5** | 5 | `custom:m-chain=5` |
+
+The strings probe in particular is the headline result. Pre-§9.47:
+6/9 in 604,420 candidates, zero chain solves. Post-§9.47: **9/9 in
+104 candidates, 7 chain solves**. The three previously-failing tasks
+all flip from FAIL to chain solve:
+
+```
+const_hello       →  (lambda (x) "hello")
+                     M8s form 1, 1 cand
+concat_sep        →  (lambda (x) (concat (concat (nth x 0) " ") (nth x 1)))
+                     M10s with sep " ", 1 cand
+repeat_by_len     →  (lambda (x) (reduce (lambda (acc _) (concat acc (nth x 0)))
+                                         (range (string-length (nth x 1)))
+                                         ""))
+                     M11s, 1 cand
+```
+
+Three additional tasks that were Flat solves in §9.46 are now chain
+solves (cheaper and more semantically informative):
+
+```
+first_arg            →  M8s form 2 (was Flat 16 cand)
+concat_two           →  M10s with sep="" (was Flat 20 cand)
+concat_upper_first   →  M10s with h=wrap-string-upper (was Flat 4256 cand)
+```
+
+Two tasks remain Flat solves and are correct fall-throughs:
+
+- `length_first` — output type is `Int`, the dispatcher routes to
+  `m-chain-numeric`, the numeric pool has no string atoms, so the
+  numeric branch returns `(found false)` and Flat handles it via
+  `(string-length (nth x 0))`. The cross-type case (string in,
+  numeric out) is the deferred §9.46.5 question; not blocking for
+  P1.
+- `concat_three` — Flat finds `(string-join x (nth x 1))`, a clever
+  decomposition that doesn't fit any string M-shape. The chain's
+  `m-chain-string` returns `(found false)` and Flat takes over. A
+  hypothetical M11s extension that included pairwise concat in the
+  pool could find `(concat a (concat b b))` instead, but the cost
+  multiplier (pool²) isn't justified by one task.
+
+Physics 37/37 holds with byte-identical synthesized code. The type
+dispatcher adds one `(int? first-out)` check to the start of every
+multi-arg synth and otherwise contributes zero overhead to numeric
+specs.
+
+#### 9.47.4 Three observations from P1
+
+1. **Path E is genuinely cheaper than Path D for this domain.** P1
+   landed in one session with no Rust changes and ~775 LOC of new
+   meta-curriculum. Path D would have required pulling apart M8/M10/
+   M11/M12's tight coupling to `fit-affine` first, then redesigning
+   the pool entry shape, then verifying physics still passes. The
+   "domain duplication" worry from §9.46.4 is real (m_pool_string
+   structurally mirrors m_pool, ~60% shared shape) but the
+   *cognitive* duplication is small — each file is independently
+   readable and the dispatcher pattern is obvious.
+
+2. **The type dispatcher is a primitive case of cross-domain
+   meta-learning.** `m-chain-output-kind` is a tiny featurizer
+   (output-type → branch) and the rest of the chain is a tiny
+   "fit by domain." This is structurally identical to what Path D
+   would build, just with two domains hardcoded instead of an
+   extensible registry. If a third domain (grids) makes the
+   dispatcher feel cramped, that's the moment to revisit Path D —
+   not before.
+
+3. **The 6 chain solves on strings include three "free upgrades"**
+   that weren't in the original §9.46 failure set — `first_arg`,
+   `concat_two`, and `concat_upper_first` were Flat solves that
+   the new chain now handles in 1 candidate each. The chain
+   improvement isn't just "fix the failures"; it's "the chain
+   becomes the primary recognizer for the domain." Same pattern
+   as numeric: most multi-arg numeric tasks are chain solves, with
+   Flat as the fallback. Strings are now the same shape.
+
+#### 9.47.5 What's deferred
+
+- **Cross-type fits** (string→int, int→string, etc.). The
+  `length_first` task is the canonical example. Two paths: (a) add
+  a "projection pool" that featurizes string atoms through length
+  into int-typed pool entries, then runs the numeric chain on
+  them; (b) add a dedicated cross-type detect-* in the numeric
+  branch that scans for `string-length (nth x i)` shapes. (a) is
+  closer to Path D, (b) is closer to Path E. Defer until a
+  curriculum task forces the question.
+
+- **`m12s` structural pair for strings.** Numeric M12 recognizes
+  `op_b(h, op_u(g))`. The string analogue would be
+  `concat(h, op_u(g))` where `op_u ∈ {string-upper, string-lower,
+  string-reverse}`. The probe's `concat_upper_first` task is
+  exactly this shape but already solves via M10s + unary-l1 in 1
+  cand, so M12s is unmotivated for P1. Add it when a real
+  curriculum task needs `concat(g, upper(h))` style with the
+  unary on the second operand.
+
+- **String-domain library reuse.** M7 already runs in both
+  branches but the chain has never been tested with a string
+  library function defined upstream of the strings probe. This
+  is the natural follow-up curriculum: chain `concat_two` →
+  `concat_three` → larger compositions, and watch M7 fire on
+  the later tasks.
+
+- **`probe_strings_mchain.selph` is small and hand-picked.** A
+  larger string curriculum (10× more tasks) would surface shapes
+  the current detect-* family doesn't handle and tell us where
+  P2 needs to invest. Worth doing as a second strings probe before
+  starting P2 grids.
+
+#### 9.47.6 What's next: P2 grids
+
+The §9.47 plan in §9.46.4 had P2 = grids. With P1 validated, P2
+becomes concrete: build the minimal grid kernel in eval_v2 (Path C
+hybrid: ~300-500 LOC Rust with `Value::Grid` and ~10 primitives),
+write `m_pool_grid.selph` mirroring `m_pool_string.selph`, write
+the grid detect-* family (rotate/flip/transpose/color-swap/
+crop-to-bbox), validate against an ARC mini-curriculum.
+
+The P1 result is encouraging for P2 because the per-domain pool
+pattern composes cleanly. Adding a third branch to the dispatcher
+is a one-line change; adding `m_pool_grid.selph` is a parallel
+copy-and-edit of `m_pool_string.selph`; the grid detect-* family
+mirrors the string one. The hard part is the Rust kernel, not the
+meta-curriculum work.
+
+P2 should be a separate session — kernel work is mechanical but
+substantial enough to deserve its own scope.

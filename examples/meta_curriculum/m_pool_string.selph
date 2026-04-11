@@ -1,0 +1,315 @@
+; ─────────────────────────────────────────────────────────────────────────
+; m_pool_string: string-domain pool builder (§9.47 P1)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Path E from §9.46.4: type-dependent pools. The numeric `make-pool`
+; (m_pool.selph) operates on Int/Num cols and a numeric unary catalog
+; (sqrt/log/exp/...). This file is the parallel string-typed pool
+; builder. Same flag interface, same pool entry shape, same skip-set
+; integration — only the value type and the unary catalog differ.
+;
+; Pool entry shape (unchanged from m_pool):
+;
+;   (ns ("source" Node)        ; AST node for the expression
+;       ("col"    list-of-str) ; behavior column over spec inputs
+;       ("kind"   string))     ; tag for diagnostics
+;
+; Flags (in the flags ns):
+;
+;   "unary-l1"     — single-level unary wraps (string-upper/lower/reverse)
+;   "unary-l2"     — second-level wraps over L1 entries
+;   "libs"         — library function calls returning strings
+;   "constants"    — string atoms extracted via m13's extract-data-atoms
+;
+; Defaults: all false. Detect-* must opt in.
+;
+; "products" is intentionally omitted: there's no string × string → string
+; analogue worth keeping in the pool. Concat is the affine analogue and
+; lives inside detect-concat-pair, not in the pool itself.
+
+; ── Spec helpers ─────────────────────────────────────────────────────
+
+(define m-pool-str-spec-inputs  (lambda (s) (ns-get s "inputs")))
+(define m-pool-str-spec-outputs (lambda (s) (ns-get s "outputs")))
+(define m-pool-str-spec-arity   (lambda (s) (ns-get s "arity")))
+
+; ── Type predicates ──────────────────────────────────────────────────
+
+(define m-pool-str? (lambda (v) (string? v)))
+
+(define m-pool-str-all-strings?
+  (lambda (col)
+    (reduce (lambda (acc v) (and acc (m-pool-str? v))) col true)))
+
+(define m-pool-str-flag?
+  (lambda (flags key)
+    (if (ns-has flags key)
+      (= (ns-get flags key) true)
+      false)))
+
+; ── Pool entry constructor ───────────────────────────────────────────
+
+(define m-pool-str-entry
+  (lambda (source col kind)
+    (ns ("source" source) ("col" col) ("kind" kind))))
+
+(define m-pool-str-entry-source (lambda (e) (ns-get e "source")))
+(define m-pool-str-entry-col    (lambda (e) (ns-get e "col")))
+(define m-pool-str-entry-kind   (lambda (e) (ns-get e "kind")))
+
+; ── Unary op catalogue (string version) ──────────────────────────────
+;
+; Three string-preserving unary ops. string-trim is omitted because it
+; depends on whitespace presence — would be a no-op on most data and
+; just bloat the pool. char-code/code-char produce ints, not strings,
+; so they don't belong in this catalogue (they'd be in a string→int
+; cross-type catalogue, deferred per §9.46.5).
+
+(define m-pool-str-unary-ops
+  (list
+    (list "string-upper"   (lambda (v) (string-upper v)))
+    (list "string-lower"   (lambda (v) (string-lower v)))
+    (list "string-reverse" (lambda (v) (string-reverse v)))))
+
+; ── Level 0: indexed string atoms ────────────────────────────────────
+;
+; For each input position, build `(nth x i)` and the column of that
+; position's values across spec rows. Filter to positions whose first
+; row value is a string — mixed-type spec rows skip non-string slots.
+
+(define m-pool-str-l0
+  (lambda (s)
+    (let ((arity (m-pool-str-spec-arity s))
+          (inputs (m-pool-str-spec-inputs s)))
+      (filter (lambda (e) (not (nil? e)))
+        (map
+          (lambda (i)
+            (let ((col (map (lambda (row) (nth row i)) inputs)))
+              (if (m-pool-str-all-strings? col)
+                (m-pool-str-entry
+                  (make-app "nth" (make-symbol "x") (make-int i))
+                  col
+                  "atom")
+                nil)))
+          (range arity))))))
+
+; ── Unary wraps ──────────────────────────────────────────────────────
+;
+; For each entry × each unary op, build the wrapped entry. The wrapped
+; col must remain all-string (string-upper/lower/reverse all preserve
+; string type, so this is automatic). `try` guards against any
+; primitive that errors on a malformed input — defensive but rare.
+
+(define m-pool-str-wrap-entry
+  (lambda (entry op-pair)
+    (let ((op-name (head op-pair))
+          (op-fn (head (tail op-pair))))
+      (let ((wrapped-col (try (map op-fn (m-pool-str-entry-col entry)) nil)))
+        (if (or (nil? wrapped-col) (not (m-pool-str-all-strings? wrapped-col)))
+          nil
+          (m-pool-str-entry
+            (make-app op-name (m-pool-str-entry-source entry))
+            wrapped-col
+            (concat "wrap-" op-name)))))))
+
+(define m-pool-str-unary-wraps
+  (lambda (entries)
+    (filter (lambda (e) (not (nil? e)))
+      (reduce append
+        (map (lambda (entry)
+               (map (lambda (op) (m-pool-str-wrap-entry entry op))
+                    m-pool-str-unary-ops))
+             entries)
+        (list)))))
+
+; ── Library function calls ───────────────────────────────────────────
+;
+; Mirrors m_pool's m-pool-libs but filters columns to all-string. Any
+; library function whose output column is non-string for any row is
+; rejected (we only want pool entries that satisfy the string-fit
+; primitives). Skip set integration is the same as the numeric pool.
+
+(define m-pool-str-safe-apply
+  (lambda (f arg-list)
+    (try (apply f arg-list) nil)))
+
+(define m-pool-str-effective-arity
+  (lambda (lib-fn parent-inputs)
+    (let ((sample-row (head parent-inputs)))
+      (if (list? sample-row)
+        (let ((max-k (length sample-row)))
+          (reduce
+            (lambda (acc i)
+              (if (not (nil? acc))
+                acc
+                (let ((k (+ i 1)))
+                  (let ((sublist (slice sample-row 0 k)))
+                    (let ((res (m-pool-str-safe-apply lib-fn (list sublist))))
+                      (if (nil? res) nil k))))))
+            (range max-k)
+            nil))
+        nil))))
+
+(define m-pool-str-ordered-tuples
+  (lambda (n k)
+    (if (= k 0)
+      (list (list))
+      (let ((shorter (m-pool-str-ordered-tuples n (- k 1))))
+        (reduce append
+          (map
+            (lambda (tup)
+              (map
+                (lambda (i) (cons i tup))
+                (filter
+                  (lambda (i) (not (contains tup i)))
+                  (range n))))
+            shorter)
+          (list))))))
+
+(define m-pool-str-build-lib-call
+  (lambda (lib-name positions)
+    (let ((nth-args (map (lambda (i) (make-app "nth" (make-symbol "x") (make-int i))) positions)))
+      (let ((list-node (apply make-app (cons (make-symbol "list") nth-args))))
+        (make-app lib-name list-node)))))
+
+(define m-pool-str-lib-column
+  (lambda (lib-fn positions inputs)
+    (let ((cols (map
+                  (lambda (row)
+                    (let ((sub (map (lambda (p) (nth row p)) positions)))
+                      (m-pool-str-safe-apply lib-fn (list sub))))
+                  inputs)))
+      (if (reduce (lambda (acc v) (and acc (and (not (nil? v)) (m-pool-str? v))))
+                  cols
+                  true)
+        cols
+        nil))))
+
+(define m-pool-str-skip-set
+  (lambda ()
+    (try __synth_skip__ (list))))
+
+(define m-pool-str-in-skip?
+  (lambda (name)
+    (contains (m-pool-str-skip-set) name)))
+
+(define m-pool-str-libs
+  (lambda (s)
+    (let ((parent-arity (m-pool-str-spec-arity s))
+          (inputs (m-pool-str-spec-inputs s)))
+      (let ((lib-names
+              (filter (lambda (n) (not (m-pool-str-in-skip? n)))
+                      (ns-keys (env-functions)))))
+        (reduce append
+          (map
+            (lambda (name)
+              (let ((lib-fn (ns-get (env-functions) name)))
+                (let ((eff-arity (m-pool-str-effective-arity lib-fn inputs)))
+                  (if (or (nil? eff-arity) (> eff-arity parent-arity))
+                    (list)
+                    (let ((tuples (m-pool-str-ordered-tuples parent-arity eff-arity)))
+                      (filter (lambda (e) (not (nil? e)))
+                        (map
+                          (lambda (positions)
+                            (let ((col (m-pool-str-lib-column lib-fn positions inputs)))
+                              (if (nil? col)
+                                nil
+                                (m-pool-str-entry
+                                  (m-pool-str-build-lib-call name positions)
+                                  col
+                                  (concat "lib-" name)))))
+                          tuples)))))))
+            lib-names)
+          (list))))))
+
+; ── String constants from data atoms ─────────────────────────────────
+;
+; Reuse M13's extract-data-atoms — it already supports strings via
+; primitive?. Filter the result to strings only and emit one pool
+; entry per unique string with a constant column.
+;
+; Also seed two baseline string constants ("" and " ") because they
+; almost never appear directly in spec rows but are extremely common
+; in fit results — separators are the string analogue of the numeric
+; baseline {0, 1, -1, 2}.
+
+(define m-pool-str-baseline-constants (list "" " "))
+
+(define m-pool-str-dedup
+  (lambda (xs)
+    (reduce
+      (lambda (acc x)
+        (if (contains acc x) acc (append acc (list x))))
+      xs
+      (list))))
+
+(define m-pool-str-constants
+  (lambda (s)
+    (let ((n-rows (length (m-pool-str-spec-inputs s)))
+          (data-atoms (extract-data-atoms s)))
+      (let ((string-atoms
+              (m-pool-str-dedup
+                (append
+                  m-pool-str-baseline-constants
+                  (filter m-pool-str? data-atoms)))))
+        (map
+          (lambda (s-val)
+            (m-pool-str-entry
+              (make-str s-val)
+              (map (lambda (_) s-val) (range n-rows))
+              (concat "const-" s-val)))
+          string-atoms)))))
+
+; ── Top-level: make-pool-string ──────────────────────────────────────
+;
+; Build a string pool with the requested levels and inclusions. The
+; assembly order matters — L1/L2 wraps depend on what's already in
+; the pool, so flags must be applied in dependency order.
+
+(define make-pool-string
+  (lambda (s flags)
+    (let ((base (m-pool-str-l0 s)))
+      (let ((with-unary-l1
+              (if (m-pool-str-flag? flags "unary-l1")
+                (append base (m-pool-str-unary-wraps base))
+                base)))
+        (let ((with-unary-l2
+                (if (m-pool-str-flag? flags "unary-l2")
+                  (let ((l1-wraps
+                          (filter
+                            (lambda (e)
+                              (let ((k (m-pool-str-entry-kind e)))
+                                (and (>= (string-length k) 5)
+                                     (= (string-take k 5) "wrap-"))))
+                            with-unary-l1)))
+                    (append with-unary-l1 (m-pool-str-unary-wraps l1-wraps)))
+                  with-unary-l1)))
+          (let ((with-libs
+                  (if (m-pool-str-flag? flags "libs")
+                    (append with-unary-l2 (m-pool-str-libs s))
+                    with-unary-l2)))
+            (let ((with-constants
+                    (if (m-pool-str-flag? flags "constants")
+                      (append with-libs (m-pool-str-constants s))
+                      with-libs)))
+              with-constants)))))))
+
+; ── Smoke test ───────────────────────────────────────────────────────
+
+(define m-pool-str-test-spec
+  (ns ("inputs"  (list (list "hello" "world") (list "foo" "bar") (list "abc" "xyz")))
+      ("outputs" (list "hello world" "foo bar" "abc xyz"))
+      ("arity"   2)))
+
+(print "─── m_pool_string smoke test ───")
+(print (concat "  L0 only: "
+               (to-string (length (make-pool-string m-pool-str-test-spec (ns))))
+               " entries"))
+(print (concat "  +unary-l1: "
+               (to-string (length (make-pool-string m-pool-str-test-spec
+                                    (ns ("unary-l1" true)))))
+               " entries"))
+(print (concat "  +constants: "
+               (to-string (length (make-pool-string m-pool-str-test-spec
+                                    (ns ("unary-l1" true) ("constants" true)))))
+               " entries"))

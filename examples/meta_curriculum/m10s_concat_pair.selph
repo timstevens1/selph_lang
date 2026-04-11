@@ -1,0 +1,191 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M10s: concat pair fit (§9.47 P1)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; String analogue of m10_affine_combination.selph. The numeric Form 3
+; recognizes
+;
+;   target == h(x) + C · g(x)
+;
+; where C is a learned scalar. The string analogue recognizes
+;
+;   target == h(x) ++ sep ++ g(x)
+;
+; where sep is a learned constant string and `++` is concat. The
+; separator can be the empty string (plain concat), a single space,
+; or any constant slice extracted from row 0 and validated across
+; all rows.
+;
+; The pool is the same shape as M10's: indexed string atoms plus
+; their unary-wrapped variants (string-upper / string-lower /
+; string-reverse). Pair iteration is O(pool²).
+
+; ── Helpers ──────────────────────────────────────────────────────────
+
+(define m10s-spec-outputs (lambda (s) (ns-get s "outputs")))
+
+(define m10s-str? (lambda (v) (string? v)))
+
+(define m10s-string-target
+  (lambda (s)
+    (let ((outs (m10s-spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (m10s-str? v))) outs true)
+        outs
+        nil))))
+
+; ── fit-concat-pair primitive ────────────────────────────────────────
+;
+; For columns h-col and g-col and target output column, find a constant
+; string `sep` such that target[i] == concat(h-col[i], sep, g-col[i])
+; for every i. Returns sep on success, nil on failure.
+;
+; Algorithm:
+;   1. Read row 0: out_0, h_0, g_0.
+;   2. If len(out_0) < len(h_0) + len(g_0), the pair can't fit. Reject.
+;   3. Verify that out_0 starts with h_0 and ends with g_0.
+;   4. Extract sep = out_0[len(h_0) : len(out_0) - len(g_0)].
+;   5. Verify on every row: out_i == h_i ++ sep ++ g_i.
+;
+; The verification step catches the case where row 0 happens to fit but
+; the pattern is coincidental — exactly the same robustness fit-affine
+; gets from its pivot+verify structure.
+
+(define fit-concat-pair
+  (lambda (h-col g-col target)
+    (if (or (= (length h-col) 0) (= (length target) 0))
+      nil
+      (let ((h0 (head h-col))
+            (g0 (head g-col))
+            (out0 (head target)))
+        (let ((len-h (string-length h0))
+              (len-g (string-length g0))
+              (len-out (string-length out0)))
+          (if (< len-out (+ len-h len-g))
+            nil
+            (let ((prefix-ok (= (string-take out0 len-h) h0))
+                  (suffix-ok (= (string-drop out0 (- len-out len-g)) g0)))
+              (if (not (and prefix-ok suffix-ok))
+                nil
+                (let ((sep (string-slice out0 len-h (- len-out len-g))))
+                  (let ((all-ok
+                          (reduce
+                            (lambda (acc i)
+                              (if acc
+                                (= (concat (concat (nth h-col i) sep) (nth g-col i))
+                                   (nth target i))
+                                false))
+                            (range (length target))
+                            true)))
+                    (if all-ok sep nil)))))))))))
+
+; ── Pool builder ─────────────────────────────────────────────────────
+;
+; M10s consumes string pool with unary-l1 enabled (matches M10's
+; numeric pool: base atoms + unary wraps). Constants flag is NOT
+; required because the separator is learned from data, not seeded as
+; a pool entry.
+
+(define m10s-build-pool
+  (lambda (s) (make-pool-string s (ns ("unary-l1" true)))))
+
+(define m10s-pool-source (lambda (e) (ns-get e "source")))
+(define m10s-pool-col    (lambda (e) (ns-get e "col")))
+
+; ── Source emission ──────────────────────────────────────────────────
+
+(define m10s-emit-concat-pair
+  (lambda (h-source sep g-source)
+    (make-lambda (list "x")
+      (if (= sep "")
+        (make-app "concat" h-source g-source)
+        (make-app "concat"
+          (make-app "concat" h-source (make-str sep))
+          g-source)))))
+
+; ── Detection ────────────────────────────────────────────────────────
+;
+; Iterate ordered pairs (h, g) over the pool. The pair (i, i) is
+; included — there are real cases where target == h ++ sep ++ h
+; (e.g., the strings probe's `concat_three` task, which is
+; `(concat a (concat b b))`).
+;
+; Once a fit is found, return the wrapped result and stop. The first
+; match wins — same convention as M10.
+
+(define detect-concat-pair
+  (lambda (s)
+    (let ((target (m10s-string-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-string target"))
+        (let ((pool (m10s-build-pool s)))
+          (let ((result
+                  (reduce
+                    (lambda (acc h-entry)
+                      (if (not (nil? acc)) acc
+                        (reduce
+                          (lambda (acc2 g-entry)
+                            (if (not (nil? acc2)) acc2
+                              (let ((sep (fit-concat-pair
+                                           (m10s-pool-col h-entry)
+                                           (m10s-pool-col g-entry)
+                                           target)))
+                                (if (nil? sep)
+                                  nil
+                                  (ns ("kind" "concat-pair")
+                                      ("h-kind" (ns-get h-entry "kind"))
+                                      ("g-kind" (ns-get g-entry "kind"))
+                                      ("sep" sep)
+                                      ("source-node"
+                                        (m10s-emit-concat-pair
+                                          (m10s-pool-source h-entry)
+                                          sep
+                                          (m10s-pool-source g-entry))))))))
+                          pool
+                          nil)))
+                    pool
+                    nil)))
+            (if (nil? result)
+              (ns ("found" false) ("reason" "no concat pair matched"))
+              (ns-put result "found" true))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(define m10s-make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+; Test 1: plain concat (sep = "")
+(define m10s-concat-spec
+  (m10s-make-spec
+    (list (list "a" "b") (list "foo" "bar") (list "x" "y"))
+    (list "ab" "foobar" "xy")
+    2))
+
+; Test 2: concat with single-space separator
+(define m10s-concat-sep-spec
+  (m10s-make-spec
+    (list (list "a" "b") (list "foo" "bar") (list "x" "y"))
+    (list "a b" "foo bar" "x y")
+    2))
+
+; Test 3: concat where one half has been uppercased — needs unary-l1
+(define m10s-upper-then-concat-spec
+  (m10s-make-spec
+    (list (list "a" "b") (list "foo" "bar") (list "x" "y"))
+    (list "Ab" "FOObar" "Xy")
+    2))
+
+(define m10s-run-test
+  (lambda (label spec)
+    (do
+      (print (concat "─── " label " ───"))
+      (let ((result (detect-concat-pair spec)))
+        (if (ns-get result "found")
+          (print (concat "  ✓ h=" (ns-get result "h-kind")
+                         " g=" (ns-get result "g-kind")
+                         " sep='" (ns-get result "sep") "'"))
+          (print (concat "  ✗ " (ns-get result "reason"))))))))
+
+(m10s-run-test "f((a,b)) = a++b (no sep)" m10s-concat-spec)
+(m10s-run-test "f((a,b)) = a++' '++b (space sep)" m10s-concat-sep-spec)
+(m10s-run-test "f((a,b)) = upper(a)++b" m10s-upper-then-concat-spec)

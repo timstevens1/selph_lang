@@ -1,0 +1,145 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M8s: constant-string fit (§9.47 P1)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; String analogue of m8_constant_fit.selph. Recognizes two shapes:
+;
+;   Form 1:  target == "constant"      (every output equal)
+;   Form 2:  target == g(x)            (output is exactly some pool entry's
+;                                       column — the string analogue of
+;                                       fit-scale with C=1, since strings
+;                                       have no scalar multiplication)
+;
+; The string equivalent of M8's fit-affine doesn't exist as a closed-form
+; solver — instead each form is its own dedicated check.
+
+; ── Helpers ──────────────────────────────────────────────────────────
+
+(define m8s-spec-outputs (lambda (s) (ns-get s "outputs")))
+
+(define m8s-str? (lambda (v) (string? v)))
+
+(define m8s-cols-equal?
+  (lambda (xs ys)
+    (if (= (length xs) (length ys))
+      (reduce
+        (lambda (acc pair) (and acc (= (head pair) (head (tail pair)))))
+        (zip xs ys)
+        true)
+      false)))
+
+(define m8s-string-target
+  (lambda (s)
+    (let ((outs (m8s-spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (m8s-str? v))) outs true)
+        outs
+        nil))))
+
+; ── fit-constant-string primitive ────────────────────────────────────
+;
+; If every value in target equals the head, return that constant.
+; Otherwise return nil. The empty-target case returns nil — a vacuous
+; success would emit code that we can't validate against any input.
+
+(define fit-constant-string
+  (lambda (target)
+    (if (= (length target) 0)
+      nil
+      (let ((c (head target)))
+        (if (reduce (lambda (acc v) (and acc (= v c))) target true)
+          c
+          nil)))))
+
+; ── Pool builder ─────────────────────────────────────────────────────
+;
+; M8s consults the L0 pool plus unary-l1 wraps for Form 2. Form 1
+; doesn't consult the pool at all (recognizer reads target directly).
+; Including unary-l1 lets `(string-upper (nth x 0))` and the other
+; wrap-* entries be picked up as Form 2 matches without going through
+; M10s's pair iteration. The pool grows from `arity` to
+; `arity * (1 + len(unary-ops))` entries — for typical 2-arg specs
+; that's 2 → 8, negligible iteration cost.
+
+(define m8s-build-pool (lambda (s) (make-pool-string s (ns ("unary-l1" true)))))
+
+(define m8s-pool-source (lambda (e) (ns-get e "source")))
+(define m8s-pool-col    (lambda (e) (ns-get e "col")))
+
+; ── Source emission ──────────────────────────────────────────────────
+
+(define m8s-wrap-lambda
+  (lambda (body) (make-lambda (list "x") body)))
+
+(define m8s-emit-bare
+  (lambda (c)
+    (m8s-wrap-lambda (make-str c))))
+
+(define m8s-emit-atom
+  (lambda (g-source)
+    (m8s-wrap-lambda g-source)))
+
+; ── Detection ────────────────────────────────────────────────────────
+
+(define m8s-try-form-1
+  (lambda (target)
+    (let ((c (fit-constant-string target)))
+      (if (nil? c)
+        nil
+        (ns ("kind" "form-1-string") ("c" c)
+            ("source-node" (m8s-emit-bare c)))))))
+
+(define m8s-try-form-2
+  (lambda (pool target)
+    (reduce
+      (lambda (acc entry)
+        (if (not (nil? acc)) acc
+          (if (m8s-cols-equal? (m8s-pool-col entry) target)
+            (ns ("kind" "form-2-string")
+                ("source-node" (m8s-emit-atom (m8s-pool-source entry))))
+            nil)))
+      pool
+      nil)))
+
+(define detect-constant-string
+  (lambda (s)
+    (let ((target (m8s-string-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-string target"))
+        (let ((pool (m8s-build-pool s)))
+          (let ((r1 (m8s-try-form-1 target)))
+            (let ((result (if (nil? r1)
+                            (m8s-try-form-2 pool target)
+                            r1)))
+              (if (nil? result)
+                (ns ("found" false) ("reason" "no string shape matched"))
+                (ns-put result "found" true)))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(define m8s-make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+(define m8s-const-spec
+  (m8s-make-spec
+    (list (list "a" "b") (list "foo" "bar") (list "x" "y"))
+    (list "hello" "hello" "hello")
+    2))
+
+(define m8s-identity-spec
+  (m8s-make-spec
+    (list (list "a" "b") (list "foo" "bar") (list "x" "y"))
+    (list "a" "foo" "x")
+    2))
+
+(define m8s-run-test
+  (lambda (label spec)
+    (do
+      (print (concat "─── " label " ───"))
+      (let ((result (detect-constant-string spec)))
+        (if (ns-get result "found")
+          (print (concat "  ✓ kind=" (ns-get result "kind")))
+          (print (concat "  ✗ " (ns-get result "reason"))))))))
+
+(m8s-run-test "constant 'hello'" m8s-const-spec)
+(m8s-run-test "identity (nth x 0)" m8s-identity-spec)

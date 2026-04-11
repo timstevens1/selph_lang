@@ -44,6 +44,10 @@ cat \
     "$META/m10_affine_combination.selph" \
     "$META/m11_product_fit.selph" \
     "$META/m12_structural_pair_fit.selph" \
+    "$META/m_pool_string.selph" \
+    "$META/m8s_constant_string.selph" \
+    "$META/m10s_concat_pair.selph" \
+    "$META/m11s_string_repeat.selph" \
     "$META/m_chain.selph" \
     "$CURRICULUM" \
     > "$COMBINED"

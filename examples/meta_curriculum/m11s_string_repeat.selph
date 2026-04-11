@@ -1,0 +1,165 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M11s: string repeat-by-length fit (§9.47 P1)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; String analogue of m11_product_fit's Form 4. The numeric Form 4
+; recognizes
+;
+;   target == C · (e1(x) · e2(x))
+;
+; — a scaled product of two pool entries. The string analogue is
+;
+;   target == repeat(s(x), length(n(x)))
+;
+; — repeat the string `s` exactly `length(n)` times. This is the only
+; cross-type fit in the §9.47 P1 family: `s` is a string atom,
+; `length(n)` is an int derived from a string atom. There's no
+; explicit "scale C" in the string version because string repetition
+; doesn't admit fractional or negative counts.
+;
+; This shape covers the §9.46 strings probe `repeat_by_len` task and
+; is the closest the string family gets to multiplicative composition.
+
+; ── Helpers ──────────────────────────────────────────────────────────
+
+(define m11s-spec-outputs (lambda (s) (ns-get s "outputs")))
+
+(define m11s-str? (lambda (v) (string? v)))
+
+(define m11s-string-target
+  (lambda (s)
+    (let ((outs (m11s-spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (m11s-str? v))) outs true)
+        outs
+        nil))))
+
+; ── string-repeat helper ─────────────────────────────────────────────
+;
+; eval_v2 doesn't expose a string-repeat builtin (only string-take /
+; string-drop / etc.), so we define one in pure SELPH. Recursive on
+; the count. Bound at the m11s level so the synth's library probe
+; sees it once and skips it via __synth_skip__.
+;
+; Edge cases: n <= 0 → empty string. n is presumed to be a small
+; nonneg int — typical curriculum values fit in 0..32.
+
+(define m11s-string-repeat
+  (lambda (s n)
+    (if (<= n 0)
+      ""
+      (concat s (m11s-string-repeat s (- n 1))))))
+
+; ── fit-string-repeat-by-length primitive ────────────────────────────
+;
+; For string column s-col and string column n-col and target output
+; column, check whether target[i] == repeat(s-col[i], length(n-col[i]))
+; for every i. Returns true on success, nil on failure.
+;
+; Why true vs nil instead of returning the count: there is no scalar
+; parameter to learn — the count is determined per-row by length(n).
+; The fit either holds or it doesn't.
+
+(define fit-string-repeat-by-length
+  (lambda (s-col n-col target)
+    (let ((all-ok
+            (reduce
+              (lambda (acc i)
+                (if acc
+                  (= (m11s-string-repeat (nth s-col i) (string-length (nth n-col i)))
+                     (nth target i))
+                  false))
+              (range (length target))
+              true)))
+      (if all-ok true nil))))
+
+; ── Pool builder ─────────────────────────────────────────────────────
+;
+; M11s consumes the L0 string pool only. Adding unary-l1 would let us
+; recognize shapes like `repeat(upper(s), length(n))` but the cost
+; multiplier (3× per atom) doesn't pay off for the §9.47 P1 probe.
+; Easy extension if a real curriculum task demands it later.
+
+(define m11s-build-pool (lambda (s) (make-pool-string s (ns))))
+
+(define m11s-pool-source (lambda (e) (ns-get e "source")))
+(define m11s-pool-col    (lambda (e) (ns-get e "col")))
+
+; ── Source emission ──────────────────────────────────────────────────
+;
+; Emits a recursive helper inline rather than referencing
+; m11s-string-repeat directly: if grow-v2 binds the synthesized
+; lambda into env as a library function, that function would close
+; over m11s-string-repeat from the m11s scope, which works at
+; runtime but is brittle if the m11s file is reordered. Inlining
+; the loop via reduce keeps the synthesized lambda self-contained.
+
+(define m11s-emit-string-repeat
+  (lambda (s-source n-source)
+    (make-lambda (list "x")
+      (make-app "reduce"
+        (make-lambda (list "acc" "_")
+          (make-app "concat" (make-symbol "acc") s-source))
+        (make-app "range" (make-app "string-length" n-source))
+        (make-str "")))))
+
+; ── Detection ────────────────────────────────────────────────────────
+
+(define detect-string-repeat
+  (lambda (s)
+    (let ((target (m11s-string-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-string target"))
+        (let ((pool (m11s-build-pool s)))
+          (let ((result
+                  (reduce
+                    (lambda (acc s-entry)
+                      (if (not (nil? acc)) acc
+                        (reduce
+                          (lambda (acc2 n-entry)
+                            (if (not (nil? acc2)) acc2
+                              (let ((ok (fit-string-repeat-by-length
+                                          (m11s-pool-col s-entry)
+                                          (m11s-pool-col n-entry)
+                                          target)))
+                                (if (nil? ok)
+                                  nil
+                                  (ns ("kind" "string-repeat-by-length")
+                                      ("s-kind" (ns-get s-entry "kind"))
+                                      ("n-kind" (ns-get n-entry "kind"))
+                                      ("source-node"
+                                        (m11s-emit-string-repeat
+                                          (m11s-pool-source s-entry)
+                                          (m11s-pool-source n-entry))))))))
+                          pool
+                          nil)))
+                    pool
+                    nil)))
+            (if (nil? result)
+              (ns ("found" false) ("reason" "no string-repeat shape matched"))
+              (ns-put result "found" true))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(define m11s-make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+; The probe's `repeat_by_len` task: a × len(b)
+(define m11s-repeat-by-len-spec
+  (m11s-make-spec
+    (list (list "a" "xx") (list "b" "yyy") (list "ab" "z")
+          (list "c" "wwww") (list "xy" "pp"))
+    (list "aa" "bbb" "ab" "cccc" "xyxy")
+    2))
+
+(define m11s-run-test
+  (lambda (label spec)
+    (do
+      (print (concat "─── " label " ───"))
+      (let ((result (detect-string-repeat spec)))
+        (if (ns-get result "found")
+          (print (concat "  ✓ s=" (ns-get result "s-kind")
+                         " n=" (ns-get result "n-kind")))
+          (print (concat "  ✗ " (ns-get result "reason"))))))))
+
+(m11s-run-test "repeat(a, length(b))" m11s-repeat-by-len-spec)
