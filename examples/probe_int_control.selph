@@ -1,0 +1,40 @@
+; ─────────────────────────────────────────────────────────────────────────
+; §9.46 Int control probe
+; ─────────────────────────────────────────────────────────────────────────
+;
+; A small int-domain task-args curriculum used as a control alongside
+; the §9.46 strings probe. The point of this file is NOT to measure how
+; many tasks the M-chain can solve — it's to confirm that the M-chain
+; integration path works at all on simple integer multi-arg tasks
+; before we draw any conclusions from a string-domain failure.
+;
+; Each task is intentionally trivial. If even one of these fails, the
+; problem is in the integration, not the strings probe.
+;
+; Concatenate with m_pool + m13 + m7..m12 + m_chain in front, then
+; run via `selph grow-v2`. Expected outcome: 3/3 solves, all via
+; either Flat (cheap enumeration) or custom:m-chain.
+
+; M8 form 1 analogue — output is a non-trivial constant.
+; 17 isn't in any input row, so Flat can only reach it via affine
+; fit / data-atom seeding. Forces the M-chain to be the credited
+; solver, not Flat-with-tiny-budget.
+(task-args "const_17" 2
+  ((1 1) 17) ((2 3) 17) ((5 7) 17) ((10 0) 17) ((0 0) 17))
+
+; M10 affine analogue — output = a + 2*b. Affine fit over both atoms.
+(task-args "a_plus_2b" 2
+  ((1 1) 3) ((3 4) 11) ((5 6) 17) ((10 20) 50) ((0 0) 0))
+
+; M11 product analogue — output = 3*(a*b). Product fit with scale.
+(task-args "three_ab" 2
+  ((1 2) 6) ((3 4) 36) ((5 6) 90) ((2 7) 42) ((0 9) 0))
+
+; M9 unary wrap analogue — output = a*a (but no `square` in env).
+; Forces M9 to wrap a base atom or M11 form 4 to fire on a self-product.
+(task-args "a_squared" 2
+  ((2 0) 4) ((3 0) 9) ((5 0) 25) ((7 0) 49) ((10 0) 100))
+
+; M12 structural pair analogue — output = a + (b * b).
+(task-args "a_plus_bsq" 2
+  ((1 2) 5) ((3 3) 12) ((4 5) 29) ((0 6) 36) ((10 1) 11))

@@ -1,0 +1,105 @@
+; ─────────────────────────────────────────────────────────────────────────
+; §9.46 String probe — does the M-chain generalize beyond physics?
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Each task in this file is the closest sensible string analogue of one
+; of the physics shapes the M-chain currently recognizes. The goal is
+; not to solve them all — it's to read the trace and learn which parts
+; of the recognizer surface are physics-shaped vs. domain-general.
+;
+; Predicted outcome before running: most or all tasks FAIL. The M-chain's
+; fit-affine primitive operates on numeric columns; m-pool-num? rejects
+; strings; the unary catalog is sqrt/log/exp/... — none of which apply.
+; If that prediction holds, the §9.46 finding is "make-pool is currently
+; numeric-only and any non-numeric domain (strings, grids, ...) needs
+; either a parallel pool builder or a domain-agnostic refactor."
+;
+; But the prediction could be wrong in interesting ways:
+;   1. Some tasks may solve via plain Flat enumeration without the chain
+;      ever firing — that's library-style synthesis, not M-chain validation.
+;   2. The chain might crash or hang on string inputs (versus the clean
+;      "no signal" failure mode we want).
+;   3. M7 (library detection) might fire if a relevant helper is in env,
+;      since M7 is shape-agnostic — it tries `(libfn (list ai aj))` and
+;      checks output equality, no numeric assumptions.
+;
+; Concatenate with m_pool + m13 + m7..m12 + m_chain in front, then
+; run via `selph grow-v2`.
+
+; ── M8 form 1 analogue — constant string output ──────────────────────
+; Output is "hello" regardless of inputs. M8 should recognize this as
+; a constant fit. Numeric M8 succeeds when fit-affine returns a=0, b=k.
+; For strings there's no equivalent of fit-affine.
+(task-args "const_hello" 2
+  (("a" "b") "hello") (("foo" "bar") "hello")
+  (("xy" "zz") "hello") (("p" "q") "hello") (("" "") "hello"))
+
+; ── M8 form 2 analogue — identity (output = arg0) ────────────────────
+; Trivially solvable by Flat enumeration as `(nth x 0)`. Including it
+; as a sanity check that the multi-arg path itself works on strings.
+(task-args "first_arg" 2
+  (("a" "b") "a") (("foo" "bar") "foo") (("hello" "world") "hello")
+  (("xy" "zz") "xy") (("p" "q") "p"))
+
+; ── M10 affine analogue — concat of two args ─────────────────────────
+; The cleanest string analogue of `a + b`. If the M-chain were
+; domain-aware, M10 would emit `(string-concat a b)`. Today: Flat or fail.
+(task-args "concat_two" 2
+  (("a" "b") "ab") (("foo" "bar") "foobar")
+  (("hello" "world") "helloworld") (("xy" "zz") "xyzz") (("" "q") "q"))
+
+; ── M10 affine + constant — concat with separator ────────────────────
+; Analogue of `a + " " + b`. Requires constant " " seeded as a literal,
+; which is what M13 (data atoms) does for numeric constants. M13 should
+; pick up " " from no source — it's not in any spec row — so this likely
+; fails unless Flat finds it.
+(task-args "concat_sep" 2
+  (("a" "b") "a b") (("foo" "bar") "foo bar")
+  (("hello" "world") "hello world") (("x" "y") "x y") (("" "q") " q"))
+
+; ── M9 unary wrap analogue — uppercase first arg ─────────────────────
+; The numeric M9 wraps a single atom with one of {sqrt, log, exp, ...}.
+; The string analogue would wrap with {string-upper, string-lower,
+; string-reverse, ...} but the unary catalog is hardcoded numeric.
+; Expected to fail unless Flat reaches `(string-upper (nth x 0))`.
+(task-args "upper_first" 2
+  (("hello" "x") "HELLO") (("foo" "y") "FOO") (("a" "z") "A")
+  (("test" "q") "TEST") (("xyz" "p") "XYZ"))
+
+; ── M11 product analogue — repeat first by length of second ──────────
+; Output = a × len(b). Numeric M11 fits `h + C·(e1·e2)`; the string
+; analogue would need string-repeat + string-length wrapped together.
+; Almost certainly out of reach for both Flat and the chain.
+(task-args "repeat_by_len" 3
+  (("a" "xx") "aa") (("b" "yyy") "bbb") (("ab" "z") "ab")
+  (("c" "wwww") "cccc") (("xy" "pp") "xyxy"))
+
+; ── M12 structural pair analogue — concat (upper a) with b ───────────
+; Numeric M12 emits `op_b(h, op_u(g))`. String analogue: combine
+; arg-as-is with a wrapped sibling. Reachable by Flat at depth 2 if
+; string-upper and string-concat are both in the int catalog.
+(task-args "concat_upper_first" 2
+  (("hello" "world") "HELLOworld") (("a" "b") "Ab")
+  (("foo" "bar") "FOObar") (("x" "yz") "Xyz") (("p" "q") "Pq"))
+
+; ── String → int: length ─────────────────────────────────────────────
+; Tests whether the chain handles "string input, int output" — a hybrid
+; shape that breaks make-pool's "all columns are numeric" assumption from
+; the input side rather than the output side. Should fail.
+(task-args "length_first" 2
+  (("a" "x") 1) (("ab" "x") 2) (("foo" "x") 3)
+  (("hello" "x") 5) (("" "x") 0))
+
+; ── M7 library reuse — pre-defined helper ────────────────────────────
+; The only M-stage that should fire on strings, IF a library function
+; with the right shape is in env. The probe doesn't pre-define any
+; string library — it relies on grow-v2 binding earlier solved tasks
+; into env. Since `concat_two` (above) defines `concat-two` if solved,
+; this task tests whether M7 picks it up. If so, this is the one
+; positive datapoint the strings probe yields.
+(task-args "concat_three"  2
+  (("a" "b") "abb") (("x" "yz") "xyzyz") (("foo" "z") "foozz")
+  (("p" "qr") "pqrqr") (("hi" "x") "hixx"))
+; Note: "concat_three" computes (concat a (concat b b)), which an M7
+; equivalent would discover as `(concat-two a (concat-two b b))` if
+; concat_two is in env from an earlier solve.

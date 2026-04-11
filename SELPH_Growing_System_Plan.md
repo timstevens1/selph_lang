@@ -7249,3 +7249,253 @@ The §9.45 thesis has been validated at the physics level. Future
 sections should focus on either (a) cleaning up the long tail of
 deferred items or (b) testing the architecture against a new
 domain — not on more physics work, since physics is at 100%.
+
+### 9.46 Strings probe — the M-chain is numeric-specialist, not domain-general (April 11, 2026)
+
+§9.45.13.8 listed "test `make-pool` against a non-physics curriculum"
+as the cheapest informative experiment for §9.46. ARC was the
+intended target until a survey of the v2 substrate revealed that
+grids have no representation in `types_v2`/`eval_v2` at all
+(`legacy_value_to_v2` silently turns `Value::Grid` into `Nil`),
+so a real ARC probe would require ~1500 LOC of grid-kernel work
+*before* the M-chain could see a single task. That's a full
+sub-section's worth of substrate investment to answer one
+yes/no question.
+
+Strings, by contrast, already round-trip through `legacy_value_to_v2`
+and the synth catalog already exposes the legacy string builtins
+(`concat`, `string-upper`, `string-length`, `string-join`, etc.).
+A strings probe could be built and run in an afternoon. So §9.46
+became a strings probe with ARC as the question it was actually
+trying to answer.
+
+#### 9.46.1 Probe design
+
+Two task-args curricula in `examples/`:
+
+- `probe_int_control.selph`: 5 multi-arg int tasks chosen so that
+  Flat enumeration at depth 2 *cannot* reach the answer in a
+  single candidate. Each task targets one M-stage shape:
+  - `const_17` → M8 form 1 (constant fit)
+  - `a_plus_2b` → M10 (affine combination)
+  - `three_ab` → M11 form 4 (scaled product)
+  - `a_squared` → M11 form 4 with C=1 (self-product)
+  - `a_plus_bsq` → M12 (structural pair)
+
+- `probe_strings_mchain.selph`: 9 multi-arg string tasks chosen
+  as the closest sensible string analogue of each numeric M-stage
+  shape:
+  - `const_hello`, `first_arg`, `concat_two`, `concat_sep`,
+    `upper_first`, `repeat_by_len`, `concat_upper_first`,
+    `length_first`, `concat_three`
+
+Two runner scripts in repo root (since `grow-v2` has no
+`--library` / `--preamble` flag):
+
+- `run_probe.sh`: prepends `m_pool` + `m13` + `m7..m12` + `m_chain`
+  to the curriculum file via `cat` and runs `selph grow-v2`. This
+  is the same physical concatenation pattern §9.45.11 used to
+  reproduce physics 37/37.
+- `run_probe_nochain.sh`: same prepend, but appends
+  `(define __decomposers__ (ns))` after `m_chain` to force
+  `try_selph_decomposers` to find nothing. Crucially, `m_chain.selph`
+  is still loaded so `__synth_skip__` gets populated — without
+  the skip set, every task probes ~30 M-stage helpers as library
+  components and the run hangs (this happened on the first
+  no-chain attempt and is itself a confirmation of §9.45.13.3's
+  necessity).
+
+#### 9.46.2 Results
+
+| Run | Solved | Total candidates | Notes |
+|---|---|---|---|
+| `probe_int_control + chain` | **5/5** | **5** (1 each) | Every solve via M-chain |
+| `probe_int_control − chain` | **5/5** | **29,846** | Flat reaches all but ~6000× slower |
+| `probe_strings + chain` | **6/9** | **604,420** | Zero chain solves; 3 fails ate 200k cand each |
+| `probe_strings − chain` | **6/9** | **604,420** | **Byte-identical to + chain** |
+
+Per-task synthesized code on the int control demonstrates that the
+chain is the actual solver, not Flat. With chain, every task emits
+float-tagged literals from `fit-affine`:
+
+```
+const_17    →  (lambda (x) 17.0)
+a_plus_2b   →  (lambda (x) (add (nth x 0) (multiply 2.0 (nth x 1))))
+three_ab    →  (lambda (x) (multiply 3.0 (multiply (nth x 0) (nth x 1))))
+a_squared   →  (lambda (x) (multiply 1.0 (multiply (nth x 0) (nth x 0))))
+a_plus_bsq  →  (lambda (x) (add (nth x 0) (abs (multiply (nth x 1) (nth x 1)))))
+```
+
+Without chain, the same tasks emit pure-int Flat enumeration results
+that bear no fit-affine signature:
+
+```
+const_17    →  (lambda (x) (add 7 10))           ; 811 cand
+a_plus_2b   →  (lambda (x) (add (add (nth x 0) (nth x 1)) (nth x 1)))   ; 2,542 cand
+three_ab    →  (lambda (x) (multiply (multiply 3 (nth x 0)) (nth x 1))) ; 22,517 cand
+a_squared   →  (lambda (x) (multiply (nth x 0) (nth x 0)))              ; 43 cand
+a_plus_bsq  →  (lambda (x) (add (multiply (nth x 1) (nth x 1)) (nth x 0))) ; 3,933 cand
+```
+
+The strings probe has the inverse property: with-chain and
+without-chain runs are *byte-identical* — same 6 solves, same 3
+failures, same candidate counts down to the digit, same synthesized
+expressions. The chain runs through every M-stage on every string
+task and returns `(ns ("found" false))` every time.
+
+The 6 string solves are all plain Flat enumeration over the legacy
+string builtin catalogue:
+
+```
+first_arg              →  (lambda (x) (nth x 0))                            ; 16 cand
+concat_two             →  (lambda (x) (reduce concat x))                    ; 20 cand
+upper_first            →  (lambda (x) (string-upper (nth x 0)))             ; 43 cand
+length_first           →  (lambda (x) (string-length (nth x 0)))            ; 51 cand
+concat_three           →  (lambda (x) (string-join x (nth x 1)))            ; 34 cand
+concat_upper_first     →  (lambda (x) (concat (string-upper (nth x 0)) (nth x 1))) ; 4,256 cand
+```
+
+The 3 failures (200k cand each) are precisely the cases the chain
+*would* recognize if it spoke strings:
+
+- `const_hello` → analogue of M8 form 1. The output column is
+  `("hello" "hello" "hello" "hello" "hello")`, but `m-pool-num?`
+  rejects strings, so M8 never sees it.
+- `concat_sep` → analogue of M10 with a constant " " separator.
+  M13 (`extract-data-atoms`) is also numeric-only, so " " is never
+  seeded as an atom, and Flat at depth 2 budget 200k can't construct
+  `(concat (concat a " ") b)` from primitives alone.
+- `repeat_by_len` → analogue of M11 form 4 (scaled product) with
+  a string-repeat × string-length wrapping. Two-deep mixed-type
+  composition, out of Flat reach at this budget.
+
+#### 9.46.3 Three findings
+
+1. **The M-chain on numeric domains is a cost reducer, not an
+   expressivity expander.** Flat enumeration with default budget
+   eventually solves all 5 int control tasks (in 30k candidates
+   total); the chain just gets there in 5. This is a meaningful
+   refinement of the §9.45 narrative — the chain doesn't unlock
+   new shapes at the type level, it short-circuits the search by
+   recognizing them analytically. On physics this looks like an
+   expressivity gain because Flat can't reach `(* 0.5 (* a (* t t)))`
+   inside any reasonable budget at depth 2; on integers Flat can,
+   so the chain's value compresses to a constant-factor speedup.
+   This is the right way to think about §9.45's contribution
+   going forward.
+
+2. **The M-chain contributes literally nothing on strings.** The
+   with-chain and without-chain string runs are byte-identical.
+   Every detect-* function early-exits the moment its pool builder
+   sees non-numeric columns. The chain isn't broken; it's
+   specialized. Strings aren't an exotic domain — they're 1D,
+   well-typed, and have a rich legacy builtin catalog. If the
+   chain can't fire on them, it certainly can't fire on grids.
+
+3. **The blockage is in `m_pool.selph`, not the integration.**
+   The numeric assumptions are concentrated in three places, all
+   inside the meta-curriculum:
+   - `m-pool-num?` (m_pool.selph:45) accepts only Int/Num
+   - `m-pool-unary-ops` (m_pool.selph:76) is hardcoded
+     `sqrt/log/exp/sin/cos/abs/negate/sq` — all numeric
+   - `fit-affine` operates on f64 columns with `output = a·x + b`,
+     undefined for non-numeric values
+   M13's `extract-data-atoms` is also numeric-biased — it picks
+   up Int/Num literals from spec rows but skips strings, bools,
+   and lists. Every detect-* function sits behind these gates.
+
+#### 9.46.4 What this means for the ARC question
+
+The original §9.46 question was *"does make-pool generalize beyond
+physics?"* The strings probe answers **no, in a specific way**:
+make-pool isn't physics-specific, it's *numeric-specific*. Strings
+are the easier non-numeric domain (1D, well-typed, legacy builtins
+already in catalogue). Grids are strictly harder. The
+sharpened decision tree for ARC:
+
+- **Path A — Faithful Rust port of 62 grid builtins** (~1500 LOC).
+  The chain still contributes nothing to grid tasks because pool
+  entries can't represent grids. ARC runs on Flat alone, which is
+  what the §9.43 baseline already showed (3% solve rate). This
+  path delivers grids without the analytical recognizer the
+  M-chain represents.
+
+- **Path C — Hybrid grid kernel + `grid_lib.selph`** (~300-500 LOC
+  Rust + 800 LOC SELPH). Same outcome as Path A in terms of
+  M-chain participation: zero. The hybrid path is more consistent
+  with the §9.38 thesis but doesn't *answer* the §9.45 question
+  for ARC. We'd be in the same place strings are now: Flat
+  handles easy cases via builtins, chain stays asleep, hard
+  cases (grid analogues of M8/M10/M11) fail at budget.
+
+- **Path D — Generalize `make-pool` itself** (new direction). Make
+  pool entries carry an opaque "feature column" computed by a
+  domain-specific featurizer. Replace `fit-affine` with
+  `find-pattern(feature_col, output_col)` where the pattern
+  primitive is dispatched on column type. This is real design
+  work — maybe 1000-2000 LOC of meta-curriculum, plus the
+  underlying type discipline to make featurizers composable. The
+  payoff is that ARC, strings, and any future domain all share
+  one recognizer surface instead of needing per-domain pool
+  builders.
+
+- **Path E — Accept the M-chain as numeric-specialist.** Build
+  parallel `make-pool-string`, `make-pool-grid`, etc. — separate
+  per-domain pool builders that share nothing structural. The
+  duplication is embarrassing but every domain gets its own
+  recognizer without architectural risk. This is the path of
+  least design effort but maximum sprawl.
+
+#### 9.46.5 Open follow-ups
+
+- **`cmd_grow_v2` mislabels chain solves as Flat** (main.rs:1631).
+  The multi-arg branch hardcodes `Strategy::Flat` for every
+  successful synth result regardless of whether
+  `try_selph_decomposers` or plain enumeration actually solved
+  it. This is why "By strategy: Flat=5" appears even when all 5
+  solves are M-chain. Trivial fix: thread the strategy through
+  `synth_v2::SynthResult` and report it. Without this fix the
+  by-strategy summary is silently misleading.
+
+- **`run_probe.sh` and `run_probe_nochain.sh`** in repo root are
+  the first reproducible way to run any curriculum file against
+  the M-chain. They were built for §9.46 but are useful for any
+  future probe. Worth preserving and documenting.
+
+- **The smoke-test contamination from §9.45.13.4** is visible
+  in every probe run: `m_pool` and m-stage files print ~50 lines
+  of self-test output to stderr at preamble eval time, including
+  smoke-test verifies for `osc_T`, `kinematic_s`, etc. Not a
+  blocker but noisy. The deferred `physics_lib.selph` extraction
+  would fix this.
+
+- **The strings probe failures are also Flat budget failures.**
+  All three (`const_hello`, `concat_sep`, `repeat_by_len`) hit
+  exactly 200k candidates and bail. Worth checking whether
+  raising the budget to 1M or depth to 3 lets Flat reach them
+  via raw enumeration. If yes, the §9.46 finding is "the chain
+  is unhelpful but not load-bearing"; if no, the finding is
+  "the chain is unhelpful AND irreplaceable for these shapes"
+  and the case for Path D strengthens.
+
+#### 9.46.6 What's next
+
+§9.46 closes the strings probe cleanly. The §9.45 thesis is
+*partially* validated: the M-chain works as designed within the
+numeric domain it was built for, and degrades to "no signal" on
+non-numeric domains. The §9.45.13.8 question
+*"does make-pool generalize beyond physics?"* is now answered:
+**no, not without explicit generalization work**. The decision
+for §9.47+ becomes which of the four paths (A, C, D, E) above
+to commit to before any more substrate or curriculum work.
+
+My read: **Path D is the right answer if we want one recognizer
+surface across domains, and Path E is the right answer if we
+accept domain-specific recognizers as a permanent feature of the
+architecture.** Paths A and C are dominated — they invest in
+grids without addressing the recognizer question, and we'd end
+up back here with the same decision after burning the kernel
+work.
+
+The next session should pick a path before doing any more
+substrate or meta-curriculum work.

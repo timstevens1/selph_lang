@@ -1,0 +1,52 @@
+#!/bin/bash
+# §9.46 probe runner: concatenates the M-chain in dependency order
+# in front of the requested curriculum file and runs `selph grow-v2`.
+#
+# Usage: ./run_probe.sh <curriculum.selph> [extra grow-v2 args ...]
+#
+# Why this exists: grow-v2 has no --library or --preamble flag, so the
+# pure-SELPH M-stage chain has to be physically prepended to whatever
+# task file we want to run against. This script does that consistently
+# so probes are reproducible.
+
+set -e
+
+if [ -z "$1" ]; then
+    echo "Usage: $0 <curriculum.selph> [grow-v2 args]" >&2
+    exit 1
+fi
+
+CURRICULUM="$1"
+shift
+
+REPO="$(cd "$(dirname "$0")" && pwd)"
+SELPH="$REPO/selph_fast/target/release/selph"
+META="$REPO/examples/meta_curriculum"
+
+if [ ! -x "$SELPH" ]; then
+    echo "Building selph..." >&2
+    (cd "$REPO/selph_fast" && cargo build --release >&2)
+fi
+
+# Dependency-ordered load. m_pool first (provides make-pool); m13
+# (provides extract-data-atoms which m_pool's "constants" flag and
+# m11/m12 depend on); then m7..m12 in any order; m_chain LAST because
+# it registers __decomposers__ and __synth_skip__ from current env.
+COMBINED="$(mktemp -t probe.XXXXXX.selph)"
+trap 'rm -f "$COMBINED"' EXIT
+
+cat \
+    "$META/m_pool.selph" \
+    "$META/m13_data_atoms.selph" \
+    "$META/m7_library_detection.selph" \
+    "$META/m8_constant_fit.selph" \
+    "$META/m9_unary_wrap.selph" \
+    "$META/m10_affine_combination.selph" \
+    "$META/m11_product_fit.selph" \
+    "$META/m12_structural_pair_fit.selph" \
+    "$META/m_chain.selph" \
+    "$CURRICULUM" \
+    > "$COMBINED"
+
+echo "Combined file: $COMBINED ($(wc -l < "$COMBINED") lines)" >&2
+exec "$SELPH" grow-v2 "$COMBINED" "$@"
