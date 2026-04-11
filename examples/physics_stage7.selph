@@ -1,0 +1,109 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Stage 7 physics curriculum (§9.44)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Stage 7 tests the §9.31.5 / §9.43.8 thesis directly: once a base
+; equation is in the library, *derived equations from the same
+; physical context should solve in dramatically fewer candidates*
+; than the base. Stage 6 demonstrated cross-arity reuse (rel_mass via
+; lorentz_gamma); Stage 7 demonstrates same-arity reuse, where the
+; library function is called as `(lib x)` on the whole input list.
+;
+; Family: undamped mass-spring oscillator. All tasks share inputs
+; (m, k) and build out the standard derivations from T = 2π√(m/k).
+;
+;   osc_T(m,k)        = 2π√(m/k)         base; Form 2 affine fit
+;   osc_freq(m,k)     = 1/T              same-arity reuse
+;   osc_T_sq(m,k)     = T² = 4π²·m/k     same-arity reuse via square,
+;                                          OR direct via Form 2
+;   osc_omega(m,k)    = √(k/m) = 2π/T    direct OR library route
+;   osc_omega_sq(m,k) = k/m              trivial; sanity that the
+;                                          synth doesn't over-reach
+;
+; Inputs are mostly integers but every task carries at least one
+; fractional value (or fractional output) so the §9.31 force_num
+; carve-out routes everything through the Num catalog.
+
+; ── osc_T: T = 2π√(m/k) ──────────────────────────────────────────────
+;
+; Same shape as Stage 5a pendulum_T. The affine-fit pass discovers
+; 2π as the coefficient of √(m/k) via Form 2 (`C · g`).
+
+(task-args "osc_T" 4
+  ((1.0  1.0)  6.283185307179586)    ; 2π·√1 = 2π
+  ((4.0  1.0)  12.566370614359172)   ; 2π·2 = 4π
+  ((1.0  4.0)  3.141592653589793)    ; 2π·0.5 = π
+  ((9.0  1.0)  18.84955592153876)    ; 2π·3 = 6π
+  ((1.0  9.0)  2.0943951023931953)   ; 2π/3
+  ((0.25 1.0)  3.141592653589793)    ; 2π·0.5 = π
+  ((1.0  0.25) 12.566370614359172))  ; 2π·2 = 4π
+
+; ── osc_freq: f = 1/T ────────────────────────────────────────────────
+;
+; Pure same-arity library reuse. Expected solution shape:
+;   (divide 1 (osc_T x))
+; which is depth 2 from the input-var atom and a literal `1`.
+; If reuse is working, candidate count should be in the low thousands
+; or less, dramatically below osc_T's own count.
+
+(task-args "osc_freq" 3
+  ((1.0  1.0)  0.15915494309189535)
+  ((4.0  1.0)  0.07957747154594767)
+  ((1.0  4.0)  0.3183098861837907)
+  ((9.0  1.0)  0.05305164769729845)
+  ((1.0  9.0)  0.4774648292756861)
+  ((0.25 1.0)  0.3183098861837907)
+  ((1.0  0.25) 0.07957747154594767))
+
+; ── osc_T_sq: T² = 4π²·m/k ───────────────────────────────────────────
+;
+; Two competing solutions:
+;   (a) library reuse:  (multiply (osc_T x) (osc_T x))   — depth 3
+;   (b) affine fit:     4π²·(m/k)                         — Form 2
+; Either is fine; observing which one the synth finds first is the
+; interesting datum. Reuse should dominate when osc_T's priority is
+; comparable to the primitive multiply chain.
+
+(task-args "osc_T_sq" 3
+  ((1.0  1.0)  39.47841760435743)
+  ((4.0  1.0)  157.91367041742973)
+  ((1.0  4.0)  9.869604401089358)
+  ((9.0  1.0)  355.30575834921693)
+  ((1.0  9.0)  4.386490844928859)
+  ((0.25 1.0)  9.869604401089358)
+  ((1.0  0.25) 157.91367041742973))
+
+; ── osc_omega: ω = √(k/m) ────────────────────────────────────────────
+;
+; Direct shape: (sqrt (divide (nth x 1) (nth x 0))) — depth 3, no
+; constants needed. Library route would be `2π · osc_freq` or
+; `2π / osc_T`, both depth 2 with a 2π constant the affine pass
+; would have to land. The direct route should win cleanly; this
+; task tests that the library's existence does NOT distract the
+; synth from a cheaper direct solution.
+
+(task-args "osc_omega" 3
+  ((1.0  1.0)  1.0)
+  ((4.0  1.0)  0.5)
+  ((1.0  4.0)  2.0)
+  ((9.0  1.0)  0.3333333333333333)
+  ((1.0  9.0)  3.0)
+  ((0.25 1.0)  2.0)
+  ((1.0  0.25) 0.5))
+
+; ── osc_omega_sq: ω² = k/m ───────────────────────────────────────────
+;
+; Trivial: (divide (nth x 1) (nth x 0)). Depth 1 from indexed atoms.
+; Sanity that the synth still picks the obvious answer when an
+; expanding library is available — over-reach would mean the synth
+; tries (square (osc_omega x)) reuse when the direct form is shorter.
+; Note: at least one fractional input keeps force_num active.
+
+(task-args "osc_omega_sq" 2
+  ((1.0  1.0)  1.0)
+  ((4.0  1.0)  0.25)
+  ((1.0  4.0)  4.0)
+  ((9.0  1.0)  0.1111111111111111)
+  ((1.0  9.0)  9.0)
+  ((0.25 1.0)  4.0)
+  ((1.0  0.25) 0.25))

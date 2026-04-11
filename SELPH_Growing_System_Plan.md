@@ -6077,3 +6077,206 @@ multi-arg branch). 87/87 synth_v2 tests still pass.
    tasks pay it, and only when main enumeration fails. The
    "expensive forms 5 + S + L" turn out to be fine in practice
    because they only fire where they help.
+
+---
+
+### 9.44 Stage 7 lands — library reuse buried by score ordering (April 11, 2026)
+
+§9.43.8 listed Stage 7 — the "multi-equation curriculum" — as the
+next physics direction. The premise from §9.31.5 was that *once a
+base equation is in the library, derived equations from the same
+physical context should solve in dramatically fewer candidates than
+the base*. This is the §9.31.5 / §9.38 thesis in its most testable
+form: same physical scaffold → many equations → cheap reuse.
+
+Stage 7 lands with a clean two-part finding: every task solves, but
+**library reuse never fires**. The substrate is more capable than
+the §9.31.5 plan assumed (the affine-fit pass alone covers the
+oscillator family) but the *mechanism* the plan called for —
+derived equations cheaply reusing earlier ones — does not surface
+under the current synth ordering.
+
+#### 9.44.1 The curriculum
+
+Five tasks, all 2-arg `(m, k)`, all in the undamped mass-spring
+oscillator family. The hypothesis: `osc_T` is the seed, the rest
+should solve via short library-reuse compositions.
+
+```
+osc_T(m,k)        = 2π√(m/k)              base
+osc_freq(m,k)     = 1/T                    same-arity reuse
+osc_T_sq(m,k)     = T² = 4π²·m/k           reuse via square
+osc_omega(m,k)    = √(k/m) = 2π/T          reuse OR direct
+osc_omega_sq(m,k) = k/m                    trivial direct
+```
+
+The expected library-reuse shapes are tiny: `(divide 1 (osc_T x))`
+for `osc_freq`, `(multiply (osc_T x) (osc_T x))` for `osc_T_sq`,
+and so on. Each is depth 2–3 from atoms `{1, x, (osc_T x)}`. If
+reuse works, `osc_freq` should solve in <1k candidates — orders
+of magnitude below `osc_T`'s ~200k.
+
+#### 9.44.2 Results
+
+All 5 tasks solve at the default budget (200k):
+
+```
+Flat  osc_T          201265 cand   0.984s   2π·√(m/k) via affine fit
+Flat  osc_freq       201405 cand   1.046s   0.159·√(k/m) via affine fit
+Flat  osc_T_sq       200057 cand   1.103s   4π²·m/k via affine fit
+Flat  osc_omega       14798 cand   0.286s   √k/√m direct
+Flat  osc_omega_sq       89 cand   0.000s   k/m direct
+```
+
+The candidate counts tell the story. `osc_freq` and `osc_T_sq` cost
+*the same as `osc_T` itself* — they're not reusing it, they're
+re-deriving the closed form from scratch. The solutions printed are
+the affine-fit pass output: each derived equation is fit as
+`C · g(args)` over the existing pool, with C discovered numerically.
+
+`osc_omega` and `osc_omega_sq` solve cheaply via direct enumeration
+because their closed forms have no irrational constants — no
+affine-fit needed and no reuse needed.
+
+**The §9.31.5 thesis is not validated.** Every task lands, but via
+re-derivation, not via the library reuse pathway the plan called for.
+
+#### 9.44.3 Diagnosis
+
+Traced end-to-end with a sequence of probes:
+
+1. **`(osc_T x)` is reachable.** A probe task whose target output
+   exactly equals `osc_T(m,k)` solves in **30 candidates**, with
+   the printed solution `(lambda (x) (osc_T x))`. So library
+   discovery (`library_components_from_env`), env binding, the
+   probe-and-filter pass, and the depth-1 enumeration of
+   `(arity_1_lib input_var)` all work.
+
+2. **The literal `1` is in the seed pool.** A probe task whose
+   target is constantly `1.0` solves in 2 candidates with `(lambda
+   (x) 1)`. The Int and Num literal `1` atoms are present at
+   depth 0 with priority 0.
+
+3. **`(divide 1 (osc_T x))` is never tested.** Even at 5M budget
+   at depth 2, normal enumeration exhausts and falls to affine fit.
+   A diagnostic print over `pending` showed: depth 2 has **15.98M
+   candidates pending**, of which 22,753 use `(osc_T x)` as one of
+   their args. But the candidates pulled from the priority queue
+   first are the high-scoring `(osc_T arg33)`, `(map_osc_T arg33)`,
+   `(reduce_add arg33)` shapes (score ~150). The shapes we want
+   — `(divide 1 (osc_T x))`, `(divide nth_i (osc_T x))` — score
+   ~65 because the literal `1` and the divide primitive both
+   contribute 0 to the score.
+
+   The score formula is `comp.priority + (arg1.priority +
+   arg2.priority) / 2` for binary apps. With:
+   - `divide.priority = 0.0` (primitive)
+   - literal `1.priority = 0.0` (data-derived and primitive both
+     priority 0)
+   - `(osc_T x).priority = 130` (lib 30 + input_var 100)
+
+   `(divide 1 (osc_T x))` scores `0 + (0 + 130)/2 = 65`. With ~50
+   binary components and ~1500 depth-1 entries, depth-2 pending
+   has millions of candidates scoring above 65. The library-reuse
+   shape sinks to the bottom of the queue.
+
+4. **Bumping the literal priority to 1000 did not help.** Even when
+   `1.0`'s score component dominates, the queue is so wide that the
+   top 500k tested candidates still don't reach the
+   library-reuse shapes. The issue is *queue depth*, not single-
+   candidate ranking.
+
+The affine-fit pass then runs after enumeration exhausts, picks
+the closed form `0.159 · √(k/m)` over the pool, and verifies it.
+Mathematically equivalent to the library-reuse form, computationally
+unrelated to it.
+
+#### 9.44.4 Two Rust fixes considered (and deferred)
+
+**A. Eager library-reuse pre-pass.** Mirror the §9.42 affine-fit
+pass shape: a focused pre-enumeration pass that, for each library
+function L of arity 1 returning Num, tests a small fixed catalog of
+canonical wrappers — `(L x)`, `(unary_op (L x))`, `(op_b literal
+(L x))`, `(op_b nth_i (L x))`, `(op_b (L x) (L x))`. O(libs × ~30)
+candidates total, essentially free. Guaranteed to surface
+library-reuse shapes regardless of priority queue ordering.
+
+**B. Structural priority boost.** Add a `lib_depth` field to
+`SynthPool`. `materialize_app` increments it when the dispatched
+component is a library function. The pending sort score adds
+`lib_depth × BONUS`. Smaller code change, but affects every
+enumeration uniformly and risks regressing the existing 32/32
+physics + 55-task curricula.
+
+Both are valid Rust patches. Both are also exactly the kind of
+substrate change §9.38 said to defer.
+
+#### 9.44.5 Why this becomes meta-curriculum work
+
+The §9.40–§9.41 meta-curriculum already wrote the
+separable-decomposer in pure SELPH. The same pattern applies here:
+
+Library reuse is a *recognition* problem. Given a target value table
+for a multi-arg task and a library function `L`, the system should
+detect "the target equals `f(L(args))` for some short `f`", and
+construct the candidate `f(L(x))` directly — bypassing the
+priority queue entirely.
+
+This is structurally identical to what M5 does for additive
+separability and what M6 does for 3-arg separability. The
+meta-curriculum already has the machinery — it just needs a new
+stage that teaches "library detection":
+
+```
+stage: probe each library function L on the task inputs.
+       compute residuals expected[i] / L(inputs[i]) and
+       expected[i] - L(inputs[i]).
+       if residuals are constant or simple, emit
+       (op_b L(x) C) or (op_b C L(x)) directly.
+```
+
+The recognition is cheap (one apply per library function per
+example), the emission is structural, and the result is a SELPH
+program that lives in the curriculum, not the kernel. Stage 7
+becomes the forcing function for an M7 (or M8) meta-curriculum
+step.
+
+This matches the §9.38 stance: when the substrate doesn't surface
+a useful candidate shape, the answer is a curriculum step that
+teaches the system *to look for that shape directly*, not a Rust
+patch that biases enumeration globally.
+
+#### 9.44.6 What §9.44 validates
+
+- The substrate's affine-fit pass is more general than §9.43.7
+  recognized — it handles the oscillator family without library
+  reuse at all. Every Stage 7 task solves at default budget.
+- The §9.31.5 library-reuse thesis is **not** what's making physics
+  curricula work. Re-derivation via affine fit is the dominant
+  pathway end-to-end.
+- The score-based priority queue at depth 2+ is dominated by
+  high-arity-product candidates from primitives, drowning out
+  low-priority literal compositions like `(op_b 1 (lib x))`.
+- The §9.38 thesis still holds: rather than patching the kernel,
+  the right next step is a meta-curriculum stage that teaches the
+  system the library-detection pattern in pure SELPH.
+
+#### 9.44.7 Open follow-ups
+
+- **M7: library-detection meta-curriculum**. Teach the system to
+  scan available library functions, probe them against task data,
+  and emit library-reuse candidates directly. Builds on the
+  M0–M6 pure-SELPH decomposer infrastructure from §9.40–§9.41.
+- **Re-run Stage 7 after M7 lands**. The success criterion is no
+  longer "all 5 solve" (already true) but "`osc_freq` and
+  `osc_T_sq` solve in <1k candidates each via library reuse, not
+  ~200k via affine fit."
+- **Generalize the §9.43.8 follow-ups conditional on M7**. The
+  "Form L generalization" and "fit pass into single-input" items
+  may turn out to be moot if library detection becomes the
+  dominant pathway for derived equations. Worth re-evaluating
+  after M7.
+- **Rust fix as the fallback**. If M7 turns out to be much harder
+  than the §9.40–§9.41 decomposers (which it shouldn't —
+  recognition is simpler than decomposition), fall back to fix A
+  (eager library-reuse pre-pass) as the bounded substrate change.
