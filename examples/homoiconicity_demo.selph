@@ -1,0 +1,103 @@
+; ─────────────────────────────────────────────────────────────────────────
+; AST homoiconicity demo (post-§9.36)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Demonstrates §9.33 item 2: SELPH programs can construct, inspect, and
+; evaluate AST trees as first-class data. This is the foundation for
+; SELPH-side decomposers (item 3) and type predicates (item 4).
+;
+; Run with:  selph eval-v2 examples/homoiconicity_demo.selph
+
+(print "─── 1. Quote captures AST without evaluating ───")
+
+; (quote ...) returns a Node value, not the result of evaluation.
+(define expr (quote (add 1 2)))
+(print (concat "  expr is: " (to-string expr)))
+(print (concat "  kind:    " (node-kind expr)))
+(print (concat "  is node? " (to-string (node? expr))))
+
+; eval-node runs the AST against the current env.
+(print (concat "  evaluated: " (to-string (eval-node expr))))
+
+(print "")
+(print "─── 2. Construct an AST programmatically ───")
+
+; Build (multiply 6 7) bottom-up via make-* builtins.
+(define product
+  (make-app "multiply" (make-int 6) (make-int 7)))
+(print (concat "  product node: " (to-string product)))
+(print (concat "  evaluated:    " (to-string (eval-node product))))
+
+(print "")
+(print "─── 3. Construct a lambda and call it ───")
+
+; (lambda (x) (add x 1)) constructed from parts.
+(define inc
+  (eval-node
+    (make-lambda
+      (list "x")
+      (make-app "add" (make-symbol "x") (make-int 1)))))
+(print (concat "  (inc 41) = " (to-string (inc 41))))
+
+; Same again but for a 2-arg lambda.
+(define plus
+  (eval-node
+    (make-lambda
+      (list "a" "b")
+      (make-app "add" (make-symbol "a") (make-symbol "b")))))
+(print (concat "  (plus 3 4) = " (to-string (plus 3 4))))
+
+(print "")
+(print "─── 4. Inspect a quoted tree ───")
+
+(define tree (quote (multiply (add x 1) (subtract x 2))))
+(print (concat "  tree:       " (to-string tree)))
+(print (concat "  kind:       " (node-kind tree)))
+(print (concat "  num children: " (to-string (length (node-children tree)))))
+
+; The first child is the head — it's a symbol, not the function value.
+; (Don't shadow the `head` builtin — name the local node `head-node`.)
+(define head-node (head (node-children tree)))
+(print (concat "  head kind:  " (node-kind head-node)))
+(print (concat "  head name:  " (node-symbol head-node)))
+
+; Walk to the first arg, which is itself an app.
+(define arg1 (nth (node-children tree) 1))
+(print (concat "  arg1:       " (to-string arg1)))
+(print (concat "  arg1 kind:  " (node-kind arg1)))
+
+(print "")
+(print "─── 5. parse-source / parse-file round-trip ───")
+
+; Parse source text into a Node, evaluate it.
+(define parsed (parse-source "(add 10 32)"))
+(print (concat "  parsed:    " (to-string parsed)))
+(print (concat "  kind:      " (node-kind parsed)))
+(print (concat "  evaluated: " (to-string (eval-node parsed))))
+
+; parse-file returns a list of Nodes — one per top-level form.
+(define forms (parse-file "(define a 1) (define b 2) (add a b)"))
+(print (concat "  parse-file forms: " (to-string (length forms))))
+
+(print "")
+(print "─── 6. Lambda inspection ───")
+
+(define f (quote (lambda (x y) (add x y))))
+(print (concat "  f params:   " (to-string (node-params f))))
+(print (concat "  f body kind: " (node-kind (head (node-children f)))))
+
+(print "")
+(print "─── 7. Let inspection ───")
+
+(define g (quote (let ((x 1) (y 2)) (add x y))))
+(print (concat "  g bindings count: " (to-string (length (node-bindings g)))))
+
+(print "")
+(print "─── 8. Special form inspection ───")
+
+(define s (quote (do (print "hi") 42)))
+(print (concat "  s kind:        " (node-kind s)))
+(print (concat "  s special form: " (node-special-form s)))
+
+(print "")
+(print "homoiconicity demo complete")

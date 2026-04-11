@@ -1,0 +1,23 @@
+; Test RD macro bridge with pre-defined half_len
+; Simulates a scenario where half_len exists from a previous run
+
+; Pre-define halve and half_len as if they were previously promoted
+(defmacro halve (s)
+  (floor (divide s 2)))
+
+(defmacro half_len (s)
+  (halve (string-length s)))
+
+; Now test: can RD's string-take inversion + macro bridge solve first_half?
+; string-take inversion derives subspec: input → len(output)
+; which should match (half_len x)
+
+(task "first_half" 2
+  ("abcd" "ab") ("abcdef" "abc") ("abcdefgh" "abcd")
+  ("xxxx" "xx") ("aabb" "aa") ("xxyy" "xx")
+  ("xxxxxx" "xxx") ("abcabc" "abc"))
+
+(task "second_half" 2
+  ("abcd" "cd") ("abcdef" "def") ("abcdefgh" "efgh")
+  ("xxxx" "xx") ("aabb" "bb") ("xxyy" "yy")
+  ("xxxxxx" "xxx") ("abcabc" "abc"))

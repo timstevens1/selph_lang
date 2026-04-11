@@ -1,0 +1,32 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Find a 2-arg "wall" task — additively separable but hard to find
+; directly by Flat search.
+; ─────────────────────────────────────────────────────────────────────────
+
+; f(a, b) = a² + b³  — additively separable, both halves are depth-2.
+(task-args "sq_plus_cube" 4
+  ((0.5 0.5) 0.375)
+  ((0.5 1.5) 3.625)
+  ((1.5 0.5) 2.375)
+  ((1.5 1.5) 5.625))
+
+; f(a, b) = a³ + b²  — same shape, swapped.
+(task-args "cube_plus_sq" 4
+  ((0.5 0.5) 0.375)
+  ((1.5 0.5) 3.625)
+  ((0.5 1.5) 2.375)
+  ((1.5 1.5) 5.625))
+
+; f(a, b) = a^4 + b³  — deeper.
+(task-args "pow4_plus_cube" 5
+  ((0.5 0.5) 0.1875)
+  ((0.5 1.5) 3.4375)
+  ((1.5 0.5) 5.1875)
+  ((1.5 1.5) 8.4375))
+
+; f(a, b) = a² + b   — easy baseline; synth should solve this trivially.
+(task-args "sq_plus_b" 3
+  ((0.5 0.5) 0.75)
+  ((0.5 1.5) 1.75)
+  ((1.5 0.5) 2.75)
+  ((1.5 1.5) 3.75))

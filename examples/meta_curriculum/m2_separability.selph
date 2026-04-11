@@ -1,0 +1,98 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M2: additive separability detector
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Question: given a multi-arg function spec, is the function additively
+; separable in some pair of variables? I.e. does there exist a split
+; into f(a, b) = g(a) + h(b)?
+;
+; The classical AI Feynman test: hold one variable fixed, see how the
+; output depends on the OTHER variable. Repeat with a different fixed
+; value. If the dependence pattern is the same (just shifted), the
+; function is separable.
+;
+; Concretely for 2-arg f over a 2×2 grid (a₁,b₁) (a₁,b₂) (a₂,b₁) (a₂,b₂):
+;   a-effect at b₁ = f(a₂,b₁) − f(a₁,b₁)
+;   a-effect at b₂ = f(a₂,b₂) − f(a₁,b₂)
+;   separable iff a-effect at b₁ == a-effect at b₂
+;
+; If the function is f(a,b) = g(a) + h(b), the a-effect collapses to
+; g(a₂) − g(a₁), which is independent of b. So separability test = true.
+;
+; This file depends on M0 helpers (inlined here for now so each meta-
+; stage file is self-contained — we'll consolidate after the loop
+; closes).
+
+; ── M0 helpers (inlined) ─────────────────────────────────────────────
+
+(define spec-inputs    (lambda (s) (ns-get s "inputs")))
+(define spec-outputs   (lambda (s) (ns-get s "outputs")))
+(define spec-arity     (lambda (s) (ns-get s "arity")))
+(define spec-size      (lambda (s) (length (spec-inputs s))))
+(define spec-input-row (lambda (s i) (nth (spec-inputs s) i)))
+(define spec-output-row(lambda (s i) (nth (spec-outputs s) i)))
+(define make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+; ── 2-arg separability over a 2×2 grid ───────────────────────────────
+;
+; The spec must have exactly 4 rows, in lexicographic order:
+;   row 0 = (a₁ b₁)
+;   row 1 = (a₁ b₂)
+;   row 2 = (a₂ b₁)
+;   row 3 = (a₂ b₂)
+;
+; This narrow assumption keeps M2 trivial. M3 (sub-spec construction)
+; relies on the same row layout. M5's wired decomposer will do the
+; row-ordering itself.
+
+(define separable-2x2?
+  (lambda (s)
+    (let ((y00 (spec-output-row s 0))
+          (y01 (spec-output-row s 1))
+          (y10 (spec-output-row s 2))
+          (y11 (spec-output-row s 3)))
+      (= (subtract y10 y00) (subtract y11 y01)))))
+
+; ── Test specs ────────────────────────────────────────────────────────
+
+; Separable: f(a, b) = a² + b
+(define spec-add-sq
+  (make-spec
+    (list (list 0.5 0.5) (list 0.5 1.5)
+          (list 1.5 0.5) (list 1.5 1.5))
+    (list 0.75 1.75 2.75 3.75)
+    2))
+
+; Non-separable: f(a, b) = a · b
+(define spec-mul
+  (make-spec
+    (list (list 0.5 0.5) (list 0.5 1.5)
+          (list 1.5 0.5) (list 1.5 1.5))
+    (list 0.25 0.75 0.75 2.25)
+    2))
+
+; Separable: f(a, b) = a + b² (output stays non-integral)
+(define spec-add-sq-b
+  (make-spec
+    (list (list 0.5 0.5) (list 0.5 1.5)
+          (list 1.5 0.5) (list 1.5 1.5))
+    (list 0.75 2.75 1.75 3.75)
+    2))
+
+; Non-separable: f(a, b) = a² · b
+(define spec-sq-mul
+  (make-spec
+    (list (list 0.5 0.5) (list 0.5 1.5)
+          (list 1.5 0.5) (list 1.5 1.5))
+    (list 0.125 0.375 1.125 3.375)
+    2))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(print "M2 smoke tests")
+(print (concat "  a² + b   (separable)     → " (to-string (separable-2x2? spec-add-sq))))
+(print (concat "  a · b    (NOT separable) → " (to-string (separable-2x2? spec-mul))))
+(print (concat "  a + b²   (separable)     → " (to-string (separable-2x2? spec-add-sq-b))))
+(print (concat "  a² · b   (NOT separable) → " (to-string (separable-2x2? spec-sq-mul))))

@@ -1,0 +1,42 @@
+; Test multi-level recursive decomposition
+; Tasks that require 2+ levels of top-down prediction
+
+; Base helpers
+(task "double" 1 (1 2) (3 6) (5 10) (0 0) (4 8))
+(task "increment" 1 (0 1) (1 2) (5 6) (10 11) (3 4))
+
+; Level 1: string-length(x) — direct, solved at RD depth 0
+(task "str_len" 1
+  ("hi" 2) ("hello" 5) ("a" 1) ("test" 4) ("abc" 3))
+
+; Level 2: double(string-length(x))
+; RD depth 1: predict "add" outermost, invert to get k = output/2 = string-length
+; Sub-synth at depth 0 needs to find string-length(x)
+; With recursive RD: predict "add", invert → k, then recursive RD predicts
+; "string-length" for the k subspec → finds it directly
+(task "double_len" 2
+  ("hi" 4) ("hello" 10) ("a" 2) ("test" 8) ("abc" 6))
+
+; Level 2: negate(string-length(x))
+(task "neg_len" 2
+  ("hi" -2) ("hello" -5) ("a" -1) ("test" -4) ("abc" -3))
+
+; Level 2: increment(string-length(x))
+(task "len_plus_1" 2
+  ("hi" 3) ("hello" 6) ("a" 2) ("test" 5) ("abc" 4))
+
+; Level 2: string-upper(string-reverse(x))
+; RD depth 1: predict string-upper, invert to get lowercase reversed
+; Sub-synth: predict string-reverse → finds it directly
+(task "upper_reverse" 2
+  ("hello" "OLLEH") ("abc" "CBA") ("xy" "YX") ("test" "TSET"))
+
+; Level 2: string-take(string-upper(x), 3)
+; RD: predict string-take, invert → k=3 (constant)
+; Sub-synth: predict string-upper → direct
+(task "upper_prefix3" 2
+  ("hello" "HEL") ("world" "WOR") ("testing" "TES") ("abcdef" "ABC"))
+
+; Level 2: string-ends-with(string-upper(x), "S")
+(task "upper_ends_s" 2
+  ("cats" true) ("dog" false) ("maps" true) ("car" false) ("tests" true))

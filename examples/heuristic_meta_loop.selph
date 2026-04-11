@@ -1,0 +1,79 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Heuristic meta-loop demo (post-§9.34)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Demonstrates the §9.33 item-1 capability: SELPH programs can pass a
+; heuristic directly into the synthesize builtin via the spec namespace,
+; enabling SELPH-side meta-learning loops.
+;
+; This script defines three candidate heuristics, runs each on the same
+; benchmark task, and prints the candidate cost of each. A real meta-loop
+; would synthesize candidate heuristics rather than enumerate them; this
+; file just demonstrates the wiring is functional.
+;
+; Run with:  selph eval-v2 examples/heuristic_meta_loop.selph
+
+; ── benchmark task ──────────────────────────────────────────────────
+;
+; Increment task: x → x + 1, depth 2 search.
+; Solvable as `(add x 1)` or `(add 1 x)`. Default order finds it
+; quickly; bad heuristics make it slower.
+
+(define benchmark-spec
+  (list (list 1 2) (list 2 3) (list 3 4) (list 10 11) (list 0 1)))
+
+; ── candidate heuristics ────────────────────────────────────────────
+
+; H1: identity — return base priority unchanged.
+(define h-identity
+  (lambda (ctx) (ns-get ctx "priority")))
+
+; H2: anti-one — penalize literal "1" heavily. This should make the
+; benchmark MUCH slower because (add x 1) needs literal 1.
+(define h-anti-one
+  (lambda (ctx)
+    (if (= (ns-get ctx "name") "1") -1000 100)))
+
+; H3: pro-add — boost components named "add" by +500. Should keep
+; benchmark fast (add still leads).
+(define h-pro-add
+  (lambda (ctx)
+    (if (= (ns-get ctx "name") "add")
+      (add (ns-get ctx "priority") 500)
+      (ns-get ctx "priority"))))
+
+; ── benchmark runner ────────────────────────────────────────────────
+;
+; Calls synthesize with a heuristic, returns just the candidate count.
+
+(define run-heuristic
+  (lambda (h)
+    (ns-get
+      (synthesize (ns
+        ("spec" benchmark-spec)
+        ("max-depth" 2)
+        ("max-candidates" 50000)
+        ("heuristic" h)))
+      "candidates")))
+
+; Baseline: no heuristic at all.
+(define run-baseline
+  (lambda ()
+    (ns-get
+      (synthesize (ns
+        ("spec" benchmark-spec)
+        ("max-depth" 2)
+        ("max-candidates" 50000)))
+      "candidates")))
+
+; ── run the comparison ──────────────────────────────────────────────
+
+(print "Heuristic meta-loop demo")
+(print "------------------------")
+(print (concat "baseline (no heuristic):  " (to-string (run-baseline))))
+(print (concat "h-identity (returns base): " (to-string (run-heuristic h-identity))))
+(print (concat "h-anti-one (-1000 for '1'): " (to-string (run-heuristic h-anti-one))))
+(print (concat "h-pro-add  (+500 for 'add'): " (to-string (run-heuristic h-pro-add))))
+(print "")
+(print "Lower is better. anti-one should be the worst by a wide")
+(print "margin; identity and pro-add should both be near baseline.")

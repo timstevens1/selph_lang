@@ -1,0 +1,62 @@
+; Recursive decomposition test curriculum
+; Tests tasks where top-down prediction should help
+
+; === Arithmetic: output = add(input, k) ===
+; k should be a constant or simple function of input
+
+; double: output = multiply(x, 2)
+(task "double" 2
+  (1 2) (2 4) (3 6) (5 10) (7 14))
+
+; add_10: output = add(x, 10)
+(task "add_10" 2
+  (1 11) (5 15) (10 20) (0 10) (3 13))
+
+; square_minus_1: output = subtract(multiply(x, x), 1)
+; This tests depth-2 decomposition
+(task "negate_val" 2
+  (3 -3) (5 -5) (0 0) (-2 2) (7 -7))
+
+; === String ops: substring extraction ===
+
+; first_char: output = string-take(x, 1)
+(task "first_char" 2
+  ("hello" "h") ("world" "w") ("abc" "a") ("xyz" "x") ("test" "t"))
+
+; drop_first: output = string-drop(x, 1)
+(task "drop_first" 2
+  ("hello" "ello") ("world" "orld") ("abc" "bc") ("xyz" "yz") ("test" "est"))
+
+; first_three: output = string-take(x, 3)
+(task "first_three" 2
+  ("hello" "hel") ("world" "wor") ("abcdef" "abc") ("xyzabc" "xyz") ("testing" "tes"))
+
+; === Unary string: direct application ===
+
+; shout: output = string-upper(x)
+(task "shout" 2
+  ("hello" "HELLO") ("world" "WORLD") ("abc" "ABC") ("test" "TEST"))
+
+; whisper: output = string-lower(x)
+(task "whisper" 2
+  ("HELLO" "hello") ("WORLD" "world") ("ABC" "abc") ("TEST" "test"))
+
+; backward: output = string-reverse(x)
+(task "backward" 2
+  ("hello" "olleh") ("abc" "cba") ("xy" "yx") ("test" "tset"))
+
+; === Count: string-length ===
+
+; str_len: output = string-length(x)
+(task "str_len" 2
+  ("hi" 2) ("hello" 5) ("a" 1) ("test" 4) ("abc" 3))
+
+; === Comparison: string-starts-with constant ===
+
+; starts_with_a: output = string-starts-with(x, "a")
+(task "starts_with_a" 2
+  ("apple" true) ("banana" false) ("avocado" true) ("cherry" false) ("ant" true))
+
+; ends_with_s: output = string-ends-with(x, "s")
+(task "ends_with_s" 2
+  ("cats" true) ("dog" false) ("buses" true) ("car" false) ("maps" true))

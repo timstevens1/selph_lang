@@ -121,6 +121,19 @@ pub enum Value {
     /// thread-local. See `BuiltinTable` below.
     Builtin(Sym),
 
+    /// First-class AST node — added in §9.36 (item 2 of the §9.33
+    /// curriculum-only kernel). Carries a NodeRef pointing into a
+    /// Rc-shared arena. SELPH programs construct nodes via the
+    /// `make-*` builtins, inspect them via `node-*` accessors, and
+    /// evaluate them via `eval-node`. The `quote` special form
+    /// returns Node values pointing into the parser's existing arena
+    /// (one Rc bump, no copy).
+    ///
+    /// This variant is what makes SELPH programs able to manipulate
+    /// other SELPH programs as data — the foundation for SELPH-side
+    /// decomposers (item 3) and type predicates (item 4).
+    Node(NodeRef),
+
     /// nil.
     Nil,
 }
@@ -398,6 +411,7 @@ struct PrimitiveTypeSyms {
     list: Sym,
     function: Sym,
     namespace: Sym,
+    node: Sym,
 }
 
 impl PrimitiveTypeSyms {
@@ -412,6 +426,7 @@ impl PrimitiveTypeSyms {
             list: intern("List"),
             function: intern("Function"),
             namespace: intern("Namespace"),
+            node: intern("Node"),
         }
     }
 }
@@ -419,6 +434,11 @@ impl PrimitiveTypeSyms {
 /// Canonical Sym for "any type" (top of the eventual lattice).
 pub fn type_any() -> Sym {
     PRIMITIVE_TYPE_SYMS.with(|s| s.any)
+}
+
+/// Canonical Sym for the AST `Node` primitive type. Added in §9.36.
+pub fn type_node() -> Sym {
+    PRIMITIVE_TYPE_SYMS.with(|s| s.node)
 }
 
 impl Value {
@@ -438,6 +458,7 @@ impl Value {
             Value::List(_) => Some(s.list),
             Value::Function(_) | Value::Builtin(_) => Some(s.function),
             Value::Ns(_) => Some(s.namespace),
+            Value::Node(_) => Some(s.node),
             Value::Nil => None,
         })
     }
@@ -541,6 +562,12 @@ impl Value {
     /// Construct a Value::Ns from a Sym-keyed map.
     pub fn ns(map: NsMap) -> Self {
         Value::Ns(Rc::new(map))
+    }
+
+    /// Construct a Value::Node from a NodeRef. Cheap — one Rc bump on
+    /// the NodeRef's underlying arena. Added in §9.36.
+    pub fn node(node_ref: NodeRef) -> Self {
+        Value::Node(node_ref)
     }
 }
 

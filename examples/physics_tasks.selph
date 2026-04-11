@@ -1,0 +1,169 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Physics curriculum — §9.31 Phase 6 first validation
+; ─────────────────────────────────────────────────────────────────────────
+;
+; All inputs/outputs use exact dyadic floats (halves, quarters, eighths)
+; so observational equivalence remains exact-equality safe. Every task
+; has at least one fractional value, which triggers the §9.31
+; per-task `force_num` carve-out in main.rs — every numeric value
+; lands as `Value::Num` and synthesis dispatches via the Num-typed
+; component catalog (add/sub/mul/div/pow/sqrt/sin/cos/exp/...).
+;
+; Single-input tasks for Stages 0–2. Multi-arg compositions (Newton,
+; Coulomb, kinematics) move to a list-of-floats encoding once we
+; pass Stage 2.
+
+; ── Stage 0: Identity, projection, constants ──────────────────────────
+; The trivial baseline. If these don't solve, the float pipeline is
+; misconfigured.
+
+(task "id_x" 1
+  (0.5 0.5) (1.5 1.5) (2.5 2.5) (3.5 3.5) (0.25 0.25))
+
+(task "const_pi" 1
+  (0.5 3.141592653589793) (1.5 3.141592653589793)
+  (2.5 3.141592653589793) (3.5 3.141592653589793))
+
+(task "const_e" 1
+  (0.5 2.718281828459045) (1.5 2.718281828459045)
+  (2.5 2.718281828459045) (3.5 2.718281828459045))
+
+(task "const_half" 1
+  (1.5 0.5) (2.5 0.5) (3.5 0.5) (0.75 0.5))
+
+; ── Stage 1: Linear ───────────────────────────────────────────────────
+; Teaches add, subtract, multiply on Num. All outputs stay non-integer
+; so the type stays Num through the synth chain.
+
+(task "neg" 1
+  (0.5 -0.5) (1.5 -1.5) (2.5 -2.5) (0.75 -0.75))
+
+(task "succ_quarter" 2
+  (0.25 0.5) (0.5 0.75) (0.75 1.0) (1.25 1.5))
+
+(task "triple" 2
+  (0.5 1.5) (1.5 4.5) (2.5 7.5) (0.25 0.75))
+
+(task "half_x" 2
+  (0.5 0.25) (1.5 0.75) (2.5 1.25) (3.5 1.75))
+
+(task "x_minus_quarter" 2
+  (0.5 0.25) (0.75 0.5) (1.25 1.0) (1.5 1.25))
+
+; ── Stage 2: Power laws ───────────────────────────────────────────────
+; Teaches pow / sqrt as named primitives.
+; All values are exact dyadic so equality is sound.
+
+(task "square" 2
+  (0.5 0.25) (1.5 2.25) (2.5 6.25) (3.5 12.25) (0.25 0.0625))
+
+(task "cube" 2
+  (0.5 0.125) (1.5 3.375) (2.5 15.625) (0.25 0.015625))
+
+(task "sqrt_x" 2
+  (0.25 0.5) (2.25 1.5) (6.25 2.5) (12.25 3.5) (0.0625 0.25))
+
+(task "x_pow_4" 3
+  (0.5 0.0625) (1.5 5.0625) (2.5 39.0625) (0.25 0.00390625))
+
+; ── Stage 2.5: Multi-arg warmup (task-args, indexed atoms) ────────────
+; `task-args` triggers the §9.31 multi-arg path: each input is a list
+; whose length is the arity, and synth_v2 seeds the pool with one
+; indexed atom per position (`(nth x i)` materialized as a depth-0
+; atom). Adversarial examples chosen so the `(reduce op x)`
+; shortcut doesn't fit — the synth has to find the structural form.
+
+(task-args "sum_ab" 3
+  ((0.5 0.25)  0.75)
+  ((1.5 0.25)  1.75)
+  ((0.5 0.75)  1.25)
+  ((0.25 1.25) 1.5))
+
+(task-args "diff_ab" 3
+  ((1.5  0.25) 1.25)
+  ((0.75 0.25) 0.5)
+  ((1.25 0.5)  0.75)
+  ((2.5  0.75) 1.75))
+
+(task-args "product_ab" 3
+  ((0.5  0.5)  0.25)
+  ((1.5  0.5)  0.75)
+  ((0.25 0.5)  0.125)
+  ((1.5  0.25) 0.375))
+
+; ── Stage 3: Multiplicative composition (Newton/Coulomb shape) ────────
+; The §9.31.8 go/no-go checkpoint. f(m1,m2,r) = m1·m2/r²
+; All inputs are exact-dyadic with r ∈ {0.25, 0.5} so the output
+; stays an exact dyadic non-integer.
+
+(task-args "newton_shape" 5
+  ((0.125 0.125 0.5)  0.0625)
+  ((0.125 0.25  0.5)  0.125)
+  ((0.25  0.125 0.5)  0.125)
+  ((0.25  0.25  0.5)  0.25)
+  ((0.5   0.125 0.5)  0.25)
+  ((0.125 0.5   0.5)  0.25)
+  ((0.5   0.25  0.5)  0.5)
+  ((0.25  0.5   0.5)  0.5)
+  ((0.125 0.125 0.25) 0.25))
+
+; (a*b)/c — simpler than Newton (no square). Validation that the
+; multi-arg path finds a depth-3 expression cheaply.
+(task-args "force_no_sq" 4
+  ((0.5  0.25 0.5)  0.25)
+  ((1.5  0.25 0.5)  0.75)
+  ((0.25 1.5  0.5)  0.75)
+  ((0.5  0.5  0.25) 1.0)
+  ((0.5  0.25 0.25) 0.5)
+  ((0.25 0.5  0.25) 0.5)
+  ((0.75 0.5  0.5)  0.75))
+
+; ── Stage 4: Additive + multiplicative mixing ─────────────────────────
+; Kinematics. v = u + a·t (u init velocity, a accel, t time).
+(task-args "kinematic_v" 4
+  ((0.5  0.25 0.5)  0.625)   ; 0.5 + 0.25*0.5 = 0.625
+  ((1.5  0.5  0.5)  1.75)    ; 1.5 + 0.5*0.5 = 1.75
+  ((0.25 0.5  0.25) 0.375)   ; 0.25 + 0.125 = 0.375
+  ((0.75 0.25 0.5)  0.875)
+  ((1.25 0.5  0.25) 1.375))
+
+; KE = ½·m·v²
+(task-args "kinetic_energy" 4
+  ((0.5 0.5)  0.0625)  ; 0.5·0.5·0.25 = 0.0625
+  ((0.5 1.5)  0.5625)  ; 0.5·0.5·2.25 = 0.5625
+  ((1.5 0.5)  0.1875)  ; 0.5·1.5·0.25 = 0.1875
+  ((0.25 1.5) 0.28125) ; 0.5·0.25·2.25 = 0.28125
+  ((1.5 1.5)  1.6875)) ; 0.5·1.5·2.25 = 1.6875
+
+; s = u·t + ½·a·t²
+(task-args "kinematic_s" 5
+  ((0.5  0.5  0.5) 0.3125)    ; 0.25 + 0.5·0.5·0.25 = 0.25 + 0.0625 = 0.3125
+  ((1.5  0.5  0.5) 0.8125)    ; 0.75 + 0.0625 = 0.8125
+  ((0.5  1.5  0.5) 0.4375)    ; 0.25 + 0.5·1.5·0.25 = 0.25 + 0.1875 = 0.4375
+  ((0.25 0.5  0.5) 0.1875)    ; 0.125 + 0.0625 = 0.1875
+  ((0.5  0.5  1.5) 1.3125))   ; 0.75 + 0.5·0.5·2.25 = 0.75 + 0.5625 = 1.3125
+
+; ── Stage 5: Transcendentals ──────────────────────────────────────────
+; sin/cos/exp on inputs that have NO exact-dyadic outputs. These will
+; expose the dedup ε-equivalence gap (val_hash bit-bucketing).
+; If they pass, both dedup and exact-equality verify are working.
+
+; NOTE: these constants come from Rust's libm — Python's libm differs
+; in last-digit precision for some inputs (e.g. sin(1.5)). With exact-
+; equality verification (no ε bucketing yet) the constants must match
+; the f64 values our eval_v2 actually produces.
+(task-args "sin_a" 2
+  ((0.5)  0.479425538604203)
+  ((1.5)  0.9974949866040544)
+  ((0.25) 0.24740395925452294))
+
+(task-args "cos_a" 2
+  ((0.5)  0.8775825618903728)
+  ((1.5)  0.0707372016677029)
+  ((0.25) 0.9689124217106447))
+
+(task-args "exp_a" 2
+  ((0.5)  1.6487212707001282)
+  ((1.5)  4.4816890703380645)
+  ((0.25) 1.2840254166877414))
+

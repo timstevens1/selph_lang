@@ -50,8 +50,8 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::eval_v2;
-use crate::intern::{intern, Sym};
-use crate::types_v2::{type_any, Env, Node, SpecialForm, Value};
+use crate::intern::{intern, resolve, Sym};
+use crate::types_v2::{type_any, Env, Node, NsMap, SpecialForm, Value};
 
 // ────────────────────────────────────────────────────────────────────────────
 // SynthComponent — a primitive or user-defined function available for synth
@@ -118,8 +118,36 @@ pub enum LiteralKind {
     /// The synthesis input variable (resolved at apply-time, not eval-time).
     InputVar,
     Int(i64),
+    /// Floating-point literal — added for the §9.31 physics curriculum.
+    /// Carries a wrapped f64; equality is by `to_bits` so duplicate
+    /// literals (e.g. two `0.5` seeds) compare as equal.
+    Num(f64),
     Str(String),
     Bool(bool),
+    /// Indexed positional argument — added for the §9.31 multi-arg
+    /// path. Materializes to a `(nth x N)` subtree so the rest of
+    /// the synthesizer treats it as an atomic depth-0 entry while
+    /// the runtime still receives a list-shaped input. Carries the
+    /// list index. The atom's `ret_type` (on the SynthComponent
+    /// wrapper) carries the type of `x[N]`.
+    Indexed(usize),
+    /// Constant-fitting hole — added for §9.41 constant-hole
+    /// synthesis (the AI Feynman preprocessing analog). Materializes
+    /// to `Node::Symbol(__hole__)`. A candidate containing one or
+    /// more holes is evaluated under fit-and-verify mode in
+    /// `test_candidate`: the synth wraps the body as
+    /// `(lambda (x __hole__) <body>)`, evaluates at H=0 and H=1 on
+    /// the first row to determine the affine slope, solves
+    /// `H = (target − b) / a`, and verifies the fitted constant
+    /// against the remaining rows. On success, the hole symbol is
+    /// substituted with `Node::Num(fitted)` in the result so the
+    /// returned source is hole-free.
+    ///
+    /// Restriction: the candidate body must be **affine in the
+    /// hole** for the affine fit to succeed. `(multiply H H)` and
+    /// other nonlinear-in-H bodies fail the verify step and get
+    /// rejected — this is correct behaviour, not a bug.
+    Hole,
 }
 
 impl SynthComponent {
@@ -178,6 +206,36 @@ impl SynthComponent {
 // SELPH calls. Reachability is unchanged; only how the universe is
 // populated differs.
 
+/// §9.37 Stage B: per-type metadata loaded from a SELPH `__types__`
+/// namespace. Each type entry can carry an optional predicate (a SELPH
+/// lambda taking a Value and returning a Bool — used for type-of
+/// queries from curriculum code), a list of supertype Syms (for
+/// subtype graph hints; note the hot-path `slot_accepts` is still
+/// hardcoded for performance), an optional priority (for ordering
+/// type-keyed dispatch), and a list of (name-Sym, decomposer Value)
+/// pairs for type-keyed decomposer dispatch in §9.37 Stage C.
+///
+/// When `__types__` is absent in the env, `TypeUniverse::primitives()`
+/// builds an empty `type_metadata` map and the dispatcher falls
+/// through to the global `__decomposers__` walk + hardcoded chain.
+#[derive(Clone, Debug, Default)]
+pub struct TypeMetadata {
+    /// SELPH lambda `(lambda (v) <bool>)` testing if a value inhabits
+    /// the type. Optional — if absent, the type is recognizable by
+    /// name but has no membership predicate.
+    pub predicate: Option<Value>,
+    /// Direct supertypes by name. Transitive closure is not computed
+    /// here (the hot-path `slot_accepts` doesn't consult this map).
+    pub subtype_of: Vec<Sym>,
+    /// Numeric priority for ordering decomposer dispatch (Stage C).
+    pub priority: f64,
+    /// Decomposers registered for this type, in (key-Sym, function)
+    /// pairs. Iteration order is the namespace order from
+    /// `__types__[type-name]["decomposers"]` after a name sort
+    /// (deterministic dispatch).
+    pub decomposers: Vec<(Sym, Value)>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TypeUniverse {
     /// All known type Syms. Membership is "this Sym is a valid type
@@ -191,6 +249,10 @@ pub struct TypeUniverse {
     /// relation moves into the `__types__` namespace and these go away.
     int_sym: Sym,
     num_sym: Sym,
+    /// §9.37 Stage B: per-type metadata loaded from `__types__`.
+    /// Empty for `primitives()`; populated by `from_env(env)`. Used by
+    /// Stage C type-keyed decomposer dispatch.
+    type_metadata: HashMap<Sym, TypeMetadata>,
 }
 
 impl TypeUniverse {
@@ -212,7 +274,83 @@ impl TypeUniverse {
             any,
             int_sym,
             num_sym,
+            type_metadata: HashMap::new(),
         }
+    }
+
+    /// §9.37 Stage B: build a universe from the env's `__types__`
+    /// namespace, layered on top of the primitive baseline. Each
+    /// entry in `__types__` is expected to be a namespace with
+    /// optional fields `predicate` (function), `subtype-of` (list of
+    /// strings), `priority` (number), `decomposers` (namespace of
+    /// name → function entries).
+    ///
+    /// When `__types__` is absent, returns the primitive universe
+    /// unchanged. When entries are malformed, they're skipped silently
+    /// (curriculum-driven ergonomics — better to load partial than
+    /// crash the synth dispatcher).
+    pub fn from_env(env: &Env) -> Self {
+        let mut universe = Self::primitives();
+        let types_ns = match env.lookup(intern("__types__")) {
+            Some(Value::Ns(map)) => map,
+            _ => return universe,
+        };
+        for (&type_sym, type_val) in types_ns.iter() {
+            // Each entry must itself be a namespace.
+            let entry_ns = match type_val {
+                Value::Ns(m) => m,
+                _ => continue,
+            };
+            universe.known.insert(type_sym);
+
+            let mut meta = TypeMetadata::default();
+
+            // Optional predicate field.
+            if let Some(p) = entry_ns.get(&intern("predicate")) {
+                if matches!(p, Value::Function(_) | Value::Builtin(_)) {
+                    meta.predicate = Some(p.clone());
+                }
+            }
+
+            // Optional subtype-of field (list of strings).
+            if let Some(Value::List(supers)) = entry_ns.get(&intern("subtype-of")) {
+                for s in supers.iter() {
+                    if let Value::Str(name) = s {
+                        meta.subtype_of.push(intern(name.as_ref()));
+                    }
+                }
+            }
+
+            // Optional priority.
+            if let Some(p) = entry_ns.get(&intern("priority")) {
+                meta.priority = match p {
+                    Value::Int(n) => *n as f64,
+                    Value::Num(n) => *n,
+                    _ => 0.0,
+                };
+            }
+
+            // Optional decomposers namespace. Sorted by name for
+            // deterministic dispatch order (matches Stage A).
+            if let Some(Value::Ns(decomp_ns)) = entry_ns.get(&intern("decomposers")) {
+                let mut entries: Vec<(Sym, Value)> = decomp_ns
+                    .iter()
+                    .filter(|(_, v)| matches!(v, Value::Function(_) | Value::Builtin(_)))
+                    .map(|(&k, v)| (k, v.clone()))
+                    .collect();
+                entries.sort_by_key(|(s, _)| resolve(*s));
+                meta.decomposers = entries;
+            }
+
+            universe.type_metadata.insert(type_sym, meta);
+        }
+        universe
+    }
+
+    /// §9.37 Stage B: get the metadata for a type Sym, or None if the
+    /// type isn't registered in `__types__`. Used by Stage C dispatch.
+    pub fn type_metadata(&self, sym: Sym) -> Option<&TypeMetadata> {
+        self.type_metadata.get(&sym)
     }
 
     /// Register an additional type Sym (for the eventual `(deftype ...)`
@@ -537,6 +675,92 @@ pub fn primitive_components() -> Vec<SynthComponent> {
         "floor", intern("floor"), vec![num], num, 0.0,
     ));
 
+    // ── Float arithmetic (Num × Num → Num) — §9.31 physics curriculum ─
+    // Same eval_v2 builtins as the Int versions; the type signatures
+    // here are what synth uses to compose them. Without these, a task
+    // whose `x` is `Num` can't reach `add`/`subtract`/`multiply`
+    // because `slot_accepts(Int, Num)` is false.
+    //
+    // Priority is set to 1.0 so they don't crowd out the cheap Int
+    // path on integer-typed tasks (where they'd never compose anyway,
+    // since `slot_accepts(Num, Int)` IS true and the Int versions
+    // have priority 0.0 — same effective ordering on integer inputs).
+    for name in &["add", "subtract", "multiply"] {
+        comps.push(SynthComponent::named(
+            *name, intern(name), vec![num, num], num, 1.0,
+        ));
+    }
+    for name in &["abs", "negate"] {
+        comps.push(SynthComponent::named(
+            *name, intern(name), vec![num], num, 1.0,
+        ));
+    }
+    comps.push(SynthComponent::named(
+        "min", intern("min"), vec![num, num], num, 1.0,
+    ));
+    comps.push(SynthComponent::named(
+        "max", intern("max"), vec![num, num], num, 1.0,
+    ));
+    // Transcendentals & power. `pow` and `sqrt` already exist as
+    // builtins; we just expose them as Num components for synth.
+    comps.push(SynthComponent::named(
+        "pow", intern("pow"), vec![num, num], num, 1.0,
+    ));
+    comps.push(SynthComponent::named(
+        "sqrt", intern("sqrt"), vec![num], num, 2.0,
+    ));
+    comps.push(SynthComponent::named(
+        "log", intern("log"), vec![num], num, 3.0,
+    ));
+    comps.push(SynthComponent::named(
+        "exp", intern("exp"), vec![num], num, 3.0,
+    ));
+    comps.push(SynthComponent::named(
+        "sin", intern("sin"), vec![num], num, 4.0,
+    ));
+    comps.push(SynthComponent::named(
+        "cos", intern("cos"), vec![num], num, 4.0,
+    ));
+    comps.push(SynthComponent::named(
+        "tan", intern("tan"), vec![num], num, 4.0,
+    ));
+
+    // §9.43 list constructors are NOT seeded here — they're added
+    // by `synthesize_inner` only on the multi-arg path so they don't
+    // inflate single-input enumeration cost. See the §9.43.6 cost
+    // notes in SELPH_Growing_System_Plan.md.
+
+    // Float literal constants — the basic seeds for physics tasks.
+    // Includes 0.5 (half), 2.0 (square exponent), -1.0 (sign flip).
+    // PI and E are emitted as Num literals — they're constant, so
+    // there's no runtime difference between a literal and a
+    // zero-arity builtin call, and the literal form skips one
+    // application step in the candidate tree.
+    //
+    // Domain-specific constants like 0.25, 0.125 are NOT seeded
+    // here. The principled mechanism for them is data-derived
+    // literal seeding (`augment_components_with_data_literals`),
+    // which scans the task's input/output values and adds any
+    // unique Num atoms it finds. This keeps the kernel catalog
+    // free of physics constants while still letting the synth
+    // reach common dyadics that appear in the spec data itself.
+    for (name, val) in [
+        ("0.0", 0.0_f64),
+        ("1.0", 1.0_f64),
+        ("2.0", 2.0_f64),
+        ("0.5", 0.5_f64),
+        ("-1.0", -1.0_f64),
+        ("pi", std::f64::consts::PI),
+        ("e", std::f64::consts::E),
+    ] {
+        comps.push(SynthComponent::literal(
+            name,
+            LiteralKind::Num(val),
+            num,
+            0.0,
+        ));
+    }
+
     // ── String unary str→str ───────────────────────────────────────────
     for name in &["string-upper", "string-lower", "string-reverse", "string-trim"] {
         comps.push(SynthComponent::named(
@@ -756,6 +980,34 @@ pub fn primitive_components() -> Vec<SynthComponent> {
 /// input value the task supplies.
 pub fn input_var_component(input_type: Sym) -> SynthComponent {
     SynthComponent::literal("x", LiteralKind::InputVar, input_type, 100.0)
+}
+
+/// Build an indexed-positional-arg component for a multi-arg task.
+/// `idx` is the position into the args list; `arg_type` is the runtime
+/// type of `args[idx]`. Materializes to a `(nth x idx)` subtree at
+/// search time, so the rest of the synthesizer treats it as a depth-0
+/// atom of type `arg_type`. Used by the §9.31 multi-arg path.
+pub fn indexed_arg_component(idx: usize, arg_type: Sym) -> SynthComponent {
+    SynthComponent::literal(
+        format!("arg{}", idx),
+        LiteralKind::Indexed(idx),
+        arg_type,
+        100.0,
+    )
+}
+
+/// Build the constant-fitting hole atom for §9.42 constant-hole
+/// synthesis. Typed `Num` so the synth's type-gated composition
+/// flows it into Num arithmetic slots; carries a low priority so
+/// hole-bearing candidates aren't tried before hole-free ones at
+/// the same depth (hole-free wins are preferred when both exist).
+pub fn hole_component() -> SynthComponent {
+    SynthComponent::literal(
+        "__hole__",
+        LiteralKind::Hole,
+        intern("Num"),
+        0.5,
+    )
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1059,6 +1311,10 @@ pub fn default_skip_set() -> HashSet<Sym> {
 
 /// Which strategy was used to solve a task. Used for tracing and to
 /// signal which fallback fired.
+///
+/// `Custom(Sym)` was added in §9.37 (item 3) for SELPH-defined
+/// decomposers registered in the `__decomposers__` namespace. The Sym
+/// is the entry's key in that namespace, used for trace output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
     Flat,
@@ -1068,18 +1324,23 @@ pub enum Strategy {
     DivideConquer,
     Induction,
     Memo,
+    Custom(Sym),
 }
 
 impl Strategy {
-    pub fn name(&self) -> &'static str {
+    /// Short label for trace / log output. Returns a String because the
+    /// `Custom` variant resolves a Sym to its name string. Hardcoded
+    /// variants return a constant String to keep the API uniform.
+    pub fn name(&self) -> String {
         match self {
-            Strategy::Flat => "Flat",
-            Strategy::RecursiveDecomposition => "RD",
-            Strategy::BoolDecomp => "BD",
-            Strategy::HigherOrder => "HO",
-            Strategy::DivideConquer => "D&C",
-            Strategy::Induction => "IN",
-            Strategy::Memo => "Memo",
+            Strategy::Flat => "Flat".to_string(),
+            Strategy::RecursiveDecomposition => "RD".to_string(),
+            Strategy::BoolDecomp => "BD".to_string(),
+            Strategy::HigherOrder => "HO".to_string(),
+            Strategy::DivideConquer => "D&C".to_string(),
+            Strategy::Induction => "IN".to_string(),
+            Strategy::Memo => "Memo".to_string(),
+            Strategy::Custom(sym) => format!("custom:{}", resolve(*sym)),
         }
     }
 }
@@ -4467,6 +4728,207 @@ pub fn recursive_decompose(
 /// `flat_budget` is the candidate budget for the Flat strategy and is
 /// also passed to RD/HO/D&C/Induction sub-syntheses. BD and Memo are
 /// bounded by their own intrinsic costs and ignore it.
+/// §9.37 Stage A: walk the env's `__decomposers__` namespace, calling
+/// each entry as a SELPH decomposer until one returns a `found: true`
+/// result. Each decomposer is a SELPH lambda accepting one argument
+/// (the spec namespace, in the same shape `bi_synthesize` accepts) and
+/// returning either `nil` (doesn't apply) or a result namespace
+/// `(ns ("found" true) ("nodes" <Node>) ("candidates" <Int>))`.
+///
+/// Returns `Some((nodes, root, candidates, name_sym))` on the first
+/// successful decomposer, where `name_sym` is the entry's key in the
+/// namespace (used for trace output via `Strategy::Custom`).
+///
+/// Iteration order is deterministic: entries are sorted by their Sym's
+/// resolved string. Same-key duplicates can't happen because NsMap is
+/// keyed by Sym.
+///
+/// Decomposers that error or return malformed results are silently
+/// skipped — same failure mode as the source-loaded heuristic path
+/// (§9.32). The curriculum is responsible for testing its own
+/// decomposers; the dispatcher is best-effort.
+fn try_selph_decomposers(
+    env: &Env,
+    inputs: &[Value],
+    expected: &[Value],
+    max_depth: usize,
+    max_budget: usize,
+) -> Option<(Vec<Node>, usize, usize, Sym)> {
+    let decomp_ns = match env.lookup(intern("__decomposers__")) {
+        Some(Value::Ns(map)) => map,
+        _ => return None,
+    };
+    if decomp_ns.is_empty() {
+        return None;
+    }
+
+    // Sort entries by name for deterministic dispatch order. NsMap is
+    // a HashMap so iteration order is otherwise nondeterministic.
+    let mut entries: Vec<(Sym, Value)> = decomp_ns
+        .iter()
+        .map(|(&k, v)| (k, v.clone()))
+        .collect();
+    entries.sort_by_key(|(s, _)| resolve(*s));
+
+    // Build the spec namespace once. Same shape `bi_synthesize` accepts:
+    // `(ns ("spec" <list of (in, out) pairs>) ("max-depth" n) ("max-candidates" n))`.
+    let spec_pairs: Vec<Value> = inputs
+        .iter()
+        .zip(expected.iter())
+        .map(|(i, e)| Value::list(vec![i.clone(), e.clone()]))
+        .collect();
+    let mut spec_ns = NsMap::new();
+    spec_ns.insert(intern("spec"), Value::list(spec_pairs));
+    spec_ns.insert(intern("max-depth"), Value::Int(max_depth as i64));
+    spec_ns.insert(intern("max-candidates"), Value::Int(max_budget as i64));
+    let spec_val = Value::ns(spec_ns);
+
+    let mut total_cands = 0usize;
+    for (name_sym, decomposer) in &entries {
+        if !matches!(decomposer, Value::Function(_) | Value::Builtin(_)) {
+            continue;
+        }
+        match eval_v2::apply(decomposer, std::slice::from_ref(&spec_val), env) {
+            Ok(Value::Ns(result)) => {
+                // Tally any candidate count the decomposer reports —
+                // even on failure. Lets the dispatcher sum search
+                // costs across attempts.
+                if let Some(cands) = result.get(&intern("candidates")) {
+                    let n = match cands {
+                        Value::Int(n) => *n as usize,
+                        Value::Num(n) => *n as usize,
+                        _ => 0,
+                    };
+                    total_cands += n;
+                }
+                if matches!(
+                    result.get(&intern("found")),
+                    Some(Value::Bool(true))
+                ) {
+                    if let Some(Value::Node(node_ref)) =
+                        result.get(&intern("nodes"))
+                    {
+                        // Materialize the constructed AST into a fresh
+                        // owned Vec<Node>. The NodeRef's arena is Rc-shared
+                        // and may live longer than this dispatcher call;
+                        // owning the Vec keeps the StrategyResult
+                        // self-contained.
+                        let nodes: Vec<Node> = node_ref.nodes.iter().cloned().collect();
+                        return Some((nodes, node_ref.idx, total_cands, *name_sym));
+                    }
+                    // Found but missing nodes — skip silently. A future
+                    // version could log this as a curriculum bug.
+                }
+            }
+            Ok(Value::Nil) => continue,
+            Ok(_) => continue,
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
+/// §9.37 Stage C: type-keyed decomposer dispatch. Walk the universe's
+/// `type_metadata` for the inferred output type — and the `Any`
+/// fallback type — calling each registered decomposer in order. Same
+/// shape as `try_selph_decomposers` (Stage A) but with a per-type
+/// scope.
+///
+/// The dispatcher uses the inferred output Sym to look up decomposers,
+/// so a curriculum that registers a decomposer under `("Int" (ns
+/// ("decomposers" (ns ("my-decomp" my-fn)))))` will see it called
+/// only for Int-output tasks. Decomposers under `Any` are called for
+/// every task (after the type-specific ones).
+///
+/// Returns the same shape as `try_selph_decomposers`, with `name_sym`
+/// being the decomposer's key in its `decomposers` namespace.
+fn try_type_keyed_decomposers(
+    env: &Env,
+    universe: &TypeUniverse,
+    inputs: &[Value],
+    expected: &[Value],
+    max_depth: usize,
+    max_budget: usize,
+) -> Option<(Vec<Node>, usize, usize, Sym)> {
+    // No __types__ loaded → nothing to dispatch.
+    if universe.type_metadata.is_empty() {
+        return None;
+    }
+
+    // Infer the output type Sym from the first expected value.
+    // (Mirrors `infer_uniform_type_sym` semantics — we only check the
+    // first value because Stage B's universe doesn't yet enforce
+    // type uniformity at the boundary.)
+    let target_sym = expected
+        .first()
+        .and_then(Value::type_sym)
+        .unwrap_or_else(type_any);
+
+    // Collect candidate decomposer lists in dispatch order: the target
+    // type first, then `Any` as a fallback. Each entry is
+    // (name_sym, function_value).
+    let mut candidates: Vec<(Sym, Value)> = Vec::new();
+    if let Some(meta) = universe.type_metadata.get(&target_sym) {
+        candidates.extend(meta.decomposers.iter().cloned());
+    }
+    let any_sym = type_any();
+    if target_sym != any_sym {
+        if let Some(meta) = universe.type_metadata.get(&any_sym) {
+            candidates.extend(meta.decomposers.iter().cloned());
+        }
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Build the spec namespace once (same shape as Stage A).
+    let spec_pairs: Vec<Value> = inputs
+        .iter()
+        .zip(expected.iter())
+        .map(|(i, e)| Value::list(vec![i.clone(), e.clone()]))
+        .collect();
+    let mut spec_ns = NsMap::new();
+    spec_ns.insert(intern("spec"), Value::list(spec_pairs));
+    spec_ns.insert(intern("max-depth"), Value::Int(max_depth as i64));
+    spec_ns.insert(intern("max-candidates"), Value::Int(max_budget as i64));
+    let spec_val = Value::ns(spec_ns);
+
+    let mut total_cands = 0usize;
+    for (name_sym, decomposer) in &candidates {
+        if !matches!(decomposer, Value::Function(_) | Value::Builtin(_)) {
+            continue;
+        }
+        match eval_v2::apply(decomposer, std::slice::from_ref(&spec_val), env) {
+            Ok(Value::Ns(result)) => {
+                if let Some(cands) = result.get(&intern("candidates")) {
+                    let n = match cands {
+                        Value::Int(n) => *n as usize,
+                        Value::Num(n) => *n as usize,
+                        _ => 0,
+                    };
+                    total_cands += n;
+                }
+                if matches!(
+                    result.get(&intern("found")),
+                    Some(Value::Bool(true))
+                ) {
+                    if let Some(Value::Node(node_ref)) =
+                        result.get(&intern("nodes"))
+                    {
+                        let nodes: Vec<Node> = node_ref.nodes.iter().cloned().collect();
+                        return Some((nodes, node_ref.idx, total_cands, *name_sym));
+                    }
+                }
+            }
+            Ok(Value::Nil) => continue,
+            Ok(_) => continue,
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
 pub fn synthesize_with_strategies(
     components: &[SynthComponent],
     inputs: &[Value],
@@ -4476,6 +4938,40 @@ pub fn synthesize_with_strategies(
     max_depth: usize,
     flat_budget: usize,
 ) -> StrategyResult {
+    // §9.37 Stage A: global SELPH decomposers from `__decomposers__`
+    // run BEFORE the hardcoded chain. Curriculum is in charge.
+    if let Some((nodes, root, sd_explored, name_sym)) =
+        try_selph_decomposers(env, inputs, expected, max_depth, flat_budget)
+    {
+        return StrategyResult {
+            found: true,
+            nodes: Some(nodes),
+            root: Some(root),
+            candidates_explored: sd_explored,
+            strategy: Some(Strategy::Custom(name_sym)),
+        };
+    }
+
+    // §9.37 Stage C: type-keyed decomposers from `__types__`. The
+    // dispatcher infers the output type Sym from the spec, looks up
+    // that type's decomposers list (and the `Any` fallback), and
+    // calls each in order. This is the more ergonomic registration
+    // path: a curriculum says "this decomposer applies to Int outputs"
+    // by hanging the function under `("Int" (ns ("decomposers" ...)))`.
+    if let Some((nodes, root, td_explored, name_sym)) =
+        try_type_keyed_decomposers(
+            env, universe, inputs, expected, max_depth, flat_budget,
+        )
+    {
+        return StrategyResult {
+            found: true,
+            nodes: Some(nodes),
+            root: Some(root),
+            candidates_explored: td_explored,
+            strategy: Some(Strategy::Custom(name_sym)),
+        };
+    }
+
     // Strategy 1: Flat enumerative.
     let flat = synthesize(
         components, inputs, expected, env, universe, max_depth, flat_budget,
@@ -4730,6 +5226,14 @@ pub struct SynthPool {
     pub root: usize,
     pub ret_type: Sym,
     pub priority: f64,
+    /// True if this candidate's body contains at least one
+    /// `LiteralKind::Hole` reference. Set by `materialize_atom` for
+    /// the hole atom and propagated through `materialize_app` from
+    /// any argument that has it. `test_candidate` branches on this
+    /// flag: hole-bearing candidates go through the affine
+    /// fit-and-verify path; hole-free candidates use the normal
+    /// equality verify. Added in §9.42 (constant-hole synthesis).
+    pub has_hole: bool,
 }
 
 /// Result of a synthesis search.
@@ -4792,6 +5296,90 @@ enum TestOutcome {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Scan a task's inputs and expected outputs for unique primitive
+/// values (Int, Num, Str, Bool) and return them as zero-arity
+/// literal components. The §9.41 data-derived literal seeding pass
+/// uses this to surface useful constants from the spec data without
+/// requiring the synth catalog to hardcode physics fractions like
+/// `0.125` or task-specific magic numbers.
+///
+/// One level of list-unwrapping is performed so multi-arg inputs
+/// (e.g. `(list 0.5 0.25 0.5)`) surface their per-position values.
+/// Lists deeper than one level (lists of lists) are not unwrapped —
+/// inner structure usually means the values are part of a structural
+/// answer, not free constants.
+pub fn collect_data_literals(inputs: &[Value], expected: &[Value]) -> Vec<SynthComponent> {
+    use std::collections::HashSet;
+    let int_t = intern("Int");
+    let num_t = intern("Num");
+    let str_t = intern("String");
+    let bool_t = intern("Bool");
+
+    // Dedup buckets — Num values key on `to_bits` so two distinct f64
+    // bit patterns stay distinct, including +0.0 vs -0.0.
+    let mut seen_int: HashSet<i64> = HashSet::new();
+    let mut seen_num: HashSet<u64> = HashSet::new();
+    let mut seen_str: HashSet<String> = HashSet::new();
+    let mut seen_bool: HashSet<bool> = HashSet::new();
+    let mut out: Vec<SynthComponent> = Vec::new();
+
+    let mut visit = |v: &Value| {
+        match v {
+            Value::Int(n) => {
+                if seen_int.insert(*n) {
+                    out.push(SynthComponent::literal(
+                        n.to_string(), LiteralKind::Int(*n), int_t, 0.0,
+                    ));
+                }
+            }
+            Value::Num(n) => {
+                let bits = n.to_bits();
+                if n.is_finite() && seen_num.insert(bits) {
+                    out.push(SynthComponent::literal(
+                        n.to_string(), LiteralKind::Num(*n), num_t, 0.0,
+                    ));
+                }
+            }
+            Value::Str(s) => {
+                let owned = s.as_ref().to_string();
+                if seen_str.insert(owned.clone()) {
+                    out.push(SynthComponent::literal(
+                        format!("\"{}\"", owned), LiteralKind::Str(owned), str_t, 0.0,
+                    ));
+                }
+            }
+            Value::Bool(b) => {
+                if seen_bool.insert(*b) {
+                    out.push(SynthComponent::literal(
+                        b.to_string(), LiteralKind::Bool(*b), bool_t, 0.0,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    };
+
+    let scan = |v: &Value, visit: &mut dyn FnMut(&Value)| {
+        // One-level unwrap for lists (multi-arg inputs are lists of args).
+        if let Value::List(items) = v {
+            for item in items.iter() {
+                visit(item);
+            }
+        } else {
+            visit(v);
+        }
+    };
+
+    for v in inputs.iter() {
+        scan(v, &mut visit);
+    }
+    for v in expected.iter() {
+        scan(v, &mut visit);
+    }
+
+    out
+}
+
 /// Stable hash of a Value for observational-equivalence dedup.
 /// Function/Builtin/Ns hash to a constant (no useful structural hash).
 pub fn val_hash(v: &Value) -> u64 {
@@ -4824,7 +5412,13 @@ pub fn val_hash(v: &Value) -> u64 {
         Value::Nil => {
             5u8.hash(&mut h);
         }
-        Value::Function(_) | Value::Builtin(_) | Value::Ns(_) => {
+        Value::Function(_) | Value::Builtin(_) | Value::Ns(_) | Value::Node(_) => {
+            // Opaque values — hash to a constant. Synthesis dedup is
+            // structural over primitives + lists; functions, namespaces,
+            // and Nodes don't compose meaningfully into the candidate
+            // pool, so collapsing them all into a single hash bucket is
+            // both correct and consistent with how legacy v1 handled
+            // Function/Builtin.
             6u8.hash(&mut h);
         }
     }
@@ -4845,7 +5439,11 @@ pub fn infer_uniform_type_sym(vs: &[Value]) -> Option<Sym> {
 
 /// Remap every node-index reference inside `node` by adding `offset`.
 /// Used when concatenating sub-expression node trees during materialization.
-fn remap_node(node: &Node, offset: usize) -> Node {
+/// Remap every node-index reference inside `node` by adding `offset`.
+/// Used when concatenating sub-expression node trees during materialization
+/// (synth-side) and during AST construction from SELPH (eval_v2's
+/// `make-*` builtins, §9.36).
+pub fn remap_node(node: &Node, offset: usize) -> Node {
     match node {
         Node::App(c) => Node::App(c.iter().map(|i| i + offset).collect()),
         Node::SpecialApp(form, c) => {
@@ -4868,11 +5466,40 @@ fn remap_node(node: &Node, offset: usize) -> Node {
 /// Returns `None` if the component isn't a literal (caller should not
 /// call this on arity > 0 components).
 fn materialize_atom(comp: &SynthComponent) -> Option<SynthPool> {
+    // Most literal kinds materialize to a single node. `Indexed` is
+    // the exception: it expands to a 4-node `(nth x N)` subtree so
+    // multi-arg synthesis can treat positional arguments as
+    // depth-0 atoms while keeping the runtime lambda single-input
+    // (the input is the args list).
+    if let Dispatch::Literal(LiteralKind::Indexed(idx)) = &comp.dispatch {
+        let nodes = vec![
+            Node::Symbol(intern("nth")),
+            Node::Symbol(intern("x")),
+            Node::Int(*idx as i64),
+            Node::App(vec![0, 1, 2]),
+        ];
+        return Some(SynthPool {
+            nodes,
+            root: 3,
+            ret_type: comp.ret_type,
+            priority: comp.priority,
+            has_hole: false,
+        });
+    }
+
+    // §9.42 hole atom — emits a special symbol that test_candidate
+    // recognizes and routes through the affine fit-and-verify path.
+    let mut has_hole = false;
     let node = match &comp.dispatch {
         Dispatch::Literal(LiteralKind::InputVar) => Node::Symbol(intern("x")),
         Dispatch::Literal(LiteralKind::Int(n)) => Node::Int(*n),
+        Dispatch::Literal(LiteralKind::Num(n)) => Node::Num(*n),
         Dispatch::Literal(LiteralKind::Str(s)) => Node::Str(s.clone()),
         Dispatch::Literal(LiteralKind::Bool(b)) => Node::Bool(*b),
+        Dispatch::Literal(LiteralKind::Hole) => {
+            has_hole = true;
+            Node::Symbol(intern("__hole__"))
+        }
         _ => return None,
     };
     Some(SynthPool {
@@ -4880,6 +5507,7 @@ fn materialize_atom(comp: &SynthComponent) -> Option<SynthPool> {
         root: 0,
         ret_type: comp.ret_type,
         priority: comp.priority,
+        has_hole,
     })
 }
 
@@ -4947,11 +5575,15 @@ fn materialize_app(comp: &SynthComponent, args: &[&SynthPool]) -> SynthPool {
         sum / args.len() as f64
     };
 
+    // Propagate `has_hole` from any argument that contains the hole.
+    let has_hole = args.iter().any(|a| a.has_hole);
+
     SynthPool {
         nodes,
         root: app_root,
         ret_type: comp.ret_type,
         priority: comp.priority + arg_priority_term,
+        has_hole,
     }
 }
 
@@ -4974,6 +5606,12 @@ fn wrap_lambda(entry: &SynthPool) -> (Vec<Node>, usize) {
 /// the inferred uniform output type (`None` if examples disagree); when
 /// `Some`, candidates whose return type can't satisfy the target slot
 /// are skipped.
+///
+/// §9.42: when `entry.has_hole` is set, the candidate is dispatched
+/// to the affine fit-and-verify path. The return tuple's second
+/// element carries the hole-substituted entry on success — callers
+/// should wrap that one (not the original) when constructing the
+/// final lambda.
 fn test_candidate(
     entry: &SynthPool,
     inputs: &[Value],
@@ -4982,13 +5620,22 @@ fn test_candidate(
     seen: &mut HashSet<Vec<u64>>,
     target: Option<Sym>,
     universe: &TypeUniverse,
-) -> TestOutcome {
+) -> (TestOutcome, Option<SynthPool>) {
     // Type gate. The candidate's return type must be able to flow into
     // a slot of type `target`.
     if let Some(t) = target {
         if !universe.slot_accepts(t, entry.ret_type) {
-            return TestOutcome::Skipped;
+            return (TestOutcome::Skipped, None);
         }
+    }
+
+    // §9.42 fit-and-verify branch for hole-bearing candidates. With
+    // the post-§9.42-rev2 design (focused affine-fit pass), normal
+    // synth never gets hole-bearing entries here — but the branch is
+    // kept as a safety net in case a caller injects them via
+    // `extra_seeds`.
+    if entry.has_hole {
+        return test_hole_candidate(entry, inputs, expected, env, seen);
     }
 
     // Wrap as lambda and evaluate once to get the function value.
@@ -4996,7 +5643,7 @@ fn test_candidate(
     let nodes_rc: Rc<[Node]> = nodes.into();
     let f = match eval_v2::eval(&nodes_rc, lambda_idx, env) {
         Ok(v) => v,
-        Err(_) => return TestOutcome::Errored,
+        Err(_) => return (TestOutcome::Errored, None),
     };
 
     let mut beh: Vec<u64> = Vec::with_capacity(inputs.len());
@@ -5009,22 +5656,183 @@ fn test_candidate(
                     matches += 1;
                 }
             }
-            Err(_) => return TestOutcome::Errored,
+            Err(_) => return (TestOutcome::Errored, None),
         }
     }
 
     // Observational equivalence dedup.
     if !beh.is_empty() {
         if seen.contains(&beh) {
-            return TestOutcome::Deduped;
+            return (TestOutcome::Deduped, None);
         }
         seen.insert(beh);
     }
 
     if matches == inputs.len() && !inputs.is_empty() {
-        TestOutcome::Solution
+        (TestOutcome::Solution, None)
     } else {
-        TestOutcome::Tested
+        (TestOutcome::Tested, None)
+    }
+}
+
+/// §9.42 affine fit-and-verify path for hole-bearing candidates.
+///
+/// Wraps `(entry.body)` as `(lambda (x __hole__) <body>)`, evaluates
+/// at H=0 and H=1 on the first input row to determine the affine
+/// slope `a = f(1) − f(0)` and intercept `b = f(0)`, solves
+/// `H = (target₀ − b) / a`, and verifies the fitted constant against
+/// the remaining rows. On success, returns the entry with `__hole__`
+/// substituted by `Num(fitted)`.
+///
+/// Restrictions:
+/// - The body must produce a numeric value at H=0 (otherwise
+///   `value_to_f64` returns None and we bail).
+/// - `a` must be non-zero (the hole has to actually affect the
+///   output, otherwise the fit is meaningless).
+/// - The body must be **affine in H** for the verify step to pass.
+///   Quadratic-in-H bodies (e.g. `(multiply __hole__ __hole__)`)
+///   compute a wrong fitted value from the first row that fails on
+///   subsequent rows. This is correct behaviour — those candidates
+///   need a different fitting strategy that we don't yet implement.
+fn test_hole_candidate(
+    entry: &SynthPool,
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    seen: &mut HashSet<Vec<u64>>,
+) -> (TestOutcome, Option<SynthPool>) {
+    let hole_sym = intern("__hole__");
+
+    // Build (lambda (x __hole__) <body>) so we can re-call with
+    // different hole values in the same compiled closure.
+    let mut nodes = entry.nodes.clone();
+    let body_idx = entry.root;
+    let lambda_idx = nodes.len();
+    nodes.push(Node::Lambda(vec![intern("x"), hole_sym], body_idx));
+    let nodes_rc: Rc<[Node]> = nodes.into();
+
+    let f = match eval_v2::eval(&nodes_rc, lambda_idx, env) {
+        Ok(v) => v,
+        Err(_) => return (TestOutcome::Errored, None),
+    };
+
+    // Probe H=0 and H=1 on the first input.
+    let probe = |h: f64| -> Option<f64> {
+        match eval_v2::apply(&f, &[inputs[0].clone(), Value::Num(h)], env) {
+            Ok(v) => value_to_f64(&v),
+            Err(_) => None,
+        }
+    };
+    let b = match probe(0.0) {
+        Some(x) if x.is_finite() => x,
+        _ => return (TestOutcome::Tested, None),
+    };
+    let b_plus_a = match probe(1.0) {
+        Some(x) if x.is_finite() => x,
+        _ => return (TestOutcome::Tested, None),
+    };
+    let a = b_plus_a - b;
+    if a.abs() < 1e-12 {
+        // Hole doesn't affect output → not a meaningful fit.
+        return (TestOutcome::Tested, None);
+    }
+
+    let target_val = match value_to_f64(&expected[0]) {
+        Some(x) if x.is_finite() => x,
+        _ => return (TestOutcome::Tested, None),
+    };
+    let fitted_h = (target_val - b) / a;
+    if !fitted_h.is_finite() {
+        return (TestOutcome::Tested, None);
+    }
+
+    // Verify on every row with the fitted constant.
+    let hole_val = Value::Num(fitted_h);
+    for (inp, exp) in inputs.iter().zip(expected.iter()) {
+        match eval_v2::apply(&f, &[inp.clone(), hole_val.clone()], env) {
+            Ok(v) => {
+                if !values_close_or_equal(&v, exp, 1e-9) {
+                    return (TestOutcome::Tested, None);
+                }
+            }
+            Err(_) => return (TestOutcome::Errored, None),
+        }
+    }
+
+    // §9.42 design note: hole-bearing candidates DO NOT participate in
+    // observational-equivalence dedup. Two structurally different
+    // hole-bearing candidates can produce identical fitted-behaviour
+    // vectors purely by coincidence (different fitted constants
+    // happen to land on the same row outputs), and deduping them
+    // would prune structurally distinct compositions that need to be
+    // available at deeper depths. The cost of keeping them is
+    // bounded — hole-bearing candidates are a small fraction of the
+    // total search space, and many self-prune via the affine fit
+    // failing to match all rows. The `seen` parameter is unused on
+    // this path (kept in the signature for symmetry with
+    // `test_candidate`).
+    let _ = seen;
+
+    // Substitute __hole__ with Num(fitted_h) in a copy of the nodes.
+    let substituted = substitute_hole(entry, fitted_h);
+    (TestOutcome::Solution, Some(substituted))
+}
+
+/// Diagnostic helper: wrap a SynthPool entry as `(lambda (x) body)`
+/// and eval it to a Function value. Used by the §9.42 affine-fit
+/// pass to probe pool entries against expected behavior signatures.
+fn wrap_lambda_then_eval(entry: &SynthPool, env: &Env) -> Option<Value> {
+    let (nodes, lambda_idx) = wrap_lambda(entry);
+    let nodes_rc: Rc<[Node]> = nodes.into();
+    eval_v2::eval(&nodes_rc, lambda_idx, env).ok()
+}
+
+/// Helper: Int / Num → f64. Returns None for any other variant.
+fn value_to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Num(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// Helper: relative-tolerance numeric equality. Falls back to exact
+/// `values_equal` for non-numeric variants. Used by §9.42 hole-fit
+/// verify because the affine fit can introduce sub-ε rounding even
+/// when the fit is mathematically perfect.
+fn values_close_or_equal(a: &Value, b: &Value, eps: f64) -> bool {
+    if eval_v2::values_equal(a, b) {
+        return true;
+    }
+    match (value_to_f64(a), value_to_f64(b)) {
+        (Some(x), Some(y)) => {
+            let diff = (x - y).abs();
+            let scale = x.abs().max(y.abs()).max(1.0);
+            diff / scale < eps
+        }
+        _ => false,
+    }
+}
+
+/// Walk an entry's node arena and replace every `Node::Symbol(__hole__)`
+/// with `Node::Num(fitted)`. Used by §9.42 to bake the fitted constant
+/// into the candidate before returning it as the result.
+fn substitute_hole(entry: &SynthPool, fitted: f64) -> SynthPool {
+    let hole_sym = intern("__hole__");
+    let new_nodes: Vec<Node> = entry
+        .nodes
+        .iter()
+        .map(|n| match n {
+            Node::Symbol(s) if *s == hole_sym => Node::Num(fitted),
+            _ => n.clone(),
+        })
+        .collect();
+    SynthPool {
+        nodes: new_nodes,
+        root: entry.root,
+        ret_type: entry.ret_type,
+        priority: entry.priority,
+        has_hole: false,
     }
 }
 
@@ -5052,6 +5860,52 @@ pub fn synthesize(
     max_depth: usize,
     max_candidates: usize,
 ) -> SynthResult {
+    synthesize_inner(
+        components, inputs, expected, env, universe,
+        max_depth, max_candidates, None,
+    )
+}
+
+/// Multi-arg variant of `synthesize` for the §9.31 physics curriculum
+/// path. Each task input is a list of length `arg_types.len()`; the
+/// runtime lambda is still single-input (`(lambda (x) ...)`) and
+/// receives the list as `x`, but the search-time pool is seeded with
+/// one indexed-atom per position. Each indexed atom materializes to
+/// `(nth x i)` and carries the type of `args[i]`, so the rest of the
+/// pipeline (reachability prune, type-gated composition, dedup) sees
+/// N typed atoms instead of one List atom plus a swarm of `(nth x i)`
+/// shapes inflating depth-1 fanout.
+pub fn synthesize_args(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    arg_types: &[Sym],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+) -> SynthResult {
+    let seed_atoms: Vec<SynthComponent> = arg_types
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| indexed_arg_component(i, t))
+        .collect();
+    synthesize_inner(
+        components, inputs, expected, env, universe,
+        max_depth, max_candidates, Some(seed_atoms),
+    )
+}
+
+fn synthesize_inner(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+    extra_seeds: Option<Vec<SynthComponent>>,
+) -> SynthResult {
     // Empty examples: nothing to fit. Return failure rather than
     // returning an arbitrary trivial program.
     if inputs.is_empty() || inputs.len() != expected.len() {
@@ -5062,8 +5916,24 @@ pub fn synthesize(
     let input_type = infer_uniform_type_sym(inputs).unwrap_or_else(type_any);
     let target = infer_uniform_type_sym(expected);
 
+    // Capture whether we're on the multi-arg path (used at the end
+    // of the function for the affine-fit pass).
+    let extra_seeds_was_some = extra_seeds.is_some();
+
     // ── Reachability prune ─────────────────────────────────────────────
-    let seeds = vec![input_type];
+    // For multi-arg, the reach seeds are the per-arg types, NOT the
+    // outer List type — so arithmetic on Num args gets reached even
+    // though the outer `x` is a list.
+    let seeds: Vec<Sym> = match &extra_seeds {
+        Some(atoms) => {
+            let mut s: Vec<Sym> = atoms.iter().map(|a| a.ret_type).collect();
+            // Always include the outer list type so any list-shaped
+            // helper components stay reachable too.
+            s.push(input_type);
+            s
+        }
+        None => vec![input_type],
+    };
     let reach = universe.reachable_for_task(&seeds, target, components);
     let scoped_refs = filter_components_by_reach(components, &reach, universe);
 
@@ -5079,7 +5949,62 @@ pub fn synthesize(
     let probed = probe_filter_components(&scoped, env, &inputs[0], input_type, universe);
 
     let mut all_components = probed;
-    all_components.push(input_var_component(input_type));
+
+    // ── Data-derived literal seeding (multi-arg only) ─────────────────
+    // §9.41: scan inputs and outputs for unique primitive Int / Num /
+    // Str / Bool values and seed them as depth-0 literal components.
+    // Only fires on the multi-arg path (`extra_seeds.is_some()`)
+    // because:
+    //   - The existing single-input synthesize tests assert NEGATIVE
+    //     conditions ("Memo is the fallback when Flat can't reach
+    //     constant 99") that data-derived seeding fundamentally
+    //     contradicts: with the constant always seeded, Flat solves
+    //     them at depth 0. Gating the new behaviour to multi-arg
+    //     keeps those tests valid.
+    //   - The multi-arg path is new (§9.39) and its only consumers
+    //     are the §9.40 meta-curriculum decomposers, where rich data
+    //     constants are exactly what's wanted.
+    if extra_seeds.is_some() {
+        let data_lits = collect_data_literals(inputs, expected);
+        for lit in data_lits {
+            // Skip if a literal with the same value is already in the
+            // pool (matches the static seed entries).
+            let dup = all_components.iter().any(|c| match (&c.dispatch, &lit.dispatch) {
+                (Dispatch::Literal(LiteralKind::Int(a)), Dispatch::Literal(LiteralKind::Int(b))) => a == b,
+                (Dispatch::Literal(LiteralKind::Num(a)), Dispatch::Literal(LiteralKind::Num(b))) => a.to_bits() == b.to_bits(),
+                (Dispatch::Literal(LiteralKind::Str(a)), Dispatch::Literal(LiteralKind::Str(b))) => a == b,
+                (Dispatch::Literal(LiteralKind::Bool(a)), Dispatch::Literal(LiteralKind::Bool(b))) => a == b,
+                _ => false,
+            });
+            if !dup {
+                all_components.push(lit);
+            }
+        }
+    }
+
+    match extra_seeds {
+        Some(atoms) => {
+            // Multi-arg path: indexed atoms instead of the single
+            // input-var. Keep the input-var too, so a body that
+            // genuinely wants the whole list (e.g., `(reduce + x)`)
+            // can still reach it.
+            all_components.push(input_var_component(input_type));
+            all_components.extend(atoms);
+            // §9.43 list constructors — needed by Form L for cross-
+            // arity library reuse. Only added on the multi-arg path.
+            let num = intern("Num");
+            let list_ = intern("List");
+            all_components.push(SynthComponent::named(
+                "list", intern("list"), vec![num, num], list_, 5.0,
+            ));
+            all_components.push(SynthComponent::named(
+                "list", intern("list"), vec![num, num, num], list_, 5.0,
+            ));
+        }
+        None => {
+            all_components.push(input_var_component(input_type));
+        }
+    }
 
     // ── Depth 0: build atom pool from constants + input variable ──────
     let mut pool: Vec<SynthPool> = Vec::new();
@@ -5095,18 +6020,25 @@ pub fn synthesize(
     let mut explored: usize = 0;
     let mut seen: HashSet<Vec<u64>> = HashSet::new();
 
+    // §9.42 affine-fit pass needs an end-of-search hook even when
+    // the main enumeration runs out of budget. We track exhausted-or-
+    // converged state via this flag and break out instead of early-
+    // returning.
+    let mut budget_exhausted = false;
+
     // Test depth-0 atoms.
-    for entry in &pool {
+    'depth0: for entry in &pool {
         if explored >= max_candidates {
-            return SynthResult::not_found(explored);
+            budget_exhausted = true;
+            break 'depth0;
         }
         explored += 1;
-        match test_candidate(entry, inputs, expected, env, &mut seen, target, universe) {
-            TestOutcome::Solution => {
-                let (n, r) = wrap_lambda(entry);
-                return SynthResult::success(n, r, explored);
-            }
-            _ => {}
+        let (outcome, hole_sub) =
+            test_candidate(entry, inputs, expected, env, &mut seen, target, universe);
+        if let TestOutcome::Solution = outcome {
+            let final_entry = hole_sub.as_ref().unwrap_or(entry);
+            let (n, r) = wrap_lambda(final_entry);
+            return SynthResult::success(n, r, explored);
         }
     }
 
@@ -5114,7 +6046,10 @@ pub fn synthesize(
     let mut prev_start: usize = 0;
     let mut prev_end: usize = pool.len();
 
-    for _depth in 1..=max_depth {
+    'depth_loop: for _depth in 1..=max_depth {
+        if budget_exhausted {
+            break 'depth_loop;
+        }
         let prev_range_start = prev_start;
         let prev_range_end = prev_end;
         let all_end = prev_end;
@@ -5198,7 +6133,8 @@ pub fn synthesize(
 
         for desc in pending {
             if explored >= max_candidates {
-                return SynthResult::not_found(explored);
+                budget_exhausted = true;
+                break 'depth_loop;
             }
             explored += 1;
 
@@ -5207,9 +6143,12 @@ pub fn synthesize(
                 desc.args.iter().map(|&i| &pool[i]).collect();
             let entry = materialize_app(comp, &arg_refs);
 
-            match test_candidate(&entry, inputs, expected, env, &mut seen, target, universe) {
+            let (outcome, hole_sub) =
+                test_candidate(&entry, inputs, expected, env, &mut seen, target, universe);
+            match outcome {
                 TestOutcome::Solution => {
-                    let (n, r) = wrap_lambda(&entry);
+                    let final_entry = hole_sub.as_ref().unwrap_or(&entry);
+                    let (n, r) = wrap_lambda(final_entry);
                     return SynthResult::success(n, r, explored);
                 }
                 TestOutcome::Tested | TestOutcome::Skipped => {
@@ -5234,7 +6173,658 @@ pub fn synthesize(
         prev_end = pool.len();
     }
 
+    // ── §9.42 affine-fit pass (multi-arg only) ────────────────────────
+    //
+    // After normal enumeration finishes (whether by convergence,
+    // budget exhaustion, or hitting max_depth), run a focused
+    // constant-hole search over the final pool. The hypothesis:
+    // many physics formulas have the shape
+    // `f(args) = h(args) + C·g(args)` where h and g are simple
+    // closed-form expressions and C is a buried constant (e.g.
+    // ½·a·t² has h=u·t, g=t², C=0.125 with a_ref=0.25).
+    //
+    // The hole-as-an-atom approach inflated fanout enormously
+    // (every binary op tries the hole at every position); the
+    // focused pass tries the canonical affine shape directly:
+    //
+    //   1. C  alone (constant function)
+    //   2. C · g(args)
+    //   3. h(args) + C · g(args)
+    //
+    // Pool size² × constant overhead is much smaller than the
+    // equivalent hole-as-atom enumeration. The pass uses its own
+    // independent budget — even if normal enumeration burned through
+    // `max_candidates`, the affine-fit pass still runs.
+    if extra_seeds_was_some {
+        let mut fit_explored: usize = 0;
+        // Independent budget bounded by pool size: every (h, g) pair
+        // is one fit attempt, so `pool² + pool + 1` is a safe upper
+        // bound. Cap at 250k to avoid pathological pools.
+        let pool_n = pool.len();
+        let fit_budget = (pool_n * pool_n + pool_n + 1).min(250_000);
+        if let Some(result) = affine_fit_pass(
+            &pool, inputs, expected, env, target, universe,
+            &mut fit_explored, fit_budget,
+        ) {
+            // Add the fit-pass cost to the reported explored count.
+            return SynthResult {
+                candidates_explored: explored + fit_explored,
+                ..result
+            };
+        }
+        explored += fit_explored;
+    }
+    let _ = budget_exhausted;
+
     SynthResult::not_found(explored)
+}
+
+/// §9.42 affine-fit pass over the final synth pool. Tries the
+/// canonical `h + C·g` shape over all pairs (h, g), fitting C in
+/// pure f64 arithmetic against precomputed behavior vectors.
+/// Avoids the per-pair eval+verify cost of the naive approach.
+///
+/// Forms tried:
+///   - `C` (constant function)
+///   - `C · g` for each g
+///   - `h + C · g` for each pair (h, g)
+///   - `C · (e1 · e2)` for each pair (e1, e2)
+///
+/// All four forms reduce to "find C such that target = h + C·g for
+/// every row" with the appropriate h and g vectors. The fit is
+/// closed-form: pick a row where g≠0, solve `C = (target - h) / g`,
+/// then verify.
+fn affine_fit_pass(
+    pool: &[SynthPool],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    target: Option<Sym>,
+    universe: &TypeUniverse,
+    explored: &mut usize,
+    _max_candidates: usize,
+) -> Option<SynthResult> {
+    let num_sym = intern("Num");
+    if let Some(t) = target {
+        if !universe.slot_accepts(t, num_sym) {
+            return None;
+        }
+    }
+    let num_entries: Vec<&SynthPool> = pool
+        .iter()
+        .filter(|e| !e.has_hole && universe.slot_accepts(num_sym, e.ret_type))
+        .collect();
+
+    // Precompute behavior vectors (Vec<f64>) for each entry. None
+    // for entries that error or produce non-numeric values on any
+    // row — those can't participate in affine fits.
+    let n_rows = inputs.len();
+    let target_vec: Option<Vec<f64>> = expected
+        .iter()
+        .map(|e| value_to_f64(e).filter(|x| x.is_finite()))
+        .collect();
+    let target_vec = target_vec?;
+
+    let mut behaviors: Vec<Option<Vec<f64>>> = Vec::with_capacity(num_entries.len());
+    for e in &num_entries {
+        let f = match wrap_lambda_then_eval(e, env) {
+            Some(v) => v,
+            None => { behaviors.push(None); continue; }
+        };
+        let mut beh: Vec<f64> = Vec::with_capacity(n_rows);
+        let mut ok = true;
+        for inp in inputs {
+            match eval_v2::apply(&f, &[inp.clone()], env) {
+                Ok(v) => match value_to_f64(&v) {
+                    Some(x) if x.is_finite() => beh.push(x),
+                    _ => { ok = false; break; }
+                },
+                Err(_) => { ok = false; break; }
+            }
+        }
+        behaviors.push(if ok { Some(beh) } else { None });
+    }
+
+    // Helper: find C such that target[i] = h[i] + C·g[i] for every i.
+    // Returns Some(C) if a consistent C exists; None otherwise.
+    let zero_h = vec![0.0; n_rows];
+    let fit_affine = |h: &[f64], g: &[f64]| -> Option<f64> {
+        // Find a row with g != 0 to solve from.
+        let pivot = (0..n_rows).find(|&i| g[i].abs() > 1e-12)?;
+        let c = (target_vec[pivot] - h[pivot]) / g[pivot];
+        if !c.is_finite() {
+            return None;
+        }
+        // Verify on every row.
+        for i in 0..n_rows {
+            let pred = h[i] + c * g[i];
+            let exp = target_vec[i];
+            let diff = (pred - exp).abs();
+            let scale = pred.abs().max(exp.abs()).max(1.0);
+            if diff / scale > 1e-9 {
+                return None;
+            }
+        }
+        Some(c)
+    };
+
+    // Form 1: bare HOLE (constant function).
+    *explored += 1;
+    if let Some(c) = fit_affine(&zero_h, &vec![1.0; n_rows]) {
+        let cand = build_bare_hole();
+        let sub = substitute_hole(&cand, c);
+        let (n, r) = wrap_lambda(&sub);
+        return Some(SynthResult::success(n, r, *explored));
+    }
+
+    // Form 2: C · g for each g.
+    for (gi, gbeh) in behaviors.iter().enumerate() {
+        let gbeh = match gbeh { Some(b) => b, None => continue };
+        *explored += 1;
+        if let Some(c) = fit_affine(&zero_h, gbeh) {
+            let cand = build_scale_hole(num_entries[gi]);
+            let sub = substitute_hole(&cand, c);
+            let (n, r) = wrap_lambda(&sub);
+            return Some(SynthResult::success(n, r, *explored));
+        }
+    }
+
+    // Form 2b: C · (unary_op g) for each unary op and each g. Common
+    // unary wrappings (sqrt, log, exp, sin, cos, negate, abs) often
+    // bury the right structure that main enumeration misses due to
+    // priority ordering. Cheap — pool * 7 ops.
+    let unary_ops: &[(&str, fn(f64) -> f64)] = &[
+        ("sqrt",   f64::sqrt),
+        ("log",    f64::ln),
+        ("exp",    f64::exp),
+        ("sin",    f64::sin),
+        ("cos",    f64::cos),
+        ("negate", |x| -x),
+        ("abs",    f64::abs),
+    ];
+    for (op_name, op_fn) in unary_ops {
+        let op_sym = intern(op_name);
+        for (gi, gbeh) in behaviors.iter().enumerate() {
+            let gbeh = match gbeh { Some(b) => b, None => continue };
+            // Apply the unary op elementwise to g's behavior.
+            let wrapped: Vec<f64> = gbeh.iter().map(|&x| op_fn(x)).collect();
+            // Skip if any wrapped value is non-finite (e.g. log of
+            // zero, sqrt of negative).
+            if !wrapped.iter().all(|x| x.is_finite()) { continue; }
+            *explored += 1;
+            if let Some(c) = fit_affine(&zero_h, &wrapped) {
+                // Construct (op g) as a SynthPool.
+                let mut nodes: Vec<Node> = Vec::new();
+                for n in &num_entries[gi].nodes {
+                    nodes.push(remap_node(n, 0));
+                }
+                let g_root = num_entries[gi].root;
+                let op_idx = nodes.len();
+                nodes.push(Node::Symbol(op_sym));
+                let app_idx = nodes.len();
+                nodes.push(Node::App(vec![op_idx, g_root]));
+                let wrapped_pool = SynthPool {
+                    nodes, root: app_idx,
+                    ret_type: intern("Num"),
+                    priority: 0.0,
+                    has_hole: false,
+                };
+                let cand = build_scale_hole(&wrapped_pool);
+                let sub = substitute_hole(&cand, c);
+                let (n, r) = wrap_lambda(&sub);
+                return Some(SynthResult::success(n, r, *explored));
+            }
+        }
+    }
+
+    // Form 3: h + C · g for each pair (h, g).
+    for (hi, hbeh) in behaviors.iter().enumerate() {
+        let hbeh = match hbeh { Some(b) => b, None => continue };
+        for (gi, gbeh) in behaviors.iter().enumerate() {
+            let gbeh = match gbeh { Some(b) => b, None => continue };
+            *explored += 1;
+            if let Some(c) = fit_affine(hbeh, gbeh) {
+                let cand = build_affine_combo(num_entries[hi], num_entries[gi]);
+                let sub = substitute_hole(&cand, c);
+                let (n, r) = wrap_lambda(&sub);
+                return Some(SynthResult::success(n, r, *explored));
+            }
+        }
+    }
+
+    // Form 4: C · (e1 · e2) for each pair. The composed g behavior
+    // is the elementwise product of e1 and e2 behaviors — no need
+    // to call eval; we compute it from the precomputed vectors.
+    for (i, ibeh) in behaviors.iter().enumerate() {
+        let ibeh = match ibeh { Some(b) => b, None => continue };
+        for (j, jbeh) in behaviors.iter().enumerate() {
+            let jbeh = match jbeh { Some(b) => b, None => continue };
+            *explored += 1;
+            // Composed behavior = elementwise product.
+            let composed: Vec<f64> = (0..n_rows).map(|k| ibeh[k] * jbeh[k]).collect();
+            if let Some(c) = fit_affine(&zero_h, &composed) {
+                let composed_pool = build_op_combo(num_entries[i], num_entries[j], intern("multiply"));
+                let cand = build_scale_hole(&composed_pool);
+                let sub = substitute_hole(&cand, c);
+                let (n, r) = wrap_lambda(&sub);
+                return Some(SynthResult::success(n, r, *explored));
+            }
+        }
+    }
+
+    // Form S: structural pair-fit `(op_b h (op_u g))` with NO
+    // constant fit. Catches shapes like `A·cos(ωt)` where the
+    // outer combiner is binary and the inner is a unary wrap of
+    // a pool entry. The predicted output is computed in pure
+    // arithmetic from precomputed behaviors. Cost is bounded by
+    // pool² × 4 binary × 7 unary ≈ 28 × pool².
+    let binary_ops: &[(&str, fn(f64, f64) -> f64)] = &[
+        ("multiply", |a, b| a * b),
+        ("add",      |a, b| a + b),
+        ("subtract", |a, b| a - b),
+        ("divide",   |a, b| a / b),
+    ];
+    for (op_b_name, op_b_fn) in binary_ops {
+        let op_b_sym = intern(op_b_name);
+        for (hi, hbeh) in behaviors.iter().enumerate() {
+            let hbeh = match hbeh { Some(b) => b, None => continue };
+            for (gi, gbeh) in behaviors.iter().enumerate() {
+                let gbeh = match gbeh { Some(b) => b, None => continue };
+                for (op_u_name, op_u_fn) in unary_ops {
+                    let op_u_sym = intern(op_u_name);
+                    *explored += 1;
+                    // Compute predicted column = h_b op_b op_u(g_b).
+                    let mut ok = true;
+                    let mut all_match = true;
+                    for k in 0..n_rows {
+                        let uval = op_u_fn(gbeh[k]);
+                        if !uval.is_finite() { ok = false; break; }
+                        let pred = op_b_fn(hbeh[k], uval);
+                        if !pred.is_finite() { ok = false; break; }
+                        let exp = target_vec[k];
+                        let diff = (pred - exp).abs();
+                        let scale = pred.abs().max(exp.abs()).max(1.0);
+                        if diff / scale > 1e-9 { all_match = false; break; }
+                    }
+                    if ok && all_match {
+                        // Build (op_b h (op_u g)) — no hole.
+                        let mut nodes: Vec<Node> = Vec::new();
+                        for n in &num_entries[hi].nodes {
+                            nodes.push(remap_node(n, 0));
+                        }
+                        let h_root = num_entries[hi].root;
+                        let g_offset = nodes.len();
+                        for n in &num_entries[gi].nodes {
+                            nodes.push(remap_node(n, g_offset));
+                        }
+                        let g_root = num_entries[gi].root + g_offset;
+                        let u_sym_idx = nodes.len();
+                        nodes.push(Node::Symbol(op_u_sym));
+                        let u_app = nodes.len();
+                        nodes.push(Node::App(vec![u_sym_idx, g_root]));
+                        let b_sym_idx = nodes.len();
+                        nodes.push(Node::Symbol(op_b_sym));
+                        let b_app = nodes.len();
+                        nodes.push(Node::App(vec![b_sym_idx, h_root, u_app]));
+                        let cand = SynthPool {
+                            nodes, root: b_app,
+                            ret_type: intern("Num"),
+                            priority: 0.0,
+                            has_hole: false,
+                        };
+                        let (n, r) = wrap_lambda(&cand);
+                        return Some(SynthResult::success(n, r, *explored));
+                    }
+                }
+            }
+        }
+    }
+
+    // Form L: cross-arity library reuse. For each library function
+    // `lib :: List → Num` discovered in the env, try the shape
+    // `(op_b (nth x h) (lib (list (nth x i) (nth x j))))` for all
+    // distinct indexed-atom triples (h, i, j). This is the only way
+    // to reach formulas like rel_mass = m₀ · γ(v, c) where γ is a
+    // 2-arg library function and the parent task is 3-arg.
+    //
+    // Cost is bounded: arity³ × num_libs × 4 binary ops × n_rows
+    // library evaluations. For arity 3 with 2 libraries: ~150 evals.
+    {
+        let arity = match inputs.first() {
+            Some(Value::List(items)) => items.len(),
+            _ => 0,
+        };
+        if arity >= 3 {
+            // Discover library functions in the env that take a single
+            // list arg and return a numeric value.
+            let skip = default_skip_set();
+            let lib_comps = library_components_from_env(env, &skip);
+            let lib_fns: Vec<(Sym, Value)> = lib_comps
+                .iter()
+                .filter(|c| c.arity == 1
+                    && c.param_types.len() == 1
+                    && (c.param_types[0] == intern("List") || c.param_types[0] == intern("Any")))
+                .filter_map(|c| {
+                    if let Dispatch::Named(sym) = c.dispatch {
+                        env.lookup(sym).map(|v| (sym, v))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Indexed-atom positions 0..arity.
+            for h_idx in 0..arity {
+                for i_idx in 0..arity {
+                    if i_idx == h_idx { continue; }
+                    for j_idx in 0..arity {
+                        if j_idx == h_idx || j_idx == i_idx { continue; }
+                        for (lib_sym, lib_val) in &lib_fns {
+                            // Compute (lib (list args[i_idx] args[j_idx]))
+                            // for each row.
+                            let mut lib_results: Vec<f64> = Vec::with_capacity(n_rows);
+                            let mut ok = true;
+                            for inp in inputs {
+                                let row_args = match inp {
+                                    Value::List(items) => items,
+                                    _ => { ok = false; break; }
+                                };
+                                let sub_list = Value::list(vec![
+                                    row_args[i_idx].clone(),
+                                    row_args[j_idx].clone(),
+                                ]);
+                                match eval_v2::apply(lib_val, &[sub_list], env) {
+                                    Ok(v) => match value_to_f64(&v) {
+                                        Some(x) if x.is_finite() => lib_results.push(x),
+                                        _ => { ok = false; break; }
+                                    },
+                                    Err(_) => { ok = false; break; }
+                                }
+                            }
+                            if !ok { continue; }
+                            // Get h_idx atom column.
+                            let mut h_col: Vec<f64> = Vec::with_capacity(n_rows);
+                            let mut h_ok = true;
+                            for inp in inputs {
+                                let items = match inp {
+                                    Value::List(items) => items,
+                                    _ => { h_ok = false; break; }
+                                };
+                                match value_to_f64(&items[h_idx]) {
+                                    Some(x) => h_col.push(x),
+                                    None => { h_ok = false; break; }
+                                }
+                            }
+                            if !h_ok { continue; }
+                            // Try each binary op `op_b` on (h_col, lib_results).
+                            for (op_b_name, op_b_fn) in binary_ops {
+                                let op_b_sym = intern(op_b_name);
+                                *explored += 1;
+                                let mut all_match = true;
+                                for k in 0..n_rows {
+                                    let pred = op_b_fn(h_col[k], lib_results[k]);
+                                    if !pred.is_finite() { all_match = false; break; }
+                                    let exp = target_vec[k];
+                                    let diff = (pred - exp).abs();
+                                    let scale = pred.abs().max(exp.abs()).max(1.0);
+                                    if diff / scale > 1e-9 { all_match = false; break; }
+                                }
+                                if all_match {
+                                    // Build the source: (op_b (nth x h_idx)
+                                    //   (lib_sym (list (nth x i_idx) (nth x j_idx)))).
+                                    let mut nodes: Vec<Node> = Vec::new();
+                                    // (nth x h_idx)
+                                    nodes.push(Node::Symbol(intern("nth")));
+                                    nodes.push(Node::Symbol(intern("x")));
+                                    nodes.push(Node::Int(h_idx as i64));
+                                    nodes.push(Node::App(vec![0, 1, 2]));
+                                    let h_root = 3;
+                                    // (nth x i_idx)
+                                    nodes.push(Node::Symbol(intern("nth")));
+                                    nodes.push(Node::Symbol(intern("x")));
+                                    nodes.push(Node::Int(i_idx as i64));
+                                    nodes.push(Node::App(vec![4, 5, 6]));
+                                    let i_root = 7;
+                                    // (nth x j_idx)
+                                    nodes.push(Node::Symbol(intern("nth")));
+                                    nodes.push(Node::Symbol(intern("x")));
+                                    nodes.push(Node::Int(j_idx as i64));
+                                    nodes.push(Node::App(vec![8, 9, 10]));
+                                    let j_root = 11;
+                                    // (list (nth x i) (nth x j))
+                                    nodes.push(Node::Symbol(intern("list")));
+                                    let list_app = nodes.len();
+                                    nodes.push(Node::App(vec![12, i_root, j_root]));
+                                    // (lib_sym (list ...))
+                                    let lib_sym_idx = nodes.len();
+                                    nodes.push(Node::Symbol(*lib_sym));
+                                    let lib_app = nodes.len();
+                                    nodes.push(Node::App(vec![lib_sym_idx, list_app]));
+                                    // (op_b h lib_call)
+                                    let op_sym_idx = nodes.len();
+                                    nodes.push(Node::Symbol(op_b_sym));
+                                    let outer_app = nodes.len();
+                                    nodes.push(Node::App(vec![op_sym_idx, h_root, lib_app]));
+                                    let cand = SynthPool {
+                                        nodes,
+                                        root: outer_app,
+                                        ret_type: intern("Num"),
+                                        priority: 0.0,
+                                        has_hole: false,
+                                    };
+                                    let (n, r) = wrap_lambda(&cand);
+                                    return Some(SynthResult::success(n, r, *explored));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Form 5: h + C · (e1 · e2). The classic u·t + ½·a·t² shape.
+    // Cost is small_h × pool² which can be huge for large pools.
+    // Bounded by:
+    //   - Threshold of 10 nodes (captures depth-1 binary ops over
+    //     two indexed atoms — needed for kinematic_s where the
+    //     inner product is `t·t`, a 10-node entry).
+    //   - Hard cap on iteration count (10M).
+    let small_idxs: Vec<usize> = (0..num_entries.len())
+        .filter(|&i| num_entries[i].nodes.len() <= 10 && behaviors[i].is_some())
+        .collect();
+    let form5_cap: usize = 200_000_000;
+    let mut form5_iters = 0usize;
+    'form5: for &hi in &small_idxs {
+        let hbeh = behaviors[hi].as_ref().unwrap();
+        for &i in &small_idxs {
+            let ibeh = behaviors[i].as_ref().unwrap();
+            for &j in &small_idxs {
+                if form5_iters >= form5_cap {
+                    break 'form5;
+                }
+                form5_iters += 1;
+                let jbeh = behaviors[j].as_ref().unwrap();
+                *explored += 1;
+                let composed: Vec<f64> = (0..n_rows).map(|k| ibeh[k] * jbeh[k]).collect();
+                if let Some(c) = fit_affine(hbeh, &composed) {
+                    let composed_pool = build_op_combo(num_entries[i], num_entries[j], intern("multiply"));
+                    let cand = build_affine_combo(num_entries[hi], &composed_pool);
+                    let sub = substitute_hole(&cand, c);
+                    let (n, r) = wrap_lambda(&sub);
+                    return Some(SynthResult::success(n, r, *explored));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Build `(op e1 e2)` from two existing pool entries. Used by §9.42
+/// affine-fit pass Form 4 to construct depth-2 building blocks on
+/// the fly.
+fn build_op_combo(e1: &SynthPool, e2: &SynthPool, op: Sym) -> SynthPool {
+    let mut nodes: Vec<Node> = Vec::new();
+    for n in &e1.nodes {
+        nodes.push(remap_node(n, 0));
+    }
+    let e1_root = e1.root;
+    let e2_offset = nodes.len();
+    for n in &e2.nodes {
+        nodes.push(remap_node(n, e2_offset));
+    }
+    let e2_root = e2.root + e2_offset;
+    let op_idx = nodes.len();
+    nodes.push(Node::Symbol(op));
+    let app_idx = nodes.len();
+    nodes.push(Node::App(vec![op_idx, e1_root, e2_root]));
+    SynthPool {
+        nodes,
+        root: app_idx,
+        ret_type: intern("Num"),
+        priority: 0.0,
+        has_hole: false,
+    }
+}
+
+/// Build the bare-hole candidate `__hole__`.
+fn build_bare_hole() -> SynthPool {
+    let nodes = vec![Node::Symbol(intern("__hole__"))];
+    SynthPool {
+        nodes,
+        root: 0,
+        ret_type: intern("Num"),
+        priority: 0.0,
+        has_hole: true,
+    }
+}
+
+/// Build `(multiply __hole__ g)` over an existing pool entry `g`.
+fn build_scale_hole(g: &SynthPool) -> SynthPool {
+    let mut nodes: Vec<Node> = Vec::new();
+    // Embed g's nodes at offset 0.
+    for n in &g.nodes {
+        nodes.push(remap_node(n, 0));
+    }
+    let g_root = g.root;
+    let mul_sym_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("multiply")));
+    let hole_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("__hole__")));
+    let app_idx = nodes.len();
+    nodes.push(Node::App(vec![mul_sym_idx, hole_idx, g_root]));
+    SynthPool {
+        nodes,
+        root: app_idx,
+        ret_type: intern("Num"),
+        priority: 0.0,
+        has_hole: true,
+    }
+}
+
+/// Build `(add h (multiply __hole__ g))` over two existing pool
+/// entries. Concatenates the two node arenas and adds the outer
+/// application nodes.
+fn build_affine_combo(h: &SynthPool, g: &SynthPool) -> SynthPool {
+    let mut nodes: Vec<Node> = Vec::new();
+    // Embed h at offset 0.
+    for n in &h.nodes {
+        nodes.push(remap_node(n, 0));
+    }
+    let h_root = h.root;
+    // Embed g at offset = h.nodes.len().
+    let g_offset = nodes.len();
+    for n in &g.nodes {
+        nodes.push(remap_node(n, g_offset));
+    }
+    let g_root = g.root + g_offset;
+    // Inner: (multiply __hole__ g)
+    let mul_sym_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("multiply")));
+    let hole_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("__hole__")));
+    let mul_app = nodes.len();
+    nodes.push(Node::App(vec![mul_sym_idx, hole_idx, g_root]));
+    // Outer: (add h (mul ...))
+    let add_sym_idx = nodes.len();
+    nodes.push(Node::Symbol(intern("add")));
+    let add_app = nodes.len();
+    nodes.push(Node::App(vec![add_sym_idx, h_root, mul_app]));
+    SynthPool {
+        nodes,
+        root: add_app,
+        ret_type: intern("Num"),
+        priority: 0.0,
+        has_hole: true,
+    }
+}
+
+/// Run the affine fit-and-verify on a hole-bearing candidate. Returns
+/// the substituted (hole-free) entry on success, or None on failure.
+/// Side-effect free; no `seen` updates because the affine-fit pass
+/// is bounded and runs after main enumeration.
+///
+/// The fit scans rows for one with a non-zero slope `a` (i.e., a row
+/// where the candidate's H=0 and H=1 evaluations differ). Without
+/// this scan, the fit would bail on candidates whose first row
+/// happens to make the hole's contribution vanish — a common case
+/// for h-style sub-specs whose first row is the reference point.
+fn try_affine_fit(
+    entry: &SynthPool,
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+) -> Option<SynthPool> {
+    let hole_sym = intern("__hole__");
+    let mut nodes = entry.nodes.clone();
+    let body_idx = entry.root;
+    let lambda_idx = nodes.len();
+    nodes.push(Node::Lambda(vec![intern("x"), hole_sym], body_idx));
+    let nodes_rc: Rc<[Node]> = nodes.into();
+
+    let f = eval_v2::eval(&nodes_rc, lambda_idx, env).ok()?;
+
+    // Scan rows for one with a meaningfully non-zero slope (a) under
+    // H=0 vs H=1. The first such row determines the fitted constant.
+    let mut fit_row: Option<(usize, f64, f64)> = None;
+    for (i, inp) in inputs.iter().enumerate() {
+        let probe = |h: f64| -> Option<f64> {
+            let v = eval_v2::apply(&f, &[inp.clone(), Value::Num(h)], env).ok()?;
+            value_to_f64(&v)
+        };
+        let b = match probe(0.0) {
+            Some(x) if x.is_finite() => x,
+            _ => return None,
+        };
+        let bplus = match probe(1.0) {
+            Some(x) if x.is_finite() => x,
+            _ => return None,
+        };
+        let a = bplus - b;
+        if a.abs() >= 1e-12 {
+            fit_row = Some((i, b, a));
+            break;
+        }
+    }
+    let (fit_idx, b, a) = fit_row?;
+
+    let target_val = value_to_f64(&expected[fit_idx]).filter(|x| x.is_finite())?;
+    let fitted_h = (target_val - b) / a;
+    if !fitted_h.is_finite() {
+        return None;
+    }
+
+    // Verify on every row.
+    let hole_val = Value::Num(fitted_h);
+    for (inp, exp) in inputs.iter().zip(expected.iter()) {
+        let v = eval_v2::apply(&f, &[inp.clone(), hole_val.clone()], env).ok()?;
+        if !values_close_or_equal(&v, exp, 1e-9) {
+            return None;
+        }
+    }
+
+    Some(substitute_hole(entry, fitted_h))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -5264,6 +6854,117 @@ mod tests {
         assert!(u.is_known(sym("Any")));
         // Int and Num are distinct (the whole point of Value::Int).
         assert_ne!(sym("Int"), sym("Num"));
+        // No custom types loaded — type_metadata is empty.
+        assert!(u.type_metadata(sym("Int")).is_none());
+    }
+
+    // ── §9.37 Stage B: TypeUniverse::from_env ───────────────────────────
+
+    /// Helper: build an env after evaluating one or more top-level
+    /// SELPH forms. The last form is typically a `(define __types__ ...)`
+    /// but earlier forms can introduce helper definitions.
+    fn env_with_types(types_src: &str) -> crate::types_v2::Env {
+        let env = crate::eval_v2::make_default_env();
+        let (old_nodes, roots) = crate::parser::parse_file(types_src).unwrap();
+        let new_nodes: std::rc::Rc<[Node]> =
+            crate::eval_v2::convert_tree(&old_nodes).into();
+        for &r in &roots {
+            crate::eval_v2::eval(&new_nodes, r, &env).unwrap();
+        }
+        env
+    }
+
+    #[test]
+    fn from_env_with_no_types_returns_primitives_baseline() {
+        let env = crate::eval_v2::make_default_env();
+        let u = TypeUniverse::from_env(&env);
+        // Same as primitives — known set has the standard types,
+        // type_metadata is empty.
+        assert!(u.is_known(sym("Int")));
+        assert!(u.type_metadata(sym("Int")).is_none());
+    }
+
+    #[test]
+    fn from_env_loads_custom_type_with_predicate_and_subtype() {
+        let env = env_with_types(
+            r#"
+            (define __types__
+              (ns ("Color" (ns
+                ("predicate" (lambda (v) (string? v)))
+                ("subtype-of" (list "String" "Any"))
+                ("priority" 50)))))
+            "#,
+        );
+        let u = TypeUniverse::from_env(&env);
+        assert!(u.is_known(sym("Color")));
+        let meta = u.type_metadata(sym("Color")).expect("Color metadata");
+        assert!(meta.predicate.is_some());
+        assert_eq!(meta.subtype_of.len(), 2);
+        assert!(meta.subtype_of.contains(&sym("String")));
+        assert!(meta.subtype_of.contains(&sym("Any")));
+        assert!((meta.priority - 50.0).abs() < 1e-9);
+        assert_eq!(meta.decomposers.len(), 0);
+    }
+
+    #[test]
+    fn from_env_loads_decomposers_for_type() {
+        let env = env_with_types(
+            r#"
+            (define id-decomp (lambda (spec) nil))
+            (define __types__
+              (ns ("Int" (ns
+                ("decomposers" (ns ("zoo-decomp" id-decomp)
+                                   ("alpha-decomp" id-decomp)))))))
+            "#,
+        );
+        let u = TypeUniverse::from_env(&env);
+        let meta = u.type_metadata(sym("Int")).expect("Int metadata");
+        assert_eq!(meta.decomposers.len(), 2);
+        // Sorted by name → alpha-decomp first, zoo-decomp second.
+        assert_eq!(resolve(meta.decomposers[0].0), "alpha-decomp");
+        assert_eq!(resolve(meta.decomposers[1].0), "zoo-decomp");
+    }
+
+    #[test]
+    fn from_env_skips_malformed_entries_silently() {
+        // The Color entry isn't a namespace — it should be skipped
+        // without error. The Int entry is well-formed and should load.
+        let env = env_with_types(
+            r#"
+            (define __types__
+              (ns ("Color" 42)
+                  ("Int" (ns ("priority" 100)))))
+            "#,
+        );
+        let u = TypeUniverse::from_env(&env);
+        assert!(u.type_metadata(sym("Color")).is_none());
+        assert!(u.type_metadata(sym("Int")).is_some());
+    }
+
+    #[test]
+    fn from_env_loads_full_bootstrap_file() {
+        // Smoke test: load the actual examples/__types__.selph and
+        // verify the 10 expected primitive types appear.
+        let src = std::fs::read_to_string("../examples/__types__.selph")
+            .expect("read bootstrap");
+        let env = crate::eval_v2::make_default_env();
+        let (old_nodes, roots) = crate::parser::parse_file(&src).unwrap();
+        let new_nodes: std::rc::Rc<[Node]> =
+            crate::eval_v2::convert_tree(&old_nodes).into();
+        for &r in &roots {
+            crate::eval_v2::eval(&new_nodes, r, &env).unwrap();
+        }
+        let u = TypeUniverse::from_env(&env);
+        for name in &[
+            "Any", "Int", "Num", "String", "Bool", "List", "Namespace",
+            "Function", "Node", "Nil",
+        ] {
+            assert!(
+                u.type_metadata(intern(name)).is_some(),
+                "expected {} in __types__",
+                name
+            );
+        }
     }
 
     #[test]

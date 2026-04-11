@@ -1,0 +1,36 @@
+; Tasks designed to test RD vs flat at depth boundaries
+; These need depth 2 compositions in flat search but RD can decompose at depth 1
+
+; === Arithmetic inversion tasks ===
+; add(x, string-length(x)) — needs depth 2 flat, RD predicts add then synths string-length
+; (skipped — needs mixed types)
+
+; === String substring with computed index ===
+; string-take(x, 3) — flat can do at depth 1 but needs to try many constants
+; Already tested above.
+
+; === concat with suffix ===
+; output = concat(x, "!") — exclamation
+(task "exclaim" 2
+  ("hello" "hello!") ("world" "world!") ("hi" "hi!") ("yes" "yes!") ("ok" "ok!"))
+
+; output = concat(">>", x) — prepend prefix
+(task "quote" 2
+  ("hello" ">>hello") ("world" ">>world") ("hi" ">>hi") ("test" ">>test"))
+
+; === Nested: string-upper(string-reverse(x)) ===
+; Needs depth 2 flat. RD predicts string-upper, inverts to get string-reverse subspec.
+(task "shout_backward" 2
+  ("hello" "OLLEH") ("abc" "CBA") ("xy" "YX") ("test" "TSET"))
+
+; string-reverse(string-upper(x)) — same result but different decomposition
+(task "backward_shout" 2
+  ("hello" "OLLEH") ("abc" "CBA") ("xy" "YX") ("test" "TSET"))
+
+; string-lower(string-reverse(x))
+(task "whisper_backward" 2
+  ("HELLO" "olleh") ("ABC" "cba") ("XY" "yx") ("TEST" "tset"))
+
+; negate(string-length(x))
+(task "neg_len" 2
+  ("hi" -2) ("hello" -5) ("a" -1) ("test" -4) ("abc" -3))

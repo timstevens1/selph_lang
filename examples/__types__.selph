@@ -1,0 +1,82 @@
+; ─────────────────────────────────────────────────────────────────────────
+; __types__ — primitive type system bootstrap (post-§9.37 Stage B)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Defines the primitive types as SELPH data. This file is loaded into
+; the curriculum env via cmd_curriculum / cmd_grow_v2 before any
+; synthesis happens, so synth_v2's TypeUniverse::from_env can pick
+; them up. The hardcoded TypeUniverse::primitives() bootstrap is the
+; fallback when this file isn't loaded — useful for tests and the
+; minimal eval-v2 path.
+;
+; Each type entry is a namespace with optional fields:
+;   "predicate"   — (lambda (v) <bool>) — value membership test
+;   "subtype-of"  — list of supertype name strings
+;   "priority"    — number (used for ordering type-keyed dispatch)
+;   "decomposers" — namespace of name → function for type-keyed
+;                   decomposer dispatch (§9.37 Stage C)
+;
+; The hot-path slot_accepts function in synth_v2 still uses the
+; hardcoded Int <: Num rule. The subtype-of declarations here are
+; informational hints that future curriculum-driven decomposers may
+; consume. A full hot-path replacement (Stage D) is deferred work.
+
+(define __types__
+  (ns
+    ; ── Top of the lattice ─────────────────────────────────────────
+    ("Any" (ns
+      ("predicate" (lambda (v) true))
+      ("priority" 0)))
+
+    ; ── Numeric ────────────────────────────────────────────────────
+    ("Int" (ns
+      ("predicate" (lambda (v) (int? v)))
+      ("subtype-of" (list "Num" "Any"))
+      ("priority" 100)))
+
+    ("Num" (ns
+      ("predicate" (lambda (v) (or (int? v) (num? v))))
+      ("subtype-of" (list "Any"))
+      ("priority" 90)))
+
+    ; ── Text ───────────────────────────────────────────────────────
+    ("String" (ns
+      ("predicate" (lambda (v) (string? v)))
+      ("subtype-of" (list "Any"))
+      ("priority" 80)))
+
+    ; ── Booleans ──────────────────────────────────────────────────
+    ("Bool" (ns
+      ("predicate" (lambda (v) (bool? v)))
+      ("subtype-of" (list "Any"))
+      ("priority" 70)))
+
+    ; ── Collections ────────────────────────────────────────────────
+    ("List" (ns
+      ("predicate" (lambda (v) (list? v)))
+      ("subtype-of" (list "Any"))
+      ("priority" 60)))
+
+    ("Namespace" (ns
+      ("predicate" (lambda (v) (ns? v)))
+      ("subtype-of" (list "Any"))
+      ("priority" 50)))
+
+    ; ── Functions ─────────────────────────────────────────────────
+    ("Function" (ns
+      ("predicate" (lambda (v) (function? v)))
+      ("subtype-of" (list "Any"))
+      ("priority" 40)))
+
+    ; ── First-class AST nodes (§9.36) ──────────────────────────────
+    ("Node" (ns
+      ("predicate" (lambda (v) (node? v)))
+      ("subtype-of" (list "Any"))
+      ("priority" 30)))
+
+    ; ── Nil ───────────────────────────────────────────────────────
+    ("Nil" (ns
+      ("predicate" (lambda (v) (nil? v)))
+      ("subtype-of" (list "Any"))
+      ("priority" 10)))
+    ))

@@ -1,0 +1,42 @@
+; Stress test: many promoted macros creating search pressure
+; With many macros, depth-2 search space explodes (N^2 arity-2 compositions)
+; RD should help by predicting the outermost function
+
+; Stage 1: promote 10 macros to bloat the component list
+(task "double" 1 (1 2) (3 6) (5 10) (0 0) (4 8))
+(task "triple" 1 (1 3) (2 6) (3 9) (0 0) (4 12))
+(task "increment" 1 (0 1) (1 2) (5 6) (10 11) (3 4))
+(task "decrement" 1 (1 0) (2 1) (5 4) (10 9) (3 2))
+(task "square" 1 (1 1) (2 4) (3 9) (4 16) (5 25))
+(task "is_even" 1 (0 true) (1 false) (2 true) (3 false) (4 true))
+(task "is_positive" 1 (1 true) (-1 false) (0 false) (5 true) (-3 false))
+(task "sign_char" 1 ("+" true) ("-" false) ("x" false) ("a" false) ("+" true))
+(task "is_long" 1 ("hi" false) ("hello" true) ("a" false) ("testing" true) ("ab" false))
+(task "shout" 1 ("hi" "HI") ("hello" "HELLO") ("abc" "ABC") ("test" "TEST"))
+
+; Stage 2: harder compositions that benefit from RD's top-down prediction
+; With 10+ macros + 55 builtins = 65+ components, depth-2 = 65^2 = 4225 arity-2 compositions
+
+; string-take(shout(x), 3) — needs to find shout then string-take
+(task "shout_prefix3" 2
+  ("hello" "HEL") ("world" "WOR") ("testing" "TES") ("abcdef" "ABC"))
+
+; string-ends-with(shout(x), "S")  — is_plural on uppercased
+(task "ends_upper_s" 2
+  ("cats" true) ("dog" false) ("maps" true) ("car" false) ("tests" true))
+
+; negate(square(x))
+(task "neg_square" 2
+  (1 -1) (2 -4) (3 -9) (4 -16) (5 -25))
+
+; increment(square(x))
+(task "sq_plus_1" 2
+  (1 2) (2 5) (3 10) (4 17) (5 26))
+
+; double(string-length(shout(x)))  — depth 3 without RD, but RD can chain
+(task "double_shout_len" 2
+  ("hi" 4) ("hello" 10) ("a" 2) ("abc" 6))
+
+; string-reverse(shout(x))
+(task "reverse_shout" 2
+  ("hello" "OLLEH") ("abc" "CBA") ("test" "TSET") ("xy" "YX"))

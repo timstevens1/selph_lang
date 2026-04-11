@@ -1,0 +1,109 @@
+; ─────────────────────────────────────────────────────────────────────────
+; SELPH-defined decomposer demo (post-§9.37 Stage A)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Demonstrates §9.33 item 3 minimum: SELPH programs can register
+; decomposition strategies in __decomposers__ that synth_v2 calls
+; before its hardcoded chain. The decomposer takes a spec namespace,
+; tries to construct a solution AST via the §9.36 make-* builtins,
+; and returns either nil (doesn't apply) or
+;   (ns ("found" true) ("nodes" <constructed-AST>) ("candidates" n))
+;
+; Run with:  selph eval-v2 examples/decomposer_demo.selph
+
+; ── Helpers (would normally live in a library) ──────────────────────────
+
+(define all?
+  (lambda (pred xs)
+    (if (= (length xs) 0)
+      true
+      (if (pred (head xs))
+        (all? pred (tail xs))
+        false))))
+
+; ── Decomposer 1: arithmetic constant inversion ─────────────────────────
+;
+; Detects (add x k) tasks where k is constant across all examples.
+; For each (input, output) pair, compute k = output - input. If all
+; the k values are equal, return (lambda (x) (add x k)).
+
+(define arith-inv-decomposer
+  (lambda (spec)
+    (let ((pairs (ns-get spec "spec")))
+      (let ((diffs (map (lambda (p)
+                          (subtract (nth p 1) (head p)))
+                        pairs)))
+        (if (all? (lambda (d) (= d (head diffs))) diffs)
+          (ns
+            ("found" true)
+            ("nodes"
+              (make-lambda (list "x")
+                (make-app "add" (make-symbol "x") (make-int (head diffs)))))
+            ("candidates" (length diffs)))
+          nil)))))
+
+; ── Decomposer 2: identity ───────────────────────────────────────────────
+;
+; Trivial: if every output equals its input, the answer is (lambda (x) x).
+
+(define identity-decomposer
+  (lambda (spec)
+    (let ((pairs (ns-get spec "spec")))
+      (if (all? (lambda (p) (= (head p) (nth p 1))) pairs)
+        (ns
+          ("found" true)
+          ("nodes" (make-lambda (list "x") (make-symbol "x")))
+          ("candidates" (length pairs)))
+        nil))))
+
+; ── Register them ───────────────────────────────────────────────────────
+
+(define __decomposers__
+  (ns
+    ("identity" identity-decomposer)
+    ("arith-inv" arith-inv-decomposer)))
+
+; ── Run some tasks and see which decomposer fires ───────────────────────
+
+(print "─── Decomposer demo ───")
+(print "")
+
+(print "Task 1: identity (x → x)")
+(define t1 (synthesize (ns
+  ("spec" (list (list 1 1) (list 7 7) (list 99 99)))
+  ("max-depth" 1)
+  ("max-candidates" 200))))
+(print (concat "  strategy:   " (ns-get t1 "strategy")))
+(print (concat "  source:     " (ns-get t1 "source")))
+(print (concat "  candidates: " (to-string (ns-get t1 "candidates"))))
+
+(print "")
+(print "Task 2: increment (x → x + 1)")
+(define t2 (synthesize (ns
+  ("spec" (list (list 1 2) (list 5 6) (list 10 11) (list 0 1)))
+  ("max-depth" 2)
+  ("max-candidates" 5000))))
+(print (concat "  strategy:   " (ns-get t2 "strategy")))
+(print (concat "  source:     " (ns-get t2 "source")))
+(print (concat "  candidates: " (to-string (ns-get t2 "candidates"))))
+
+(print "")
+(print "Task 3: x + 7 (different constant — decomposer still fires)")
+(define t3 (synthesize (ns
+  ("spec" (list (list 0 7) (list 3 10) (list 100 107)))
+  ("max-depth" 2)
+  ("max-candidates" 5000))))
+(print (concat "  strategy:   " (ns-get t3 "strategy")))
+(print (concat "  source:     " (ns-get t3 "source")))
+
+(print "")
+(print "Task 4: x * 2 (decomposers don't apply — falls through to Flat)")
+(define t4 (synthesize (ns
+  ("spec" (list (list 1 2) (list 3 6) (list 5 10)))
+  ("max-depth" 2)
+  ("max-candidates" 5000))))
+(print (concat "  strategy:   " (ns-get t4 "strategy")))
+(print (concat "  source:     " (ns-get t4 "source")))
+
+(print "")
+(print "decomposer demo complete")

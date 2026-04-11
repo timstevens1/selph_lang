@@ -1,0 +1,118 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M0: spec primitives
+; ─────────────────────────────────────────────────────────────────────────
+;
+; A "spec" is a namespace describing a synthesis task in pure SELPH:
+;
+;   (ns
+;     ("inputs"  (list (list a1 b1 c1) (list a2 b2 c2) ...))
+;     ("outputs" (list r1 r2 ...))
+;     ("arity"   3))
+;
+; Each input is a list of length `arity` (the positional args). Each
+; output is the expected scalar result. The inputs/outputs lists are
+; row-aligned: row `i` is `(spec-input-row spec i)` →
+; `(spec-output-row spec i)`.
+;
+; This file defines the trivial getters/builders. Higher meta-stages
+; (M1+) compose these into response-shape detectors and the
+; separability decomposer.
+;
+; This file is loaded into the curriculum env via the §9.39 preamble
+; path in `cmd_grow_v2`: any top-level form that isn't a `(task ...)`
+; or `(task-args ...)` gets evaluated into the env before tasks run.
+
+; ── Trivial getters ───────────────────────────────────────────────────
+
+(define spec-inputs  (lambda (s) (ns-get s "inputs")))
+(define spec-outputs (lambda (s) (ns-get s "outputs")))
+(define spec-arity   (lambda (s) (ns-get s "arity")))
+
+; Row count.
+(define spec-size (lambda (s) (length (spec-inputs s))))
+
+; ── Row access ────────────────────────────────────────────────────────
+
+; The i-th input row (a list of `arity` values).
+(define spec-input-row
+  (lambda (s i) (nth (spec-inputs s) i)))
+
+; The i-th output value.
+(define spec-output-row
+  (lambda (s i) (nth (spec-outputs s) i)))
+
+; The j-th argument of the i-th input row.
+(define spec-input-cell
+  (lambda (s i j) (nth (spec-input-row s i) j)))
+
+; ── Column access ────────────────────────────────────────────────────
+;
+; The j-th column of the inputs — a list of all values arg j takes
+; across the spec's rows. Used by M1's response-shape detection: it
+; varies one arg and inspects the column.
+
+(define spec-input-col
+  (lambda (s j)
+    (map (lambda (row) (nth row j)) (spec-inputs s))))
+
+; ── Constructors ──────────────────────────────────────────────────────
+
+; Build a spec from input rows and outputs.
+(define make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+; ── Filtering ─────────────────────────────────────────────────────────
+;
+; `spec-where-arg-eq spec j v` returns a new spec containing only the
+; rows where input arg j equals v. This is the workhorse for
+; separability detection in M2: hold one variable fixed at a value,
+; observe how the function depends on the others.
+
+(define spec-where-arg-eq
+  (lambda (s j v)
+    (let ((keep-rows (filter
+                       (lambda (pair) (= (nth (head pair) j) v))
+                       (zip (spec-inputs s) (spec-outputs s)))))
+      (make-spec
+        (map head keep-rows)
+        (map (lambda (p) (head (tail p))) keep-rows)
+        (spec-arity s)))))
+
+; ── Sample spec for the kinematic_s wall ──────────────────────────────
+;
+; This is the same data table as `kinematic_s` in physics_tasks.selph,
+; just packaged as a spec namespace so M1+ have something concrete to
+; chew on. Inputs are (u a t), output is s = u·t + ½·a·t².
+
+(define kinematic-s-spec
+  (make-spec
+    (list (list 0.5  0.5  0.5)
+          (list 1.5  0.5  0.5)
+          (list 0.5  1.5  0.5)
+          (list 0.25 0.5  0.5)
+          (list 0.5  0.5  1.5))
+    (list 0.3125 0.8125 0.4375 0.1875 1.3125)
+    3))
+
+; ── Smoke tests (preamble print) ──────────────────────────────────────
+;
+; These run during the §9.39 preamble-eval pass. Each `print` form
+; emits a single line to stderr; visual inspection confirms the
+; helpers return what we expect on the kinematic-s-spec sample.
+
+(print "M0 smoke tests")
+(print (concat "  spec-arity     = " (to-string (spec-arity kinematic-s-spec))))
+(print (concat "  spec-size      = " (to-string (spec-size kinematic-s-spec))))
+(print (concat "  spec-input-col 0 (u col) = " (to-string (spec-input-col kinematic-s-spec 0))))
+(print (concat "  spec-input-col 1 (a col) = " (to-string (spec-input-col kinematic-s-spec 1))))
+(print (concat "  spec-input-col 2 (t col) = " (to-string (spec-input-col kinematic-s-spec 2))))
+(print (concat "  spec-output-row 0 = " (to-string (spec-output-row kinematic-s-spec 0))))
+(print (concat "  spec-input-cell 1 0 (row 1, arg 0 = u) = "
+               (to-string (spec-input-cell kinematic-s-spec 1 0))))
+
+; spec-where-arg-eq: rows where t (arg 2) = 0.5 — should be 4 rows
+; (rows 0,1,2,3 in the kinematic-s-spec table). Row 4 has t=1.5 and
+; gets filtered out.
+(print (concat "  spec-where-arg-eq j=2 v=0.5 size = "
+               (to-string (spec-size (spec-where-arg-eq kinematic-s-spec 2 0.5)))))

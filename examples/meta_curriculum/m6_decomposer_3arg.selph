@@ -1,0 +1,315 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M6: 3-arg decomposer (separable with shared variable)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; The §9.40 M5 decomposer handled additive separability for 2-arg
+; functions. Many physics formulas are 3-arg with PAIRWISE additive
+; separability — i.e., for some shared variable k, the function
+; decomposes as:
+;
+;   f(args) = g(args[e], args[k]) + h(args[j], args[k])
+;
+; where e and j never appear in the same sub-function. The shared
+; variable k can appear in both halves (the kinematics formula
+; s = u·t + ½·a·t² is exactly this shape: u and a never multiply,
+; both multiply with t).
+;
+; The test: for each candidate k ∈ {0,1,2}, test whether the OTHER
+; two variables (e, j) are pairwise additively separable when k is
+; held fixed. The first k that works gives the split.
+;
+; Concretely on a 2×2×2 grid in lex order [v₀ v₁ v₂]:
+;   row(i₀, i₁, i₂) = 4·i₀ + 2·i₁ + i₂
+;
+; The test for "(e, j)-separable with k shared", for fixed k value:
+;   e-effect at j₁ == e-effect at j₂
+;
+; The g-spec is built by holding j at j_ref and letting (e, k) vary.
+; The h-spec is built by holding e at e_ref and computing
+;   h(j, k) := f(e_ref, j, k) - f(e_ref, j_ref, k).
+; Then f(e, j, k) = g(e, k) + h(j, k) recovers the parent.
+;
+; Sub-specs are 2-arg; M6 calls the new `synthesize-args` builtin
+; (§9.40) on each, which routes through the §9.39 indexed-atom path.
+
+; ── Inlined helpers ──────────────────────────────────────────────────
+
+(define spec-inputs    (lambda (s) (ns-get s "inputs")))
+(define spec-outputs   (lambda (s) (ns-get s "outputs")))
+(define spec-arity     (lambda (s) (ns-get s "arity")))
+(define spec-input-row (lambda (s i) (nth (spec-inputs s) i)))
+(define spec-output-row(lambda (s i) (nth (spec-outputs s) i)))
+(define make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+; ── 2×2×2 grid row layout ────────────────────────────────────────────
+;
+; A 2×2×2 spec has 8 rows in lex order. Row index = 4·i₀ + 2·i₁ + i₂
+; where each iₖ ∈ {0,1}. Helper picks the right row index given the
+; three binary indices.
+
+(define row-idx
+  (lambda (i0 i1 i2) (add (multiply 4 i0) (add (multiply 2 i1) i2))))
+
+; ── Pairwise separability test ───────────────────────────────────────
+;
+; "is (e, j) additively separable with k shared?"
+;
+; For each value of k (k_lo and k_hi), check that the e-effect at
+; j_lo equals the e-effect at j_hi. The e-effect at (j, k) is
+; f(e_hi, j, k) - f(e_lo, j, k).
+;
+; This needs row lookups parameterized by (e, j, k) ordering. For a
+; lex-ordered grid the row-idx call is `row-idx i0 i1 i2`. The
+; helper takes the binary indices and the position assignment.
+
+; Look up the output at position (e=ie, j=ij, k=ik) for a given
+; (e, j, k) → (axis-0, axis-1, axis-2) permutation.
+; perm is a list of 3 ints — perm[0]=axis where e lives, perm[1]=j-axis, perm[2]=k-axis.
+; To find row in lex order, we need (i₀, i₁, i₂) such that
+;   i_{perm[0]} = ie, i_{perm[1]} = ij, i_{perm[2]} = ik
+(define lookup
+  (lambda (s perm ie ij ik)
+    ; Build the axis-indexed list of bits.
+    (let ((bits (list 0 0 0)))
+      ; Hack: use a helper that builds bits via cons since we don't
+      ; have list-set. We just enumerate the possible perms manually
+      ; below — see `lookup-3` for the cleaner version.
+      0)))
+
+; Cleaner lookup: take e-axis, j-axis, k-axis and the indices, return
+; the row at that position in the lex grid.
+(define lookup-row
+  (lambda (s e-axis j-axis k-axis ie ij ik)
+    (let ((i0 (if (= e-axis 0) ie (if (= j-axis 0) ij ik)))
+          (i1 (if (= e-axis 1) ie (if (= j-axis 1) ij ik)))
+          (i2 (if (= e-axis 2) ie (if (= j-axis 2) ij ik))))
+      (spec-output-row s (row-idx i0 i1 i2)))))
+
+; "(e, j)-separable with k shared?" — checks the equality of e-effect
+; across j values for both k values.
+(define separable-pair?
+  (lambda (s e-axis j-axis k-axis)
+    (let ((eff_j0_k0 (subtract (lookup-row s e-axis j-axis k-axis 1 0 0)
+                               (lookup-row s e-axis j-axis k-axis 0 0 0)))
+          (eff_j1_k0 (subtract (lookup-row s e-axis j-axis k-axis 1 1 0)
+                               (lookup-row s e-axis j-axis k-axis 0 1 0)))
+          (eff_j0_k1 (subtract (lookup-row s e-axis j-axis k-axis 1 0 1)
+                               (lookup-row s e-axis j-axis k-axis 0 0 1)))
+          (eff_j1_k1 (subtract (lookup-row s e-axis j-axis k-axis 1 1 1)
+                               (lookup-row s e-axis j-axis k-axis 0 1 1))))
+      (and (= eff_j0_k0 eff_j1_k0) (= eff_j0_k1 eff_j1_k1)))))
+
+; Find the first separable triple (e, j, k). Returns a 3-element
+; list (e j k) or nil if no separation works.
+(define find-separable-triple
+  (lambda (s)
+    (if (separable-pair? s 0 1 2) (list 0 1 2)
+    (if (separable-pair? s 0 2 1) (list 0 2 1)
+    (if (separable-pair? s 1 2 0) (list 1 2 0)
+      nil)))))
+
+; ── Helper: extract distinct axis values from the 2×2×2 grid ─────────
+
+(define axis-lo
+  (lambda (s axis) (nth (spec-input-row s 0) axis)))
+
+(define axis-hi
+  (lambda (s axis)
+    (nth (spec-input-row s (if (= axis 0) 4 (if (= axis 1) 2 1))) axis)))
+
+; ── Sub-spec builders (2x2 sub-specs from a 2x2x2 parent) ────────────
+;
+; Given (e, j, k):
+;   g-spec: 2-arg over (e, k). Inputs are 4 rows (e_lo, e_hi) × (k_lo, k_hi).
+;     Each output is f(e, j_ref=j_lo, k).
+;   h-spec: 2-arg over (j, k). Inputs are 4 rows (j_lo, j_hi) × (k_lo, k_hi).
+;     Each output is f(e_ref=e_lo, j, k) - f(e_lo, j_lo, k).
+;
+; Sub-spec inputs are 2-element LISTS (since the sub-spec is 2-arg)
+; in the order (e-value, k-value) for g and (j-value, k-value) for h.
+; The compose function below mirrors this ordering.
+
+(define build-g-spec-3
+  (lambda (s e-axis j-axis k-axis)
+    (let ((e_lo (axis-lo s e-axis))
+          (e_hi (axis-hi s e-axis))
+          (k_lo (axis-lo s k-axis))
+          (k_hi (axis-hi s k-axis))
+          (y00 (lookup-row s e-axis j-axis k-axis 0 0 0))
+          (y01 (lookup-row s e-axis j-axis k-axis 0 0 1))
+          (y10 (lookup-row s e-axis j-axis k-axis 1 0 0))
+          (y11 (lookup-row s e-axis j-axis k-axis 1 0 1)))
+      (make-spec
+        (list (list e_lo k_lo) (list e_lo k_hi)
+              (list e_hi k_lo) (list e_hi k_hi))
+        (list y00 y01 y10 y11)
+        2))))
+
+(define build-h-spec-3
+  (lambda (s e-axis j-axis k-axis)
+    (let ((j_lo (axis-lo s j-axis))
+          (j_hi (axis-hi s j-axis))
+          (k_lo (axis-lo s k-axis))
+          (k_hi (axis-hi s k-axis))
+          ; baseline: f(e_lo, j_lo, k) for each k
+          (b_k0 (lookup-row s e-axis j-axis k-axis 0 0 0))
+          (b_k1 (lookup-row s e-axis j-axis k-axis 0 0 1))
+          ; f(e_lo, j, k):
+          (f00 (lookup-row s e-axis j-axis k-axis 0 0 0))
+          (f01 (lookup-row s e-axis j-axis k-axis 0 0 1))
+          (f10 (lookup-row s e-axis j-axis k-axis 0 1 0))
+          (f11 (lookup-row s e-axis j-axis k-axis 0 1 1)))
+      (make-spec
+        (list (list j_lo k_lo) (list j_lo k_hi)
+              (list j_hi k_lo) (list j_hi k_hi))
+        (list (subtract f00 b_k0) (subtract f01 b_k1)
+              (subtract f10 b_k0) (subtract f11 b_k1))
+        2))))
+
+; ── Compose: f(x) = g(x[e], x[k]) + h(x[j], x[k]) ────────────────────
+
+(define compose-3
+  (lambda (g h e-axis j-axis k-axis)
+    (lambda (x)
+      (add (g (list (nth x e-axis) (nth x k-axis)))
+           (h (list (nth x j-axis) (nth x k-axis)))))))
+
+; ── Spec → synthesize-args namespace ─────────────────────────────────
+
+(define zip-pairs
+  (lambda (xs ys)
+    (map (lambda (p) (list (head p) (head (tail p)))) (zip xs ys))))
+
+(define to-synth-args-ns
+  (lambda (s)
+    (ns ("spec" (zip-pairs (spec-inputs s) (spec-outputs s)))
+        ("max-depth" 5)
+        ("max-candidates" 200000))))
+
+; ── The 3-arg decomposer ────────────────────────────────────────────
+
+(define separable-decomposer-3
+  (lambda (s)
+    (let ((triple (find-separable-triple s)))
+      (if (nil? triple)
+        (ns ("found" false) ("reason" "no separable pair"))
+        (let ((e-axis (nth triple 0))
+              (j-axis (nth triple 1))
+              (k-axis (nth triple 2)))
+          (let ((g-spec (build-g-spec-3 s e-axis j-axis k-axis))
+                (h-spec (build-h-spec-3 s e-axis j-axis k-axis)))
+            (let ((g-result (synthesize-args (to-synth-args-ns g-spec)))
+                  (h-result (synthesize-args (to-synth-args-ns h-spec))))
+              (if (and (ns-get g-result "found")
+                       (ns-get h-result "found"))
+                (let ((g-fn (eval-source (ns-get g-result "source")))
+                      (h-fn (eval-source (ns-get h-result "source"))))
+                  (ns ("found"    true)
+                      ("triple"   triple)
+                      ("g-source" (ns-get g-result "source"))
+                      ("h-source" (ns-get h-result "source"))
+                      ("g-cands"  (ns-get g-result "candidates"))
+                      ("h-cands"  (ns-get h-result "candidates"))
+                      ("function" (compose-3 g-fn h-fn e-axis j-axis k-axis))))
+                (ns ("found" false)
+                    ("reason" "sub-synth failed")
+                    ("triple" triple)
+                    ("g-found" (ns-get g-result "found"))
+                    ("h-found" (ns-get h-result "found")))))))))))
+
+; ── Simple 3-arg test grid ───────────────────────────────────────────
+;
+; f(u, a, t) = u·t + a·t
+; Pairwise additively separable in (u, a) with t shared, and crucially
+; ALL constants needed for the answer (just `multiply` and `add`) are
+; in the seeded catalog — no hidden coefficients. This is what
+; M6 actually demonstrates end-to-end.
+;
+; u ∈ {0.5, 1.5}, a ∈ {0.25, 0.75}, t ∈ {0.5, 1.5}. All 8 outputs
+; are non-integral exact dyadics so observation-equivalence stays
+; sound and the per-task force-num path triggers cleanly.
+
+(define ut-plus-at-grid
+  (make-spec
+    (list (list 0.5  0.25 0.5)   ; 0.25 + 0.125 = 0.375
+          (list 0.5  0.25 1.5)   ; 0.75 + 0.375 = 1.125
+          (list 0.5  0.75 0.5)   ; 0.25 + 0.375 = 0.625
+          (list 0.5  0.75 1.5)   ; 0.75 + 1.125 = 1.875
+          (list 1.5  0.25 0.5)   ; 0.75 + 0.125 = 0.875
+          (list 1.5  0.25 1.5)   ; 2.25 + 0.375 = 2.625
+          (list 1.5  0.75 0.5)   ; 0.75 + 0.375 = 1.125
+          (list 1.5  0.75 1.5))  ; 2.25 + 1.125 = 3.375
+    (list 0.375 1.125 0.625 1.875 0.875 2.625 1.125 3.375)
+    3))
+
+; ── kinematic_s 2×2×2 grid (kept for reference; sub-synth WALL) ──────
+;
+; f(u, a, t) = u·t + ½·a·t²
+;
+; The decomposer correctly identifies the separable triple, but the
+; sub-spec for g(u, t) = u·t + ½·a_ref·t² requires the hidden constant
+; ½·a_ref = 0.125 (with a_ref = 0.25). 0.125 doesn't appear anywhere
+; in the data, so even with §9.41 data-derived literal seeding the
+; sub-synth has to construct it via `(multiply 0.5 (multiply 0.5 0.5))`
+; — adding 2 depth layers. The total search depth becomes 5+ which
+; even at 3M candidates is unreachable. Documented in §9.41 as the
+; "numerical constant fitting" wall. The principled fix is to extend
+; the synth with constant-hole synthesis (AI Feynman style).
+
+(define kinematic-s-grid
+  (make-spec
+    (list (list 0.5  0.25 0.5)
+          (list 0.5  0.25 1.5)
+          (list 0.5  0.5  0.5)
+          (list 0.5  0.5  1.5)
+          (list 1.5  0.25 0.5)
+          (list 1.5  0.25 1.5)
+          (list 1.5  0.5  0.5)
+          (list 1.5  0.5  1.5))
+    (list 0.28125 1.03125 0.3125 1.3125
+          0.78125 2.53125 0.8125 2.8125)
+    3))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(define verify-row-3
+  (lambda (f s i)
+    (let ((row (spec-input-row s i))
+          (exp (spec-output-row s i)))
+      (let ((got (f row)))
+        (print (concat "    " (to-string row)
+                       " → " (to-string got)
+                       (if (= got exp) "  ✓" "  ✗")))))))
+
+(define run-test
+  (lambda (label s)
+    (do
+      (print (concat "─── " label " ───"))
+      (print (concat "  separable triple = " (to-string (find-separable-triple s))))
+      (let ((result (separable-decomposer-3 s)))
+        (do
+          (print (concat "  found = " (to-string (ns-get result "found"))))
+          (if (ns-get result "found")
+            (do
+              (print (concat "  triple   = " (to-string (ns-get result "triple"))))
+              (print (concat "  g-source = " (ns-get result "g-source")))
+              (print (concat "  h-source = " (ns-get result "h-source")))
+              (print (concat "  g cands  = " (to-string (ns-get result "g-cands"))))
+              (print (concat "  h cands  = " (to-string (ns-get result "h-cands"))))
+              (print "  verify on parent rows:")
+              (let ((f (ns-get result "function")))
+                (do
+                  (verify-row-3 f s 0) (verify-row-3 f s 1)
+                  (verify-row-3 f s 2) (verify-row-3 f s 3)
+                  (verify-row-3 f s 4) (verify-row-3 f s 5)
+                  (verify-row-3 f s 6) (verify-row-3 f s 7))))
+            (do
+              (print (concat "  reason  = " (ns-get-or result "reason" "unknown")))
+              (print (concat "  g-found = " (to-string (ns-get-or result "g-found" "n/a"))))
+              (print (concat "  h-found = " (to-string (ns-get-or result "h-found" "n/a")))))))))))
+
+(run-test "f(u,a,t) = u·t + a·t  (simple, in-budget)" ut-plus-at-grid)
+(print "")
+(run-test "f(u,a,t) = u·t + ½·a·t²  (kinematic_s — constant-fitting wall)" kinematic-s-grid)

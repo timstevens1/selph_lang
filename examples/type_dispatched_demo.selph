@@ -1,0 +1,124 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Type-dispatched decomposer demo (post-§9.37 Stages B + C)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Demonstrates §9.33 item 4: SELPH curriculum can register decomposers
+; under specific output types via __types__ instead of using the
+; global __decomposers__ namespace. The synth_v2 dispatcher infers
+; the task's output type and only calls decomposers registered for
+; that type (and the Any fallback).
+;
+; This is the §9.31 type-dispatched RD framework expressed as a SELPH
+; namespace — every primitive type can carry its own list of strategies
+; that apply when that type is the output.
+;
+; Run with:  selph eval-v2 examples/type_dispatched_demo.selph
+
+; ── Helpers ─────────────────────────────────────────────────────────────
+
+(define all?
+  (lambda (pred xs)
+    (if (= (length xs) 0)
+      true
+      (if (pred (head xs))
+        (all? pred (tail xs))
+        false))))
+
+; ── Decomposer 1: arithmetic constant inversion (Int outputs) ───────────
+;
+; Detects (add x k) tasks where k is constant. Same logic as
+; decomposer_demo.selph, but here we register it under the Int type.
+
+(define arith-inv-decomposer
+  (lambda (spec)
+    (let ((pairs (ns-get spec "spec")))
+      (let ((diffs (map (lambda (p)
+                          (subtract (nth p 1) (head p)))
+                        pairs)))
+        (if (all? (lambda (d) (= d (head diffs))) diffs)
+          (ns
+            ("found" true)
+            ("nodes"
+              (make-lambda (list "x")
+                (make-app "add" (make-symbol "x") (make-int (head diffs)))))
+            ("candidates" (length diffs)))
+          nil)))))
+
+; ── Decomposer 2: string-prefix repeat (String outputs) ─────────────────
+;
+; Detects (concat input "<suffix>") tasks. Computes the suffix from
+; the first example, then verifies it works for the others.
+
+(define string-suffix-decomposer
+  (lambda (spec)
+    (let ((pairs (ns-get spec "spec")))
+      (let ((p0 (head pairs)))
+        (let ((in0 (head p0))
+              (out0 (nth p0 1)))
+          (if (string-starts-with out0 in0)
+            (let ((suffix (string-drop out0 (string-length in0))))
+              (if (all? (lambda (p)
+                          (= (concat (head p) suffix) (nth p 1)))
+                        pairs)
+                (ns
+                  ("found" true)
+                  ("nodes"
+                    (make-lambda (list "x")
+                      (make-app "concat" (make-symbol "x") (make-str suffix))))
+                  ("candidates" (length pairs)))
+                nil))
+            nil))))))
+
+; ── Register decomposers under their target types via __types__ ────────
+
+(define __types__
+  (ns
+    ("Int" (ns
+      ("decomposers" (ns ("arith-inv" arith-inv-decomposer)))))
+    ("String" (ns
+      ("decomposers" (ns ("string-suffix" string-suffix-decomposer)))))))
+
+; ── Run tasks and observe type-keyed dispatch ──────────────────────────
+
+(print "─── Type-dispatched decomposer demo ───")
+(print "")
+
+(print "Task 1: Int output → Int-keyed arith-inv fires")
+(define t1 (synthesize (ns
+  ("spec" (list (list 1 6) (list 5 10) (list 12 17)))
+  ("max-depth" 1)
+  ("max-candidates" 200))))
+(print (concat "  strategy: " (ns-get t1 "strategy")))
+(print (concat "  source:   " (ns-get t1 "source")))
+
+(print "")
+(print "Task 2: String output → String-keyed string-suffix fires")
+(define t2 (synthesize (ns
+  ("spec" (list (list "hello" "hello!") (list "world" "world!") (list "x" "x!")))
+  ("max-depth" 1)
+  ("max-candidates" 200))))
+(print (concat "  strategy: " (ns-get t2 "strategy")))
+(print (concat "  source:   " (ns-get t2 "source")))
+
+(print "")
+(print "Task 3: Int output → arith-inv tried but fails (not constant k)")
+(print "         Falls through to hardcoded Flat synthesis")
+(define t3 (synthesize (ns
+  ("spec" (list (list 1 1) (list 2 4) (list 3 9)))
+  ("max-depth" 2)
+  ("max-candidates" 5000))))
+(print (concat "  strategy: " (ns-get t3 "strategy")))
+(print (concat "  source:   " (ns-get t3 "source")))
+
+(print "")
+(print "Task 4: String output → string-suffix tried but fails")
+(print "         Falls through to hardcoded Flat synthesis")
+(define t4 (synthesize (ns
+  ("spec" (list (list "hi" "HI") (list "bye" "BYE")))
+  ("max-depth" 2)
+  ("max-candidates" 5000))))
+(print (concat "  strategy: " (ns-get t4 "strategy")))
+(print (concat "  source:   " (ns-get t4 "source")))
+
+(print "")
+(print "type-dispatched demo complete")

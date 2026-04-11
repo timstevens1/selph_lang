@@ -1,0 +1,113 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M1: response shape detection
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Given a column of input values and the corresponding output values
+; (a function evaluated at those inputs, with all other variables
+; held fixed), classify the response as one of:
+;
+;   "constant"       — y is the same for every x
+;   "linear"         — y = a·x + b   (first differences constant)
+;   "quadratic"      — y = a·x² + b·x + c   (second differences constant)
+;   "inverse"        — y = c/x       (y·x is constant)
+;   "inverse-square" — y = c/x²      (y·x² is constant)
+;   "other"          — none of the above
+;
+; This is the §9.31.3 "scaling test" from the AI Feynman precedent,
+; written in pure SELPH using §9.36 list/numeric primitives.
+;
+; M2's separability detector calls `response-shape` on each
+; column-after-fixing to decide whether to split.
+;
+; This file depends on M0 — load both with:
+;   selph grow-v2 examples/meta_curriculum/m1_response_shape.selph
+;   (M0 helpers are inlined here so the file is self-contained for now)
+
+; ── Numeric list helpers ──────────────────────────────────────────────
+
+; First differences: (1 3 6 10) → (2 3 4)
+(define first-diffs
+  (lambda (xs)
+    (map (lambda (p) (subtract (head (tail p)) (head p)))
+         (zip xs (tail xs)))))
+
+; Second differences = first-diffs of first-diffs.
+(define second-diffs
+  (lambda (xs) (first-diffs (first-diffs xs))))
+
+; True if every element of xs equals the first. Empty/single-element
+; lists are trivially all-equal.
+(define all-equal
+  (lambda (xs)
+    (if (< (length xs) 2)
+      true
+      (reduce (lambda (acc v) (and acc (= v (head xs))))
+              (cons true xs)))))
+
+; Element-wise multiplication of two equal-length lists.
+(define pairwise-mul
+  (lambda (xs ys)
+    (map (lambda (p) (multiply (head p) (head (tail p)))) (zip xs ys))))
+
+; Element-wise square.
+(define pairwise-sq
+  (lambda (xs) (map (lambda (v) (multiply v v)) xs)))
+
+; ── The classifier ───────────────────────────────────────────────────
+;
+; Argument shape: two equal-length lists `xs` (input column) and
+; `ys` (output column), e.g.
+;   (response-shape (list 0.5 1.0 1.5 2.0) (list 1.0 2.0 3.0 4.0))
+; → "linear"
+
+(define response-shape
+  (lambda (xs ys)
+    (if (all-equal ys)
+      "constant"
+    (if (all-equal (first-diffs ys))
+      "linear"
+    (if (all-equal (second-diffs ys))
+      "quadratic"
+    (if (all-equal (pairwise-mul xs ys))
+      "inverse"
+    (if (all-equal (pairwise-mul (pairwise-sq xs) ys))
+      "inverse-square"
+      "other")))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+;
+; Hand-crafted columns from known formulas. Each `print` shows the
+; column data and the classifier's verdict.
+
+(print "M1 smoke tests")
+
+; constant: y = 5
+(print (concat "  constant       → "
+               (response-shape (list 0.5 1.5 2.5 3.5) (list 5.0 5.0 5.0 5.0))))
+
+; linear: y = 2x + 1
+(print (concat "  linear (2x+1)  → "
+               (response-shape (list 0.5 1.5 2.5 3.5) (list 2.0 4.0 6.0 8.0))))
+
+; quadratic: y = x²  on (0.5 1.5 2.5 3.5)
+(print (concat "  quadratic (x²) → "
+               (response-shape (list 0.5 1.5 2.5 3.5) (list 0.25 2.25 6.25 12.25))))
+
+; inverse: y = 1/x  on (0.5 0.25 1.5 0.125) — y·x = 1
+(print (concat "  inverse (1/x)  → "
+               (response-shape (list 0.5 0.25 1.5 0.125) (list 2.0 4.0 0.6666666666666666 8.0))))
+
+; inverse-square: y = 1/x²  on (0.5 0.25 1.5 0.125) — y·x² = 1
+(print (concat "  inv-square     → "
+               (response-shape (list 0.5 0.25 1.5 0.125) (list 4.0 16.0 0.4444444444444444 64.0))))
+
+; other: y = sin(x)
+(print (concat "  sin (other)    → "
+               (response-shape (list 0.5 1.5 2.5 3.5)
+                               (list 0.479425538604203 0.9974949866040544
+                                     0.5984721441039565 -0.35078322768961984))))
+
+; Verify f64 precision in pairwise-mul for the inverse case
+(print "  pairwise-mul of inverse case:")
+(print (concat "    " (to-string (pairwise-mul (list 0.5 0.25 1.5 0.125)
+                                               (list 2.0 4.0 0.6666666666666666 8.0)))))

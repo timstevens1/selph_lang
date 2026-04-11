@@ -1,0 +1,124 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Stage 5b/c + Stage 6 physics curriculum (§9.43)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Builds on the §9.42 affine-fit substrate. All tasks are multi-arg
+; (`task-args`) so they route through `synthesize_args` and the
+; affine-fit pass. Expected values are computed from Rust f64 / libm
+; so verification matches exactly.
+;
+; The curriculum staircase:
+;   5a: Pendulum period   T = 2π·√(L/g)
+;   5b: SHM displacement  x = A·cos(ω·t)
+;   5c: Decay             N = N₀·exp(-λ·t)
+;   6a: Lorentz factor    γ = 1/√(1 - (v/c)²)
+;   6b: Relativistic mass m = m₀·γ
+;   6c: Length contraction L = L₀·√(1 - (v/c)²) = L₀/γ
+;
+; Stage 6 is the §9.31.5 "composite scalar fields" test. Each later
+; equation in the Lorentz family shares structure with the earlier
+; ones — the curriculum exists to demonstrate library reuse on
+; equations sharing inner structure.
+
+; ── Stage 5a: Pendulum period T = 2π·√(L/g) ──────────────────────────
+;
+; The constant 2π isn't seeded; the affine-fit pass discovers it as
+; the coefficient of √(L/g) via Form 2 (`C · g`).
+
+(task-args "pendulum_T" 4
+  ((0.5 0.125) 12.566370614359172)
+  ((0.125 0.5) 3.141592653589793)
+  ((1.5 0.375) 12.566370614359172)
+  ((0.375 1.5) 3.141592653589793)
+  ((4.5 0.5)   18.84955592153876)
+  ((0.5 0.5)    6.283185307179586))
+
+; ── Stage 5b: SHM x = A·cos(ω·t) ─────────────────────────────────────
+
+(task-args "shm_x" 4
+  ((1.5 0.5 0.5)  1.4533686325659672)
+  ((1.5 0.5 1.5)  1.0975333033107313)
+  ((0.5 1.5 0.5)  0.36584443443691045)
+  ((0.5 1.5 1.5) -0.31408681136136957)
+  ((1.5 1.5 0.5)  1.0975333033107313)
+  ((0.5 0.5 1.5)  0.36584443443691045))
+
+; ── Stage 5c: Decay N = N₀·exp(-λ·t) ─────────────────────────────────
+
+(task-args "decay_N" 4
+  ((1.5 0.5 0.5) 1.1682011746071073)
+  ((1.5 1.5 0.5) 0.708549829111522)
+  ((0.5 0.5 1.5) 0.23618327637050734)
+  ((0.5 1.5 1.5) 0.052699612280932166)
+  ((1.5 0.5 1.5) 0.708549829111522)
+  ((0.5 0.5 0.5) 0.38940039153570244))
+
+; ── Stage 6 staircase: build up the Lorentz factor from pieces ──────
+;
+; The §9.31.5 "composite scalar field" plan. Each intermediate
+; becomes a library function once solved, so subsequent tasks can
+; reach the deeper formula via shallow library compositions.
+
+; speed_fraction_sq(v, c) = (v/c)²
+(task-args "speed_frac_sq" 3
+  ((0.25 0.5)   0.25)
+  ((0.125 0.5)  0.0625)
+  ((0.375 0.5)  0.5625)
+  ((0.25 0.75)  0.1111111111111111)
+  ((0.125 0.25) 0.25)
+  ((0.5 0.75)   0.4444444444444444)
+  ((0.25 1.5)   0.027777777777777776))
+
+; lorentz_defect(v, c) = 1 - (v/c)²
+(task-args "lorentz_defect" 3
+  ((0.25 0.5)   0.75)
+  ((0.125 0.5)  0.9375)
+  ((0.375 0.5)  0.4375)
+  ((0.25 0.75)  0.8888888888888888)
+  ((0.125 0.25) 0.75)
+  ((0.5 0.75)   0.5555555555555556)
+  ((0.25 1.5)   0.9722222222222222))
+
+; ── Stage 6a: Lorentz factor γ = 1/√(1 - (v/c)²) ─────────────────────
+;
+; With `lorentz_defect` in the library, this is just `1/√defect`.
+; Form S: op_b=divide, h=1, op_u=sqrt, g=(lorentz_defect x).
+
+(task-args "lorentz_gamma" 5
+  ((0.25 0.5)   1.1547005383792517)
+  ((0.125 0.5)  1.0327955589886444)
+  ((0.375 0.5)  1.5118578920369088)
+  ((0.25 0.75)  1.0606601717798212)
+  ((0.125 0.25) 1.1547005383792517)
+  ((0.5 0.75)   1.3416407864998738)
+  ((0.5 1.5)    1.0606601717798212)
+  ((0.25 1.5)   1.01418510567422))
+
+; ── Stage 6b: Relativistic mass m = m₀·γ ─────────────────────────────
+;
+; If `lorentz_gamma` was promoted as a library function from the
+; previous task, this becomes `(multiply m₀ (lorentz_gamma (list v c)))`
+; — depth 1 with library reuse. Without reuse, it's depth 6.
+
+(task-args "rel_mass" 4
+  ((0.5 0.25 0.5)   0.5773502691896258)
+  ((1.5 0.125 0.5)  1.5491933384829666)
+  ((0.5 0.375 0.5)  0.7559289460184544)
+  ((1.5 0.25 0.75)  1.590990257669732)
+  ((0.5 0.5 0.75)   0.6708203932499369)
+  ((1.5 0.125 0.25) 1.7320508075688776)
+  ((0.5 0.25 1.5)   0.50709255283711))
+
+; ── Stage 6c: Length contraction L = L₀·√(1 - (v/c)²) ────────────────
+;
+; Same shape as relativistic mass but with √defect instead of γ.
+; If `lorentz_gamma` is in the library, this is `m₀ / γ` which the
+; affine-fit pass should reach via `(divide m₀ (γ (list v c)))`.
+
+(task-args "length_contract" 4
+  ((0.5 0.25 0.5)   0.4330127018922193)
+  ((1.5 0.125 0.5)  1.4523687548277815)
+  ((0.5 0.375 0.5)  0.33071891388307384)
+  ((1.5 0.25 0.75)  1.414213562373095)
+  ((0.5 0.5 0.75)   0.37267799624996495)
+  ((1.5 0.125 0.25) 1.299038105676658))

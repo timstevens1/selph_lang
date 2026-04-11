@@ -1,0 +1,46 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M4: compose-add
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Given two synthesized 1-arg functions g and h (each accepting a
+; 1-element list, since `synthesize_args` wraps the candidate as
+; `(lambda (x) ...)` where x is the args list), build a 2-arg
+; combiner whose result is g(x[0]) + h(x[1]).
+;
+; Insight: this is pure closure capture. No §9.36 AST builders
+; required. The returned lambda's captured env binds `g` and `h` to
+; the actual function values; calling the closure with a 2-element
+; list dispatches to them via SELPH's normal `(f arg)` syntax.
+
+; The synthesized g and h are 1-arg lambdas over RAW Num values
+; (the §9.39 update — 1-arg sub-specs use raw Num inputs, not list-
+; wrapped ones, so they route through the single-input synth path).
+; The outer combiner takes a 2-element list `x` (the parent task's
+; args) and dispatches to g/h on each position.
+(define compose-add
+  (lambda (g h)
+    (lambda (x)
+      (add (g (nth x 0))
+           (h (nth x 1))))))
+
+; ── Smoke test ──────────────────────────────────────────────────────
+;
+; g(a) := a² + 0.5    (a 1-arg lambda accepting raw Num a)
+; h(b) := b - 0.5     (a 1-arg lambda accepting raw Num b)
+; compose-add(g, h)(a, b) should give a² + b
+;
+; Test against the same f(a, b) = a² + b that M3 split.
+
+(define test-g (lambda (a) (add (multiply a a) 0.5)))
+(define test-h (lambda (b) (subtract b 0.5)))
+(define test-f (compose-add test-g test-h))
+
+(print "M4 smoke tests")
+(print (concat "  g(0.5)         = " (to-string (test-g 0.5))))     ; 0.75
+(print (concat "  g(1.5)         = " (to-string (test-g 1.5))))     ; 2.75
+(print (concat "  h(0.5)         = " (to-string (test-h 0.5))))     ; 0.0
+(print (concat "  h(1.5)         = " (to-string (test-h 1.5))))     ; 1.0
+(print (concat "  composed (0.5 0.5) = " (to-string (test-f (list 0.5 0.5))))) ; 0.75
+(print (concat "  composed (0.5 1.5) = " (to-string (test-f (list 0.5 1.5))))) ; 1.75
+(print (concat "  composed (1.5 0.5) = " (to-string (test-f (list 1.5 0.5))))) ; 2.75
+(print (concat "  composed (1.5 1.5) = " (to-string (test-f (list 1.5 1.5))))) ; 3.75

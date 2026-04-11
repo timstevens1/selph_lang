@@ -1,0 +1,33 @@
+; Test macro bridge decomposition
+; Tasks where output = f(macro(input)) and flat synthesis needs deeper search
+
+; Promote some building-block macros
+(task "word_len" 2
+  ("hello world" 5) ("hi there" 2) ("a b" 1) ("test case" 4) ("foo bar" 3))
+
+(task "first_word" 2
+  ("hello world" "hello") ("hi there" "hi") ("a b" "a") ("foo bar" "foo") ("test case" "test"))
+
+(task "last_word" 2
+  ("hello world" "world") ("hi there" "there") ("a b" "b") ("foo bar" "bar") ("test case" "case"))
+
+; Now: output = string-upper(first_word(x))
+; Macro bridge: first_word(x) → intermediate, then string-upper on it
+(task "shout_first" 2
+  ("hello world" "HELLO") ("hi there" "HI") ("a b" "A") ("foo bar" "FOO") ("test case" "TEST"))
+
+; output = string-reverse(last_word(x))
+(task "reverse_last" 2
+  ("hello world" "dlrow") ("hi there" "ereht") ("a b" "b") ("foo bar" "rab") ("test case" "esac"))
+
+; output = string-length(first_word(x))
+(task "first_word_len" 2
+  ("hello world" 5) ("hi there" 2) ("a b" 1) ("foo bar" 3) ("test case" 4))
+
+; output = string-ends-with(last_word(x), "d")
+(task "last_ends_d" 2
+  ("hello world" true) ("hi there" false) ("a b" false) ("good food" true) ("test case" false))
+
+; output = string-length(last_word(x))
+(task "last_word_len" 2
+  ("hello world" 5) ("hi there" 5) ("a b" 1) ("foo bar" 3) ("test case" 4))

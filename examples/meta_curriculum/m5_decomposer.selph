@@ -1,0 +1,177 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M5: separable-decomposer (end-to-end)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Combines M0–M4 into a single decomposer that:
+;   1. Takes a 2-arg parent spec arranged as a 2×2 grid.
+;   2. Tests for additive separability via M2's 2×2 check.
+;   3. Builds 1-arg sub-specs g and h via M3.
+;   4. Recursively calls the `synthesize` builtin on each sub-spec.
+;   5. Eval-sources the synthesized lambda strings into Function values.
+;   6. Composes via M4's compose-add.
+;   7. Returns the combined function.
+;
+; This is the §9.39.4 separable-decomposer in pure SELPH. No new
+; Rust changes — every primitive used here was shipped by §9.34
+; (synthesize as a builtin), §9.36 (eval-source), and §9.39.1
+; (Num-typed components, indexed atoms).
+;
+; The smoke test exercises the decomposer on a 2×2 spec for
+; f(a,b) = a² + b and verifies that the composed function reproduces
+; every parent row.
+
+; ── Inlined M0–M4 helpers ────────────────────────────────────────────
+
+(define spec-inputs    (lambda (s) (ns-get s "inputs")))
+(define spec-outputs   (lambda (s) (ns-get s "outputs")))
+(define spec-arity     (lambda (s) (ns-get s "arity")))
+(define spec-input-row (lambda (s i) (nth (spec-inputs s) i)))
+(define spec-output-row(lambda (s i) (nth (spec-outputs s) i)))
+(define make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+; M2: separability test on a 2×2 grid spec.
+(define separable-2x2?
+  (lambda (s)
+    (let ((y00 (spec-output-row s 0))
+          (y01 (spec-output-row s 1))
+          (y10 (spec-output-row s 2))
+          (y11 (spec-output-row s 3)))
+      (= (subtract y10 y00) (subtract y11 y01)))))
+
+; M3: 2x2 sub-spec builders. Sub-spec inputs are raw Num values.
+(define build-g-spec-2x2
+  (lambda (s)
+    (let ((a1 (nth (spec-input-row s 0) 0))
+          (a2 (nth (spec-input-row s 2) 0))
+          (y00 (spec-output-row s 0))
+          (y10 (spec-output-row s 2)))
+      (make-spec (list a1 a2) (list y00 y10) 1))))
+
+(define build-h-spec-2x2
+  (lambda (s)
+    (let ((b1 (nth (spec-input-row s 0) 1))
+          (b2 (nth (spec-input-row s 1) 1))
+          (y00 (spec-output-row s 0))
+          (y01 (spec-output-row s 1)))
+      (make-spec (list b1 b2)
+                 (list (subtract y00 y00) (subtract y01 y00))
+                 1))))
+
+; M4: compose-add over raw-Num g and h.
+(define compose-add
+  (lambda (g h)
+    (lambda (x) (add (g (nth x 0)) (h (nth x 1))))))
+
+; ── Spec-format conversion to bi_synthesize's expected shape ─────────
+;
+; bi_synthesize takes a namespace whose "spec" field is a list of
+; [input, output] pairs. Our spec-as-namespace stores inputs and
+; outputs as separate columns. The `to-synth-ns` helper zips them
+; into the pair-of-pair shape and adds search budget fields.
+
+(define zip-pairs
+  (lambda (xs ys)
+    (map (lambda (p) (list (head p) (head (tail p)))) (zip xs ys))))
+
+(define to-synth-ns
+  (lambda (s)
+    (ns ("spec" (zip-pairs (spec-inputs s) (spec-outputs s)))
+        ("max-depth" 5)
+        ("max-candidates" 200000))))
+
+; ── The decomposer ──────────────────────────────────────────────────
+
+(define separable-decomposer
+  (lambda (s)
+    (if (separable-2x2? s)
+      (let ((g-spec (build-g-spec-2x2 s))
+            (h-spec (build-h-spec-2x2 s)))
+        (let ((g-result (synthesize (to-synth-ns g-spec)))
+              (h-result (synthesize (to-synth-ns h-spec))))
+          (if (and (ns-get g-result "found")
+                   (ns-get h-result "found"))
+            (let ((g-fn (eval-source (ns-get g-result "source")))
+                  (h-fn (eval-source (ns-get h-result "source"))))
+              (ns ("found"    true)
+                  ("g-source" (ns-get g-result "source"))
+                  ("h-source" (ns-get h-result "source"))
+                  ("g-cands"  (ns-get g-result "candidates"))
+                  ("h-cands"  (ns-get h-result "candidates"))
+                  ("function" (compose-add g-fn h-fn))))
+            (ns ("found" false) ("reason" "sub-synth failed")))))
+      (ns ("found" false) ("reason" "not separable")))))
+
+; ── Smoke test ──────────────────────────────────────────────────────
+;
+; Parent: f(a, b) = a² + b on a 2×2 grid.
+; The decomposer should split into g(a) = a² + 0.5 and
+; h(b) = b - 0.5, then compose them back.
+
+(define spec-add-sq
+  (make-spec
+    (list (list 0.5 0.5) (list 0.5 1.5)
+          (list 1.5 0.5) (list 1.5 1.5))
+    (list 0.75 1.75 2.75 3.75)
+    2))
+
+; A reusable verifier: runs the decomposer on a spec, prints the
+; result, and checks every parent row. Returns the result ns.
+;
+; Verification is unrolled (4 rows) instead of using map+range,
+; because side-effecting prints inside map don't fire reliably in
+; the eval_v2 path (the result list is built but the prints get
+; lost — likely the eager-evaluation order vs the do-form sequencing).
+(define verify-row
+  (lambda (f s i)
+    (let ((row (spec-input-row s i))
+          (exp (spec-output-row s i)))
+      (let ((got (f row)))
+        (print (concat "    " (to-string row)
+                       " → " (to-string got)
+                       (if (= got exp) "  ✓" "  ✗")))))))
+
+(define run-decomposer-test
+  (lambda (label s)
+    (do
+      (print (concat "─── " label " ───"))
+      (let ((result (separable-decomposer s)))
+        (do
+          (print (concat "  found    = " (to-string (ns-get result "found"))))
+          (if (ns-get result "found")
+            (let ((f (ns-get result "function")))
+              (do
+                (print (concat "  g-source = " (ns-get result "g-source")))
+                (print (concat "  h-source = " (ns-get result "h-source")))
+                (print (concat "  g cands  = " (to-string (ns-get result "g-cands"))))
+                (print (concat "  h cands  = " (to-string (ns-get result "h-cands"))))
+                (print "  verify on parent rows:")
+                (verify-row f s 0)
+                (verify-row f s 1)
+                (verify-row f s 2)
+                (verify-row f s 3)
+                result))
+            (do
+              (print (concat "  reason   = " (ns-get result "reason")))
+              result)))))))
+
+(run-decomposer-test "f(a,b) = a² + b" spec-add-sq)
+
+; Second test: f(a, b) = a² + b² (both halves quadratic, separable).
+(define spec-sq-plus-sq
+  (make-spec
+    (list (list 0.5 0.5) (list 0.5 1.5)
+          (list 1.5 0.5) (list 1.5 1.5))
+    (list 0.5 2.5 2.5 4.5)
+    2))
+(run-decomposer-test "f(a,b) = a² + b²" spec-sq-plus-sq)
+
+; Third test: f(a, b) = a · b (NOT separable — should bail).
+(define spec-mul
+  (make-spec
+    (list (list 0.5 0.5) (list 0.5 1.5)
+          (list 1.5 0.5) (list 1.5 1.5))
+    (list 0.25 0.75 0.75 2.25)
+    2))
+(run-decomposer-test "f(a,b) = a · b" spec-mul)

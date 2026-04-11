@@ -15,9 +15,11 @@ mod eval;
 mod namespace;
 mod synth;
 mod hm;
-mod induce;
-mod divide;
-mod decompose;
+// induce, divide, decompose, recursive_decompose: removed in §9.30 —
+// the four strategy modules were reimplemented inline in synth_v2 in
+// §9.27 and §9.28, and cmd_curriculum now routes through the v2
+// dispatcher. Kept the comment as a tombstone so future readers see
+// the migration trail.
 mod library;
 mod verify;
 mod abstraction;
@@ -27,7 +29,6 @@ mod meta;
 mod taskgen;
 mod vm;
 mod trace;
-mod recursive_decompose;
 mod arc;
 #[allow(dead_code)]
 mod types_v2;
@@ -35,6 +36,8 @@ mod types_v2;
 mod eval_v2;
 #[allow(dead_code)]
 mod synth_v2;
+#[allow(dead_code)]
+mod meta_v2;
 
 use std::env;
 use std::fs;
@@ -59,6 +62,7 @@ fn main() {
         "parse" => cmd_parse(&args[2..]),
         "synth" => cmd_synth(&args[2..]),
         "curriculum" | "grow" => cmd_curriculum(&args[2..]),
+        "grow-v2" => cmd_grow_v2(&args[2..]),
         "bench" => cmd_bench(&args[2..]),
         "generate" => cmd_generate(&args[2..]),
         "verify" => cmd_verify(&args[2..]),
@@ -92,6 +96,7 @@ fn print_usage() {
     println!("    --meta                      Enable meta-heuristic learning");
     println!("    --extract                   Enable abstraction extraction");
     println!("    --library <lib.selph>       Add library (repeatable)");
+    println!("  selph grow-v2 <tasks.selph>   Run curriculum through new core (synth_v2)");
     println!("  selph bench                   Run stochastic benchmark suite");
     println!("  selph generate                Generate a curriculum in .selph format");
     println!("  selph verify <prog> <spec>    Verify a program against a spec");
@@ -440,6 +445,17 @@ fn node_to_value(nodes: &[Node], idx: usize) -> Option<Value> {
             } else {
                 Some(Value::Str(name))
             }
+        }
+        // Singleton list `(x)` — falls outside the 2+-element path below
+        // (which checks for `or` / `#grid` heads). Without this case
+        // single-arg `task-args` inputs like `((0.5) result)` would
+        // silently drop the entire task. §9.31 multi-arg path needs it.
+        Node::App(children) if children.len() == 1 => {
+            node_to_value(nodes, children[0]).map(|v| Value::List(vec![v]))
+        }
+        // Empty list `()` → Value::List([])
+        Node::App(children) if children.is_empty() => {
+            Some(Value::List(vec![]))
         }
         // (or val1 val2 ...) → Value::Alt — any alternative is acceptable
         Node::App(children) if children.len() >= 2 => {
@@ -909,13 +925,8 @@ fn cmd_curriculum(args: &[String]) {
     let mut default_depth: usize = 2;
     let mut enable_meta = false;
     let mut enable_extract = false;
-    let mut enable_validate = false;
-    let mut filter_path: Option<String> = None;
     let mut trace_path: Option<String> = None;
     let mut heuristic_path: Option<String> = None;
-    let mut enable_rd = true;
-    let mut learn_rd = false;
-    let mut rd_predictor_path: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -929,13 +940,25 @@ fn cmd_curriculum(args: &[String]) {
             "--depth" => { default_depth = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(default_depth); i += 2; }
             "--meta" => { enable_meta = true; i += 1; }
             "--extract" => { enable_extract = true; i += 1; }
-            "--validate" => { enable_validate = true; i += 1; }
-            "--filter" => { filter_path = args.get(i + 1).cloned(); i += 2; }
             "--trace" => { trace_path = args.get(i + 1).cloned(); i += 2; }
+            // --heuristic restored in §9.31 via meta_v2.
             "--heuristic" => { heuristic_path = args.get(i + 1).cloned(); i += 2; }
-            "--no-rd" => { enable_rd = false; i += 1; }
-            "--learn-rd" => { learn_rd = true; i += 1; }
-            "--rd-predictor" => { rd_predictor_path = args.get(i + 1).cloned(); i += 2; }
+            // Still disabled (depend on consumer modules not yet ported):
+            //   --filter        — needs synth_v2 per-candidate filter hook
+            //   --validate      — needs synth_v2 held-out validation API
+            //   --learn-rd      — needs the recursive_decompose port
+            //   --no-rd         — RD is non-toggleable in synth_v2
+            //   --rd-predictor  — needs RD learned-predictor port
+            // Flag parsing is preserved with a warning so existing shell
+            // scripts don't break.
+            "--no-rd" | "--learn-rd" => {
+                eprintln!("warning: {} is disabled in the post-§9.30 v2 path; flag ignored", args[i]);
+                i += 1;
+            }
+            "--validate" | "--filter" | "--rd-predictor" => {
+                eprintln!("warning: {} is disabled in the post-§9.30 v2 path; flag ignored", args[i]);
+                i += 2;
+            }
             other => { task_file = other.to_string(); i += 1; }
         }
     }
@@ -990,77 +1013,43 @@ fn cmd_curriculum(args: &[String]) {
     eprintln!("SELPH Curriculum: {} tasks", tasks.len());
     eprintln!("  Budget: {}, Default depth: {}", default_budget, default_depth);
     eprintln!("  Library: {} macros", all_macros.len());
-    if enable_meta { eprintln!("  Meta-heuristic learning: enabled"); }
+    if enable_meta { eprintln!("  Meta-RL coefficient updates: enabled (observers only post-§9.30)"); }
     if enable_extract { eprintln!("  Abstraction extraction: enabled"); }
-    if enable_validate { eprintln!("  Validation: enabled (20% held out when >= 5 examples)"); }
     if let Some(ref tp) = trace_path { eprintln!("  Trace: {}", tp); }
+    eprintln!("  Core: synth_v2 + eval_v2 + types_v2 (post-§9.30)");
 
     // Initialize curriculum trace
     let mut curriculum_trace = trace::CurriculumTrace::new(default_budget, default_depth);
 
-    // Load SELPH depth filter if provided
-    let depth_filter: Option<Box<dyn Fn(&synth::SynthComponent, usize) -> bool>> =
-        if let Some(ref fp) = filter_path {
-            match fs::read_to_string(fp) {
-                Ok(src) => {
-                    match parse_file(&src) {
-                        Ok((nodes_vec, roots)) if !roots.is_empty() => {
-                            let nodes: Rc<[Node]> = nodes_vec.into();
-                            let mut fenv = make_default_env();
-                            match eval(&nodes, roots[roots.len() - 1], &mut fenv) {
-                                Ok(filter_val) => {
-                                    eprintln!("  Filter: {} (SELPH program)", fp);
-                                    Some(synth::make_selph_depth_filter(filter_val))
-                                }
-                                Err(e) => { eprintln!("  Filter error: {}", e); None }
-                            }
-                        }
-                        _ => { eprintln!("  Filter parse error"); None }
-                    }
-                }
-                Err(e) => { eprintln!("  Filter load error: {}", e); None }
-            }
-        } else {
-            None
-        };
+    // (Depth filter and learned RD predictor loading remain disabled
+    // — they depend on consumer modules that haven't been ported yet.
+    // The --heuristic flag was restored in §9.31 via meta_v2; loading
+    // happens just below.)
 
-    // Load SELPH heuristic if provided
-    let heuristic: Option<meta::Heuristic> =
+    // Load v2 heuristic if --heuristic was passed.
+    let v2_heuristic: Option<meta_v2::Heuristic> =
         if let Some(ref hp) = heuristic_path {
             match fs::read_to_string(hp) {
                 Ok(src) => {
-                    let trimmed = src.trim();
-                    match meta::Heuristic::from_source("loaded", trimmed) {
+                    match meta_v2::Heuristic::from_source("loaded", src.trim()) {
                         Some(h) => {
-                            eprintln!("  Heuristic: {} ({})", hp, trimmed);
+                            eprintln!("  Heuristic: {} ({} chars)", hp, src.trim().len());
                             Some(h)
                         }
-                        None => { eprintln!("  Heuristic parse error: {}", hp); None }
+                        None => {
+                            eprintln!("  Heuristic parse error: {}", hp);
+                            None
+                        }
                     }
                 }
-                Err(e) => { eprintln!("  Heuristic load error: {}", e); None }
+                Err(e) => {
+                    eprintln!("  Heuristic load error: {}", e);
+                    None
+                }
             }
         } else {
             None
         };
-
-    // Load learned RD predictor if provided
-    let rd_predictor: Option<recursive_decompose::LearnedPredictor> =
-        if let Some(ref rp) = rd_predictor_path {
-            match fs::read_to_string(rp) {
-                Ok(src) => {
-                    match recursive_decompose::LearnedPredictor::from_source(src.trim()) {
-                        Some(p) => {
-                            eprintln!("  RD predictor: {}", rp);
-                            Some(p)
-                        }
-                        None => { eprintln!("  RD predictor parse error: {}", rp); None }
-                    }
-                }
-                Err(e) => { eprintln!("  RD predictor load error: {}", e); None }
-            }
-        } else { None };
-    if learn_rd { eprintln!("  Learn RD predictor: enabled"); }
 
     eprintln!("  Output: {}", output_path);
     eprintln!();
@@ -1071,9 +1060,6 @@ fn cmd_curriculum(args: &[String]) {
     let mut promoted_source = String::new();
     let total_start = std::time::Instant::now();
     let learn_rate = 50.0;
-
-    // Training data for RD predictor learning
-    let mut rd_training: Vec<recursive_decompose::PredictorTrainingPair> = Vec::new();
 
     // Priority map: learned from solutions, persists across tasks
     let mut priorities: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
@@ -1111,7 +1097,28 @@ fn cmd_curriculum(args: &[String]) {
     // Abstraction extraction state
     let mut solved_programs: Vec<(Vec<Node>, usize)> = Vec::new();
 
-    for (name, task_depth, inputs, expected) in &tasks {
+    // ── v2 env construction (post-§9.30) ────────────────────────────────
+    // The strategy fallback chain inside the task loop runs against
+    // synth_v2 + eval_v2. Library macros loaded above need to be visible
+    // to the v2 catalog builder via `library_components_from_env`, so we
+    // mirror them into a v2 env once up front and then add each promoted
+    // task solution to the same env in lockstep with `all_macros`.
+    let v2_env = eval_v2::make_default_env();
+    // §9.37 Stage B: type universe will be rebuilt per task from
+    // `__types__` so curriculum-defined types take effect mid-run.
+    // The initial value is a placeholder; the per-task block below
+    // calls `TypeUniverse::from_env(&v2_env)`.
+    for (mname, mparams, mnodes, mroot) in &all_macros {
+        if mname.starts_with("__selph_rl_") { continue; }
+        if let Err(e) = define_macro_in_v2_env(&v2_env, mname, mparams, mnodes, *mroot) {
+            eprintln!("warning: failed to load macro {} into v2 env: {}", mname, e);
+        }
+    }
+
+    for (name, task_depth, inputs, expected, _arity_hint) in &tasks {
+        // The legacy `cmd_curriculum` path doesn't honour the §9.31
+        // multi-arg arity hint — only `cmd_grow_v2` does. Tasks
+        // tagged `task-args` here fall back to single-input behavior.
         // Use the task-specified depth. The CLI --depth is only a fallback
         // for tasks that don't specify a depth in the curriculum file.
         let depth = *task_depth;
@@ -1135,115 +1142,101 @@ fn cmd_curriculum(args: &[String]) {
             library_size: all_macros.len(),
             bool_macros_available: unary_macro_count,
         };
-        let num_synth_comps_before = 0usize; // will be set after component creation
-        let mut trace_steps: Vec<trace::SolveStep> = Vec::new();
-        let input_is_grid = matches!(&inputs[0], Value::Grid(_));
-        let mut synth_comps = synth::default_synth_components_opts(&all_macros, input_is_grid);
-        let extra_bindings: Vec<(String, Value)> = Vec::new();
-        if input_is_grid {
-            for comp in &mut synth_comps {
-                if comp.name == "x" { comp.ret_type = synth::TYPE_GRID; }
-            }
-        } else if input_is_string {
-            for comp in &mut synth_comps {
-                if comp.name == "x" { comp.ret_type = synth::TYPE_STR; }
-            }
-        } else if input_is_list {
-            // Infer element type from the list contents
-            let elem_type = if let Value::List(elems) = &inputs[0] {
-                if elems.iter().all(|v| matches!(v, Value::Num(_))) {
-                    synth::TYPE_NUM
-                } else if elems.iter().all(|v| matches!(v, Value::Str(_))) {
-                    synth::TYPE_STR
-                } else {
-                    synth::TYPE_ANY
-                }
-            } else { synth::TYPE_ANY };
+        // ── v2 catalog + input conversion (post-§9.30) ──────────────
+        // The legacy synth_comps build, type biasing, priority/heuristic
+        // application, and validation split are gone. synth_v2 builds its
+        // own catalog from `v2_env` (which mirrors `all_macros`), infers
+        // input/output types from the actual values, and runs the full
+        // strategy fallback chain internally via the dispatcher.
+        let inputs_v2: Vec<types_v2::Value> = inputs.iter().map(legacy_value_to_v2).collect();
+        let expected_v2: Vec<types_v2::Value> = expected.iter().map(legacy_value_to_v2).collect();
 
-            for comp in &mut synth_comps {
-                if comp.name == "x" { comp.ret_type = synth::TYPE_LIST; }
-            }
-            // head/nth return the element type, not ANY
-            for comp in &mut synth_comps {
-                if (comp.name == "head" || comp.name == "nth") && comp.ret_type == synth::TYPE_ANY {
-                    comp.ret_type = elem_type;
-                }
-            }
-            // Note: macro param_types are already inferred by infer_macro_types.
-            // Don't override them — macros may accept different types than the
-            // raw input (e.g. num→num macros used as intermediate compositions).
-        }
+        let v2_skip = synth_v2::default_skip_set();
+        let mut v2_components = synth_v2::default_synth_components(&v2_env, &v2_skip);
 
-        // Populate usage_count from priority accumulation history
-        for comp in &mut synth_comps {
-            comp.usage_count = priorities.get(&comp.name)
-                .map(|&v| v / learn_rate)
-                .unwrap_or(0.0);
-        }
-
-        // Apply loaded heuristic if present — replaces static priority with
-        // task-dependent scoring (heuristic can read usage-count).
-        // Otherwise fall back to learned priority accumulation + sorting.
-        if let Some(ref h) = heuristic {
-            let task_ctx = meta::TaskContext::from_examples(inputs, expected);
-            synth_comps = meta::apply_heuristic(h, &synth_comps, &task_ctx);
-        } else {
-            // No heuristic: apply hard-coded priority accumulation
-            for comp in &mut synth_comps {
+        // §9.31 priority injection: when a heuristic is loaded, feed
+        // the cross-task `priorities` accumulator into
+        // `v2_components.usage_count` so the heuristic can read it via
+        // the ctx namespace, then re-score and re-sort the catalog.
+        // synth_v2's enumerator factors comp.priority into candidate
+        // scoring, so mutating the catalog here is the only hook needed.
+        //
+        // No-heuristic path: leave the catalog alone. Synth_v2's default
+        // ordering already produces a coherent search; adding the
+        // accumulated priorities directly to comp.priority ends up
+        // fighting that ordering (verified empirically: 6.5M vs 3.0M
+        // candidates on the 55-task curriculum). Heuristics that want to
+        // use cross-task priorities should read `usage-count` from the
+        // ctx namespace and combine it with `priority` themselves —
+        // that's exactly what `frequency-heuristic` and
+        // `combined-heuristic` in `examples/heuristics.selph` do.
+        if let Some(ref h) = v2_heuristic {
+            for comp in &mut v2_components {
                 if let Some(&learned) = priorities.get(&comp.name) {
-                    comp.priority += learned;
+                    comp.usage_count = learned / learn_rate;
                 }
             }
-            synth_comps.sort_by(|a, b| b.priority.partial_cmp(&a.priority)
-                .unwrap_or(std::cmp::Ordering::Equal));
+            v2_components = meta_v2::apply_heuristic_for_task(
+                h, &v2_components, &inputs_v2, &expected_v2, &v2_env,
+            );
         }
 
-        // Split examples into train/validation if --validate enabled
-        let (train_inputs, train_expected, val_pairs) = if enable_validate && inputs.len() >= 5 {
-            let val_count = (inputs.len() + 4) / 5; // ~20%, rounded up
-            let split = inputs.len() - val_count;
-            let val: Vec<(Value, Value)> = inputs[split..].iter()
-                .zip(expected[split..].iter())
-                .map(|(i, e)| (i.clone(), e.clone()))
-                .collect();
-            (&inputs[..split], &expected[..split], Some(val))
-        } else {
-            (inputs.as_slice(), expected.as_slice(), None)
-        };
+        let num_components = v2_components.len();
+        let all_comp_names: Vec<String> = v2_components.iter().map(|c| c.name.clone()).collect();
 
-        let num_components = synth_comps.len();
-        let all_comp_names: Vec<String> = synth_comps.iter().map(|c| c.name.clone()).collect();
         let mut task_solving_strategy: Option<String> = None;
         let mut task_total_candidates: usize = 0;
         let mut task_components_used: Vec<String> = Vec::new();
         let start = std::time::Instant::now();
 
-        // Strategy 0: Recursive decomposition (top-down prediction)
-        // Try this first with a fraction of the budget — it's fast when
-        // the outermost function is predictable. Disabled with --no-rd.
-        let rd_budget = default_budget / 4;
-        let rd = if enable_rd {
-            let r = recursive_decompose::try_recursive_decomposition_with_predictor(
-                &synth_comps, train_inputs, train_expected, &all_macros,
-                depth, rd_budget, rd_predictor.as_ref(),
-            );
-            total_candidates += r.candidates_explored;
-            r
-        } else {
-            recursive_decompose::RecursiveDecompResult::empty()
-        };
-        let rd_explored = rd.candidates_explored;
+        // ── synth_v2 dispatcher (post-§9.30) ────────────────────────
+        // The legacy 6-strategy fallback chain (RD → Flat → BD → IN → HO
+        // → D&C → Memo) is now a single call. synth_v2's
+        // `synthesize_with_strategies` handles dispatch internally; the
+        // strategy variant is reported back via `result.strategy`.
+        // §9.37 Stage B: rebuild the type universe per task so any
+        // `__types__` definitions added by curriculum code mid-run
+        // take effect.
+        let v2_universe = synth_v2::TypeUniverse::from_env(&v2_env);
+        let result = synth_v2::synthesize_with_strategies(
+            &v2_components, &inputs_v2, &expected_v2,
+            &v2_env, &v2_universe, depth, default_budget,
+        );
+        let elapsed = start.elapsed();
+        total_candidates += result.candidates_explored;
+        task_total_candidates = result.candidates_explored;
 
-        if rd.found {
-            let source = node_to_source(&rd.nodes, rd.root);
+        if result.found {
+            let v2_nodes = result.nodes.expect("found implies nodes");
+            let root = result.root.expect("found implies root");
+            let strategy_name = result.strategy.map(|s| s.name()).unwrap_or_else(|| "???".to_string());
+            let source = eval_v2::node_to_source(&v2_nodes, root);
+
             solved += 1;
-            let elapsed = start.elapsed();
-            eprintln!("  RD  {:30}  {:6} cand  {:.3}s  {}  [{}]",
-                     name, rd_explored, elapsed.as_secs_f64(), source, rd.strategy_used);
+            eprintln!(
+                "  {:>4}  {:30}  {:>6} cand  {:>6.3}s  {}",
+                strategy_name, name, result.candidates_explored,
+                elapsed.as_secs_f64(), source,
+            );
+            task_solving_strategy = Some(strategy_name.clone());
 
-            task_solving_strategy = Some(rd.strategy_used.clone());
-            task_total_candidates = rd_explored;
+            // Define the lambda into the v2 env so subsequent tasks
+            // discover it via library_components_from_env. The Lambda
+            // Node evaluates to a Value::Function that captures the
+            // current env — same shape as `(define name (lambda ...))`.
+            let v2_nodes_rc: Rc<[types_v2::Node]> = v2_nodes.into();
+            match eval_v2::eval(&v2_nodes_rc, root, &v2_env) {
+                Ok(func @ types_v2::Value::Function(_)) => {
+                    v2_env.define(intern(name), func);
+                }
+                Ok(other) => eprintln!("    (warning: solution did not eval to Function: {:?})", other),
+                Err(e) => eprintln!("    (warning: failed to bind solution: {})", e),
+            }
 
+            // Update priority accumulation. Post-§9.30 these no longer
+            // feed back into synth_v2's search ordering, but we still
+            // maintain them for compatibility with the cross-run state
+            // that gets serialized into grown_library.selph.
             let used_components = library::extract_components(&source);
             task_components_used = used_components.clone();
             for comp_name in &used_components {
@@ -1251,8 +1244,11 @@ fn cmd_curriculum(args: &[String]) {
                 *entry += learn_rate;
             }
 
+            // Promote into legacy `all_macros` for grown_library.selph
+            // serialization and for `--extract` (abstraction extraction
+            // operates on legacy nodes). Roundtrips through the legacy
+            // parser to construct the Vec<Node> representation.
             let body_source = extract_lambda_body(&source);
-
             let is_trivial = {
                 let trimmed = body_source.trim();
                 if trimmed.starts_with('(') && trimmed.ends_with(')') {
@@ -1281,6 +1277,9 @@ fn cmd_curriculum(args: &[String]) {
                                                 if let Node::Symbol(s) = &mnodes[i] { Some(resolve(*s)) }
                                                 else { None }
                                             }).collect();
+                                        if enable_extract {
+                                            solved_programs.push((mnodes.clone(), children[3]));
+                                        }
                                         all_macros.push((
                                             resolve(*mname), params,
                                             mnodes.clone(), children[3],
@@ -1293,366 +1292,20 @@ fn cmd_curriculum(args: &[String]) {
                 }
 
                 promoted_source.push_str(&format!(
-                    "\n; {} (recursive decomp: {}): found in {} candidates\n{}\n",
-                    name, rd.strategy_used, rd_explored, macro_line));
+                    "\n; {} ({}): found in {} candidates\n{}\n",
+                    name, strategy_name, result.candidates_explored, macro_line));
             }
 
             if enable_meta {
                 meta::update_rl_coefficients(
-                    &mut current_rl_coeffs, rd_explored, default_budget);
-            }
-            if enable_extract {
-                solved_programs.push((rd.nodes.clone(), rd.root));
+                    &mut current_rl_coeffs, result.candidates_explored, default_budget);
             }
         } else {
-
-        // Strategy 1: Flat synthesis
-        let filter_ref: Option<&dyn Fn(&synth::SynthComponent, usize) -> bool> =
-            depth_filter.as_ref().map(|f| f.as_ref());
-        let snap_ref: Option<&mut Vec<synth::CandidateRecord>> = None;
-        let sr = synth::synthesize_full(
-            &synth_comps, train_inputs, train_expected, &all_macros,
-            depth, default_budget, true,
-            val_pairs.as_deref(), &extra_bindings, filter_ref, snap_ref,
-            current_rl_coeffs);
-        total_candidates += sr.candidates_explored;
-        let elapsed = start.elapsed();
-
-        if sr.found {
-                let source = node_to_source(sr.nodes.as_ref().unwrap(), sr.root.unwrap());
-                solved += 1;
-                let explored = sr.candidates_explored;
-                eprintln!("  OK  {:30}  {:6} cand  {:.3}s  {}",
-                         name, explored, elapsed.as_secs_f64(), source);
-
-                task_solving_strategy = Some("Flat".to_string());
-                task_total_candidates = explored;
-
-                // Update priorities: boost components that appeared in the solution
-                let used_components = library::extract_components(&source);
-                task_components_used = used_components.clone();
-                for comp_name in &used_components {
-                    let entry = priorities.entry(comp_name.clone()).or_insert(0.0);
-                    *entry += learn_rate;
-                }
-
-                // Extract body from lambda for the macro
-                let body_source = extract_lambda_body(&source);
-
-                // Skip trivial promotions: if the body is just calling an
-                // existing macro with the input variable, promoting it would
-                // create a self-referential or redundant macro.
-                // e.g. if double_idx already exists and the solution is
-                // (double_idx x), don't promote (defmacro double_idx (s) (double_idx s))
-                let is_trivial = {
-                    let trimmed = body_source.trim();
-                    // Check if body is (existing_macro x) or (existing_macro s)
-                    if trimmed.starts_with('(') && trimmed.ends_with(')') {
-                        let inner = &trimmed[1..trimmed.len()-1];
-                        let parts: Vec<&str> = inner.split_whitespace().collect();
-                        parts.len() == 2
-                            && (parts[1] == "x" || parts[1] == "s")
-                            && all_macros.iter().any(|(mn, _, _, _)| mn == parts[0])
-                    } else {
-                        false
-                    }
-                };
-
-                if is_trivial {
-                    eprintln!("    (skipped promotion — trivial wrapper of existing macro)");
-                } else {
-                    let macro_line = format!("(defmacro {} (s) {})", name, body_source);
-
-                    // Parse and register the new macro
-                    if let Ok((mnodes, mroots)) = parse_file(&macro_line) {
-                        if !mroots.is_empty() {
-                            if let Node::App(children) = &mnodes[mroots[0]] {
-                                if children.len() == 4 {
-                                    if let Node::Symbol(mname) = &mnodes[children[1]] {
-                                        if let Node::App(param_indices) = &mnodes[children[2]] {
-                                            let params: Vec<String> = param_indices.iter()
-                                                .filter_map(|&i| {
-                                                    if let Node::Symbol(s) = &mnodes[i] { Some(resolve(*s)) }
-                                                    else { None }
-                                                }).collect();
-                                            all_macros.push((
-                                                resolve(*mname), params,
-                                                mnodes.clone(), children[3],
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Accumulate for output
-                    promoted_source.push_str(&format!(
-                        "\n; {}: found in {} candidates\n{}\n",
-                        name, explored, macro_line));
-                }
-
-                // Capture pool snapshot for rank-based heuristic optimization.
-                // The snapshot records (comp_name, arg_priority_sum) for each
-                // composition candidate tested. The solution is the last entry.
-                // Online RL coefficient update: nudge toward finding this solution earlier
-                if enable_meta {
-                    meta::update_rl_coefficients(
-                        &mut current_rl_coeffs, sr.candidates_explored, default_budget);
-                }
-                if enable_extract {
-                    if let (Some(nodes), Some(root)) = (&sr.nodes, sr.root) {
-                        solved_programs.push((nodes.clone(), root));
-                    }
-                }
-        } else {
-            // Fallback 0: Boolean decomposition — try (and P Q), (or P Q)
-            // for all pairs of bool-returning macros. O(macros²), instant.
-            let bool_result = bool_decompose(inputs, expected, &all_macros);
-
-            if let Some((op, m1, m2, source)) = bool_result {
-                solved += 1;
-                eprintln!("  BD  {:30}         0.000s  {}",
-                         name, source);
-
-                task_solving_strategy = Some("BD".to_string());
-                task_total_candidates = sr.candidates_explored;
-
-                let used_components = library::extract_components(&source);
-                task_components_used = used_components.clone();
-                for comp_name in &used_components {
-                    let entry = priorities.entry(comp_name.clone()).or_insert(0.0);
-                    *entry += learn_rate;
-                }
-
-                let body_source = extract_lambda_body(&source);
-                let macro_line = format!("(defmacro {} (s) {})", name, body_source);
-                if let Ok((mnodes, mroots)) = parse_file(&macro_line) {
-                    if !mroots.is_empty() {
-                        if let Node::App(children) = &mnodes[mroots[0]] {
-                            if children.len() == 4 {
-                                if let Node::Symbol(mname) = &mnodes[children[1]] {
-                                    if let Node::App(param_indices) = &mnodes[children[2]] {
-                                        let params: Vec<String> = param_indices.iter()
-                                            .filter_map(|&i| {
-                                                if let Node::Symbol(s) = &mnodes[i] { Some(resolve(*s)) }
-                                                else { None }
-                                            }).collect();
-                                        all_macros.push((
-                                            resolve(*mname), params,
-                                            mnodes.clone(), children[3],
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                promoted_source.push_str(&format!(
-                    "\n; {} (bool decomp: {} {} {})\n{}\n",
-                    name, op, m1, m2, macro_line));
-
-                if enable_meta {
-                    meta::update_rl_coefficients(
-                        &mut current_rl_coeffs, 0, default_budget);
-                }
-            } else {
-
-            // Fallback 1: Try induction
-            let ir = induce::induce_from_failure(
-                &synth_comps, inputs, expected, &all_macros, depth, default_budget / 2);
-
-            if ir.found {
-                let source = node_to_source(&ir.nodes, ir.root);
-                solved += 1;
-                total_candidates += ir.candidates_explored;
-                eprintln!("  IN  {:30}  {:6} cand  {:.3}s  {}",
-                         name, ir.candidates_explored, elapsed.as_secs_f64(), source);
-
-                task_solving_strategy = Some("Induction".to_string());
-                task_total_candidates = sr.candidates_explored + ir.candidates_explored;
-
-                let used_components = library::extract_components(&source);
-                task_components_used = used_components.clone();
-                for comp_name in &used_components {
-                    let entry = priorities.entry(comp_name.clone()).or_insert(0.0);
-                    *entry += learn_rate;
-                }
-
-                let body_source = extract_lambda_body(&source);
-                let macro_line = format!("(defmacro {} (s) {})", name, body_source);
-                if let Ok((mnodes, mroots)) = parse_file(&macro_line) {
-                    if !mroots.is_empty() {
-                        if let Node::App(children) = &mnodes[mroots[0]] {
-                            if children.len() == 4 {
-                                if let Node::Symbol(mname) = &mnodes[children[1]] {
-                                    if let Node::App(param_indices) = &mnodes[children[2]] {
-                                        let params: Vec<String> = param_indices.iter()
-                                            .filter_map(|&i| {
-                                                if let Node::Symbol(s) = &mnodes[i] { Some(resolve(*s)) }
-                                                else { None }
-                                            }).collect();
-                                        all_macros.push((resolve(*mname), params, mnodes.clone(), children[3]));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                promoted_source.push_str(&format!(
-                    "\n; {} (induced): found in {} candidates\n{}\n",
-                    name, ir.candidates_explored, macro_line));
-
-                if enable_extract {
-                    solved_programs.push((ir.nodes.clone(), ir.root));
-                }
-            } else {
-                // Fallback 1.5: Try template decomposition (higher-order)
-                let ho_r = decompose::try_decomposition(
-                    &synth_comps, inputs, expected, &all_macros, depth, default_budget / 2);
-                total_candidates += ho_r.candidates_explored;
-
-                if ho_r.found {
-                    let source = node_to_source(&ho_r.nodes, ho_r.root);
-                    solved += 1;
-                    eprintln!("  HO  {:30}  {:6} cand  {:.3}s  {}",
-                             name, ho_r.candidates_explored, elapsed.as_secs_f64(), source);
-
-                    task_solving_strategy = Some(format!("Decomp({})", ho_r.template_used));
-                    task_total_candidates = sr.candidates_explored + ir.candidates_explored + ho_r.candidates_explored;
-
-                    let used_components = library::extract_components(&source);
-                    task_components_used = used_components.clone();
-                    for comp_name in &used_components {
-                        let entry = priorities.entry(comp_name.clone()).or_insert(0.0);
-                        *entry += learn_rate;
-                    }
-
-                    let body_source = extract_lambda_body(&source);
-                    let macro_line = format!("(defmacro {} (s) {})", name, body_source);
-                    if let Ok((mnodes, mroots)) = parse_file(&macro_line) {
-                        if !mroots.is_empty() {
-                            if let Node::App(children) = &mnodes[mroots[0]] {
-                                if children.len() == 4 {
-                                    if let Node::Symbol(mname) = &mnodes[children[1]] {
-                                        if let Node::App(param_indices) = &mnodes[children[2]] {
-                                            let params: Vec<String> = param_indices.iter()
-                                                .filter_map(|&i| {
-                                                    if let Node::Symbol(s) = &mnodes[i] { Some(resolve(*s)) }
-                                                    else { None }
-                                                }).collect();
-                                            all_macros.push((resolve(*mname), params, mnodes.clone(), children[3]));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    promoted_source.push_str(&format!(
-                        "\n; {} (HO: {}): found in {} candidates\n{}\n",
-                        name, ho_r.template_used, ho_r.candidates_explored, macro_line));
-
-                    if enable_extract {
-                        solved_programs.push((ho_r.nodes.clone(), ho_r.root));
-                    }
-                } else {
-
-                // Fallback 2: Try divide-and-conquer
-                let dr = divide::divide_and_conquer(
-                    &synth_comps, inputs, expected, &all_macros, depth, default_budget / 2);
-
-                if dr.found {
-                    let source = node_to_source(&dr.nodes, dr.root);
-                    solved += 1;
-                    total_candidates += dr.candidates_explored;
-                    eprintln!("  DC  {:30}  {:6} cand  {:.3}s  {}",
-                             name, dr.candidates_explored, elapsed.as_secs_f64(), source);
-
-                    task_solving_strategy = Some("D&C".to_string());
-                    task_total_candidates = sr.candidates_explored + dr.candidates_explored;
-                    task_components_used = library::extract_components(&source);
-
-                    let body_source = extract_lambda_body(&source);
-                    let macro_line = format!("(defmacro {} (s) {})", name, body_source);
-
-                    // Register D&C solution as macro so later tasks can use it
-                    if let Ok((mnodes, mroots)) = parse_file(&macro_line) {
-                        if !mroots.is_empty() {
-                            if let Node::App(children) = &mnodes[mroots[0]] {
-                                if children.len() == 4 {
-                                    if let Node::Symbol(mname) = &mnodes[children[1]] {
-                                        if let Node::App(param_indices) = &mnodes[children[2]] {
-                                            let params: Vec<String> = param_indices.iter()
-                                                .filter_map(|&i| {
-                                                    if let Node::Symbol(s) = &mnodes[i] { Some(resolve(*s)) }
-                                                    else { None }
-                                                }).collect();
-                                            all_macros.push((resolve(*mname), params, mnodes.clone(), children[3]));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    promoted_source.push_str(&format!(
-                        "\n; {} (D&C): found in {} candidates\n{}\n",
-                        name, dr.candidates_explored, macro_line));
-
-                    if enable_extract {
-                        solved_programs.push((dr.nodes.clone(), dr.root));
-                    }
-                } else {
-                    // Fallback 3: Memorization — namespace lookup table
-                    if let Some((mem_nodes, mem_root)) = memorize_from_examples(inputs, expected) {
-                        let source = node_to_source(&mem_nodes, mem_root);
-                        solved += 1;
-                        eprintln!("  ME  {:30}  {:6} memo  {:.3}s  {}",
-                                 name, inputs.len(), elapsed.as_secs_f64(), source);
-
-                        task_solving_strategy = Some("Memo".to_string());
-                        task_total_candidates = sr.candidates_explored;
-
-                        let body_source = extract_lambda_body(&source);
-                        let macro_line = format!("(defmacro {} (s) {})", name, body_source);
-                        if let Ok((mnodes, mroots)) = parse_file(&macro_line) {
-                            if !mroots.is_empty() {
-                                if let Node::App(children) = &mnodes[mroots[0]] {
-                                    if children.len() == 4 {
-                                        if let Node::Symbol(mname) = &mnodes[children[1]] {
-                                            if let Node::App(param_indices) = &mnodes[children[2]] {
-                                                let params: Vec<String> = param_indices.iter()
-                                                    .filter_map(|&i| {
-                                                        if let Node::Symbol(s) = &mnodes[i] { Some(resolve(*s)) }
-                                                        else { None }
-                                                    }).collect();
-                                                all_macros.push((
-                                                    resolve(*mname).to_string(), params,
-                                                    mnodes.clone(), children[3],
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        promoted_source.push_str(&format!(
-                            "\n; {} (memorized: {} entries)\n{}\n",
-                            name, inputs.len(), macro_line));
-                    } else {
-                        let explored = sr.candidates_explored;
-                        eprintln!("  --  {:30}  {:6} cand  {:.3}s",
-                                 name, explored, elapsed.as_secs_f64());
-                        task_total_candidates = explored;
-                    }
-                }
-            }
-            } // end HO else
-        } // end bool_decompose else
+            eprintln!(
+                "  --    {:30}  {:>6} cand  {:>6.3}s",
+                name, result.candidates_explored, elapsed.as_secs_f64(),
+            );
         }
-        } // end recursive decomposition else
 
         // Record trace for this task
         if trace_path.is_some() {
@@ -1673,24 +1326,10 @@ fn cmd_curriculum(args: &[String]) {
             curriculum_trace.tasks.push(task_trace);
         }
 
-        // Collect training data for RD predictor
-        if learn_rd {
-            // Find the last promoted macro for this task (if solved)
-            if let Some(last_macro) = all_macros.iter().rev()
-                .find(|(mn, _, _, _)| mn == name)
-            {
-                let (_, _, mnodes, mroot) = last_macro;
-                if let Some(outermost) = recursive_decompose::extract_outermost_function(mnodes, *mroot) {
-                    let family = recursive_decompose::classify_outermost(&outermost).to_string();
-                    let features = recursive_decompose::encode_features(
-                        train_inputs, train_expected, &all_macros);
-                    rd_training.push(recursive_decompose::PredictorTrainingPair {
-                        features,
-                        family,
-                    });
-                }
-            }
-        }
+        // (Learn-RD predictor training collection — removed in §9.30
+        // along with `recursive_decompose.rs`. The learned predictor
+        // path will return when the SELPH-script integration through
+        // eval_v2 lands.)
 
         // Periodic abstraction extraction: every 10 solved tasks
         if enable_extract && solved > 0 && solved % 10 == 0 && solved_programs.len() >= 2 {
@@ -1774,67 +1413,10 @@ fn cmd_curriculum(args: &[String]) {
              total_candidates, total_elapsed.as_secs_f64());
     eprintln!("Library grew by {} macros", solved);
 
-    // Learn RD predictor from training data if --learn-rd enabled
-    if learn_rd && rd_training.len() >= 3 {
-        eprintln!();
-        eprintln!("Learning RD predictor from {} training pairs...", rd_training.len());
-
-        // Deduplicate training pairs
-        let mut seen = std::collections::HashSet::new();
-        let mut deduped: Vec<recursive_decompose::PredictorTrainingPair> = Vec::new();
-        for pair in &rd_training {
-            let key = format!("{}→{}", pair.features, pair.family);
-            if seen.insert(key) {
-                deduped.push(pair.clone());
-            }
-        }
-        eprintln!("  {} unique pairs after dedup", deduped.len());
-
-        // Show distribution
-        let mut family_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for pair in &deduped {
-            *family_counts.entry(pair.family.clone()).or_insert(0) += 1;
-        }
-        let mut counts: Vec<_> = family_counts.iter().collect();
-        counts.sort_by(|a, b| b.1.cmp(a.1));
-        for (family, count) in &counts {
-            eprintln!("    {}: {}", family, count);
-        }
-
-        let predictor_budget = 50000;
-        match recursive_decompose::learn_predictor(&deduped, predictor_budget) {
-            Some((nodes, root, cands)) => {
-                let source = node_to_source(&nodes, root);
-                eprintln!("  Learned predictor in {} candidates:", cands);
-                eprintln!("    {}", source);
-
-                // Save predictor to file
-                let pred_path = output_path.replace(".selph", "_rd_predictor.selph");
-                match fs::write(&pred_path, &source) {
-                    Ok(_) => eprintln!("  Saved predictor to {}", pred_path),
-                    Err(e) => eprintln!("  Error saving predictor: {}", e),
-                }
-
-                // Validate predictor on training data
-                if let Some(pred) = recursive_decompose::LearnedPredictor::from_source(&source) {
-                    let mut correct = 0;
-                    for pair in &deduped {
-                        if let Some(predicted) = pred.predict(&pair.features) {
-                            if predicted == pair.family {
-                                correct += 1;
-                            }
-                        }
-                    }
-                    eprintln!("  Validation: {}/{} correct ({:.0}%)",
-                        correct, deduped.len(),
-                        100.0 * correct as f64 / deduped.len() as f64);
-                }
-            }
-            None => {
-                eprintln!("  Failed to learn predictor (budget {})", predictor_budget);
-            }
-        }
-    }
+    // (Learn-RD predictor learning post-loop block — removed in §9.30
+    // along with `recursive_decompose.rs::learn_predictor`. The
+    // learned-predictor pipeline returns when SELPH-script integration
+    // through eval_v2 lands.)
 
     // Write trace JSON if requested
     if let Some(ref tp) = trace_path {
@@ -1888,9 +1470,392 @@ fn cmd_curriculum(args: &[String]) {
     }
 }
 
+/// `selph grow-v2` — chained curriculum runner against the new core
+/// (synth_v2 + eval_v2 + types_v2). The minimum-viable Step 8 driver:
+/// reuses the legacy `(task name depth (in out)...)` parser, converts
+/// the example values to v2, and routes each task through
+/// `synth_v2::synthesize_with_strategies`. Solved tasks bind their
+/// lambda into a v2 Env (mutated in place via `define`) so subsequent
+/// tasks see them as library functions through env auto-discovery.
+///
+/// Intentionally minimal — no meta, no abstraction extraction, no
+/// heuristics, no held-out validation, no curriculum trace, no learned
+/// RD predictor. The whole point of this command is to validate that
+/// the rebuilt core can run the existing 55-task curriculum end-to-end
+/// without depending on any of the legacy consumer modules.
+fn cmd_grow_v2(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: selph grow-v2 <tasks.selph> [--budget N] [--depth N]");
+        return;
+    }
+
+    let mut task_file = String::new();
+    let mut default_budget: usize = 200000;
+    let mut default_depth: usize = 2;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--budget" => {
+                default_budget = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(default_budget);
+                i += 2;
+            }
+            "--depth" => {
+                default_depth = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(default_depth);
+                i += 2;
+            }
+            other => { task_file = other.to_string(); i += 1; }
+        }
+    }
+    if task_file.is_empty() {
+        eprintln!("No task file specified");
+        return;
+    }
+
+    let task_source = match fs::read_to_string(&task_file) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Error reading {}: {}", task_file, e); return; }
+    };
+
+    let tasks = parse_curriculum_tasks(&task_source, default_depth);
+
+    eprintln!();
+    eprintln!("SELPH grow-v2: {} tasks", tasks.len());
+    eprintln!("  Budget: {}, Default depth: {}", default_budget, default_depth);
+    eprintln!("  Core: synth_v2 + eval_v2 + types_v2 (no legacy consumer modules)");
+    eprintln!();
+
+    // Single env shared across the whole curriculum. Each solved task
+    // is bound into the top scope as a Value::Function — synth_v2's
+    // `library_components_from_env` will pick it up on subsequent tasks.
+    let env = eval_v2::make_default_env();
+
+    // §9.39 meta-curriculum support: evaluate every top-level form in
+    // the task file that ISN'T `(task ...)` or `(task-args ...)`. This
+    // lets a curriculum file mix `(define helper ...)` forms with
+    // task entries — the helpers land in the same env synth uses, so
+    // any task's synth can reach them as library components.
+    // Runs even when there are no tasks, so a "helper-only" file
+    // (M0-style) can be smoke-tested for parse/eval errors.
+    if let Err(e) = eval_curriculum_preamble(&task_source, &env) {
+        eprintln!("warning: preamble eval failed: {}", e);
+    }
+
+    if tasks.is_empty() {
+        eprintln!("(no tasks; preamble-only run)");
+        return;
+    }
+    // §9.37 Stage B: type universe is rebuilt per task from
+    // `__types__` so curriculum-defined types take effect mid-run.
+
+    let mut solved = 0usize;
+    let mut total_candidates = 0usize;
+    let total_start = std::time::Instant::now();
+
+    // Per-strategy tally for the summary line.
+    let mut by_strategy: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+
+    for (name, task_depth, inputs_legacy, expected_legacy, arity_hint) in &tasks {
+        // Convert legacy Values → v2 Values once per task. The legacy
+        // parser produces Num(f64) for everything numeric; v2 prefers
+        // Int(i64) when integral so the type universe stays Int-biased
+        // (matches the §9.27 design call).
+        //
+        // §9.31 physics carve-out: a task whose inputs/outputs contain
+        // ANY non-integral float keeps every numeric value as
+        // `Value::Num`. Otherwise the integral coercion kicks in for
+        // float-domain tasks like `square 0.5 → 0.25`, where the
+        // `0.25` would normalize fine but `0.5 * 1.0 = 0.5` could
+        // produce an integer literal that the synth would then
+        // misroute through the Int catalog. Per-task all-or-nothing
+        // is the simplest rule that preserves curriculum behaviour
+        // and lets float tasks stay floaty.
+        let force_num = inputs_legacy.iter().chain(expected_legacy.iter())
+            .any(legacy_value_has_non_integral);
+        let convert = |v: &Value| -> types_v2::Value {
+            if force_num { legacy_value_to_v2_force_num(v) }
+            else { legacy_value_to_v2(v) }
+        };
+        let inputs: Vec<types_v2::Value> =
+            inputs_legacy.iter().map(&convert).collect();
+        let expected: Vec<types_v2::Value> =
+            expected_legacy.iter().map(&convert).collect();
+
+        // Rebuild the catalog per task. Cheap relative to synthesis,
+        // and ensures any newly defined library function from a
+        // previous task is visible.
+        let skip = synth_v2::default_skip_set();
+        let components = synth_v2::default_synth_components(&env, &skip);
+
+        let start = std::time::Instant::now();
+        // §9.37 Stage B: rebuild the universe per task so any
+        // `__types__` mutations from prior tasks take effect.
+        let universe = synth_v2::TypeUniverse::from_env(&env);
+
+        // §9.31 multi-arg path: when the task is `task-args` with a
+        // confirmed arity, infer per-position types from the first
+        // example and dispatch through `synthesize_args` (Flat-only,
+        // skipping the strategy chain whose decomposers all assume
+        // a single-input lambda).
+        let result = if let Some(arity) = arity_hint {
+            // Per-position type inference from the first input list.
+            let first = match inputs.first() {
+                Some(types_v2::Value::List(items)) if items.len() == *arity => items.clone(),
+                _ => {
+                    eprintln!("  WARN  {:30}  arity hint {} but first input is not a list of that length; skipping",
+                        name, arity);
+                    continue;
+                }
+            };
+            let arg_types: Vec<crate::intern::Sym> = first.iter()
+                .map(|v| v.type_sym().unwrap_or_else(types_v2::type_any))
+                .collect();
+            let synth_result = synth_v2::synthesize_args(
+                &components,
+                &inputs,
+                &arg_types,
+                &expected,
+                &env,
+                &universe,
+                *task_depth,
+                default_budget,
+            );
+            // Wrap in a StrategyResult so the success path below stays
+            // shape-compatible.
+            synth_v2::StrategyResult {
+                found: synth_result.found,
+                nodes: synth_result.nodes,
+                root: synth_result.root,
+                candidates_explored: synth_result.candidates_explored,
+                strategy: if synth_result.found {
+                    Some(synth_v2::Strategy::Flat)
+                } else { None },
+            }
+        } else {
+            synth_v2::synthesize_with_strategies(
+                &components,
+                &inputs,
+                &expected,
+                &env,
+                &universe,
+                *task_depth,
+                default_budget,
+            )
+        };
+        let elapsed = start.elapsed();
+        total_candidates += result.candidates_explored;
+
+        if result.found {
+            let nodes_vec = result.nodes.expect("found implies nodes");
+            let root = result.root.expect("found implies root");
+            let strategy_name = result
+                .strategy
+                .map(|s| s.name())
+                .unwrap_or_else(|| "???".to_string());
+            *by_strategy.entry(strategy_name.clone()).or_insert(0) += 1;
+
+            let source = eval_v2::node_to_source(&nodes_vec, root);
+            eprintln!(
+                "  {:>4}  {:30}  {:>6} cand  {:>6.3}s  {}",
+                strategy_name, name, result.candidates_explored,
+                elapsed.as_secs_f64(), source,
+            );
+
+            // Bind the synthesized lambda into the env so subsequent
+            // tasks see it as a library component. The Lambda Node at
+            // `root` evaluates to a Value::Function that captures the
+            // current env — exactly the binding model used by
+            // `(define name (lambda ...))` in source.
+            let nodes_rc: std::rc::Rc<[types_v2::Node]> = nodes_vec.into();
+            match eval_v2::eval(&nodes_rc, root, &env) {
+                Ok(func @ types_v2::Value::Function(_)) => {
+                    env.define(intern(name), func);
+                }
+                Ok(other) => {
+                    eprintln!("    (warning: solution did not eval to Function: {:?})", other);
+                }
+                Err(e) => {
+                    eprintln!("    (warning: failed to bind solution as library: {})", e);
+                }
+            }
+
+            solved += 1;
+        } else {
+            eprintln!(
+                "  FAIL  {:30}  {:>6} cand  {:>6.3}s",
+                name, result.candidates_explored, elapsed.as_secs_f64(),
+            );
+        }
+    }
+
+    let total_elapsed = total_start.elapsed();
+    eprintln!();
+    eprintln!("─────────────────────────────────────────────────────");
+    eprintln!("Solved {}/{} tasks in {:.2}s ({} candidates total)",
+        solved, tasks.len(), total_elapsed.as_secs_f64(), total_candidates);
+    if !by_strategy.is_empty() {
+        let parts: Vec<String> = by_strategy.iter()
+            .map(|(s, n)| format!("{}={}", s, n))
+            .collect();
+        eprintln!("By strategy: {}", parts.join(", "));
+    }
+}
+
+/// Define a legacy macro into a v2 env so synth_v2 can discover it as
+/// a library function via `library_components_from_env`. The roundtrip
+/// path is: legacy nodes → source string → legacy parser → v2
+/// node tree (via `eval_v2::convert_tree`) → eval. Same path the parser
+/// uses for `(define name (lambda (params) body))`, which is what the
+/// `defmacro` form desugars to in the v2 converter.
+///
+/// Used by the post-§9.30 cmd_curriculum to keep `all_macros` (legacy)
+/// and the v2 env in lockstep without duplicating definitions.
+fn define_macro_in_v2_env(
+    env: &types_v2::Env,
+    name: &str,
+    params: &[String],
+    nodes: &[Node],
+    root: usize,
+) -> Result<(), String> {
+    let body_src = node_to_source(nodes, root);
+    let macro_src = format!(
+        "(defmacro {} ({}) {})",
+        name,
+        params.join(" "),
+        body_src,
+    );
+    let (old_nodes, roots) = parse_file(&macro_src).map_err(|e| e.to_string())?;
+    let new_nodes_vec = eval_v2::convert_tree(&old_nodes);
+    let new_nodes: Rc<[types_v2::Node]> = new_nodes_vec.into();
+    for r in &roots {
+        eval_v2::eval(&new_nodes, *r, env).map_err(|e| e)?;
+    }
+    Ok(())
+}
+
+/// Convert a legacy `types::Value` (as produced by `parse_curriculum_tasks`)
+/// into a `types_v2::Value`. Curriculum task data is restricted to the
+/// primitive variants — Num, Str, Bool, List, Nil — so this never sees
+/// Function/Closure/RustMacro/Namespace/Grid/Alt. Numeric values get
+/// normalized: integral f64s become Int, fractional ones stay Num.
+fn legacy_value_to_v2(v: &Value) -> types_v2::Value {
+    match v {
+        Value::Num(n) => {
+            if n.is_finite() && (n - n.round()).abs() < 1e-9
+                && *n >= i64::MIN as f64 && *n <= i64::MAX as f64
+            {
+                types_v2::Value::Int(*n as i64)
+            } else {
+                types_v2::Value::Num(*n)
+            }
+        }
+        Value::Str(s) => types_v2::Value::str(s),
+        Value::Bool(b) => types_v2::Value::Bool(*b),
+        Value::List(items) => {
+            let v2_items: Vec<types_v2::Value> = items.iter().map(legacy_value_to_v2).collect();
+            types_v2::Value::list(v2_items)
+        }
+        Value::Nil => types_v2::Value::Nil,
+        other => {
+            eprintln!("warning: legacy_value_to_v2 saw unsupported variant {:?}, using nil", other);
+            types_v2::Value::Nil
+        }
+    }
+}
+
+/// Like `legacy_value_to_v2` but never coerces integral floats to Int.
+/// Used by `cmd_grow_v2` for tasks whose value table contains at least
+/// one non-integral number — keeps every numeric value as `Value::Num`
+/// so the synthesizer dispatches to the Num-typed component catalog
+/// (the §9.31 physics curriculum path). Integers, lists, strings, etc
+/// are passed through unchanged: only `Value::Num` is special-cased.
+fn legacy_value_to_v2_force_num(v: &Value) -> types_v2::Value {
+    match v {
+        Value::Num(n) => types_v2::Value::Num(*n),
+        Value::List(items) => {
+            let v2_items: Vec<types_v2::Value> =
+                items.iter().map(legacy_value_to_v2_force_num).collect();
+            types_v2::Value::list(v2_items)
+        }
+        // Non-numeric variants — same as the normalizing path.
+        Value::Str(s) => types_v2::Value::str(s),
+        Value::Bool(b) => types_v2::Value::Bool(*b),
+        Value::Nil => types_v2::Value::Nil,
+        other => {
+            eprintln!("warning: legacy_value_to_v2_force_num saw unsupported variant {:?}, using nil", other);
+            types_v2::Value::Nil
+        }
+    }
+}
+
+/// Evaluate every top-level form in `source` that ISN'T a `(task ...)`
+/// or `(task-args ...)` entry against `env`. Used by `cmd_grow_v2` to
+/// load `(define helper ...)` forms that ride alongside curriculum
+/// tasks in the same file. The §9.39 meta-curriculum needs this so
+/// the spec primitives, decomposers, and `__decomposers__` namespace
+/// can be defined in the same file as the tasks that exercise them.
+///
+/// Errors from individual forms are reported but don't stop the
+/// loop — a typo in one helper shouldn't kill the whole curriculum.
+fn eval_curriculum_preamble(source: &str, env: &types_v2::Env) -> Result<(), String> {
+    let (legacy_nodes, roots) = parse_file(source).map_err(|e| e.to_string())?;
+    let task_sym = intern("task");
+    let task_args_sym = intern("task-args");
+
+    // Convert to v2 nodes once; per-form eval just picks the right
+    // root index.
+    let v2_nodes_vec = eval_v2::convert_tree(&legacy_nodes);
+    let v2_nodes: Rc<[types_v2::Node]> = v2_nodes_vec.into();
+
+    for &root in &roots {
+        // Skip task forms — those go through parse_curriculum_tasks.
+        let is_task = match &legacy_nodes[root] {
+            Node::App(children) if !children.is_empty() => {
+                if let Node::Symbol(s) = &legacy_nodes[children[0]] {
+                    *s == task_sym || *s == task_args_sym
+                } else { false }
+            }
+            _ => false,
+        };
+        if is_task { continue; }
+
+        // Eval the form. Top-level `(define ...)` mutates env.top_scope.
+        // Other expressions are evaluated for side effects (e.g.
+        // `(print ...)`); their values are discarded.
+        if let Err(e) = eval_v2::eval(&v2_nodes, root, env) {
+            eprintln!("  preamble: form failed: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+/// True if `v` is a numeric value with a non-integral component
+/// (recursively into lists). The §9.31 physics carve-out uses this
+/// per-task: any one fractional float in inputs/outputs flips the
+/// task to Num-typed value conversion.
+fn legacy_value_has_non_integral(v: &Value) -> bool {
+    match v {
+        Value::Num(n) => {
+            !(n.is_finite() && (n - n.round()).abs() < 1e-9
+                && *n >= i64::MIN as f64 && *n <= i64::MAX as f64)
+        }
+        Value::List(items) => items.iter().any(legacy_value_has_non_integral),
+        _ => false,
+    }
+}
+
 fn parse_curriculum_tasks(source: &str, default_depth: usize)
-    -> Vec<(String, usize, Vec<Value>, Vec<Value>)>
+    -> Vec<(String, usize, Vec<Value>, Vec<Value>, Option<usize>)>
 {
+    // Each tuple is (name, depth, inputs, expected, arity_hint).
+    //
+    // arity_hint = None     → standard `(task ...)`. Single-input synth.
+    // arity_hint = Some(N)  → `(task-args ...)`. Each input value is
+    //                         expected to be a List of length N; the
+    //                         synth uses indexed-atom seeds (§9.31
+    //                         multi-arg path) instead of a single
+    //                         InputVar.
     let mut tasks = Vec::new();
 
     let (nodes, roots) = match parse_file(source) {
@@ -1898,13 +1863,26 @@ fn parse_curriculum_tasks(source: &str, default_depth: usize)
         Err(e) => { eprintln!("Parse error in task file: {}", e); return tasks; }
     };
 
+    let task_sym = intern("task");
+    let task_args_sym = intern("task-args");
+
     for &root in &roots {
         // Each task: (task "name" depth (in1 out1) (in2 out2) ...)
+        // Or:        (task-args "name" depth (in1 out1) ...)  where
+        // each in is a list whose length is the multi-arg arity.
         if let Node::App(children) = &nodes[root] {
             if children.len() < 4 { continue; }
-            if let Node::Symbol(s) = &nodes[children[0]] {
-                if *s != intern("task") { continue; }
-            } else { continue; }
+            let head = match &nodes[children[0]] {
+                Node::Symbol(s) => *s,
+                _ => continue,
+            };
+            let is_args = if head == task_args_sym {
+                true
+            } else if head == task_sym {
+                false
+            } else {
+                continue;
+            };
 
             let name = match &nodes[children[1]] {
                 Node::Str(s) => s.clone(),
@@ -1935,7 +1913,26 @@ fn parse_curriculum_tasks(source: &str, default_depth: usize)
             }
 
             if !inputs.is_empty() {
-                tasks.push((name, depth, inputs, expected));
+                let arity_hint = if is_args {
+                    // Infer arity from the first input list's length.
+                    // Tasks with mixed list lengths fall back to None
+                    // (treated as ordinary single-input).
+                    if let Some(Value::List(items)) = inputs.first() {
+                        let n = items.len();
+                        if inputs.iter().all(|v| matches!(v, Value::List(l) if l.len() == n)) {
+                            Some(n)
+                        } else {
+                            eprintln!("warning: task-args {} has inconsistent input arities; treating as single-input", name);
+                            None
+                        }
+                    } else {
+                        eprintln!("warning: task-args {} input is not a list; treating as single-input", name);
+                        None
+                    }
+                } else {
+                    None
+                };
+                tasks.push((name, depth, inputs, expected, arity_hint));
             }
         }
     }
@@ -1946,92 +1943,8 @@ fn parse_curriculum_tasks(source: &str, default_depth: usize)
 /// Boolean decomposition: try (and P Q), (or P Q), (not P) for all
 /// bool-returning macros in the library. Returns (op, macro1, macro2, source)
 /// if a combination matches all examples. O(macros²), essentially instant.
-fn bool_decompose(
-    inputs: &[Value],
-    expected: &[Value],
-    macros: &[(String, Vec<String>, Vec<Node>, usize)],
-) -> Option<(String, String, String, String)> {
-    // Only applicable for boolean output tasks
-    if expected.is_empty() || !matches!(&expected[0], Value::Bool(_)) {
-        return None;
-    }
-
-    // Collect bool-returning unary macros and precompute their outputs
-    let mut bool_macros: Vec<(String, Vec<bool>)> = Vec::new();
-
-    for (mname, params, mnodes, mroot) in macros {
-        if params.len() != 1 { continue; }
-        let mnodes_rc: Rc<[Node]> = mnodes.clone().into();
-        let sym_params: Vec<Sym> = params.iter().map(|s| intern(s)).collect();
-        let val = Value::RustMacro(sym_params, mnodes_rc.clone(), *mroot);
-
-        let mut outputs = Vec::new();
-        let mut all_bool = true;
-        for inp in inputs {
-            let mut env = eval::make_default_env();
-            // Also load other macros so compositions work
-            for (mn2, p2, n2, r2) in macros {
-                let n2_rc: Rc<[Node]> = n2.clone().into();
-                env_define(&mut env, intern(mn2),
-                    Value::RustMacro(p2.iter().map(|s| intern(s)).collect(), n2_rc, *r2));
-            }
-            match eval::apply(&val, &[inp.clone()], &mnodes_rc, &mut env) {
-                Ok(Value::Bool(b)) => outputs.push(b),
-                _ => { all_bool = false; break; }
-            }
-        }
-        if all_bool && outputs.len() == inputs.len() {
-            bool_macros.push((mname.clone(), outputs));
-        }
-    }
-
-    let expected_bools: Vec<bool> = expected.iter().filter_map(|v| {
-        if let Value::Bool(b) = v { Some(*b) } else { None }
-    }).collect();
-    if expected_bools.len() != expected.len() { return None; }
-
-    // Try (not P)
-    for (name, outputs) in &bool_macros {
-        let negated: Vec<bool> = outputs.iter().map(|b| !b).collect();
-        if negated == expected_bools {
-            let source = format!("(lambda (x) (not ({} x)))", name);
-            return Some(("not".into(), name.clone(), String::new(), source));
-        }
-    }
-
-    // Try (and P Q) and (or P Q)
-    for (i, (name1, out1)) in bool_macros.iter().enumerate() {
-        for (name2, out2) in bool_macros.iter().skip(i) {
-            // and
-            let and_result: Vec<bool> = out1.iter().zip(out2).map(|(a, b)| *a && *b).collect();
-            if and_result == expected_bools {
-                let source = format!("(lambda (x) (and ({} x) ({} x)))", name1, name2);
-                return Some(("and".into(), name1.clone(), name2.clone(), source));
-            }
-
-            // or
-            let or_result: Vec<bool> = out1.iter().zip(out2).map(|(a, b)| *a || *b).collect();
-            if or_result == expected_bools {
-                let source = format!("(lambda (x) (or ({} x) ({} x)))", name1, name2);
-                return Some(("or".into(), name1.clone(), name2.clone(), source));
-            }
-
-            // Also try with negations: (and P (not Q)), (and (not P) Q)
-            let and_not2: Vec<bool> = out1.iter().zip(out2).map(|(a, b)| *a && !*b).collect();
-            if and_not2 == expected_bools {
-                let source = format!("(lambda (x) (and ({} x) (not ({} x))))", name1, name2);
-                return Some(("and-not".into(), name1.clone(), name2.clone(), source));
-            }
-            let and_not1: Vec<bool> = out1.iter().zip(out2).map(|(a, b)| !*a && *b).collect();
-            if and_not1 == expected_bools {
-                let source = format!("(lambda (x) (and (not ({} x)) ({} x)))", name1, name2);
-                return Some(("not-and".into(), name1.clone(), name2.clone(), source));
-            }
-        }
-    }
-
-    None
-}
+// (`bool_decompose` removed in §9.30 — replaced by
+// `synth_v2::bool_decompose` which the dispatcher calls automatically.)
 
 fn extract_lambda_body(source: &str) -> String {
     // "(lambda (x) body)" -> "body" with x replaced by s
@@ -2562,7 +2475,7 @@ fn cmd_meta_optimize(args: &[String]) {
     }
 
     // Load task files to rebuild training examples
-    let mut all_tasks: Vec<(String, usize, Vec<Value>, Vec<Value>)> = Vec::new();
+    let mut all_tasks: Vec<(String, usize, Vec<Value>, Vec<Value>, Option<usize>)> = Vec::new();
     for tf in &task_files {
         match fs::read_to_string(tf) {
             Ok(s) => {
@@ -2593,8 +2506,8 @@ fn cmd_meta_optimize(args: &[String]) {
         .collect();
 
     let training_tasks: Vec<meta::TrainingTask> = all_tasks.iter()
-        .filter(|(name, _, _, _)| trace_by_name.contains_key(name))
-        .map(|(name, _, inputs, expected)| {
+        .filter(|(name, _, _, _, _)| trace_by_name.contains_key(name))
+        .map(|(name, _, inputs, expected, _)| {
             let avail = trace_by_name.get(name)
                 .and_then(|t| if t.all_components_available.is_empty() {
                     None

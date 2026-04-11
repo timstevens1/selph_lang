@@ -1,0 +1,35 @@
+; Optimization curriculum — Stage 0-1
+; Tests synthesize_optimize integration with the curriculum runner.
+;
+; Stage 0: Constant optimization (validate plumbing)
+; Stage 1: Function optimization with constraints
+
+; === Stage 0: Constant optimization ===
+
+; Find f(x) that always returns 0
+; Fitness: sum of |f(0)| + |f(1)| + |f(5)| — minimum is 0
+(opt-task "const_zero" 1
+  :minimize "(lambda (f) (add (abs (f 0)) (add (abs (f 1)) (abs (f 5)))))")
+
+; Find f(x) that always returns 5
+; Fitness: sum of |f(0)-5| + |f(1)-5| + |f(3)-5| — minimum is 0
+(opt-task "const_five" 1
+  :minimize "(lambda (f) (add (abs (subtract (f 0) 5)) (add (abs (subtract (f 1) 5)) (abs (subtract (f 3) 5)))))")
+
+; === Stage 1: Function optimization with base constraints ===
+
+; Find f(x) = 2*x (constrained: f(0)=0, f(1)=2; optimize on f(3)=6, f(5)=10)
+(opt-task "double" 2
+  :minimize "(lambda (f) (add (abs (subtract (f 3) 6)) (abs (subtract (f 5) 10))))"
+  :spec ((0 0) (1 2)))
+
+; Find f(x) = x+1 (constrained: f(0)=1, f(1)=2; optimize on f(4)=5, f(9)=10)
+(opt-task "inc" 2
+  :minimize "(lambda (f) (add (abs (subtract (f 4) 5)) (abs (subtract (f 9) 10))))"
+  :spec ((0 1) (1 2)))
+
+; === Stage 2: Meta-optimization ===
+; Learn a priority boost for count-char that minimizes total candidates
+; on two counting tasks. The fitness function calls synthesize internally.
+(opt-task "meta_count_char_boost" 1
+  :minimize "(lambda (f) (let ((boost (f 0))) (let ((r1 (synthesize (ns (\"spec\" (list (list \"a\" 1) (list \"aa\" 2) (list \"aaa\" 3) (list \"b\" 0) (list \"ab\" 1))) (\"max-candidates\" 100) (\"priorities\" (ns (\"count-char\" boost))))))) (let ((r2 (synthesize (ns (\"spec\" (list (list \"b\" 1) (list \"bb\" 2) (list \"bbb\" 3) (list \"a\" 0) (list \"ab\" 1))) (\"max-candidates\" 100) (\"priorities\" (ns (\"count-char\" boost))))))) (add (ns-get r1 \"candidates\") (ns-get r2 \"candidates\"))))))")

@@ -105,6 +105,12 @@ pub fn value_to_string(v: &Value) -> String {
             keys.sort();
             format!("<ns {:?}>", keys)
         }
+        Value::Node(node_ref) => {
+            // Render the underlying AST as source — same path used by
+            // (synthesize ...) results. This makes Node values
+            // self-describing in REPL output and print statements.
+            node_to_source(&node_ref.nodes, node_ref.idx)
+        }
     }
 }
 
@@ -376,13 +382,24 @@ fn eval_special(
             Ok(last)
         }
         SpecialForm::Quote => {
-            // (quote x) — return the source representation as a string.
-            // Stub for now; needs node_to_source translated to new Node.
+            // (quote x) — return x as a first-class AST Node value
+            // (§9.36, item 2 of the §9.33 curriculum-only kernel).
+            //
+            // The quoted child already lives in the parser's arena;
+            // we just construct a NodeRef pointing at it. The Rc clone
+            // is one refcount bump — quote is essentially free.
+            //
+            // No evaluation happens inside the quoted expression:
+            // symbols stay as Node::Symbol entries, applications stay
+            // as Node::App, etc. Resolution happens later if and when
+            // the resulting Node is passed to (eval-node ...).
             if children.len() != 1 {
                 return Err("quote: expected one argument".into());
             }
-            // TODO: implement node_to_source for new Node enum.
-            Err("quote: not yet implemented in eval_v2".into())
+            Ok(Value::node(NodeRef {
+                nodes: Rc::clone(nodes),
+                idx: children[0],
+            }))
         }
         SpecialForm::Try => {
             // (try expr fallback)
@@ -513,6 +530,12 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("pow"), bi_pow);
     t.register(intern("sqrt"), bi_sqrt);
     t.register(intern("log"), bi_log);
+    t.register(intern("exp"), bi_exp);
+    t.register(intern("sin"), bi_sin);
+    t.register(intern("cos"), bi_cos);
+    t.register(intern("tan"), bi_tan);
+    t.register(intern("pi"), bi_pi);
+    t.register(intern("e"), bi_e);
 
     // Comparison
     t.register(intern("="), bi_eq);
@@ -604,10 +627,38 @@ fn build_builtin_table() -> BuiltinTable {
     // Bucket 6: meta operations. Most now delegate to synth_v2; only
     // synthesize-optimize remains stubbed pending the optimize port.
     t.register(intern("synthesize"), bi_synthesize);
+    t.register(intern("synthesize-args"), bi_synthesize_args);
     t.register(intern("synthesize-optimize"), bi_stub_synthesize_optimize);
     t.register(intern("test-spec"), bi_test_spec);
     t.register(intern("memorize"), bi_memorize);
     t.register(intern("eval-source"), bi_eval_source);
+
+    // §9.36: AST homoiconicity. Construction + inspection builtins
+    // for working with first-class Node values. (`quote` is a special
+    // form, registered through SpecialForm::Quote — not here.)
+    t.register(intern("make-int"), bi_make_int);
+    t.register(intern("make-num"), bi_make_num);
+    t.register(intern("make-str"), bi_make_str);
+    t.register(intern("make-bool"), bi_make_bool);
+    t.register(intern("make-symbol"), bi_make_symbol);
+    t.register(intern("make-app"), bi_make_app);
+    t.register(intern("make-if"), bi_make_if);
+    t.register(intern("make-lambda"), bi_make_lambda);
+    t.register(intern("make-let"), bi_make_let);
+    t.register(intern("node?"), bi_is_node);
+    t.register(intern("node-kind"), bi_node_kind);
+    t.register(intern("node-int"), bi_node_int);
+    t.register(intern("node-num"), bi_node_num);
+    t.register(intern("node-str"), bi_node_str);
+    t.register(intern("node-bool"), bi_node_bool);
+    t.register(intern("node-symbol"), bi_node_symbol);
+    t.register(intern("node-children"), bi_node_children);
+    t.register(intern("node-params"), bi_node_params);
+    t.register(intern("node-bindings"), bi_node_bindings);
+    t.register(intern("node-special-form"), bi_node_special_form);
+    t.register(intern("eval-node"), bi_eval_node);
+    t.register(intern("parse-source"), bi_parse_source);
+    t.register(intern("parse-file"), bi_parse_file);
 
     t
 }
@@ -622,6 +673,8 @@ fn build_default_scope() -> Scope {
         "add", "+", "subtract", "-", "multiply", "*", "divide", "/",
         "modulo", "%", "negate", "abs", "min", "max",
         "floor", "ceil", "round", "pow", "sqrt", "log",
+        // §9.31 physics curriculum — transcendentals & constants
+        "exp", "sin", "cos", "tan", "pi", "e",
         // Comparison
         "=", "<", ">", "<=", ">=", "not", "even", "odd",
         // String
@@ -648,7 +701,18 @@ fn build_default_scope() -> Scope {
         // Errors / control
         "error",
         // Bucket 6 stubs
-        "synthesize", "synthesize-optimize", "test-spec", "memorize", "eval-source",
+        "synthesize", "synthesize-args", "synthesize-optimize", "test-spec", "memorize", "eval-source",
+        // §9.36 AST homoiconicity — construction
+        "make-int", "make-num", "make-str", "make-bool", "make-symbol",
+        "make-app", "make-if", "make-lambda", "make-let",
+        // §9.36 AST homoiconicity — inspection
+        "node?", "node-kind", "node-int", "node-num", "node-str",
+        "node-bool", "node-symbol", "node-children", "node-params",
+        "node-bindings", "node-special-form",
+        // §9.36 AST homoiconicity — evaluation
+        "eval-node",
+        // §9.36 AST homoiconicity — parsing
+        "parse-source", "parse-file",
     ];
     for name in names {
         let sym = intern(name);
@@ -842,6 +906,34 @@ fn bi_log(args: &[Value], _env: &Env) -> Result<Value, String> {
     Ok(Value::Num(a.ln()))
 }
 
+fn bi_exp(args: &[Value], _env: &Env) -> Result<Value, String> {
+    let (a, _) = as_nums(&args[0], &Value::Num(0.0))?;
+    Ok(Value::Num(a.exp()))
+}
+
+fn bi_sin(args: &[Value], _env: &Env) -> Result<Value, String> {
+    let (a, _) = as_nums(&args[0], &Value::Num(0.0))?;
+    Ok(Value::Num(a.sin()))
+}
+
+fn bi_cos(args: &[Value], _env: &Env) -> Result<Value, String> {
+    let (a, _) = as_nums(&args[0], &Value::Num(0.0))?;
+    Ok(Value::Num(a.cos()))
+}
+
+fn bi_tan(args: &[Value], _env: &Env) -> Result<Value, String> {
+    let (a, _) = as_nums(&args[0], &Value::Num(0.0))?;
+    Ok(Value::Num(a.tan()))
+}
+
+fn bi_pi(_args: &[Value], _env: &Env) -> Result<Value, String> {
+    Ok(Value::Num(std::f64::consts::PI))
+}
+
+fn bi_e(_args: &[Value], _env: &Env) -> Result<Value, String> {
+    Ok(Value::Num(std::f64::consts::E))
+}
+
 // ── comparison ──────────────────────────────────────────────────────────────
 
 fn bi_eq(args: &[Value], _env: &Env) -> Result<Value, String> {
@@ -864,6 +956,16 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b))
         }
         (Value::Nil, Value::Nil) => true,
+        // Node equality is identity-based (§9.35 D8/R5): two Node values
+        // are equal iff they reference the same arena and the same index.
+        // Structural equality on ASTs is expensive and rarely the right
+        // semantics — usually you want either cache-hit identity or
+        // explicit string comparison via node-to-source. A separate
+        // (node-equal? a b) builtin can be added later if structural
+        // equality is wanted.
+        (Value::Node(x), Value::Node(y)) => {
+            std::rc::Rc::ptr_eq(&x.nodes, &y.nodes) && x.idx == y.idx
+        }
         _ => false,
     }
 }
@@ -1434,6 +1536,7 @@ fn bi_type_of(args: &[Value], _env: &Env) -> Result<Value, String> {
         Value::List(_) => "list",
         Value::Ns(_) => "namespace",
         Value::Function(_) | Value::Builtin(_) => "function",
+        Value::Node(_) => "node",
         Value::Nil => "nil",
     };
     Ok(Value::str(name))
@@ -1446,6 +1549,550 @@ fn bi_error(args: &[Value], _env: &Env) -> Result<Value, String> {
         value_to_string(&args[0])
     };
     Err(msg)
+}
+
+// ── §9.36 AST homoiconicity: construction + inspection builtins ─────────────
+//
+// Item 2 of the §9.33 curriculum-only kernel. SELPH programs construct AST
+// nodes via `(make-int 5)`, `(make-app "add" arg1 arg2)`, etc., inspect
+// them via `(node-kind n)` and friends, and evaluate them via
+// `(eval-node n)`. Combined with `(quote ...)` (sub-step 2b) and
+// `(parse-source "...")` (sub-step 2f), this gives SELPH programs the
+// ability to manipulate other SELPH programs as data — the foundation
+// for SELPH-side decomposers (item 3) and type predicates (item 4).
+//
+// Design notes (from §9.35):
+//   - Each `make-*` allocates a fresh Rc-shared arena. Sub-trees are
+//     copied via `synth_v2::remap_node`.
+//   - `make-app` accepts the head as either a Symbol Node or a string
+//     (auto-wrapped via `intern`). It NEVER accepts a Function value —
+//     a Function carries env capture and would smuggle runtime env into
+//     pure data.
+//   - `make-lambda` and `make-let` take param/binding names as Strings.
+//   - `eval-node` uses the caller's env (no second env parameter).
+//   - Inspection accessors (node-int, node-symbol, etc.) are typed and
+//     error on the wrong node kind. `node-kind` returns a string for
+//     dispatch.
+
+/// Helper: extract the underlying NodeRef from a Value::Node argument,
+/// returning a clean error message naming the builtin if the value
+/// isn't a node.
+fn as_node<'a>(builtin: &str, v: &'a Value) -> Result<&'a NodeRef, String> {
+    match v {
+        Value::Node(n) => Ok(n),
+        _ => Err(format!("{}: expected a Node, got {:?}", builtin, v)),
+    }
+}
+
+/// Helper: build a single-Node Value::Node arena.
+fn single_node_value(node: Node) -> Value {
+    let nodes_rc: Rc<[Node]> = vec![node].into();
+    Value::node(NodeRef {
+        nodes: nodes_rc,
+        idx: 0,
+    })
+}
+
+// ── Construction builtins ───────────────────────────────────────────────────
+
+fn bi_make_int(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("make-int: expected 1 arg, got {}", args.len()));
+    }
+    let n = match &args[0] {
+        Value::Int(n) => *n,
+        Value::Num(n) => *n as i64,
+        other => return Err(format!("make-int: expected number, got {:?}", other)),
+    };
+    Ok(single_node_value(Node::Int(n)))
+}
+
+fn bi_make_num(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("make-num: expected 1 arg, got {}", args.len()));
+    }
+    let n = match &args[0] {
+        Value::Int(n) => *n as f64,
+        Value::Num(n) => *n,
+        other => return Err(format!("make-num: expected number, got {:?}", other)),
+    };
+    Ok(single_node_value(Node::Num(n)))
+}
+
+fn bi_make_str(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("make-str: expected 1 arg, got {}", args.len()));
+    }
+    let s = match &args[0] {
+        Value::Str(s) => s.as_ref().to_string(),
+        other => return Err(format!("make-str: expected string, got {:?}", other)),
+    };
+    Ok(single_node_value(Node::Str(s)))
+}
+
+fn bi_make_bool(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("make-bool: expected 1 arg, got {}", args.len()));
+    }
+    let b = match &args[0] {
+        Value::Bool(b) => *b,
+        other => return Err(format!("make-bool: expected bool, got {:?}", other)),
+    };
+    Ok(single_node_value(Node::Bool(b)))
+}
+
+fn bi_make_symbol(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("make-symbol: expected 1 arg, got {}", args.len()));
+    }
+    let name = match &args[0] {
+        Value::Str(s) => s.as_ref().to_string(),
+        other => return Err(format!("make-symbol: expected string, got {:?}", other)),
+    };
+    let sym = intern(&name);
+    Ok(single_node_value(Node::Symbol(sym)))
+}
+
+/// Internal: copy a NodeRef's nodes into `out`, applying offset, and return
+/// the new index of the root. Used by all multi-arg constructors.
+fn copy_subtree(node_ref: &NodeRef, out: &mut Vec<Node>) -> usize {
+    let offset = out.len();
+    for n in node_ref.nodes.iter() {
+        out.push(crate::synth_v2::remap_node(n, offset));
+    }
+    node_ref.idx + offset
+}
+
+/// Internal: extract a Node value from an argument that may be a
+/// Value::Node OR a Value::Str (auto-wrapped as a Symbol Node). Used
+/// only by make-app's head argument for ergonomics.
+fn arg_to_node_or_symbol_str(builtin: &str, v: &Value) -> Result<NodeRef, String> {
+    match v {
+        Value::Node(n) => Ok(n.clone()),
+        Value::Str(s) => {
+            let sym = intern(s.as_ref());
+            let nodes_rc: Rc<[Node]> = vec![Node::Symbol(sym)].into();
+            Ok(NodeRef {
+                nodes: nodes_rc,
+                idx: 0,
+            })
+        }
+        other => Err(format!(
+            "{}: head must be a Node or string, got {:?}",
+            builtin, other
+        )),
+    }
+}
+
+fn bi_make_app(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("make-app: expected at least 1 arg (head)".into());
+    }
+    let head = arg_to_node_or_symbol_str("make-app", &args[0])?;
+    let mut out: Vec<Node> = Vec::new();
+    let head_idx = copy_subtree(&head, &mut out);
+    let mut child_indices: Vec<usize> = vec![head_idx];
+    for arg in &args[1..] {
+        let node_ref = as_node("make-app", arg)?;
+        let idx = copy_subtree(node_ref, &mut out);
+        child_indices.push(idx);
+    }
+    let app_idx = out.len();
+    out.push(Node::App(child_indices));
+    let nodes_rc: Rc<[Node]> = out.into();
+    Ok(Value::node(NodeRef {
+        nodes: nodes_rc,
+        idx: app_idx,
+    }))
+}
+
+fn bi_make_if(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(format!(
+            "make-if: expected 3 args (cond, then, else), got {}",
+            args.len()
+        ));
+    }
+    let cond = as_node("make-if", &args[0])?;
+    let then_ = as_node("make-if", &args[1])?;
+    let else_ = as_node("make-if", &args[2])?;
+    let mut out: Vec<Node> = Vec::new();
+    let cond_idx = copy_subtree(cond, &mut out);
+    let then_idx = copy_subtree(then_, &mut out);
+    let else_idx = copy_subtree(else_, &mut out);
+    let if_idx = out.len();
+    out.push(Node::If(cond_idx, then_idx, else_idx));
+    let nodes_rc: Rc<[Node]> = out.into();
+    Ok(Value::node(NodeRef {
+        nodes: nodes_rc,
+        idx: if_idx,
+    }))
+}
+
+fn bi_make_lambda(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "make-lambda: expected 2 args (params-list, body), got {}",
+            args.len()
+        ));
+    }
+    let params_list = match &args[0] {
+        Value::List(l) => l,
+        other => {
+            return Err(format!(
+                "make-lambda: first arg must be a list of param names, got {:?}",
+                other
+            ))
+        }
+    };
+    let mut params: Vec<Sym> = Vec::with_capacity(params_list.len());
+    for p in params_list.iter() {
+        match p {
+            Value::Str(s) => params.push(intern(s.as_ref())),
+            other => {
+                return Err(format!(
+                    "make-lambda: param names must be strings, got {:?}",
+                    other
+                ))
+            }
+        }
+    }
+    let body = as_node("make-lambda", &args[1])?;
+    let mut out: Vec<Node> = Vec::new();
+    let body_idx = copy_subtree(body, &mut out);
+    let lam_idx = out.len();
+    out.push(Node::Lambda(params, body_idx));
+    let nodes_rc: Rc<[Node]> = out.into();
+    Ok(Value::node(NodeRef {
+        nodes: nodes_rc,
+        idx: lam_idx,
+    }))
+}
+
+fn bi_make_let(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "make-let: expected 2 args (bindings-list, body), got {}",
+            args.len()
+        ));
+    }
+    let bindings_list = match &args[0] {
+        Value::List(l) => l,
+        other => {
+            return Err(format!(
+                "make-let: first arg must be a list of (name, value-node) pairs, got {:?}",
+                other
+            ))
+        }
+    };
+
+    let mut out: Vec<Node> = Vec::new();
+    let mut bindings: Vec<(Sym, usize)> = Vec::with_capacity(bindings_list.len());
+    for (i, pair) in bindings_list.iter().enumerate() {
+        let pair_list = match pair {
+            Value::List(l) if l.len() == 2 => l,
+            other => {
+                return Err(format!(
+                    "make-let: binding {} must be a (name, value-node) pair, got {:?}",
+                    i, other
+                ))
+            }
+        };
+        let name = match &pair_list[0] {
+            Value::Str(s) => intern(s.as_ref()),
+            other => {
+                return Err(format!(
+                    "make-let: binding {} name must be a string, got {:?}",
+                    i, other
+                ))
+            }
+        };
+        let value_node = as_node("make-let", &pair_list[1])?;
+        let idx = copy_subtree(value_node, &mut out);
+        bindings.push((name, idx));
+    }
+    let body = as_node("make-let", &args[1])?;
+    let body_idx = copy_subtree(body, &mut out);
+    let let_idx = out.len();
+    out.push(Node::Let(bindings, body_idx));
+    let nodes_rc: Rc<[Node]> = out.into();
+    Ok(Value::node(NodeRef {
+        nodes: nodes_rc,
+        idx: let_idx,
+    }))
+}
+
+// ── §9.36 inspection builtins ───────────────────────────────────────────────
+
+/// Helper: build a NodeRef into the same arena as `parent` but pointing
+/// at child index `idx`. Used by `node-children` to expose subexpressions
+/// without copying — the new NodeRefs share the parent's Rc.
+fn child_node_value(parent: &NodeRef, idx: usize) -> Value {
+    Value::node(NodeRef {
+        nodes: Rc::clone(&parent.nodes),
+        idx,
+    })
+}
+
+fn bi_is_node(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("node?: expected 1 arg, got {}", args.len()));
+    }
+    Ok(Value::Bool(matches!(&args[0], Value::Node(_))))
+}
+
+fn bi_node_kind(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("node-kind: expected 1 arg, got {}", args.len()));
+    }
+    let node_ref = as_node("node-kind", &args[0])?;
+    let kind = match &node_ref.nodes[node_ref.idx] {
+        Node::Int(_) => "int",
+        Node::Num(_) => "num",
+        Node::Str(_) => "str",
+        Node::Bool(_) => "bool",
+        Node::Symbol(_) => "symbol",
+        Node::App(_) => "app",
+        Node::SpecialApp(_, _) => "special-app",
+        Node::If(_, _, _) => "if",
+        Node::Lambda(_, _) => "lambda",
+        Node::Let(_, _) => "let",
+    };
+    Ok(Value::str(kind))
+}
+
+fn bi_node_int(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("node-int: expected 1 arg, got {}", args.len()));
+    }
+    let node_ref = as_node("node-int", &args[0])?;
+    match &node_ref.nodes[node_ref.idx] {
+        Node::Int(n) => Ok(Value::Int(*n)),
+        other => Err(format!("node-int: expected Int node, got {:?}", other)),
+    }
+}
+
+fn bi_node_num(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("node-num: expected 1 arg, got {}", args.len()));
+    }
+    let node_ref = as_node("node-num", &args[0])?;
+    match &node_ref.nodes[node_ref.idx] {
+        Node::Num(n) => Ok(Value::Num(*n)),
+        other => Err(format!("node-num: expected Num node, got {:?}", other)),
+    }
+}
+
+fn bi_node_str(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("node-str: expected 1 arg, got {}", args.len()));
+    }
+    let node_ref = as_node("node-str", &args[0])?;
+    match &node_ref.nodes[node_ref.idx] {
+        Node::Str(s) => Ok(Value::str(s)),
+        other => Err(format!("node-str: expected Str node, got {:?}", other)),
+    }
+}
+
+fn bi_node_bool(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("node-bool: expected 1 arg, got {}", args.len()));
+    }
+    let node_ref = as_node("node-bool", &args[0])?;
+    match &node_ref.nodes[node_ref.idx] {
+        Node::Bool(b) => Ok(Value::Bool(*b)),
+        other => Err(format!("node-bool: expected Bool node, got {:?}", other)),
+    }
+}
+
+fn bi_node_symbol(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("node-symbol: expected 1 arg, got {}", args.len()));
+    }
+    let node_ref = as_node("node-symbol", &args[0])?;
+    match &node_ref.nodes[node_ref.idx] {
+        Node::Symbol(sym) => Ok(Value::str(resolve(*sym))),
+        other => Err(format!("node-symbol: expected Symbol node, got {:?}", other)),
+    }
+}
+
+fn bi_node_children(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "node-children: expected 1 arg, got {}",
+            args.len()
+        ));
+    }
+    let node_ref = as_node("node-children", &args[0])?;
+    // Per §9.35 D8: node-children returns subexpressions only.
+    // Structural metadata (params, bindings, special-form name) is
+    // accessed via the kind-specific accessors below.
+    let child_indices: Vec<usize> = match &node_ref.nodes[node_ref.idx] {
+        Node::Int(_) | Node::Num(_) | Node::Str(_) | Node::Bool(_) | Node::Symbol(_) => {
+            Vec::new()
+        }
+        Node::App(c) => c.clone(),
+        Node::SpecialApp(_, c) => c.clone(),
+        Node::If(a, b, c) => vec![*a, *b, *c],
+        Node::Lambda(_, body) => vec![*body],
+        Node::Let(_, body) => vec![*body],
+    };
+    let children: Vec<Value> = child_indices
+        .iter()
+        .map(|&i| child_node_value(node_ref, i))
+        .collect();
+    Ok(Value::list(children))
+}
+
+fn bi_node_params(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("node-params: expected 1 arg, got {}", args.len()));
+    }
+    let node_ref = as_node("node-params", &args[0])?;
+    match &node_ref.nodes[node_ref.idx] {
+        Node::Lambda(params, _) => {
+            let names: Vec<Value> = params
+                .iter()
+                .map(|sym| Value::str(resolve(*sym)))
+                .collect();
+            Ok(Value::list(names))
+        }
+        other => Err(format!(
+            "node-params: expected Lambda node, got {:?}",
+            other
+        )),
+    }
+}
+
+fn bi_node_bindings(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "node-bindings: expected 1 arg, got {}",
+            args.len()
+        ));
+    }
+    let node_ref = as_node("node-bindings", &args[0])?;
+    match &node_ref.nodes[node_ref.idx] {
+        Node::Let(bindings, _) => {
+            let pairs: Vec<Value> = bindings
+                .iter()
+                .map(|(name, value_idx)| {
+                    Value::list(vec![
+                        Value::str(resolve(*name)),
+                        child_node_value(node_ref, *value_idx),
+                    ])
+                })
+                .collect();
+            Ok(Value::list(pairs))
+        }
+        other => Err(format!(
+            "node-bindings: expected Let node, got {:?}",
+            other
+        )),
+    }
+}
+
+/// `(parse-source source)` — parse a single SELPH expression from a
+/// string and return it as a Node value. The result is one Node ref
+/// pointing into a fresh Rc-shared arena.
+///
+/// Companion to `eval-source`: `parse-source` returns the AST without
+/// running it, while `eval-source` parses and evaluates in one step.
+/// `(eval-node (parse-source s))` is equivalent to `(eval-source s)`.
+fn bi_parse_source(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("parse-source: expected 1 arg, got {}", args.len()));
+    }
+    let src = match &args[0] {
+        Value::Str(s) => s.as_ref().to_string(),
+        other => {
+            return Err(format!(
+                "parse-source: expected string, got {:?}",
+                other
+            ))
+        }
+    };
+    let (old_nodes, root) = crate::parser::parse_source(&src)
+        .map_err(|e| format!("parse-source: {}", e))?;
+    let new_nodes_vec = convert_tree(&old_nodes);
+    let nodes_rc: Rc<[Node]> = new_nodes_vec.into();
+    Ok(Value::node(NodeRef {
+        nodes: nodes_rc,
+        idx: root,
+    }))
+}
+
+/// `(parse-file source)` — parse a SELPH source string containing one
+/// or more top-level forms and return a list of Node values, one per
+/// form. All Node values share a single underlying Rc<[Node]> arena;
+/// the list elements differ only in their root index.
+fn bi_parse_file(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("parse-file: expected 1 arg, got {}", args.len()));
+    }
+    let src = match &args[0] {
+        Value::Str(s) => s.as_ref().to_string(),
+        other => return Err(format!("parse-file: expected string, got {:?}", other)),
+    };
+    let (old_nodes, roots) = crate::parser::parse_file(&src)
+        .map_err(|e| format!("parse-file: {}", e))?;
+    let new_nodes_vec = convert_tree(&old_nodes);
+    let nodes_rc: Rc<[Node]> = new_nodes_vec.into();
+    let nodes: Vec<Value> = roots
+        .iter()
+        .map(|&r| {
+            Value::node(NodeRef {
+                nodes: Rc::clone(&nodes_rc),
+                idx: r,
+            })
+        })
+        .collect();
+    Ok(Value::list(nodes))
+}
+
+/// `(eval-node n)` — evaluate an AST Node value against the caller's
+/// current env. The Rc<[Node]> arena is borrowed (refcount bumped),
+/// no copy. Returns whatever the Node evaluates to.
+///
+/// Combined with `quote`, `make-*`, and `parse-source`, this completes
+/// the homoiconicity round trip: SELPH programs can construct, inspect,
+/// and *run* arbitrary AST trees as data.
+fn bi_eval_node(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("eval-node: expected 1 arg, got {}", args.len()));
+    }
+    let node_ref = as_node("eval-node", &args[0])?;
+    eval(&node_ref.nodes, node_ref.idx, env)
+}
+
+fn bi_node_special_form(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "node-special-form: expected 1 arg, got {}",
+            args.len()
+        ));
+    }
+    let node_ref = as_node("node-special-form", &args[0])?;
+    match &node_ref.nodes[node_ref.idx] {
+        Node::SpecialApp(form, _) => {
+            let name = match form {
+                SpecialForm::Define => "define",
+                SpecialForm::Do => "do",
+                SpecialForm::Quote => "quote",
+                SpecialForm::And => "and",
+                SpecialForm::Or => "or",
+                SpecialForm::Try => "try",
+                SpecialForm::EvalIn => "eval-in",
+                SpecialForm::Dispatch => "dispatch",
+                SpecialForm::Ns => "ns",
+            };
+            Ok(Value::str(name))
+        }
+        other => Err(format!(
+            "node-special-form: expected SpecialApp node, got {:?}",
+            other
+        )),
+    }
 }
 
 // ── Bucket 6 stubs ──────────────────────────────────────────────────────────
@@ -1629,8 +2276,25 @@ fn bi_synthesize(args: &[Value], env: &Env) -> Result<Value, String> {
     // Build the component catalog from the caller's env. Library
     // functions defined in env are auto-discovered as components.
     let skip = crate::synth_v2::default_skip_set();
-    let components = crate::synth_v2::default_synth_components(env, &skip);
-    let universe = crate::synth_v2::TypeUniverse::primitives();
+    let mut components = crate::synth_v2::default_synth_components(env, &skip);
+    // §9.37 Stage B: build the type universe from `__types__` if
+    // present. Falls back to the primitive baseline when absent.
+    let universe = crate::synth_v2::TypeUniverse::from_env(env);
+
+    // §9.34 — `("heuristic" lambda)` field, if present, re-scores and
+    // re-sorts the catalog before dispatch. The lambda is a `Value::Function`
+    // (or `Value::Builtin`) supplied directly by the SELPH caller, so the
+    // value-form helper in `meta_v2` skips the per-component
+    // eval-the-lambda-Node step that the source-loaded path uses. This
+    // is the foundation for SELPH-side meta-learning loops: a curriculum
+    // can synthesize a heuristic candidate and pass it directly into the
+    // inner `synthesize` call without going through any CLI flag.
+    if let Some(h) = ns.get(&intern("heuristic")) {
+        components = crate::meta_v2::apply_heuristic_value_for_task(
+            h, &components, &inputs, &expected, env,
+        )
+        .map_err(|e| format!("synthesize: {}", e))?;
+    }
 
     let result = crate::synth_v2::synthesize_with_strategies(
         &components,
@@ -1659,6 +2323,118 @@ fn bi_synthesize(args: &[Value], env: &Env) -> Result<Value, String> {
     out.insert(intern("candidates"), Value::Int(result.candidates_explored as i64));
     out.insert(intern("source"), Value::str(source));
     out.insert(intern("strategy"), Value::str(strategy_name));
+    Ok(Value::ns(out))
+}
+
+/// `(synthesize-args <namespace>)` — the §9.39/§9.40 multi-arg
+/// counterpart to `synthesize`. The spec field is a list of
+/// `[input output]` pairs where each `input` is a list of length
+/// `arity`. The arity is inferred from the first row's input length;
+/// each per-position type is inferred from that row's value at the
+/// corresponding index. Synthesis dispatches through
+/// `synth_v2::synthesize_args` so the search seeds the pool with
+/// indexed atoms, collapsing the multi-arg fanout that the old
+/// list-input single-input path suffered from.
+///
+/// Returns the same `{found, candidates, source, strategy}`
+/// namespace as `synthesize`.
+fn bi_synthesize_args(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("synthesize-args: expected 1 argument (namespace)".into());
+    }
+    let ns = match &args[0] {
+        Value::Ns(m) => m.clone(),
+        _ => return Err("synthesize-args: argument must be a namespace".into()),
+    };
+
+    let spec_val = ns
+        .get(&intern("spec"))
+        .ok_or("synthesize-args: namespace must have \"spec\" field")?;
+    let pairs = match spec_val {
+        Value::List(l) => l.clone(),
+        _ => return Err("synthesize-args: \"spec\" must be a list of [input, output] pairs".into()),
+    };
+    if pairs.is_empty() {
+        return Err("synthesize-args: spec is empty".into());
+    }
+    let mut inputs = Vec::with_capacity(pairs.len());
+    let mut expected = Vec::with_capacity(pairs.len());
+    for pair in pairs.iter() {
+        let p = match pair {
+            Value::List(p) if p.len() == 2 => p,
+            _ => return Err("synthesize-args: each spec entry must be [input, output]".into()),
+        };
+        inputs.push(p[0].clone());
+        expected.push(p[1].clone());
+    }
+
+    // Each input must be a list — that's what marks it as multi-arg.
+    // Infer per-position types from the first row.
+    let first_row = match &inputs[0] {
+        Value::List(items) => items.clone(),
+        _ => return Err("synthesize-args: each input must be a list (the args tuple)".into()),
+    };
+    let arity = first_row.len();
+    let arg_types: Vec<crate::intern::Sym> = first_row
+        .iter()
+        .map(|v| v.type_sym().unwrap_or_else(crate::types_v2::type_any))
+        .collect();
+    // Sanity-check that every input row has the same arity.
+    for inp in &inputs {
+        match inp {
+            Value::List(items) if items.len() == arity => {}
+            _ => return Err(format!(
+                "synthesize-args: every input must be a list of length {}", arity
+            )),
+        }
+    }
+
+    let max_depth = ns
+        .get(&intern("max-depth"))
+        .and_then(|v| match v {
+            Value::Int(n) => Some(*n as usize),
+            Value::Num(n) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(4);
+    let max_candidates = ns
+        .get(&intern("max-candidates"))
+        .and_then(|v| match v {
+            Value::Int(n) => Some(*n as usize),
+            Value::Num(n) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(100000);
+
+    let skip = crate::synth_v2::default_skip_set();
+    let components = crate::synth_v2::default_synth_components(env, &skip);
+    let universe = crate::synth_v2::TypeUniverse::from_env(env);
+
+    let result = crate::synth_v2::synthesize_args(
+        &components,
+        &inputs,
+        &arg_types,
+        &expected,
+        env,
+        &universe,
+        max_depth,
+        max_candidates,
+    );
+
+    let source = if result.found {
+        let nodes = result.nodes.as_ref().unwrap();
+        let root = result.root.unwrap();
+        node_to_source(nodes, root)
+    } else {
+        String::new()
+    };
+
+    let mut out = NsMap::new();
+    out.insert(intern("found"), Value::Bool(result.found));
+    out.insert(intern("candidates"), Value::Int(result.candidates_explored as i64));
+    out.insert(intern("source"), Value::str(source));
+    out.insert(intern("strategy"), Value::str("Flat".to_string()));
+    out.insert(intern("arity"), Value::Int(arity as i64));
     Ok(Value::ns(out))
 }
 
@@ -2406,6 +3182,999 @@ mod tests {
         assert!(matches!(r, Value::Nil));
     }
 
+    // ── §9.36 sub-step 2b: quote returns Node values ────────────────────
+
+    #[test]
+    fn quote_returns_node_value_for_literal() {
+        // (quote 42) returns a Node value pointing at the Int literal.
+        // We verify the kind by inspecting node_to_source on the underlying
+        // NodeRef — once node-kind exists in 2d we can do it from SELPH.
+        let src = r#"(quote 42)"#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Node(node_ref) => {
+                let rendered = node_to_source(&node_ref.nodes, node_ref.idx);
+                assert_eq!(rendered, "42");
+            }
+            other => panic!("expected Value::Node, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn quote_returns_node_value_for_application() {
+        // (quote (add 1 2)) returns a Node value for the App, no eval.
+        // If eval happened, we'd see Int(3) instead.
+        let src = r#"(quote (add 1 2))"#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Node(node_ref) => {
+                let rendered = node_to_source(&node_ref.nodes, node_ref.idx);
+                assert_eq!(rendered, "(add 1 2)");
+            }
+            other => panic!("expected Value::Node, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn quote_returns_node_value_for_symbol() {
+        // (quote x) returns a Node value for the symbol — does NOT
+        // attempt to look up `x` in the env.
+        let src = r#"(quote x)"#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Node(node_ref) => {
+                let rendered = node_to_source(&node_ref.nodes, node_ref.idx);
+                assert_eq!(rendered, "x");
+            }
+            other => panic!("expected Value::Node, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn quote_does_not_evaluate_inside() {
+        // Sanity check: a quoted expression with a free variable that
+        // would otherwise produce an unbound error must not error.
+        let src = r#"(quote (some-undefined-symbol 1 2))"#;
+        let r = run_file(src);
+        assert!(r.is_ok(), "quote must not eval its argument; got {:?}", r);
+    }
+
+    #[test]
+    fn quote_value_renders_in_value_to_string() {
+        // Value::Node renders via node_to_source in value_to_string,
+        // so quoted values are self-describing in print output.
+        let nodes_rc: Rc<[Node]> = vec![Node::Int(7)].into();
+        let v = Value::node(NodeRef { nodes: nodes_rc, idx: 0 });
+        assert_eq!(value_to_string(&v), "7");
+    }
+
+    #[test]
+    fn type_of_returns_node_for_quoted_value() {
+        let src = r#"(type-of (quote (add 1 2)))"#;
+        let r = run_file(src).unwrap();
+        assert!(
+            matches!(r, Value::Str(ref s) if s.as_ref() == "node"),
+            "expected Str(\"node\"), got {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn quote_equality_is_identity_based() {
+        // §9.35 D8: two distinct quote calls produce distinct Node
+        // values even when their underlying parser arena is the same
+        // (run_file parses the whole input as one pass, so both quotes
+        // share an Rc<[Node]>). The two NodeRefs point at distinct
+        // Symbol nodes in that shared arena, so they have different
+        // indices — and thus the identity-based equality returns false.
+        let src = r#"(= (quote x) (quote x))"#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Bool(b) => assert!(!b, "expected false, got true"),
+            other => panic!("expected Bool, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn quote_equality_true_for_self_comparison() {
+        // The same NodeRef compared to itself IS equal — both arenas
+        // are the same Rc and the indices match.
+        let src = r#"
+            (define q (quote (add 1 2)))
+            (= q q)
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Bool(b) => assert!(b, "expected true, got false"),
+            other => panic!("expected Bool, got {:?}", other),
+        }
+    }
+
+    // ── §9.36 sub-step 2c: construction builtins ────────────────────────
+
+    /// Helper: assert that a Value is a Node and that node_to_source on
+    /// its underlying NodeRef matches `expected`.
+    fn assert_node_renders(v: &Value, expected: &str) {
+        match v {
+            Value::Node(node_ref) => {
+                let rendered = node_to_source(&node_ref.nodes, node_ref.idx);
+                assert_eq!(
+                    rendered, expected,
+                    "node renders to {:?}, expected {:?}",
+                    rendered, expected
+                );
+            }
+            other => panic!("expected Value::Node, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn make_int_builds_int_node() {
+        let r = run_file("(make-int 42)").unwrap();
+        assert_node_renders(&r, "42");
+    }
+
+    #[test]
+    fn make_num_builds_num_node() {
+        let r = run_file("(make-num 1.5)").unwrap();
+        assert_node_renders(&r, "1.5");
+    }
+
+    #[test]
+    fn make_str_builds_str_node() {
+        let r = run_file(r#"(make-str "hello")"#).unwrap();
+        assert_node_renders(&r, r#""hello""#);
+    }
+
+    #[test]
+    fn make_bool_builds_bool_node() {
+        let r = run_file("(make-bool true)").unwrap();
+        assert_node_renders(&r, "true");
+    }
+
+    #[test]
+    fn make_symbol_builds_symbol_node() {
+        let r = run_file(r#"(make-symbol "x")"#).unwrap();
+        assert_node_renders(&r, "x");
+    }
+
+    #[test]
+    fn make_app_with_string_head() {
+        // String head shorthand: (make-app "add" 1-node 2-node)
+        let r = run_file(r#"(make-app "add" (make-int 1) (make-int 2))"#).unwrap();
+        assert_node_renders(&r, "(add 1 2)");
+    }
+
+    #[test]
+    fn make_app_with_symbol_node_head() {
+        // Explicit Symbol Node head: equivalent to the string-head form.
+        let r = run_file(
+            r#"(make-app (make-symbol "add") (make-int 1) (make-int 2))"#,
+        )
+        .unwrap();
+        assert_node_renders(&r, "(add 1 2)");
+    }
+
+    #[test]
+    fn make_app_rejects_non_node_arg() {
+        // make-app args must be Node values (the head can be a string,
+        // but other args cannot).
+        let r = run_file(r#"(make-app "add" 1 2)"#);
+        assert!(r.is_err(), "expected error, got {:?}", r);
+        let msg = r.unwrap_err();
+        assert!(
+            msg.contains("make-app") && msg.contains("expected a Node"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn make_app_rejects_non_node_non_string_head() {
+        let r = run_file(r#"(make-app 42 (make-int 1))"#);
+        assert!(r.is_err(), "expected error, got {:?}", r);
+        let msg = r.unwrap_err();
+        assert!(
+            msg.contains("make-app") && msg.contains("head must be a Node or string"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn make_if_builds_if_node() {
+        let r = run_file(
+            r#"(make-if (make-bool true) (make-int 1) (make-int 2))"#,
+        )
+        .unwrap();
+        assert_node_renders(&r, "(if true 1 2)");
+    }
+
+    #[test]
+    fn make_lambda_builds_lambda_node() {
+        let r = run_file(
+            r#"(make-lambda (list "x") (make-app "add" (make-symbol "x") (make-int 1)))"#,
+        )
+        .unwrap();
+        assert_node_renders(&r, "(lambda (x) (add x 1))");
+    }
+
+    #[test]
+    fn make_lambda_supports_multiple_params() {
+        let r = run_file(
+            r#"(make-lambda (list "x" "y") (make-app "add" (make-symbol "x") (make-symbol "y")))"#,
+        )
+        .unwrap();
+        assert_node_renders(&r, "(lambda (x y) (add x y))");
+    }
+
+    #[test]
+    fn make_let_builds_let_node() {
+        let r = run_file(
+            r#"(make-let (list (list "x" (make-int 5)))
+                         (make-app "add" (make-symbol "x") (make-int 1)))"#,
+        )
+        .unwrap();
+        assert_node_renders(&r, "(let ((x 5)) (add x 1))");
+    }
+
+    #[test]
+    fn make_app_compose_nested() {
+        // Build (multiply (add x 1) (subtract x 2)) bottom-up.
+        let r = run_file(
+            r#"
+            (make-app "multiply"
+              (make-app "add" (make-symbol "x") (make-int 1))
+              (make-app "subtract" (make-symbol "x") (make-int 2)))
+            "#,
+        )
+        .unwrap();
+        assert_node_renders(&r, "(multiply (add x 1) (subtract x 2))");
+    }
+
+    #[test]
+    fn make_int_rejects_non_number() {
+        let r = run_file(r#"(make-int "hello")"#);
+        assert!(r.is_err(), "expected error, got {:?}", r);
+    }
+
+    #[test]
+    fn make_lambda_rejects_non_string_param() {
+        let r = run_file(r#"(make-lambda (list 1) (make-int 0))"#);
+        assert!(r.is_err(), "expected error, got {:?}", r);
+        let msg = r.unwrap_err();
+        assert!(
+            msg.contains("make-lambda") && msg.contains("param names must be strings"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    // ── §9.36 sub-step 2d: inspection builtins ──────────────────────────
+
+    /// Helper: extract a Str value or panic.
+    fn assert_str(v: &Value, expected: &str) {
+        match v {
+            Value::Str(s) => assert_eq!(s.as_ref(), expected, "got {:?}", v),
+            other => panic!("expected Str, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn node_predicate_distinguishes_nodes_from_other_values() {
+        match run_file("(node? (quote x))").unwrap() {
+            Value::Bool(b) => assert!(b),
+            other => panic!("expected Bool, got {:?}", other),
+        }
+        match run_file("(node? 42)").unwrap() {
+            Value::Bool(b) => assert!(!b),
+            other => panic!("expected Bool, got {:?}", other),
+        }
+        match run_file(r#"(node? "hello")"#).unwrap() {
+            Value::Bool(b) => assert!(!b),
+            other => panic!("expected Bool, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn node_kind_returns_correct_string_per_kind() {
+        assert_str(&run_file("(node-kind (make-int 1))").unwrap(), "int");
+        assert_str(&run_file("(node-kind (make-num 1.5))").unwrap(), "num");
+        assert_str(&run_file(r#"(node-kind (make-str "x"))"#).unwrap(), "str");
+        assert_str(&run_file("(node-kind (make-bool true))").unwrap(), "bool");
+        assert_str(
+            &run_file(r#"(node-kind (make-symbol "x"))"#).unwrap(),
+            "symbol",
+        );
+        assert_str(
+            &run_file(r#"(node-kind (make-app "add" (make-int 1) (make-int 2)))"#).unwrap(),
+            "app",
+        );
+        assert_str(
+            &run_file(
+                r#"(node-kind (make-if (make-bool true) (make-int 1) (make-int 2)))"#,
+            )
+            .unwrap(),
+            "if",
+        );
+        assert_str(
+            &run_file(r#"(node-kind (make-lambda (list "x") (make-symbol "x")))"#).unwrap(),
+            "lambda",
+        );
+        assert_str(
+            &run_file(
+                r#"(node-kind (make-let (list (list "x" (make-int 1))) (make-symbol "x")))"#,
+            )
+            .unwrap(),
+            "let",
+        );
+        // SpecialApp comes from quoted source.
+        assert_str(
+            &run_file(r#"(node-kind (quote (do 1 2)))"#).unwrap(),
+            "special-app",
+        );
+    }
+
+    #[test]
+    fn node_typed_accessors_extract_literal_values() {
+        match run_file("(node-int (make-int 42))").unwrap() {
+            Value::Int(n) => assert_eq!(n, 42),
+            other => panic!("got {:?}", other),
+        }
+        match run_file("(node-num (make-num 1.5))").unwrap() {
+            Value::Num(n) => assert_eq!(n, 1.5),
+            other => panic!("got {:?}", other),
+        }
+        assert_str(&run_file(r#"(node-str (make-str "hi"))"#).unwrap(), "hi");
+        match run_file("(node-bool (make-bool true))").unwrap() {
+            Value::Bool(b) => assert!(b),
+            other => panic!("got {:?}", other),
+        }
+        assert_str(
+            &run_file(r#"(node-symbol (make-symbol "abc"))"#).unwrap(),
+            "abc",
+        );
+    }
+
+    #[test]
+    fn node_typed_accessors_error_on_wrong_kind() {
+        let r = run_file("(node-int (make-str \"hello\"))");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("expected Int node"));
+
+        let r = run_file("(node-symbol (make-int 1))");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("expected Symbol node"));
+    }
+
+    #[test]
+    fn node_children_returns_subexpressions_for_app() {
+        // (add 1 2) → 3 children: head symbol "add", literal 1, literal 2.
+        let src = r#"
+            (define n (make-app "add" (make-int 1) (make-int 2)))
+            (length (node-children n))
+        "#;
+        match run_file(src).unwrap() {
+            Value::Int(n) => assert_eq!(n, 3),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn node_children_empty_for_literals() {
+        let src = r#"(length (node-children (make-int 42)))"#;
+        match run_file(src).unwrap() {
+            Value::Int(n) => assert_eq!(n, 0),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn node_children_for_lambda_returns_body_only() {
+        // (lambda (x) x) — children should be just the body.
+        // Per §9.35 D8, params are accessed via node-params, not children.
+        let src = r#"
+            (define n (make-lambda (list "x") (make-symbol "x")))
+            (length (node-children n))
+        "#;
+        match run_file(src).unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn node_children_for_if_returns_three() {
+        let src = r#"
+            (define n (make-if (make-bool true) (make-int 1) (make-int 2)))
+            (length (node-children n))
+        "#;
+        match run_file(src).unwrap() {
+            Value::Int(n) => assert_eq!(n, 3),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn node_params_returns_lambda_param_names() {
+        let src = r#"
+            (define n (make-lambda (list "a" "b") (make-symbol "a")))
+            (node-params n)
+        "#;
+        match run_file(src).unwrap() {
+            Value::List(l) => {
+                assert_eq!(l.len(), 2);
+                assert_str(&l[0], "a");
+                assert_str(&l[1], "b");
+            }
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn node_params_errors_on_non_lambda() {
+        let r = run_file("(node-params (make-int 1))");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("expected Lambda node"));
+    }
+
+    #[test]
+    fn node_bindings_returns_let_bindings() {
+        let src = r#"
+            (define n (make-let
+              (list (list "x" (make-int 5)) (list "y" (make-int 6)))
+              (make-symbol "x")))
+            (length (node-bindings n))
+        "#;
+        match run_file(src).unwrap() {
+            Value::Int(n) => assert_eq!(n, 2),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn node_special_form_extracts_form_name_from_quoted_special() {
+        let src = r#"(node-special-form (quote (do 1 2)))"#;
+        assert_str(&run_file(src).unwrap(), "do");
+    }
+
+    #[test]
+    fn walk_quoted_app_via_inspection() {
+        // Quote an expression, then walk it via children + accessors.
+        // Verifies that quote+inspection is sufficient to introspect
+        // an entire AST without parsing or eval.
+        let src = r#"
+            (define expr (quote (add x 1)))
+            (define head (head (node-children expr)))
+            (node-symbol head)
+        "#;
+        assert_str(&run_file(src).unwrap(), "add");
+    }
+
+    // ── §9.36 sub-step 2e: eval-node ────────────────────────────────────
+
+    #[test]
+    fn eval_node_evaluates_literal() {
+        let src = r#"(eval-node (make-int 42))"#;
+        match run_file(src).unwrap() {
+            Value::Int(n) => assert_eq!(n, 42),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_node_evaluates_quoted_application() {
+        // (eval-node (quote (add 1 2))) → 3
+        let src = r#"(eval-node (quote (add 1 2)))"#;
+        match run_file(src).unwrap() {
+            Value::Int(n) => assert_eq!(n, 3),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_node_evaluates_constructed_application() {
+        // Build (multiply 6 7) via make-app, then evaluate.
+        let src = r#"
+            (eval-node (make-app "multiply" (make-int 6) (make-int 7)))
+        "#;
+        match run_file(src).unwrap() {
+            Value::Int(n) => assert_eq!(n, 42),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_node_constructed_lambda_is_callable() {
+        // Build (lambda (x) (add x 1)), eval-node it to get a Function,
+        // then call it.
+        let src = r#"
+            (define inc (eval-node
+              (make-lambda (list "x")
+                (make-app "add" (make-symbol "x") (make-int 1)))))
+            (inc 41)
+        "#;
+        match run_file(src).unwrap() {
+            Value::Int(n) => assert_eq!(n, 42),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_node_uses_caller_env() {
+        // The constructed Node references `y` as a free symbol. When
+        // eval-node runs against an env that has `y` defined, it
+        // resolves correctly.
+        let src = r#"
+            (define y 100)
+            (eval-node (make-app "add" (make-symbol "y") (make-int 5)))
+        "#;
+        match run_file(src).unwrap() {
+            Value::Int(n) => assert_eq!(n, 105),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    // ── §9.36 sub-step 2f: parse-source / parse-file ────────────────────
+
+    #[test]
+    fn parse_source_returns_node_for_literal() {
+        let src = r#"(node-kind (parse-source "42"))"#;
+        assert_str(&run_file(src).unwrap(), "int");
+    }
+
+    #[test]
+    fn parse_source_returns_node_for_application() {
+        let src = r#"(node-kind (parse-source "(add 1 2)"))"#;
+        assert_str(&run_file(src).unwrap(), "app");
+    }
+
+    #[test]
+    fn parse_source_round_trip_via_eval_node() {
+        // (eval-node (parse-source s)) should equal (eval-source s).
+        let src = r#"(eval-node (parse-source "(add 6 7)"))"#;
+        match run_file(src).unwrap() {
+            Value::Int(n) => assert_eq!(n, 13),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_file_returns_list_of_nodes() {
+        let src = r#"
+            (length (parse-file "(define x 1) (add x 2)"))
+        "#;
+        match run_file(src).unwrap() {
+            Value::Int(n) => assert_eq!(n, 2),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_file_each_form_is_a_node() {
+        let src = r#"
+            (define forms (parse-file "(define x 1) (add x 2)"))
+            (node? (head forms))
+        "#;
+        match run_file(src).unwrap() {
+            Value::Bool(b) => assert!(b),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_source_errors_on_invalid_input() {
+        // The parser is permissive and produces a Symbol for "(((",
+        // not an error. Use a clearer non-string input to verify the
+        // type-check error path: passing an Int yields the typed error.
+        let r = run_file("(parse-source 42)");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("expected string"));
+    }
+
+    // ── §9.37 Stage A: SELPH-defined decomposer dispatch ────────────────
+
+    #[test]
+    fn selph_decomposer_fires_when_registered() {
+        // Define a simple "always-identity" decomposer that returns
+        // (lambda (x) x) for any task. Wire it into __decomposers__,
+        // then synthesize a task. The result should come from the
+        // SELPH decomposer (strategy "custom:identity"), not the
+        // hardcoded Flat strategy.
+        //
+        // The (eval-source ...) for the (lambda (x) x) result is
+        // wrapped in a make-lambda call to keep the test
+        // self-contained — no string parsing needed.
+        let src = r#"
+            (define identity-decomp
+              (lambda (spec)
+                (ns
+                  ("found" true)
+                  ("nodes" (make-lambda (list "x") (make-symbol "x")))
+                  ("candidates" 1))))
+            (define __decomposers__ (ns ("identity" identity-decomp)))
+            (synthesize (ns
+              ("spec" (list (list 1 1) (list 2 2)))
+              ("max-depth" 1)
+              ("max-candidates" 200)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                assert!(
+                    matches!(map.get(&intern("found")), Some(Value::Bool(true))),
+                    "expected found=true"
+                );
+                let strategy = map.get(&intern("strategy")).unwrap().as_str().unwrap().to_string();
+                assert_eq!(
+                    strategy, "custom:identity",
+                    "expected SELPH decomposer to win, got {:?}",
+                    strategy
+                );
+                let source = map.get(&intern("source")).unwrap().as_str().unwrap().to_string();
+                assert_eq!(source, "(lambda (x) x)");
+            }
+            other => panic!("expected Ns, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn selph_decomposer_returning_nil_falls_through() {
+        // A decomposer that returns nil should be skipped, and the
+        // hardcoded Flat strategy should pick up the task.
+        let src = r#"
+            (define always-fails (lambda (spec) nil))
+            (define __decomposers__ (ns ("never" always-fails)))
+            (synthesize (ns
+              ("spec" (list (list 1 1) (list 2 2)))
+              ("max-depth" 1)
+              ("max-candidates" 200)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                assert!(matches!(
+                    map.get(&intern("found")),
+                    Some(Value::Bool(true))
+                ));
+                let strategy = map
+                    .get(&intern("strategy"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert_eq!(
+                    strategy, "Flat",
+                    "expected Flat fallback, got {:?}",
+                    strategy
+                );
+            }
+            other => panic!("expected Ns, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn selph_decomposer_arithmetic_inversion() {
+        // A more interesting decomposer: detects (add x k) tasks where
+        // k = output - input is constant across all examples, and
+        // returns the constructed lambda. This is the simplest example
+        // of a SELPH-side strategy that builds non-trivial output.
+        //
+        // The benchmark task is increment (depth 2 in flat space, but
+        // the SELPH decomposer solves it in 5 candidates regardless of
+        // max-depth).
+        let src = r#"
+            (define arith-inv
+              (lambda (spec)
+                (let ((pairs (ns-get spec "spec")))
+                  ; Compute k = out - in for each pair, all in one pass.
+                  (let ((diffs
+                          (map (lambda (p)
+                                 (subtract (nth p 1) (head p)))
+                               pairs)))
+                    ; If all diffs are equal, return (lambda (x) (add x k)).
+                    (if (all? (lambda (d) (= d (head diffs))) diffs)
+                      (ns
+                        ("found" true)
+                        ("nodes"
+                          (make-lambda (list "x")
+                            (make-app "add"
+                              (make-symbol "x")
+                              (make-int (head diffs)))))
+                        ("candidates" (length diffs)))
+                      nil)))))
+            (define all? (lambda (pred xs)
+              (if (= (length xs) 0) true
+                (if (pred (head xs))
+                  (all? pred (tail xs))
+                  false))))
+            (define __decomposers__ (ns ("arith-inv" arith-inv)))
+            (synthesize (ns
+              ("spec" (list (list 1 2) (list 2 3) (list 5 6) (list 10 11)))
+              ("max-depth" 2)
+              ("max-candidates" 5000)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                assert!(
+                    matches!(map.get(&intern("found")), Some(Value::Bool(true))),
+                    "expected found=true"
+                );
+                let strategy = map
+                    .get(&intern("strategy"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert_eq!(
+                    strategy, "custom:arith-inv",
+                    "expected SELPH decomposer to win, got {:?}",
+                    strategy
+                );
+                let source = map.get(&intern("source")).unwrap().as_str().unwrap().to_string();
+                assert_eq!(source, "(lambda (x) (add x 1))");
+            }
+            other => panic!("expected Ns, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn selph_decomposer_dispatch_is_deterministic() {
+        // Two decomposers, both apply. The one whose name sorts first
+        // wins (per §9.37 Stage A's name-sort dispatch order).
+        let src = r#"
+            (define wraps-as-add
+              (lambda (spec)
+                (ns ("found" true)
+                    ("nodes" (make-lambda (list "x") (make-app "add" (make-symbol "x") (make-int 0))))
+                    ("candidates" 1))))
+            (define wraps-as-multiply
+              (lambda (spec)
+                (ns ("found" true)
+                    ("nodes" (make-lambda (list "x") (make-app "multiply" (make-symbol "x") (make-int 1))))
+                    ("candidates" 1))))
+            (define __decomposers__ (ns
+              ("z-add" wraps-as-add)
+              ("a-multiply" wraps-as-multiply)))
+            (synthesize (ns
+              ("spec" (list (list 1 1) (list 2 2)))
+              ("max-depth" 1)
+              ("max-candidates" 200)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                let strategy = map
+                    .get(&intern("strategy"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert_eq!(
+                    strategy, "custom:a-multiply",
+                    "expected name-sort winner, got {:?}",
+                    strategy
+                );
+            }
+            other => panic!("expected Ns, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn no_decomposers_means_legacy_dispatch() {
+        // Sanity check: when __decomposers__ doesn't exist, the
+        // dispatcher behaves exactly as before §9.37.
+        let src = r#"
+            (synthesize (ns
+              ("spec" (list (list 1 1) (list 2 2)))
+              ("max-depth" 1)
+              ("max-candidates" 200)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                let strategy = map
+                    .get(&intern("strategy"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert_eq!(strategy, "Flat");
+            }
+            other => panic!("expected Ns, got {:?}", other),
+        }
+    }
+
+    // ── §9.37 Stage C: type-keyed decomposer dispatch ───────────────────
+
+    #[test]
+    fn type_keyed_decomposer_fires_for_matching_output_type() {
+        // Register a decomposer under __types__["Int"]["decomposers"].
+        // The increment task has Int outputs, so the decomposer should
+        // be called.
+        let src = r#"
+            (define always-zero
+              (lambda (spec)
+                (ns ("found" true)
+                    ("nodes" (make-lambda (list "x") (make-int 0)))
+                    ("candidates" 1))))
+            (define __types__
+              (ns ("Int" (ns ("decomposers" (ns ("zero" always-zero)))))))
+            (synthesize (ns
+              ("spec" (list (list 1 0) (list 2 0)))
+              ("max-depth" 1)
+              ("max-candidates" 200)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                let strategy = map
+                    .get(&intern("strategy"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert_eq!(
+                    strategy, "custom:zero",
+                    "expected type-keyed decomposer to win"
+                );
+            }
+            other => panic!("expected Ns, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn type_keyed_decomposer_skips_non_matching_output_type() {
+        // The decomposer is registered under Int, but the task has
+        // String output. The decomposer should NOT be called.
+        let src = r#"
+            (define would-break
+              (lambda (spec)
+                (ns ("found" true)
+                    ("nodes" (make-lambda (list "x") (make-int 999)))
+                    ("candidates" 1))))
+            (define __types__
+              (ns ("Int" (ns ("decomposers" (ns ("never" would-break)))))))
+            (synthesize (ns
+              ("spec" (list (list "hi" "HI") (list "bye" "BYE")))
+              ("max-depth" 2)
+              ("max-candidates" 5000)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                let strategy = map
+                    .get(&intern("strategy"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                // Falls through to Flat which finds string-upper.
+                assert_eq!(
+                    strategy, "Flat",
+                    "Int-keyed decomposer should not fire on String task"
+                );
+                let source = map.get(&intern("source")).unwrap().as_str().unwrap().to_string();
+                assert!(source.contains("string-upper"));
+            }
+            other => panic!("expected Ns, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn any_keyed_decomposer_fires_for_any_type() {
+        // Decomposers under "Any" run for every output type.
+        let src = r#"
+            (define catchall
+              (lambda (spec)
+                (ns ("found" true)
+                    ("nodes" (make-lambda (list "x") (make-symbol "x")))
+                    ("candidates" 1))))
+            (define __types__
+              (ns ("Any" (ns ("decomposers" (ns ("identity" catchall)))))))
+            (synthesize (ns
+              ("spec" (list (list "hi" "hi") (list "bye" "bye")))
+              ("max-depth" 1)
+              ("max-candidates" 200)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                let strategy = map
+                    .get(&intern("strategy"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert_eq!(strategy, "custom:identity");
+            }
+            other => panic!("expected Ns, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn type_specific_decomposers_run_before_any_decomposers() {
+        // Both Int and Any have decomposers; the Int one should be
+        // tried first because the task has Int output.
+        let src = r#"
+            (define int-d
+              (lambda (spec)
+                (ns ("found" true)
+                    ("nodes" (make-lambda (list "x") (make-int 1)))
+                    ("candidates" 1))))
+            (define any-d
+              (lambda (spec)
+                (ns ("found" true)
+                    ("nodes" (make-lambda (list "x") (make-int 2)))
+                    ("candidates" 1))))
+            (define __types__
+              (ns
+                ("Int" (ns ("decomposers" (ns ("specific" int-d)))))
+                ("Any" (ns ("decomposers" (ns ("fallback" any-d)))))))
+            (synthesize (ns
+              ("spec" (list (list 5 1) (list 6 1)))
+              ("max-depth" 1)
+              ("max-candidates" 200)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                let strategy = map
+                    .get(&intern("strategy"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert_eq!(
+                    strategy, "custom:specific",
+                    "Int-specific should win over Any fallback"
+                );
+            }
+            other => panic!("expected Ns, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn global_decomposers_run_before_type_keyed_decomposers() {
+        // __decomposers__ takes precedence over __types__-based dispatch.
+        let src = r#"
+            (define global-d
+              (lambda (spec)
+                (ns ("found" true)
+                    ("nodes" (make-lambda (list "x") (make-int 100)))
+                    ("candidates" 1))))
+            (define type-d
+              (lambda (spec)
+                (ns ("found" true)
+                    ("nodes" (make-lambda (list "x") (make-int 200)))
+                    ("candidates" 1))))
+            (define __decomposers__ (ns ("g" global-d)))
+            (define __types__ (ns
+              ("Int" (ns ("decomposers" (ns ("t" type-d)))))))
+            (synthesize (ns
+              ("spec" (list (list 1 100) (list 2 100)))
+              ("max-depth" 1)
+              ("max-candidates" 200)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                let strategy = map
+                    .get(&intern("strategy"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert_eq!(
+                    strategy, "custom:g",
+                    "global decomposer should win over type-keyed"
+                );
+            }
+            other => panic!("expected Ns, got {:?}", other),
+        }
+    }
+
     #[test]
     fn bucket6_synthesize_solves_identity_via_flat() {
         // Identity task — synth_v2 Flat should find (lambda (x) x) at depth 0.
@@ -2519,6 +4288,139 @@ mod tests {
             }
             _ => panic!("expected Ns"),
         }
+    }
+
+    #[test]
+    fn bucket6_synthesize_accepts_heuristic_in_spec() {
+        // §9.34: a heuristic can be passed directly into the synthesize
+        // builtin via the spec namespace. The heuristic is a SELPH lambda
+        // taking a context namespace and returning a numeric score.
+        // This is the foundation for SELPH-side meta-learning loops.
+        //
+        // We use a default-identity heuristic here — it should not change
+        // the result of an easy task that synth_v2 already solves cleanly.
+        // The point of this test is that the wiring works (no errors,
+        // result still found), not that the heuristic does anything
+        // interesting.
+        let src = r#"
+            (define h (lambda (ctx) (ns-get ctx "priority")))
+            (synthesize (ns
+                ("spec" (list (list 1 1) (list 2 2) (list 3 3)))
+                ("max-depth" 1)
+                ("max-candidates" 200)
+                ("heuristic" h)))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Ns(map) => {
+                assert!(
+                    matches!(map.get(&intern("found")), Some(Value::Bool(true))),
+                    "expected found=true with identity heuristic"
+                );
+                let source = map.get(&intern("source")).unwrap().as_str().unwrap().to_string();
+                assert_eq!(source, "(lambda (x) x)", "got source: {}", source);
+            }
+            _ => panic!("expected Ns, got {:?}", r),
+        }
+    }
+
+    #[test]
+    fn bucket6_synthesize_heuristic_actually_runs() {
+        // Stronger test: the heuristic must observably affect the search.
+        //
+        // Using the identity task wouldn't work — synth_v2 tests all
+        // depth-0 atoms in catalog order before any priority-based
+        // sort kicks in (atom enumeration is unconditional, only
+        // composite candidates are score-sorted). So heuristic
+        // priorities don't affect atom-only solutions.
+        //
+        // We use the increment task instead: `(add x 1)` is a depth-1
+        // composite, which DOES go through the pending-candidate sort.
+        // A heuristic that deprioritizes the literal `1` should push
+        // `(add x 1)` to the end of pending, making the search test
+        // many more candidates before finding it.
+        let src_with_anti_one = r#"
+            (define anti-one (lambda (ctx)
+              (if (= (ns-get ctx "name") "1") -1000 100)))
+            (synthesize (ns
+                ("spec" (list (list 1 2) (list 2 3) (list 3 4) (list 10 11)))
+                ("max-depth" 2)
+                ("max-candidates" 50000)
+                ("heuristic" anti-one)))
+        "#;
+        let src_without = r#"
+            (synthesize (ns
+                ("spec" (list (list 1 2) (list 2 3) (list 3 4) (list 10 11)))
+                ("max-depth" 2)
+                ("max-candidates" 50000)))
+        "#;
+
+        let r_with = run_file(src_with_anti_one).unwrap();
+        let r_without = run_file(src_without).unwrap();
+
+        let cand_with = match &r_with {
+            Value::Ns(m) => match m.get(&intern("candidates")) {
+                Some(Value::Int(n)) => *n,
+                _ => panic!("missing candidates"),
+            },
+            _ => panic!("expected Ns"),
+        };
+        let cand_without = match &r_without {
+            Value::Ns(m) => match m.get(&intern("candidates")) {
+                Some(Value::Int(n)) => *n,
+                _ => panic!("missing candidates"),
+            },
+            _ => panic!("expected Ns"),
+        };
+
+        // Both should solve.
+        match &r_with {
+            Value::Ns(m) => assert!(
+                matches!(m.get(&intern("found")), Some(Value::Bool(true))),
+                "with-heuristic must still solve, got {:?}",
+                m.get(&intern("found"))
+            ),
+            _ => panic!("expected Ns"),
+        }
+        match &r_without {
+            Value::Ns(m) => assert!(
+                matches!(m.get(&intern("found")), Some(Value::Bool(true))),
+                "without-heuristic must solve"
+            ),
+            _ => panic!("expected Ns"),
+        }
+
+        // The anti-one heuristic should make the search strictly more
+        // expensive: deprioritizing literal `1` pushes `(add x 1)` to
+        // the end of the pending sort. If both are equal, the
+        // heuristic isn't flowing through to the candidate scoring.
+        assert!(
+            cand_with > cand_without,
+            "anti-one heuristic must increase candidate count: with={}, without={}",
+            cand_with,
+            cand_without
+        );
+    }
+
+    #[test]
+    fn bucket6_synthesize_rejects_non_function_heuristic() {
+        // §9.34: passing a non-function value as the heuristic must
+        // produce a clear error rather than silently doing nothing.
+        let src = r#"
+            (synthesize (ns
+                ("spec" (list (list 1 1) (list 2 2)))
+                ("max-depth" 1)
+                ("max-candidates" 200)
+                ("heuristic" 42)))
+        "#;
+        let r = run_file(src);
+        assert!(r.is_err(), "expected error, got {:?}", r);
+        let msg = r.unwrap_err();
+        assert!(
+            msg.contains("heuristic must be a function value"),
+            "unexpected error: {}",
+            msg
+        );
     }
 
     #[test]

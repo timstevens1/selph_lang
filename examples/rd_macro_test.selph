@@ -1,0 +1,31 @@
+; Test RD with promoted macros
+; First teach halve and half_len, then see if RD can solve first_half
+
+; halve: integer division by 2
+(task "halve" 2
+  (0 0) (1 0) (2 1) (4 2) (6 3) (8 4)
+  (10 5) (3 1) (5 2) (7 3))
+
+; half_len: string → number (half the string length)
+(task "half_len" 2
+  ("ab" 1) ("abcd" 2) ("abcdef" 3) ("abcdefgh" 4)
+  ("a" 0) ("abc" 1) ("abcde" 2) ("abcdefghij" 5))
+
+; first_half: output = string-take(x, half_len(x))
+; RD should predict string-take, invert to get k = len(output),
+; then sub-synth finds (half_len x) using the promoted macro
+(task "first_half" 2
+  ("abcd" "ab") ("abcdef" "abc") ("abcdefgh" "abcd")
+  ("xxxx" "xx") ("aabb" "aa") ("xxyy" "xx")
+  ("xxxxxx" "xxx") ("abcabc" "abc"))
+
+; second_half: output = string-drop(x, half_len(x))
+(task "second_half" 2
+  ("abcd" "cd") ("abcdef" "def") ("abcdefgh" "efgh")
+  ("xxxx" "xx") ("aabb" "bb") ("xxyy" "yy")
+  ("xxxxxx" "xxx") ("abcabc" "abc"))
+
+; Also try: negate(half_len(x)) — arithmetic on macro result
+(task "neg_half_len" 2
+  ("ab" -1) ("abcd" -2) ("abcdef" -3) ("abcdefgh" -4)
+  ("a" 0) ("abc" -1) ("abcde" -2))

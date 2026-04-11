@@ -1,0 +1,101 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Meta-curriculum M3: sub-spec construction
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Given a 2-arg additively-separable spec arranged as a 2×2 grid:
+;
+;   row 0 = (a₁ b₁) → y00
+;   row 1 = (a₁ b₂) → y01
+;   row 2 = (a₂ b₁) → y10
+;   row 3 = (a₂ b₂) → y11
+;
+; Build two single-arg sub-specs whose synthesized results compose
+; back into the original via addition:
+;
+;   g-spec: input  = (a₁) (a₂)
+;           output = y00  y10        ; = f(a, b₁)
+;
+;   h-spec: input  = (b₁) (b₂)
+;           output = 0.0  (y01-y00)  ; = f(a₁, b) − f(a₁, b₁)
+;
+; The arithmetic identity:
+;   g(a) + h(b) = f(a, b₁) + (f(a₁, b) − f(a₁, b₁))
+;               = (g_true(a) + h_true(b₁)) + (g_true(a₁) + h_true(b)) − (g_true(a₁) + h_true(b₁))
+;               = g_true(a) + h_true(b)
+;               = f(a, b)              ✓ (when f is additively separable)
+;
+; The sub-specs are 1-arg `task-args` style: each row's input is a
+; 1-element list `(a)` so the synth's `synthesize_args` path picks it
+; up and dispatches to the float arithmetic catalog.
+
+; ── Inlined M0 helpers ───────────────────────────────────────────────
+
+(define spec-inputs    (lambda (s) (ns-get s "inputs")))
+(define spec-outputs   (lambda (s) (ns-get s "outputs")))
+(define spec-arity     (lambda (s) (ns-get s "arity")))
+(define spec-input-row (lambda (s i) (nth (spec-inputs s) i)))
+(define spec-output-row(lambda (s i) (nth (spec-outputs s) i)))
+(define make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+; ── Sub-spec builders ────────────────────────────────────────────────
+;
+; 1-arg sub-spec inputs are RAW Num values (not wrapped in 1-element
+; lists). This routes through the synth's single-input path with
+; `input_type = Num`, where the Num arithmetic catalog applies
+; directly without an extra `(nth x 0)` step. The compose-add (M4)
+; calls g/h with raw Nums to match.
+
+; g-spec: input = unique a values, output = f at (a, b₁) for each.
+(define build-g-spec-2x2
+  (lambda (s)
+    (let ((a1 (nth (spec-input-row s 0) 0))
+          (a2 (nth (spec-input-row s 2) 0))
+          (y00 (spec-output-row s 0))
+          (y10 (spec-output-row s 2)))
+      (make-spec
+        (list a1 a2)
+        (list y00 y10)
+        1))))
+
+; h-spec: input = unique b values, output = f(a₁, b) − f(a₁, b₁).
+(define build-h-spec-2x2
+  (lambda (s)
+    (let ((b1 (nth (spec-input-row s 0) 1))
+          (b2 (nth (spec-input-row s 1) 1))
+          (y00 (spec-output-row s 0))
+          (y01 (spec-output-row s 1)))
+      (make-spec
+        (list b1 b2)
+        (list (subtract y00 y00) (subtract y01 y00))
+        1))))
+
+; ── Pretty-printer for specs (for the smoke test output) ─────────────
+
+(define show-spec
+  (lambda (s)
+    (concat "{arity="
+      (concat (to-string (spec-arity s))
+        (concat " inputs="
+          (concat (to-string (spec-inputs s))
+            (concat " outputs="
+              (concat (to-string (spec-outputs s)) "}"))))))))
+
+; ── Test setup ───────────────────────────────────────────────────────
+;
+; Reuse the M2 test specs. f(a, b) = a² + b on a 2×2 grid.
+
+(define spec-add-sq
+  (make-spec
+    (list (list 0.5 0.5) (list 0.5 1.5)
+          (list 1.5 0.5) (list 1.5 1.5))
+    (list 0.75 1.75 2.75 3.75)
+    2))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(print "M3 smoke tests")
+(print (concat "  parent  = " (show-spec spec-add-sq)))
+(print (concat "  g-spec  = " (show-spec (build-g-spec-2x2 spec-add-sq))))
+(print (concat "  h-spec  = " (show-spec (build-h-spec-2x2 spec-add-sq))))
