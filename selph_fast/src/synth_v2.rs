@@ -3786,6 +3786,7 @@ fn rd_sub_synthesize(
                 nodes: Some(rd.nodes),
                 root: Some(rd.root),
                 candidates_explored: rd.candidates_explored,
+                decomposer_name: None,
             };
         }
         let remaining = max_candidates.saturating_sub(rd.candidates_explored);
@@ -5234,6 +5235,13 @@ pub struct SynthResult {
     pub nodes: Option<Vec<Node>>,
     pub root: Option<usize>,
     pub candidates_explored: usize,
+    /// Set when a curriculum-side decomposer (the M-chain) solved
+    /// this task. Carries the `__decomposers__` ns key that fired.
+    /// `None` for plain Flat enumeration solves and for failures.
+    /// Threaded through to grow-v2's strategy reporting so the
+    /// "By strategy" summary distinguishes chain solves from Flat
+    /// solves on the multi-arg path (the §9.46 mislabel fix).
+    pub decomposer_name: Option<Sym>,
 }
 
 impl SynthResult {
@@ -5243,6 +5251,7 @@ impl SynthResult {
             nodes: None,
             root: None,
             candidates_explored: explored,
+            decomposer_name: None,
         }
     }
 
@@ -5252,6 +5261,22 @@ impl SynthResult {
             nodes: Some(nodes),
             root: Some(root),
             candidates_explored: explored,
+            decomposer_name: None,
+        }
+    }
+
+    /// Success path for curriculum-side decomposer hits. Same as
+    /// `success` but tags the result with the firing decomposer's
+    /// ns key so grow-v2 can label the strategy correctly.
+    fn success_from_decomposer(
+        nodes: Vec<Node>, root: usize, explored: usize, name_sym: Sym,
+    ) -> Self {
+        Self {
+            found: true,
+            nodes: Some(nodes),
+            root: Some(root),
+            candidates_explored: explored,
+            decomposer_name: Some(name_sym),
         }
     }
 }
@@ -5854,10 +5879,12 @@ fn synthesize_inner(
     // after enumeration exhausts, inflating reported candidate
     // counts even when the chain itself would be cheap.
     if extra_seeds_was_some {
-        if let Some((nodes, root, sd_explored, _name_sym)) =
+        if let Some((nodes, root, sd_explored, name_sym)) =
             try_selph_decomposers(env, inputs, expected, max_depth, max_candidates)
         {
-            return SynthResult::success(nodes, root, sd_explored);
+            return SynthResult::success_from_decomposer(
+                nodes, root, sd_explored, name_sym,
+            );
         }
     }
 

@@ -1621,15 +1621,25 @@ fn cmd_grow_v2(args: &[String]) {
                 default_budget,
             );
             // Wrap in a StrategyResult so the success path below stays
-            // shape-compatible.
+            // shape-compatible. §9.46 fix: when synth_v2 reports a
+            // curriculum-side decomposer (the M-chain) fired, label
+            // the strategy with that decomposer's ns key instead of
+            // the previously hardcoded `Flat`. Without this, every
+            // multi-arg success was credited to Flat, including
+            // chain solves — making the "By strategy" summary
+            // silently misleading.
+            let strategy = if synth_result.found {
+                Some(match synth_result.decomposer_name {
+                    Some(name) => synth_v2::Strategy::Custom(name),
+                    None => synth_v2::Strategy::Flat,
+                })
+            } else { None };
             synth_v2::StrategyResult {
                 found: synth_result.found,
                 nodes: synth_result.nodes,
                 root: synth_result.root,
                 candidates_explored: synth_result.candidates_explored,
-                strategy: if synth_result.found {
-                    Some(synth_v2::Strategy::Flat)
-                } else { None },
+                strategy,
             }
         } else {
             synth_v2::synthesize_with_strategies(
