@@ -1,14 +1,19 @@
 ; ─────────────────────────────────────────────────────────────────────────
-; Meta-curriculum M8s: constant-string fit (§9.47 P1)
+; Meta-curriculum M8s: constant-string fit (§9.47 P1 + P1.5)
 ; ─────────────────────────────────────────────────────────────────────────
 ;
-; String analogue of m8_constant_fit.selph. Recognizes two shapes:
+; String analogue of m8_constant_fit.selph. Recognizes three shapes:
 ;
 ;   Form 1:  target == "constant"      (every output equal)
 ;   Form 2:  target == g(x)            (output is exactly some pool entry's
 ;                                       column — the string analogue of
 ;                                       fit-scale with C=1, since strings
 ;                                       have no scalar multiplication)
+;   Form 3:  target == if (contains <set-A> g(x)) then "label-A" else "label-B"
+;            (binary classification by atom membership — added §9.47 P1.5
+;            to handle context-sensitive POS tagging where the output is
+;            one of two labels determined by which set the discriminating
+;            atom falls into)
 ;
 ; The string equivalent of M8's fit-affine doesn't exist as a closed-form
 ; solver — instead each form is its own dedicated check.
@@ -65,6 +70,98 @@
 (define m8s-pool-source (lambda (e) (ns-get e "source")))
 (define m8s-pool-col    (lambda (e) (ns-get e "col")))
 
+; ── fit-multi-classify primitive ─────────────────────────────────────
+;
+; Generalized partition recognizer. For pool column e-col and target
+; output column, check whether e-col cleanly partitions the rows by
+; output label. Returns (ns ("labels" ...) ("vals-by-label" ...)) on
+; success or nil on failure.
+;
+; A "clean partition" means: for every pair of distinct output labels
+; (l1, l2), the set of e-values appearing in label-l1 rows is disjoint
+; from the set appearing in label-l2 rows. If any e-value appears in
+; rows of two different labels, the atom doesn't discriminate.
+;
+; Cap on k: at most 4 distinct labels. Beyond that the emitted
+; if-chain becomes unwieldy and the search cost rises faster than
+; the value (real curricula past 4 labels usually want a different
+; encoding, like one-hot output).
+;
+; The canonical use case is POS tagging by previous-word membership:
+;   "i run"   → e-col[0] = "i",   target = "verb"
+;   "the run" → e-col[1] = "the", target = "noun"
+; The value sets {"i", "they", ...} and {"the", "a", ...} are
+; disjoint, so prev-word is a clean discriminator.
+
+(define m8s-distinct-labels
+  (lambda (target)
+    (reduce
+      (lambda (acc v)
+        (if (contains acc v) acc (append acc (list v))))
+      target
+      (list))))
+
+(define m8s-vals-for-label
+  (lambda (e-col target label)
+    (reduce
+      (lambda (acc i)
+        (let ((row-label (nth target i))
+              (row-val (nth e-col i)))
+          (if (= row-label label)
+            (if (contains acc row-val) acc (append acc (list row-val)))
+            acc)))
+      (range (length target))
+      (list))))
+
+(define m8s-disjoint?
+  (lambda (xs ys)
+    (reduce
+      (lambda (acc x) (and acc (not (contains ys x))))
+      xs
+      true)))
+
+; All pairs of distinct elements from a list (i < j ordering).
+(define m8s-distinct-pairs
+  (lambda (xs)
+    (let ((n (length xs)))
+      (reduce append
+        (map
+          (lambda (i)
+            (map (lambda (j) (list (nth xs i) (nth xs j)))
+                 (filter (lambda (j) (> j i)) (range n))))
+          (range n))
+        (list)))))
+
+; Check that the partition implied by `vals-by-label` is clean: every
+; pair of label-value sets is disjoint. `vals-by-label` is a list of
+; lists (parallel to `labels`) — vals-by-label[i] is the set of
+; e-col values appearing in label-i rows.
+(define m8s-partition-clean?
+  (lambda (vals-by-label)
+    (let ((index-pairs (m8s-distinct-pairs (range (length vals-by-label)))))
+      (reduce
+        (lambda (acc pair)
+          (and acc
+               (m8s-disjoint?
+                 (nth vals-by-label (head pair))
+                 (nth vals-by-label (head (tail pair))))))
+        index-pairs
+        true))))
+
+(define fit-multi-classify
+  (lambda (e-col target)
+    (let ((labels (m8s-distinct-labels target)))
+      (if (or (< (length labels) 2) (> (length labels) 4))
+        nil
+        (let ((vals-by-label
+                (map (lambda (l) (m8s-vals-for-label e-col target l)) labels)))
+          (if (m8s-partition-clean? vals-by-label)
+            (ns ("labels" labels) ("vals-by-label" vals-by-label))
+            nil))))))
+
+; Backwards-compat alias kept for the smoke test.
+(define fit-binary-classify fit-multi-classify)
+
 ; ── Source emission ──────────────────────────────────────────────────
 
 (define m8s-wrap-lambda
@@ -77,6 +174,43 @@
 (define m8s-emit-atom
   (lambda (g-source)
     (m8s-wrap-lambda g-source)))
+
+; Build a `(list "v0" "v1" ...)` AST node from a list of strings.
+(define m8s-emit-string-list
+  (lambda (vs)
+    (let ((str-nodes (map make-str vs)))
+      (apply make-app (cons (make-symbol "list") str-nodes)))))
+
+; Build a chain of nested ifs that emit the multi-classify decision
+; tree. For k labels [l1, l2, l3, ..., lk] with value sets
+; [v1, v2, ..., vk-1] (the last label is the else fall-through):
+;
+;   (if (contains v1 e) l1
+;     (if (contains v2 e) l2
+;       (if (contains v3 e) l3 ... lk-1)))
+;
+; The last label is emitted as the else of the deepest if. With k=2
+; this collapses to a single if — same shape as the original
+; binary-classify emit.
+(define m8s-build-classify-chain
+  (lambda (e-source labels vals-by-label)
+    (let ((k (length labels)))
+      (if (= k 1)
+        (make-str (head labels))
+        (make-if
+          (make-app "contains"
+            (m8s-emit-string-list (head vals-by-label))
+            e-source)
+          (make-str (head labels))
+          (m8s-build-classify-chain
+            e-source
+            (tail labels)
+            (tail vals-by-label)))))))
+
+(define m8s-emit-multi-classify
+  (lambda (e-source labels vals-by-label)
+    (m8s-wrap-lambda
+      (m8s-build-classify-chain e-source labels vals-by-label))))
 
 ; ── Detection ────────────────────────────────────────────────────────
 
@@ -100,6 +234,107 @@
       pool
       nil)))
 
+; Form 3: multi-classify by atom membership. Iterate the pool and
+; for each entry try fit-multi-classify (k ∈ {2, 3, 4}). The first
+; clean partition wins. This is the §9.47 P1.5 addition for
+; context-sensitive POS, generalized to small multi-class.
+(define m8s-try-form-3
+  (lambda (pool target)
+    (reduce
+      (lambda (acc entry)
+        (if (not (nil? acc)) acc
+          (let ((fit (fit-multi-classify (m8s-pool-col entry) target)))
+            (if (nil? fit)
+              nil
+              (ns ("kind" "form-3-classify")
+                  ("k"      (length (ns-get fit "labels")))
+                  ("labels" (ns-get fit "labels"))
+                  ("source-node"
+                    (m8s-emit-multi-classify
+                      (m8s-pool-source entry)
+                      (ns-get fit "labels")
+                      (ns-get fit "vals-by-label"))))))))
+      pool
+      nil)))
+
+; Form 4: pair-equality classify. Iterate ordered pairs (e1, e2) of
+; distinct pool entries and build a derived "equality column" where
+; col[i] = (e1[i] == e2[i]). Run the binary-classify partition logic
+; on the (boolean) equality column. The first clean partition wins.
+;
+; This is the §9.47 P1.5 addition for subject/object disambiguation
+; via pairwise comparison: the discriminating feature is "does atom
+; e1 equal atom e2 on this row" — e.g., "is the target word the same
+; as the first word of the sentence" gives subject vs object.
+;
+; Cost: O(pool² × rows). For ~12 pool entries on 6-row specs that's
+; ~864 ops, well below any practical budget.
+
+(define m8s-eq-col
+  (lambda (col-a col-b)
+    (map (lambda (i) (= (nth col-a i) (nth col-b i)))
+         (range (length col-a)))))
+
+; True iff col is not all-true and not all-false (otherwise the
+; partition would be vacuous).
+(define m8s-discriminating?
+  (lambda (col)
+    (let ((has-true (reduce (lambda (acc v) (or acc v)) col false))
+          (has-false (reduce (lambda (acc v) (or acc (not v))) col false)))
+      (and has-true has-false))))
+
+; Helper: given the fit result and the source pair, build the
+; standard ns describing the form-4 hit. Defined before its caller
+; so the env lookup at definition-time of m8s-fit-pair-equality
+; resolves correctly.
+(define m8s-build-pair-equality-result
+  (lambda (e1 e2 fit)
+    (let ((labels (ns-get fit "labels"))
+          (vals (ns-get fit "vals-by-label")))
+      (let ((first-is-true (contains (head vals) true)))
+        (let ((true-label  (if first-is-true (head labels) (head (tail labels))))
+              (false-label (if first-is-true (head (tail labels)) (head labels))))
+          (ns ("kind" "form-4-pair-equality")
+              ("true-label"  true-label)
+              ("false-label" false-label)
+              ("source-node"
+                (m8s-wrap-lambda
+                  (make-if
+                    (make-app "=" (m8s-pool-source e1) (m8s-pool-source e2))
+                    (make-str true-label)
+                    (make-str false-label))))))))))
+
+; Attempt the equality-classify fit for an (e1, e2) pair. Returns the
+; result ns on success, or nil. Pulled out of m8s-try-form-4 to keep
+; nesting depth manageable.
+(define m8s-fit-pair-equality
+  (lambda (e1 e2 target)
+    (if (= (m8s-pool-col e1) (m8s-pool-col e2))
+      nil
+      (let ((eq-col (m8s-eq-col (m8s-pool-col e1) (m8s-pool-col e2))))
+        (if (not (m8s-discriminating? eq-col))
+          nil
+          (let ((fit (fit-multi-classify eq-col target)))
+            (if (or (nil? fit) (not (= (length (ns-get fit "labels")) 2)))
+              nil
+              (m8s-build-pair-equality-result e1 e2 fit))))))))
+
+(define m8s-try-form-4
+  (lambda (pool target)
+    (reduce
+      (lambda (acc e1)
+        (if (not (nil? acc))
+          acc
+          (reduce
+            (lambda (acc2 e2)
+              (if (not (nil? acc2))
+                acc2
+                (m8s-fit-pair-equality e1 e2 target)))
+            pool
+            nil)))
+      pool
+      nil)))
+
 (define detect-constant-string
   (lambda (s)
     (let ((target (m8s-string-target s)))
@@ -107,12 +342,12 @@
         (ns ("found" false) ("reason" "non-string target"))
         (let ((pool (m8s-build-pool s)))
           (let ((r1 (m8s-try-form-1 target)))
-            (let ((result (if (nil? r1)
-                            (m8s-try-form-2 pool target)
-                            r1)))
-              (if (nil? result)
-                (ns ("found" false) ("reason" "no string shape matched"))
-                (ns-put result "found" true)))))))))
+            (let ((r2 (if (nil? r1) (m8s-try-form-2 pool target) r1)))
+              (let ((r3 (if (nil? r2) (m8s-try-form-3 pool target) r2)))
+                (let ((result (if (nil? r3) (m8s-try-form-4 pool target) r3)))
+                  (if (nil? result)
+                    (ns ("found" false) ("reason" "no string shape matched"))
+                    (ns-put result "found" true)))))))))))
 
 ; ── Smoke tests ──────────────────────────────────────────────────────
 
@@ -143,3 +378,13 @@
 
 (m8s-run-test "constant 'hello'" m8s-const-spec)
 (m8s-run-test "identity (nth x 0)" m8s-identity-spec)
+
+; Form 3 smoke: the run-pos ambiguity case in miniature.
+(define m8s-run-pos-spec
+  (m8s-make-spec
+    (list (list "i" "run") (list "they" "run") (list "we" "run")
+          (list "a" "run") (list "the" "run") (list "morning" "run"))
+    (list "verb" "verb" "verb" "noun" "noun" "noun")
+    2))
+
+(m8s-run-test "run pos (binary classify)" m8s-run-pos-spec)

@@ -1,0 +1,183 @@
+; ─────────────────────────────────────────────────────────────────────────
+; String POS curriculum — context-sensitive label disambiguation (§9.47.2)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Purpose: stress-test the §9.47 P1 string chain on a domain it wasn't
+; designed for. The string family was built around fit-style shapes
+; (constant fit, concat pair, repeat). POS tagging is fundamentally a
+; partition-by-feature shape: the output is one of K labels determined
+; by membership of some atom in a discoverable set.
+;
+; The headline test is the "run" verb/noun ambiguity:
+;
+;   "i run"     → verb        (preceded by pronoun)
+;   "the run"   → noun        (preceded by article)
+;
+; Same word, different label, discriminated by the previous word's
+; class. Solving this requires the chain to (a) find that prev_word
+; is the relevant feature and (b) discover the correct partition of
+; values. Neither M8s, M10s, nor M11s does this in P1 — they all
+; produce columns and check exact equality, not membership-based
+; classification.
+;
+; Encoding: most tasks use a 2-word window (("prev" "target") "label")
+; so position 0 is the discriminator. Some stretch tasks use a
+; 3-word window or a sentence+index encoding to test whether deeper
+; context structure can be discovered.
+
+; ── Stage 0: Trivial controls ────────────────────────────────────────
+; These should solve via the existing M8s/M10s — proves the
+; multi-arg path is wired correctly for string-typed inputs.
+
+; Constant label, ignores both inputs entirely.
+(task-args "always_noun" 2
+  (("the" "cat") "noun") (("a" "dog") "noun") (("the" "house") "noun")
+  (("an" "apple") "noun") (("the" "tree") "noun") (("a" "book") "noun"))
+
+; Echo position 1 (the target word).
+(task-args "echo_target" 2
+  (("the" "cat") "cat") (("a" "dog") "dog") (("the" "house") "house")
+  (("an" "apple") "apple") (("the" "tree") "tree") (("a" "book") "book"))
+
+; Echo position 0 (the previous word).
+(task-args "echo_prev" 2
+  (("the" "cat") "the") (("a" "dog") "a") (("the" "house") "the")
+  (("an" "apple") "an") (("the" "tree") "the") (("a" "book") "a"))
+
+; Concat the two — sanity check that M10s fires on this domain.
+(task-args "concat_window" 2
+  (("the" "cat") "thecat") (("a" "dog") "adog") (("the" "house") "thehouse")
+  (("an" "apple") "anapple") (("the" "tree") "thetree") (("a" "book") "abook"))
+
+; Concat with space — common POS-tagger output format.
+(task-args "concat_window_sp" 2
+  (("the" "cat") "the cat") (("a" "dog") "a dog") (("the" "house") "the house")
+  (("an" "apple") "an apple") (("the" "tree") "the tree") (("a" "book") "a book"))
+
+; ── Stage 1: Single-feature classification ───────────────────────────
+; Output is one of two labels. The discriminating feature is whether
+; the previous word is in some small set. The target word is
+; constant across rows so the synthesizer must look at position 0.
+
+; Binary classification: prev word is "the" → "definite", else "indefinite".
+(task-args "definite_check" 2
+  (("the" "cat") "definite") (("the" "dog") "definite") (("the" "house") "definite")
+  (("a" "cat") "indefinite") (("a" "dog") "indefinite") (("an" "apple") "indefinite"))
+
+; Article vs. non-article preceding a noun.
+(task-args "has_article" 2
+  (("the" "cat") "yes") (("a" "dog") "yes") (("an" "apple") "yes")
+  (("my" "cat") "no") (("his" "dog") "no") (("their" "apple") "no"))
+
+; Pronoun vs. article — the canonical POS feature.
+(task-args "pronoun_or_article" 2
+  (("i" "see") "pronoun") (("we" "go") "pronoun") (("they" "run") "pronoun")
+  (("the" "cat") "article") (("a" "dog") "article") (("an" "apple") "article"))
+
+; ── Stage 2: The "run" ambiguity ─────────────────────────────────────
+; The headline test. Same target word "run" gets different labels
+; based on the previous word. The chain must discover that the
+; output depends on which set the previous word falls into.
+
+(task-args "run_pos" 2
+  (("i" "run") "verb")
+  (("they" "run") "verb")
+  (("we" "run") "verb")
+  (("you" "run") "verb")
+  (("a" "run") "noun")
+  (("the" "run") "noun")
+  (("morning" "run") "noun")
+  (("long" "run") "noun"))
+
+; Same idea, more pronouns and modifiers — bigger sets to discriminate.
+(task-args "run_pos_extended" 2
+  (("i" "run") "verb") (("they" "run") "verb") (("we" "run") "verb")
+  (("you" "run") "verb") (("she" "run") "verb") (("he" "run") "verb")
+  (("a" "run") "noun") (("the" "run") "noun") (("an" "run") "noun")
+  (("my" "run") "noun") (("his" "run") "noun") (("her" "run") "noun"))
+
+; A second ambiguous word: "fly"
+(task-args "fly_pos" 2
+  (("i" "fly") "verb") (("they" "fly") "verb") (("we" "fly") "verb")
+  (("a" "fly") "noun") (("the" "fly") "noun") (("one" "fly") "noun"))
+
+; Two-word ambiguity: "walk"
+(task-args "walk_pos" 2
+  (("i" "walk") "verb") (("they" "walk") "verb") (("you" "walk") "verb")
+  (("a" "walk") "noun") (("the" "walk") "noun") (("morning" "walk") "noun"))
+
+; ── Stage 3: Constructed labels ──────────────────────────────────────
+; The label isn't a fixed string per partition — it's a function of
+; the inputs. Tests whether the chain composes classification with
+; concat-style emission. Likely too hard for P1 string family.
+
+; Tag the target with its part of speech: produce "run/V" or "run/N".
+(task-args "run_tagged" 2
+  (("i" "run") "run/V") (("they" "run") "run/V") (("we" "run") "run/V")
+  (("a" "run") "run/N") (("the" "run") "run/N") (("morning" "run") "run/N"))
+
+; ── Stage 4: 3-word window ───────────────────────────────────────────
+; Adds a token before the discriminator. Position 1 is the
+; discriminator; position 0 is noise. Tests whether the chain can
+; ignore irrelevant atoms.
+
+(task-args "run_pos_3window" 3
+  (("yes" "i" "run") "verb") (("now" "they" "run") "verb")
+  (("often" "we" "run") "verb") (("today" "you" "run") "verb")
+  (("yes" "a" "run") "noun") (("now" "the" "run") "noun")
+  (("often" "morning" "run") "noun") (("today" "long" "run") "noun"))
+
+; ── Stage 5: Subject vs object via pairwise equality ────────────────
+; The classic syntactic disambiguation. Encoding: positions 0..n-2
+; are the sentence words (flat, no nested lists), position n-1 is
+; the target word. The label is "subject" if the target equals the
+; subject word in the sentence, "object" if it equals the object
+; word.
+;
+; The discriminating function is "target equals sentence-word-at-position-K"
+; for some position K. This requires the chain to compare two pool
+; entries (target vs subject-position) — the M8s Form 4 pair-equality
+; classifier added in §9.47 P1.5.
+;
+; Note on encoding: a more natural encoding would be
+; ((sentence-as-list target-word) → label) but the §9.47 P1 string
+; pool only seeds atoms from string-typed positions, not from
+; descending into list positions. The flat-tuple encoding keeps
+; everything string-typed and lets the existing pool builder work
+; without modification. Descending into list atoms is a deferred
+; extension.
+
+; Subject + verb + object + target. The discriminator: target == (nth x 0)
+; → "subject", target == (nth x 2) → "object". The chain should find
+; either ((nth x 3), (nth x 0)) or ((nth x 3), (nth x 2)) as the
+; discriminating pair.
+(task-args "subj_obj_3word" 4
+  (("cats" "chase" "dogs" "cats") "subject")
+  (("cats" "chase" "dogs" "dogs") "object")
+  (("dogs" "chase" "cats" "dogs") "subject")
+  (("dogs" "chase" "cats" "cats") "object")
+  (("boys" "see" "girls" "boys") "subject")
+  (("boys" "see" "girls" "girls") "object"))
+
+; 5-word sentence + target = 6 positions. Subject is at index 1
+; (after "the"), object at index 4 (after the second "the"), target
+; at index 5. Discriminator: ((nth x 5), (nth x 1)) or
+; ((nth x 5), (nth x 4)).
+(task-args "subj_obj_simple" 6
+  (("the" "cat" "chased" "the" "dog" "cat") "subject")
+  (("the" "cat" "chased" "the" "dog" "dog") "object")
+  (("the" "dog" "chased" "the" "cat" "dog") "subject")
+  (("the" "dog" "chased" "the" "cat" "cat") "object")
+  (("the" "boy" "saw" "the" "girl" "boy") "subject")
+  (("the" "boy" "saw" "the" "girl" "girl") "object"))
+
+; ── Stage 6: Mixed POS — three labels ────────────────────────────────
+; Stretches binary-classify into multi-class. Three POS labels
+; based on the previous word. P1 binary classifier won't handle
+; this; tests whether the chain can be extended to k>2.
+
+(task-args "three_pos" 2
+  (("i" "run") "verb") (("we" "run") "verb")
+  (("the" "run") "noun") (("a" "run") "noun")
+  (("very" "fast") "adverb") (("quite" "slow") "adverb")
+  (("really" "tall") "adverb"))

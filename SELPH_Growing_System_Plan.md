@@ -7698,3 +7698,282 @@ meta-curriculum work.
 
 P2 should be a separate session — kernel work is mechanical but
 substantial enough to deserve its own scope.
+
+### 9.47.2 String POS curriculum — context-sensitive disambiguation lands (April 11, 2026)
+
+P1 closed with the §9.46 strings probe at 9/9 — but that probe was
+six fit-style shapes plus three fall-throughs. The user's interest in
+context-sensitive POS tagging (the canonical "I run fast" vs "going
+on a run" case) prompted a real test of how far the §9.47 string
+chain could be pushed: **can a fit-style recognizer learn
+discrimination by context?**
+
+#### 9.47.2.1 The new curriculum
+
+`examples/string_pos_curriculum.selph` — 17 multi-arg string tasks
+across six difficulty stages:
+
+| Stage | Tasks | Shape |
+|---|---|---|
+| 0: trivial controls | 5 | constant, identity, concat (sanity) |
+| 1: single-feature classify | 3 | binary label by article-presence / pronoun |
+| 2: "run" ambiguity | 4 | same target, different label by previous word |
+| 3: constructed labels | 1 | "run/V" vs "run/N" — concat composed with classify |
+| 4: 3-window | 1 | discriminator at position 1, noise at position 0 |
+| 5: subject/object | 2 | pairwise equality across positions |
+| 6: 3-class POS | 1 | k=3 partition (verb / noun / adverb) |
+
+The headline is the "run" ambiguity. Encoding is a 2-word window
+`("prev" "target")` with the target word constant ("run") and the
+label varying by previous word:
+
+```
+("i" "run")       → "verb"
+("they" "run")    → "verb"
+("we" "run")      → "verb"
+("a" "run")       → "noun"
+("the" "run")     → "noun"
+("morning" "run") → "noun"
+```
+
+Same word, different label, discriminator is the previous word's
+*set membership* — not its identity. None of M8s/M10s/M11s as built
+in P1 could recognize this; they're all column-equality fits.
+
+#### 9.47.2.2 Baseline
+
+```
+selph grow-v2 (run_probe.sh) string_pos_curriculum.selph
+
+Solved 5/17 tasks in 1.96s (600,005 candidates total)
+By strategy: custom:m-chain=5
+```
+
+Exactly the 5 Stage 0 controls. Every POS / classification /
+subject-object task fails at 50k cand each. The pattern was
+predictable from the §9.46 finding: the chain only recognizes shapes
+its forms know about, and "binary classification by atom membership"
+wasn't one of them.
+
+The 12 failures grouped into four categories:
+
+| Category | Tasks | Needs |
+|---|---|---|
+| Binary classify by membership | 8 | Partition rows by output, find atom whose value sets are disjoint per partition |
+| Three-class classify | 1 | k>2 generalization of binary classify |
+| Conditional emission + concat | 1 | Classify composed with constructed labels |
+| Pairwise equality classify | 2 | Compare two pool entries' columns row-by-row |
+
+#### 9.47.2.3 The fix: M8s Forms 3 and 4
+
+Two new forms added to `detect-constant-string` (and the file is now
+arguably misnamed — it handles four shapes including non-constant
+classification — but the detect-* entry point name is unchanged so
+the chain dispatcher doesn't need to know).
+
+**Form 3 — `fit-multi-classify`** (~80 LOC). Generalized partition
+recognizer. For pool column `e-col` and target output column,
+partition rows by output label, build the set of `e-col` values
+appearing in each label's rows, check that all pairwise sets are
+disjoint. If yes, the atom cleanly discriminates and the
+recognizer emits a chain of `(if (contains <set-i> e) "label-i" ...)`
+tests with the last label as the else fall-through. Caps at k=4
+distinct labels — beyond that the if-chain becomes unwieldy.
+
+The binary case (k=2) is the canonical POS shape. The k=3 case
+extends to multi-class POS like `three_pos`. The recognizer is the
+same code path either way — k is determined by the spec.
+
+**Form 4 — `fit-pair-equality`** (~70 LOC). For each ordered pair
+`(e1, e2)` of distinct pool entries, build a derived "equality
+column" where `eq[i] = (e1[i] == e2[i])`. If the column is
+discriminating (not all-true / not all-false) and `fit-multi-classify`
+on that column produces exactly 2 labels, emit
+`(if (= e1-source e2-source) "true-label" "false-label")`. The
+"true" branch is determined by which label's value-set contains
+`true`.
+
+This is the cross-position recognizer. It catches subject/object
+discrimination because the rule "target word equals subject word"
+is exactly an equality between two indexed atoms.
+
+Cost: O(pool²) per spec for Form 4, O(pool) for Form 3. With pool
+size ~12 (3 atoms × unary-l1) on 6-row specs, both are well under
+1000 ops per task. The chain dispatch order (Form 1 → 2 → 3 → 4)
+short-circuits as soon as a cheaper form fits, so Form 4 only runs
+when nothing earlier matches.
+
+#### 9.47.2.4 Encoding subject/object: a forced re-encoding
+
+The first attempt at the subject/object tasks used the natural
+encoding `((sentence target) → label)` where `sentence` is a
+list-of-strings. The problem: `m_pool_string`'s L0 builder only
+seeds atoms from positions whose values are *strings*, not lists
+of strings. With one input position being a list, the pool only
+contained one string atom (the target word) and Form 4 needs at
+least two distinct pool entries to compare.
+
+The fix was to flatten the encoding: `((w0 w1 w2 ... target) → label)`
+with each sentence word in its own task-args position. This keeps
+every position string-typed and lets the existing pool builder seed
+one atom per word. The synthesized solutions show this working:
+
+```
+subj_obj_3word  →  (lambda (x) (if (= (nth x 0) (nth x 3)) "subject" "object"))
+subj_obj_simple →  (lambda (x) (if (= (nth x 1) (nth x 5)) "subject" "object"))
+```
+
+For the simple case the chain found that **position 1** — the noun
+after the first "the" — discriminates against the target (position 5).
+It picked this out of `pool² = 36` possible pairs by trying each in
+order and stopping at the first clean partition.
+
+The flat encoding is a workaround. The cleaner fix is "list-aware
+pool entries" — descend into list-typed input positions and seed
+atoms for fixed sub-positions like `(nth (nth x 0) k)` for
+k = 0..len-1. This is a deferred extension; Path D's "featurizer"
+framing would handle it natively, Path E's per-domain pools would
+need an explicit list-pool builder.
+
+#### 9.47.2.5 Results
+
+```
+Solved 17/17 tasks in 0.00s (17 candidates total)
+By strategy: custom:m-chain=17
+```
+
+**Every task in the curriculum solves via the chain in exactly 1
+candidate.** Selected synthesized lambdas:
+
+```
+run_pos             →  (lambda (x) (if (contains (list "i" "they" "we" "you") (nth x 0)) "verb" "noun"))
+run_pos_3window     →  (lambda (x) (if (contains (list "i" "they" "we" "you") (nth x 1)) "verb" "noun"))
+run_tagged          →  (lambda (x) (if (contains (list "i" "they" "we") (nth x 0)) "run/V" "run/N"))
+three_pos           →  (lambda (x) (if (contains (list "i" "we") (nth x 0)) "verb"
+                                     (if (contains (list "the" "a") (nth x 0)) "noun" "adverb")))
+subj_obj_3word      →  (lambda (x) (if (= (nth x 0) (nth x 3)) "subject" "object"))
+subj_obj_simple     →  (lambda (x) (if (= (nth x 1) (nth x 5)) "subject" "object"))
+```
+
+Three things worth pointing out:
+
+1. **`run_pos_3window` automatically found `(nth x 1)`** as the
+   discriminator. The 3-word window has noise in position 0 and the
+   real discriminator in position 1. The chain iterates the pool in
+   order, tries Form 3 on each entry, and picks the first clean
+   partition. No hint about which position matters. This is the
+   behavior we'd want a "feature selection" learner to have, and
+   it falls out of the partition-disjointness check for free.
+
+2. **`run_tagged` works because Form 3 only cares about distinct
+   output values, not their content.** "run/V" and "run/N" are two
+   distinct strings; the partition check works the same way it
+   does for "verb"/"noun". The recognizer doesn't know it's
+   tagging a word — it just notices that the prev-word column
+   cleanly discriminates two label classes.
+
+3. **`subj_obj_simple` picked position 1 over position 4** even
+   though both would work as discriminators (with reversed labels).
+   This is iteration-order dependent: Form 4 walks pool² in order
+   and the first hit wins. A hypothetical improvement would
+   prefer the *simplest* discriminator (lowest-index atom), but
+   for a 1-cand solution that's already minimal, it doesn't
+   matter.
+
+Regression check across all curricula:
+
+| Curriculum | Result | Strategy split |
+|---|---|---|
+| `string_pos_curriculum` | **17/17** | custom:m-chain=17 |
+| `probe_strings_mchain` | 9/9 | Flat=2, custom:m-chain=7 |
+| `probe_int_control` | 5/5 | custom:m-chain=5 |
+| `physics_tasks` | 24/24 | Flat=13, custom:m-chain=11 |
+| `physics_stage6` | 8/8 | custom:m-chain=8 |
+| `physics_stage7` | 5/5 | custom:m-chain=5 |
+
+Zero regressions. The new forms only fire when Forms 1 and 2 don't
+match, so numeric and existing string tasks behave identically.
+
+#### 9.47.2.6 What §9.47.2 demonstrates
+
+The §9.47 P1 architecture (per-domain pools with type dispatch)
+proved extensible to a meaningfully harder shape — partition by
+feature — with **no Rust changes and ~150 LOC of new
+meta-curriculum**. The §9.46 thesis stands and is sharpened: the
+M-chain isn't a fixed recognizer surface, it's a *substrate* for
+adding recognizers, and adding new shapes is the natural mode of
+work.
+
+More importantly: the chain is now demonstrating shapes that
+cross over from "fit a closed-form expression" into "learn a
+discrete classification function." The Form 3/4 partition
+recognizers are structurally close to a decision-tree learner —
+they discover both the discriminating feature *and* the
+classification function in one pass. This is the closest the chain
+has come to genuinely recognizing learnability rather than
+fittability, and it happened by adding two short functions to one
+file.
+
+Two implications worth flagging:
+
+1. **The same partition-by-feature shape is useful for numeric
+   too.** Step functions, piecewise constants, and threshold
+   classifiers are all the numeric analogue. Form 3 in `m8`
+   (numeric M8) would close that gap if a curriculum task
+   demanded it. Worth keeping in mind for any future numeric
+   curriculum that hits a step-function wall.
+
+2. **Path E's "per-domain duplication" worry continues to be
+   small.** Form 3 and Form 4 only exist in m8s, not in m8 — they
+   were added where the curriculum needed them. The numeric chain
+   stayed unchanged. If/when the numeric chain needs partition
+   recognizers, we'd add them as numeric forms. The two domains
+   evolve independently and that's fine.
+
+#### 9.47.2.7 What's still beyond the chain (and what they need)
+
+The 17/17 result hides three real limits the curriculum doesn't
+test but a larger one would:
+
+- **Word-internal features.** "If the target ends in -ing, label
+  it 'gerund'." The chain has no shape that recognizes regex /
+  suffix / character-class features — it only does set membership
+  on whole atoms. A "string-suffix predicate" pool extension
+  would unlock this.
+
+- **Sequence-position arithmetic.** "If the target appears before
+  the verb, label it 'subject'; if after, 'object'." This is
+  what the user originally asked about. The current encoding
+  side-steps it via flat tuples + pairwise equality, but a real
+  parser needs to *find* the verb position dynamically and do
+  numeric comparison. That's a join across the string and
+  numeric branches, which the type dispatcher currently routes
+  separately.
+
+- **Feature combinations.** "If the prev word is article AND the
+  target word ends in vowel, label it 'noun'." Form 3 partitions
+  on a single atom; conjunction of two features isn't expressible
+  without a different recognizer (or an extended pool that
+  pre-computes derived columns).
+
+These are all expressible in the existing substrate with new
+recognizer forms. The pattern from §9.47.2 — add two short
+functions to one file when a new shape comes up — is the
+ongoing mode of work as curricula get richer.
+
+#### 9.47.2.8 What's next
+
+Original §9.47 plan still holds: P2 = grids. The §9.47.2 result
+strengthens the case because it shows the per-domain pool pattern
+*scales within a domain* by recognizer addition, not just across
+domains by file copy. P2 grids will follow the same shape: minimal
+Rust kernel, parallel `m_pool_grid.selph`, grid-specific
+detect-* family that grows as the curriculum surfaces shapes.
+
+Side question worth noting before P2: should there be a shared
+partition framework that both numeric and string forms use, or
+should numeric Form 3 (when added) be a separate copy? The current
+state is "each domain has its own". After two domains with
+overlapping shapes, this is the moment Path D would feel less
+hypothetical — but until a third domain forces the question,
+Path E's "copy when needed" remains the lower-overhead answer.
