@@ -959,6 +959,34 @@ pub fn primitive_components() -> Vec<SynthComponent> {
         15.0,
     ));
 
+    // ── Grid cross-type bridges (§9.50) ────────────────────────────
+    // Only the ops that bridge types (List↔Int). Unary grid→grid
+    // transforms stay out of enumeration — the M-chain handles them
+    // without polluting the search space.
+    //
+    // Grid → Int extractors:
+    comps.push(SynthComponent::named(
+        "grid-height", intern("grid-height"), vec![list_], int, 5.0,
+    ));
+    comps.push(SynthComponent::named(
+        "grid-width", intern("grid-width"), vec![list_], int, 5.0,
+    ));
+    comps.push(SynthComponent::named(
+        "grid-object-count", intern("grid-object-count"), vec![list_], int, 5.0,
+    ));
+    // (Grid, Int) → Grid constructors. Priority 15 keeps them behind
+    // simpler ops. The builtins themselves guard against huge outputs
+    // (see the size cap in bi_grid_scale/bi_grid_tile).
+    comps.push(SynthComponent::named(
+        "grid-scale", intern("grid-scale"), vec![list_, int], list_, 15.0,
+    ));
+    comps.push(SynthComponent::named(
+        "grid-tile", intern("grid-tile"), vec![list_, int], list_, 15.0,
+    ));
+    // Binary Grid × Grid → Grid ops stay out of the primitive catalog
+    // to avoid combinatorial explosion at depth 2. The M-chain handles
+    // them via targeted probing in the grid pool builder.
+
     comps
 }
 
@@ -5848,16 +5876,62 @@ pub fn synthesize_args_with_test(
     test_inputs: &[Value],
     test_expected: &[Value],
 ) -> SynthResult {
-    let seed_atoms: Vec<SynthComponent> = arg_types
+    synthesize_args_with_extra_seeds(
+        components, inputs, arg_types, expected, env, universe,
+        max_depth, max_candidates, test_inputs, test_expected, &[],
+    )
+}
+
+/// Like `synthesize_args_with_test` but with additional literal constants
+/// injected as depth-0 seed components. The `extra_seeds` are appended
+/// to the indexed arg atoms, widening the reachable type set and making
+/// cross-type compositions possible (e.g. `grid-scale(grid, 2)` when
+/// `2` is an extra seed).
+pub fn synthesize_args_with_extra_seeds(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    arg_types: &[Sym],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+    test_inputs: &[Value],
+    test_expected: &[Value],
+    extra_seeds: &[SynthComponent],
+) -> SynthResult {
+    let mut seed_atoms: Vec<SynthComponent> = arg_types
         .iter()
         .enumerate()
         .map(|(i, &t)| indexed_arg_component(i, t))
         .collect();
+    seed_atoms.extend_from_slice(extra_seeds);
     synthesize_inner(
         components, inputs, expected, env, universe,
         max_depth, max_candidates, Some(seed_atoms),
         test_inputs, test_expected,
     )
+}
+
+/// Convert a `Value` into a literal `SynthComponent` for use as an
+/// extra seed. Returns `None` for types that can't be literals
+/// (lists, namespaces, functions, etc.).
+pub fn value_to_seed_component(v: &Value, priority: f64) -> Option<SynthComponent> {
+    match v {
+        Value::Int(n) => Some(SynthComponent::literal(
+            n.to_string(), LiteralKind::Int(*n), intern("Int"), priority,
+        )),
+        Value::Num(n) => Some(SynthComponent::literal(
+            n.to_string(), LiteralKind::Num(*n), intern("Num"), priority,
+        )),
+        Value::Str(s) => Some(SynthComponent::literal(
+            format!("\"{}\"", s), LiteralKind::Str(s.to_string()), intern("Str"), priority,
+        )),
+        Value::Bool(b) => Some(SynthComponent::literal(
+            b.to_string(), LiteralKind::Bool(*b), intern("Bool"), priority,
+        )),
+        _ => None,
+    }
 }
 
 fn synthesize_inner(
@@ -6563,8 +6637,9 @@ mod tests {
         // String literals
         assert!(names.contains(&"a"));
         assert!(names.contains(&"("));
-        // No grid components
-        assert!(!names.iter().any(|n| n.starts_with("grid-")));
+        // §9.50: cross-type grid bridges are now in primitives
+        assert!(names.contains(&"grid-height"));
+        assert!(names.contains(&"grid-width"));
         // No `x` (input variable is task-specific)
         assert!(!names.contains(&"x"));
     }

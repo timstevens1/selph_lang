@@ -254,6 +254,83 @@
             (concat name1 "(" n2 ")")
             (pm-probe-d2-inner op1 name1 (tail ops2) spec)))))))
 
+; ── Constant discovery ────────────────────────────────────────────────
+;
+; Analyze a failing spec to discover implicit constants — values that
+; are consistent across all training examples but not present as inputs.
+; These become extra-seeds for retry synthesis.
+
+(define pm-discover-constants
+  (lambda (spec)
+    (let ((pairs spec))
+      (let ((candidates (list)))
+        ; Height ratio: output_h / input_h (if consistent integer)
+        (let ((h-ratios (map (lambda (p)
+                (let ((ig (pm-get-input-grid p))
+                      (og (pm-get-output-grid p)))
+                  (let ((ih (try (length ig) 0))
+                        (oh (try (length og) 0)))
+                    (if (and (> ih 0) (> oh 0) (= (modulo oh ih) 0))
+                      (/ oh ih) -1))))
+                pairs)))
+          (let ((candidates
+                  (if (and (pm-all-same? h-ratios) (> (head h-ratios) 1))
+                    (append candidates (list (head h-ratios)))
+                    candidates)))
+            ; Width ratio: output_w / input_w
+            (let ((w-ratios (map (lambda (p)
+                    (let ((ig (pm-get-input-grid p))
+                          (og (pm-get-output-grid p)))
+                      (let ((iw (try (length (head ig)) 0))
+                            (ow (try (length (head og)) 0)))
+                        (if (and (> iw 0) (> ow 0) (= (modulo ow iw) 0))
+                          (/ ow iw) -1))))
+                    pairs)))
+              (let ((candidates
+                      (if (and (pm-all-same? w-ratios)
+                               (> (head w-ratios) 1)
+                               (not (pm-member? (head w-ratios) candidates)))
+                        (append candidates (list (head w-ratios)))
+                        candidates)))
+                ; Small useful constants: 2, 3 (common ARC scale factors)
+                (let ((candidates
+                        (reduce (lambda (acc c)
+                                  (if (pm-member? c acc) acc (append acc (list c))))
+                                (list 2 3) candidates)))
+                  candidates)))))))))
+
+(define pm-all-same?
+  (lambda (lst)
+    (if (<= (length lst) 1) true
+      (pm-all? (lambda (v) (= v (head lst))) (tail lst)))))
+
+; ── Extra-seeds retry ────────────────────────────────────────────────
+;
+; Re-run synthesis with discovered constants as extra-seeds. Only
+; attempts if there are constants to inject and held-out test data.
+
+(define pm-retry-with-seeds
+  (lambda (r constants)
+    (let ((spec   (ns-get r "spec"))
+          (budget (ns-get r "max-candidates"))
+          (depth  (ns-get r "depth"))
+          (arity  (try (ns-get r "arity") false))
+          (test   (try (ns-get r "test") (list))))
+      (let ((synth-ns
+              (if (= (length test) 0)
+                (ns ("spec" spec)
+                    ("max-depth" (max depth 2))
+                    ("max-candidates" budget)
+                    ("extra-seeds" constants))
+                (ns ("spec" spec)
+                    ("max-depth" (max depth 2))
+                    ("max-candidates" budget)
+                    ("extra-seeds" constants)
+                    ("test" test)))))
+        (if arity
+          (synthesize-args synth-ns)
+          (synthesize synth-ns))))))
+
 ; ── Build diagnosis for one failure ──────────────────────────────────
 
 (define pm-diagnose-one
@@ -270,16 +347,29 @@
             (probe-1    (try (pm-probe-unary spec) "error"))
             (probe-2    (if (= (try (pm-probe-unary spec) "error") "none")
                           (try (pm-probe-depth2 spec) "error")
-                          "skipped")))
-        (ns ("name"          name)
-            ("size"          size-cat)
-            ("colors"        color-cat)
-            ("constant-out"  const-out)
-            ("dims-consistent" dims-cons)
-            ("objects"       obj-cat)
-            ("scale"         scale-cat)
-            ("probe-1"       probe-1)
-            ("probe-2"       probe-2))))))
+                          "skipped"))
+            (constants  (try (pm-discover-constants spec) (list))))
+        ; Try extra-seeds retry if we found constants
+        (let ((retry-result
+                (if (> (length constants) 0)
+                  (try (pm-retry-with-seeds r constants) (ns ("found" false)))
+                  (ns ("found" false)))))
+          (let ((retry-found (try (ns-get retry-result "found") false)))
+            (ns ("name"          name)
+                ("size"          size-cat)
+                ("colors"        color-cat)
+                ("constant-out"  const-out)
+                ("dims-consistent" dims-cons)
+                ("objects"       obj-cat)
+                ("scale"         scale-cat)
+                ("probe-1"       probe-1)
+                ("probe-2"       probe-2)
+                ("constants"     constants)
+                ("retry-found"   retry-found)
+                ("retry-source"
+                  (if retry-found
+                    (try (ns-get retry-result "source") "")
+                    "")))))))))
 
 ; ── Tally helper ─────────────────────────────────────────────────────
 

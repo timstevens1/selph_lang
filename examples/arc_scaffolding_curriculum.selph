@@ -5,6 +5,36 @@
 ; Each task has enough examples + held-out test data to defeat
 ; memorization (M-chain Form 5). Solutions must actually call the
 ; grid builtins to generalize.
+;
+; Stage A tasks: grid→scalar extractors (grid-height, grid-width).
+; These are scalar-output tasks that the M-chain's numeric branch
+; can solve directly. Once in the library, they become type bridges.
+
+; ── grid_height: grid→int ────────────────────────────────────────────
+
+(task-args "grid_height" 2
+  ((((1 2) (3 4))) 2)
+  ((((5 0 5) (0 5 0) (5 0 5))) 3)
+  ((((7))) 1)
+  ((((1 0 0 0) (0 1 0 0) (0 0 1 0) (0 0 0 1) (0 0 0 0))) 5)
+  ((((2 2) (2 2) (2 2) (2 2))) 4)
+  (test (((3 3 3) (3 0 3))) 2))
+
+; ── grid_width: grid→int ─────────────────────────────────────────────
+
+(task-args "grid_width" 2
+  ((((1 2 3) (4 5 6))) 3)
+  ((((7 8) (9 0))) 2)
+  ((((5))) 1)
+  ((((1 0 0 0 0) (0 1 0 0 0))) 5)
+  ((((2 2 2) (2 2 2) (2 2 2) (2 2 2))) 3)
+  (test (((3 3) (3 3) (3 3))) 2))
+
+; ══════════════════════════════════════════════════════════════════════════
+; Stage B tasks: operations that need the Stage A library + extra-seeds.
+; These will fail in the initial run but become solvable when the
+; post-mortem discovers constants and retries with extra-seeds.
+; ══════════════════════════════════════════════════════════════════════════
 
 ; ── extract_object: grid-trim ────────────────────────────────────────
 

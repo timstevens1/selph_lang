@@ -2451,6 +2451,19 @@ fn bi_synthesize(args: &[Value], env: &Env) -> Result<Value, String> {
     // present. Falls back to the primitive baseline when absent.
     let universe = crate::synth_v2::TypeUniverse::from_env(env);
 
+    // §9.50: inject extra-seeds as literal components. These are
+    // depth-0 constants that widen the reachable type set. For the
+    // single-arg path they go into the component catalog directly
+    // (synthesize_with_strategies passes them to synthesize_inner
+    // via the flat enumeration step).
+    if let Some(Value::List(seeds)) = ns.get(&intern("extra-seeds")) {
+        for seed in seeds.iter() {
+            if let Some(comp) = crate::synth_v2::value_to_seed_component(seed, 50.0) {
+                components.push(comp);
+            }
+        }
+    }
+
     // §9.34 — `("heuristic" lambda)` field, if present, re-scores and
     // re-sorts the catalog before dispatch. The lambda is a `Value::Function`
     // (or `Value::Builtin`) supplied directly by the SELPH caller, so the
@@ -2598,11 +2611,25 @@ fn bi_synthesize_args(args: &[Value], env: &Env) -> Result<Value, String> {
         }
     }
 
+    // §9.50: read "extra-seeds" — a list of literal values to inject
+    // as depth-0 constants. These widen the reachable type set, enabling
+    // cross-type compositions like grid-scale(grid, 2) where 2 is a
+    // discovered constant. Priority 50.0 puts them above data-derived
+    // literals (0.0) but below input variables (100.0).
+    let mut extra_seed_components = Vec::new();
+    if let Some(Value::List(seeds)) = ns.get(&intern("extra-seeds")) {
+        for seed in seeds.iter() {
+            if let Some(comp) = crate::synth_v2::value_to_seed_component(seed, 50.0) {
+                extra_seed_components.push(comp);
+            }
+        }
+    }
+
     let skip = crate::synth_v2::default_skip_set();
     let components = crate::synth_v2::default_synth_components(env, &skip);
     let universe = crate::synth_v2::TypeUniverse::from_env(env);
 
-    let result = crate::synth_v2::synthesize_args_with_test(
+    let result = crate::synth_v2::synthesize_args_with_extra_seeds(
         &components,
         &inputs,
         &arg_types,
@@ -2613,6 +2640,7 @@ fn bi_synthesize_args(args: &[Value], env: &Env) -> Result<Value, String> {
         max_candidates,
         &test_inputs,
         &test_expected,
+        &extra_seed_components,
     );
 
     let source = if result.found {
@@ -3254,7 +3282,9 @@ fn bi_grid_scale(args: &[Value], _env: &Env) -> Result<Value, String> {
         Value::Num(n) => *n as usize,
         _ => return Err("grid-scale: factor must be a number".into()),
     };
-    if factor == 0 { return Err("grid-scale: factor must be > 0".into()); }
+    if factor == 0 || factor > 10 {
+        return Err("grid-scale: factor must be 1-10".into());
+    }
     let h = g.len();
     let w = if h > 0 { g[0].len() } else { 0 };
     let mut out = vec![vec![0i64; w * factor]; h * factor];
@@ -3290,8 +3320,14 @@ fn bi_grid_tile(args: &[Value], _env: &Env) -> Result<Value, String> {
             _ => return Err("grid-tile: cols must be a number".into()),
         }
     } else { nr };
+    if nr == 0 || nr > 10 || nc > 10 {
+        return Err("grid-tile: factors must be 1-10".into());
+    }
     let h = g.len();
     let w = if h > 0 { g[0].len() } else { 0 };
+    if h * nr > 100 || w * nc > 100 {
+        return Err("grid-tile: result too large (max 100x100)".into());
+    }
     let mut out = vec![vec![0i64; w * nc]; h * nr];
     for tr in 0..nr {
         for tc in 0..nc {

@@ -1777,7 +1777,7 @@ fn cmd_grow_v2(args: &[String]) {
                             // Tally each diagnostic dimension.
                             let dimensions = ["size", "colors", "constant-out",
                                               "dims-consistent", "objects", "scale",
-                                              "probe-1", "probe-2"];
+                                              "probe-1", "probe-2", "retry-found"];
                             for dim in &dimensions {
                                 let mut tally: std::collections::BTreeMap<String, usize> =
                                     std::collections::BTreeMap::new();
@@ -1813,10 +1813,21 @@ fn cmd_grow_v2(args: &[String]) {
                                     let p2 = ns.get(&intern("probe-2"))
                                         .map(|v| eval_v2::value_to_string(v))
                                         .unwrap_or_default();
-                                    eprintln!("  {:12}  size={:12} colors={:14} probe={}{}",
-                                        name, size, colors, p1,
-                                        if p2 != "skipped" && p2 != "none" && !p2.is_empty()
-                                            { format!(" d2={}", p2) } else { String::new() });
+                                    let retried = ns.get(&intern("retry-found"))
+                                        .map(|v| matches!(v, types_v2::Value::Bool(true)))
+                                        .unwrap_or(false);
+                                    let retry_src = ns.get(&intern("retry-source"))
+                                        .map(|v| eval_v2::value_to_string(v))
+                                        .unwrap_or_default();
+                                    if retried {
+                                        eprintln!("  {:12}  RECOVERED  {}",
+                                            name, retry_src);
+                                    } else {
+                                        eprintln!("  {:12}  size={:12} colors={:14} probe={}{}",
+                                            name, size, colors, p1,
+                                            if p2 != "skipped" && p2 != "none" && !p2.is_empty()
+                                                { format!(" d2={}", p2) } else { String::new() });
+                                    }
                                 }
                             }
                         }
