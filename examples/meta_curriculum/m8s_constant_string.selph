@@ -57,15 +57,24 @@
 
 ; ── Pool builder ─────────────────────────────────────────────────────
 ;
-; M8s consults the L0 pool plus unary-l1 wraps for Form 2. Form 1
-; doesn't consult the pool at all (recognizer reads target directly).
-; Including unary-l1 lets `(string-upper (nth x 0))` and the other
-; wrap-* entries be picked up as Form 2 matches without going through
-; M10s's pair iteration. The pool grows from `arity` to
-; `arity * (1 + len(unary-ops))` entries — for typical 2-arg specs
-; that's 2 → 8, negligible iteration cost.
+; M8s consults the L0 pool plus unary-l1 wraps for Forms 2-4, plus
+; the §9.47.3 word-internal derived features (suffixes, prefixes,
+; capital) for Forms 3-6 to discriminate by morphological features.
+; Form 1 doesn't consult the pool at all.
+;
+; Pool size for typical 2-arg specs: 2 base + 6 unary wraps + 14
+; suffix entries + 8 prefix entries + 2 capital entries = ~32
+; entries. Cost per task is still trivial (Form 4 pair-iteration is
+; ~32² = 1024 fits, each fit linear in row count).
 
-(define m8s-build-pool (lambda (s) (make-pool-string s (ns ("unary-l1" true)))))
+(define m8s-build-pool
+  (lambda (s)
+    (make-pool-string s
+      (ns ("unary-l1" true)
+          ("suffixes" true)
+          ("prefixes" true)
+          ("capital"  true)
+          ("numeric"  true)))))
 
 (define m8s-pool-source (lambda (e) (ns-get e "source")))
 (define m8s-pool-col    (lambda (e) (ns-get e "col")))
@@ -175,11 +184,31 @@
   (lambda (g-source)
     (m8s-wrap-lambda g-source)))
 
-; Build a `(list "v0" "v1" ...)` AST node from a list of strings.
-(define m8s-emit-string-list
+; Polymorphic value-to-Node converter. Dispatches on runtime type so
+; the emit works for string atoms (Form 3 on base atoms) AND for
+; boolean derived features (Form 3 on suffix/prefix predicates from
+; the §9.47.3 word-internal feature pool). Without the bool case,
+; emitting an if-contains test on a derived feature column would
+; crash with "make-str: expected string, got Bool(true)".
+(define m8s-value-to-node
+  (lambda (v)
+    (if (string? v) (make-str v)
+      (if (bool? v) (make-bool v)
+        (if (int? v) (make-int v)
+          (if (num? v) (make-num v)
+            (error (concat "m8s-value-to-node: unsupported value type for "
+                           (to-string v)))))))))
+
+; Build a `(list v0 v1 ...)` AST node from a list of values, picking
+; the right make-* per value type. Used by the multi-classify emit
+; when building the literal value-set list.
+(define m8s-emit-value-list
   (lambda (vs)
-    (let ((str-nodes (map make-str vs)))
-      (apply make-app (cons (make-symbol "list") str-nodes)))))
+    (let ((nodes (map m8s-value-to-node vs)))
+      (apply make-app (cons (make-symbol "list") nodes)))))
+
+; Backwards-compat alias.
+(define m8s-emit-string-list m8s-emit-value-list)
 
 ; Build a chain of nested ifs that emit the multi-classify decision
 ; tree. For k labels [l1, l2, l3, ..., lk] with value sets
@@ -234,28 +263,67 @@
       pool
       nil)))
 
-; Form 3: multi-classify by atom membership. Iterate the pool and
-; for each entry try fit-multi-classify (k ∈ {2, 3, 4}). The first
-; clean partition wins. This is the §9.47 P1.5 addition for
-; context-sensitive POS, generalized to small multi-class.
+; Distinct-count of a column. Used as the "simplicity score" for
+; Form 3's preference: discriminators with fewer distinct column
+; values are preferred because they generalize better. A boolean
+; suffix predicate (2 distinct vals) beats a literal-word discriminator
+; (n distinct vals where n = num training rows).
+(define m8s-distinct-count
+  (lambda (col)
+    (length
+      (reduce
+        (lambda (acc v) (if (contains acc v) acc (append acc (list v))))
+        col
+        (list)))))
+
+; Form 3: multi-classify by atom membership. Iterates the entire
+; pool, collects all entries that yield a clean partition, and
+; picks the entry with the smallest distinct-value count.
+;
+; The key §9.47.3 change: prefer the SIMPLEST discriminator over the
+; FIRST matching one. Without this, base string atoms (which trivially
+; partition any spec where each input row is unique) would win over
+; derived feature predicates (which discriminate based on a real
+; rule). Memorization beats learning unless we score against it.
+;
+; Tie-break: when two entries have the same distinct count, the one
+; encountered earlier in pool order wins (reduce's left-fold
+; preserves first-seen).
 (define m8s-try-form-3
   (lambda (pool target)
-    (reduce
-      (lambda (acc entry)
-        (if (not (nil? acc)) acc
-          (let ((fit (fit-multi-classify (m8s-pool-col entry) target)))
-            (if (nil? fit)
-              nil
-              (ns ("kind" "form-3-classify")
-                  ("k"      (length (ns-get fit "labels")))
-                  ("labels" (ns-get fit "labels"))
-                  ("source-node"
-                    (m8s-emit-multi-classify
-                      (m8s-pool-source entry)
-                      (ns-get fit "labels")
-                      (ns-get fit "vals-by-label"))))))))
-      pool
-      nil)))
+    (let ((hits
+            (filter (lambda (e) (not (nil? e)))
+              (map
+                (lambda (entry)
+                  (let ((fit (fit-multi-classify (m8s-pool-col entry) target)))
+                    (if (nil? fit)
+                      nil
+                      (ns ("entry" entry)
+                          ("fit"   fit)
+                          ("score" (m8s-distinct-count
+                                     (m8s-pool-col entry)))))))
+                pool))))
+      (if (= (length hits) 0)
+        nil
+        (let ((best
+                (reduce
+                  (lambda (acc h)
+                    (if (or (nil? acc) (< (ns-get h "score") (ns-get acc "score")))
+                      h
+                      acc))
+                  hits
+                  nil)))
+          (let ((entry (ns-get best "entry"))
+                (fit   (ns-get best "fit")))
+            (ns ("kind" "form-3-classify")
+                ("k"      (length (ns-get fit "labels")))
+                ("labels" (ns-get fit "labels"))
+                ("score"  (ns-get best "score"))
+                ("source-node"
+                  (m8s-emit-multi-classify
+                    (m8s-pool-source entry)
+                    (ns-get fit "labels")
+                    (ns-get fit "vals-by-label"))))))))))
 
 ; Form 4: pair-equality classify. Iterate ordered pairs (e1, e2) of
 ; distinct pool entries and build a derived "equality column" where
@@ -304,6 +372,225 @@
                     (make-str true-label)
                     (make-str false-label))))))))))
 
+; ── Form 5: sequence-position arithmetic (§9.47.3) ───────────────────
+;
+; Numeric ordering classify. For each ordered pair (e1, e2) of
+; distinct numeric pool entries, build an "ordering column" where
+; eq[i] = (e1[i] < e2[i]). If discriminating, run binary classify
+; on the boolean column and emit
+; (if (< e1-source e2-source) "label-true" "label-false").
+;
+; Structurally parallel to Form 4 (pair-equality) but uses `<` instead
+; of `=` and only iterates numeric atoms (kind = "numeric-atom").
+; Form 5's typical use case is sequence-position discrimination:
+; "if target index < verb index then subject else object."
+
+; Identify a column's value type by inspecting its head. Returns
+; "numeric", "string", "bool", or "other". Used to gate Form 5's
+; iteration to numeric pool entries only.
+(define m8s-pool-col-type
+  (lambda (e)
+    (let ((c (m8s-pool-col e)))
+      (if (= (length c) 0)
+        "other"
+        (let ((v (head c)))
+          (if (or (int? v) (num? v)) "numeric"
+            (if (string? v) "string"
+              (if (bool? v) "bool" "other"))))))))
+
+(define m8s-numeric-pool-entries
+  (lambda (pool)
+    (filter (lambda (e) (= (m8s-pool-col-type e) "numeric")) pool)))
+
+(define m8s-lt-col
+  (lambda (col-a col-b)
+    (map (lambda (i) (< (nth col-a i) (nth col-b i)))
+         (range (length col-a)))))
+
+(define m8s-build-ordering-result
+  (lambda (e1 e2 fit)
+    (let ((labels (ns-get fit "labels"))
+          (vals (ns-get fit "vals-by-label")))
+      (let ((first-is-true (contains (head vals) true)))
+        (let ((true-label  (if first-is-true (head labels) (head (tail labels))))
+              (false-label (if first-is-true (head (tail labels)) (head labels))))
+          (ns ("kind" "form-5-ordering")
+              ("score" 2)
+              ("true-label"  true-label)
+              ("false-label" false-label)
+              ("source-node"
+                (m8s-wrap-lambda
+                  (make-if
+                    (make-app "<" (m8s-pool-source e1) (m8s-pool-source e2))
+                    (make-str true-label)
+                    (make-str false-label))))))))))
+
+(define m8s-fit-ordering
+  (lambda (e1 e2 target)
+    (if (= (m8s-pool-col e1) (m8s-pool-col e2))
+      nil
+      (let ((lt-col (m8s-lt-col (m8s-pool-col e1) (m8s-pool-col e2))))
+        (if (not (m8s-discriminating? lt-col))
+          nil
+          (let ((fit (fit-multi-classify lt-col target)))
+            (if (or (nil? fit) (not (= (length (ns-get fit "labels")) 2)))
+              nil
+              (m8s-build-ordering-result e1 e2 fit))))))))
+
+(define m8s-try-form-5
+  (lambda (pool target)
+    (let ((numerics (m8s-numeric-pool-entries pool)))
+      (reduce
+        (lambda (acc e1)
+          (if (not (nil? acc))
+            acc
+            (reduce
+              (lambda (acc2 e2)
+                (if (not (nil? acc2))
+                  acc2
+                  (m8s-fit-ordering e1 e2 target)))
+              numerics
+              nil)))
+        numerics
+        nil))))
+
+; ── Form 6: feature conjunction (§9.47.3) ────────────────────────────
+;
+; Pair-classify by joint column values. For each ordered pair (e1, e2)
+; of distinct pool entries, build a "joint column" where each cell is
+; a 2-element list `(e1[i], e2[i])`. Run fit-multi-classify on the
+; joint column. The first clean partition of joint values into label
+; classes wins, scored by the distinct joint-value count.
+;
+; This is the recognizer for k>2 morphology cases like verb_form,
+; where no single feature discriminates all classes but a pair of
+; features does:
+;   (ends-in-ing, ends-in-ed)
+;   (true,  false) → gerund
+;   (false, true ) → past
+;   (false, false) → base
+;
+; The emit is a chain of `(if (and (= e1 a) (= e2 b)) label ...)`
+; tests with the last label as the else fall-through. Each test is
+; a conjunction of two equalities, hence "feature conjunction."
+;
+; Cost: O(pool² × rows) per spec. Pool with all flags is ~30 entries
+; on a typical 2-arg spec → ~900 pairs × 6 rows = 5400 ops. Cheap.
+
+(define m8s-pair-col
+  (lambda (col-a col-b)
+    (map (lambda (i) (list (nth col-a i) (nth col-b i)))
+         (range (length col-a)))))
+
+; Build a `(if (and (= e1 v1) (= e2 v2)) label ...)` chain. Each
+; element of `pair-vals` is a 2-element list of joint values; each
+; element of `labels` is the corresponding output label. The last
+; label has no test — it's the else fall-through.
+(define m8s-build-conjunction-chain
+  (lambda (e1-source e2-source labels pair-vals)
+    (let ((k (length labels)))
+      (if (= k 1)
+        (m8s-value-to-node (head labels))
+        (let ((pv (head pair-vals)))
+          (let ((v1 (head pv))
+                (v2 (head (tail pv))))
+            (make-if
+              (make-app "and"
+                (make-app "=" e1-source (m8s-value-to-node v1))
+                (make-app "=" e2-source (m8s-value-to-node v2)))
+              (m8s-value-to-node (head labels))
+              (m8s-build-conjunction-chain
+                e1-source e2-source
+                (tail labels) (tail pair-vals)))))))))
+
+(define m8s-emit-conjunction
+  (lambda (e1-source e2-source labels pair-vals)
+    (m8s-wrap-lambda
+      (m8s-build-conjunction-chain e1-source e2-source labels pair-vals))))
+
+; For Form 6, vals-by-label[i] is a list of 2-element lists. We need
+; one representative joint value per label for the emit. Since the
+; partition is clean, every joint value in label i maps to label i
+; uniquely — but a single label may have multiple distinct joint
+; values (e.g., (true, true) and (true, false) both map to gerund).
+; The emit needs to test for ALL of them.
+;
+; Simpler implementation: flatten labels × vals-by-label into a flat
+; list of (joint-val, label) pairs, then build the chain with one
+; test per joint value. The last entry becomes the else.
+
+(define m8s-flatten-conjunction-vals
+  (lambda (labels vals-by-label)
+    (reduce append
+      (map
+        (lambda (i)
+          (let ((label (nth labels i))
+                (vals (nth vals-by-label i)))
+            (map (lambda (v) (list v label)) vals)))
+        (range (length labels)))
+      (list))))
+
+; Build the conjunction chain from a flat list of (joint-val, label)
+; pairs. The last pair's label becomes the else.
+(define m8s-build-conjunction-from-pairs
+  (lambda (e1-source e2-source pairs)
+    (let ((n (length pairs)))
+      (if (= n 1)
+        (m8s-value-to-node (head (tail (head pairs))))
+        (let ((p (head pairs)))
+          (let ((joint (head p))
+                (label (head (tail p))))
+            (let ((v1 (head joint))
+                  (v2 (head (tail joint))))
+              (make-if
+                (make-app "and"
+                  (make-app "=" e1-source (m8s-value-to-node v1))
+                  (make-app "=" e2-source (m8s-value-to-node v2)))
+                (m8s-value-to-node label)
+                (m8s-build-conjunction-from-pairs
+                  e1-source e2-source (tail pairs))))))))))
+
+(define m8s-fit-conjunction
+  (lambda (e1 e2 target)
+    (if (= (m8s-pool-col e1) (m8s-pool-col e2))
+      nil
+      (let ((joint (m8s-pair-col (m8s-pool-col e1) (m8s-pool-col e2))))
+        (let ((fit (fit-multi-classify joint target)))
+          (if (nil? fit)
+            nil
+            (let ((labels (ns-get fit "labels"))
+                  (vals (ns-get fit "vals-by-label")))
+              (let ((flat (m8s-flatten-conjunction-vals labels vals)))
+                (ns ("kind" "form-6-conjunction")
+                    ("k" (length labels))
+                    ("score" (length flat))
+                    ("source-node"
+                      (m8s-wrap-lambda
+                        (m8s-build-conjunction-from-pairs
+                          (m8s-pool-source e1)
+                          (m8s-pool-source e2)
+                          flat))))))))))))
+
+(define m8s-try-form-6
+  (lambda (pool target)
+    (let ((hits
+            (filter (lambda (e) (not (nil? e)))
+              (reduce append
+                (map
+                  (lambda (e1)
+                    (map (lambda (e2) (m8s-fit-conjunction e1 e2 target)) pool))
+                  pool)
+                (list)))))
+      (if (= (length hits) 0)
+        nil
+        (reduce
+          (lambda (acc h)
+            (if (or (nil? acc) (< (ns-get h "score") (ns-get acc "score")))
+              h
+              acc))
+          hits
+          nil)))))
+
 ; Attempt the equality-classify fit for an (e1, e2) pair. Returns the
 ; result ns on success, or nil. Pulled out of m8s-try-form-4 to keep
 ; nesting depth manageable.
@@ -335,6 +622,18 @@
       pool
       nil)))
 
+; Pick the result with the smallest score among non-nil candidates.
+; Used to merge Form 3 and Form 6 results: both can succeed on the
+; same spec, and we want the one whose discriminator has fewest
+; distinct values (proxy for "simplest rule"). Form 6 wins for
+; multi-class morphology (verb_form), Form 3 wins for binary or
+; truly single-feature shapes.
+(define m8s-pick-smaller-score
+  (lambda (a b)
+    (if (nil? a) b
+      (if (nil? b) a
+        (if (< (ns-get b "score") (ns-get a "score")) b a)))))
+
 (define detect-constant-string
   (lambda (s)
     (let ((target (m8s-string-target s)))
@@ -342,12 +641,32 @@
         (ns ("found" false) ("reason" "non-string target"))
         (let ((pool (m8s-build-pool s)))
           (let ((r1 (m8s-try-form-1 target)))
-            (let ((r2 (if (nil? r1) (m8s-try-form-2 pool target) r1)))
-              (let ((r3 (if (nil? r2) (m8s-try-form-3 pool target) r2)))
-                (let ((result (if (nil? r3) (m8s-try-form-4 pool target) r3)))
-                  (if (nil? result)
-                    (ns ("found" false) ("reason" "no string shape matched"))
-                    (ns-put result "found" true)))))))))))
+            (if (not (nil? r1))
+              (ns-put r1 "found" true)
+              (let ((r2 (m8s-try-form-2 pool target)))
+                (if (not (nil? r2))
+                  (ns-put r2 "found" true)
+                  ; Score-based merge across Forms 3, 4, 5, 6. Each
+                  ; form returns either nil or an ns with a "score"
+                  ; field. m8s-pick-smaller-score keeps the smaller
+                  ; score; ties go to whichever was earlier in the
+                  ; merge order. Forms 4 and 5 have implicit score
+                  ; 2 (binary equality / ordering). Forms 3 and 6
+                  ; have variable scores tied to discriminator size.
+                  (let ((r3 (m8s-try-form-3 pool target))
+                        (r4 (m8s-try-form-4 pool target))
+                        (r5 (m8s-try-form-5 pool target))
+                        (r6 (m8s-try-form-6 pool target)))
+                    ; Tag Form 4 / Form 5 with their implicit score.
+                    (let ((r4s (if (nil? r4) nil (ns-put r4 "score" 2)))
+                          (r5s (if (nil? r5) nil (ns-put r5 "score" 2))))
+                      (let ((best
+                              (m8s-pick-smaller-score
+                                (m8s-pick-smaller-score
+                                  (m8s-pick-smaller-score r3 r4s) r5s) r6)))
+                        (if (nil? best)
+                          (ns ("found" false) ("reason" "no string shape matched"))
+                          (ns-put best "found" true))))))))))))))
 
 ; ── Smoke tests ──────────────────────────────────────────────────────
 

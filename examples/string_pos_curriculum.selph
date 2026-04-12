@@ -181,3 +181,104 @@
   (("the" "run") "noun") (("a" "run") "noun")
   (("very" "fast") "adverb") (("quite" "slow") "adverb")
   (("really" "tall") "adverb"))
+
+; ── Stage 7: Word-internal features (§9.47.3) ────────────────────────
+; The label is determined by a morphological property of the target
+; word — its suffix, prefix, or capitalization — not by the
+; previous-word context. The chain needs derived feature columns
+; in the pool to discriminate these.
+
+; Detect gerund by -ing suffix. Single-feature on target.
+(task-args "gerund_by_ing" 1
+  (("running") "gerund") (("playing") "gerund") (("swimming") "gerund")
+  (("eating") "gerund") (("singing") "gerund")
+  (("cat") "other") (("dog") "other") (("house") "other") (("tree") "other"))
+
+; Detect past tense by -ed suffix.
+(task-args "past_by_ed" 1
+  (("walked") "past") (("played") "past") (("jumped") "past")
+  (("kicked") "past") (("opened") "past")
+  (("walk") "present") (("play") "present") (("jump") "present") (("open") "present"))
+
+; Detect plural by -s suffix.
+(task-args "plural_by_s" 1
+  (("cats") "plural") (("dogs") "plural") (("houses") "plural")
+  (("trees") "plural") (("books") "plural")
+  (("cat") "singular") (("dog") "singular") (("house") "singular") (("book") "singular"))
+
+; Detect proper noun by initial capital.
+(task-args "proper_by_capital" 1
+  (("Alice") "proper") (("Bob") "proper") (("Charlie") "proper")
+  (("London") "proper") (("Paris") "proper")
+  (("cat") "common") (("dog") "common") (("house") "common") (("river") "common"))
+
+; Detect prefix-derived negation.
+(task-args "negation_by_un" 1
+  (("undo") "negation") (("untie") "negation") (("unhappy") "negation")
+  (("unlock") "negation") (("unfair") "negation")
+  (("happy") "neutral") (("tie") "neutral") (("fair") "neutral") (("lock") "neutral"))
+
+; Three-class morphology: -ing → gerund, -ed → past, otherwise base.
+; This is the canonical Phase 2 case: no single suffix discriminates
+; all three classes (ing distinguishes gerund from {past, base},
+; ed distinguishes past from {gerund, base}). Only the conjunction
+; (ends-in-ing × ends-in-ed) gives a clean 3-way partition.
+(task-args "verb_form" 1
+  (("running") "gerund") (("playing") "gerund") (("eating") "gerund")
+  (("walked") "past") (("played") "past") (("opened") "past")
+  (("run") "base") (("walk") "base") (("eat") "base"))
+
+; ── Stage 8: Feature conjunctions (§9.47.3) ──────────────────────────
+; The label depends on the AND of two features. No single feature
+; suffices; the chain must combine two pool entries via Form 6.
+
+; Article + -ing → gerund-as-noun. Pronoun + -ing → present-progressive.
+; Article + non-ing → noun. Pronoun + non-ing → other.
+; Four-way partition over two features: (prev word class × target suffix).
+(task-args "gerund_context" 2
+  (("the" "running") "gerund-noun") (("a" "swimming") "gerund-noun")
+  (("the" "playing") "gerund-noun")
+  (("i" "running") "verb-progressive") (("we" "swimming") "verb-progressive")
+  (("they" "playing") "verb-progressive")
+  (("the" "cat") "common-noun") (("a" "dog") "common-noun")
+  (("the" "house") "common-noun")
+  (("i" "cat") "other") (("we" "dog") "other") (("they" "house") "other"))
+
+; Capitalization + suffix conjunction. Capital + -land/-burg etc would
+; be a place name; we test the simpler "capital + -ing" → "proper gerund"
+; vs other combinations.
+(task-args "capital_morph" 2
+  (("Alice" "running") "proper-gerund") (("Bob" "playing") "proper-gerund")
+  (("Charlie" "swimming") "proper-gerund")
+  (("alice" "running") "common-gerund") (("bob" "playing") "common-gerund")
+  (("charlie" "swimming") "common-gerund")
+  (("Alice" "cat") "proper-noun") (("Bob" "dog") "proper-noun")
+  (("alice" "cat") "common-noun") (("bob" "dog") "common-noun"))
+
+; ── Stage 9: Sequence-position arithmetic (§9.47.3) ──────────────────
+; Position of target relative to position of verb determines the
+; subject/object label. Encoding gives the indices directly so the
+; chain doesn't need to find them — Form 5 (numeric ordering classify)
+; just discovers `(< target_idx verb_idx)` as the discriminator.
+;
+; This is the deferred sequence-position arithmetic from §9.47.2: the
+; minimal demonstration that the chain can use numeric atoms to
+; discriminate non-numeric outputs.
+
+(task-args "subj_obj_by_idx" 2
+  ((1 3) "subject") ((5 3) "object")
+  ((0 2) "subject") ((4 2) "object")
+  ((2 5) "subject") ((7 5) "object"))
+
+; Variant: comparison against a fixed verb position. Inputs are
+; (target_idx, verb_idx) where verb_idx varies but the relationship
+; is the same.
+(task-args "before_after" 2
+  ((0 2) "before") ((1 2) "before") ((3 2) "after") ((4 2) "after")
+  ((1 5) "before") ((2 5) "before") ((6 5) "after") ((7 5) "after"))
+
+; Equality-based: same position → "match", different → "diff".
+; Should solve via Form 4 (pair-equality on numeric atoms), not Form 5.
+(task-args "pos_match" 2
+  ((1 1) "match") ((2 2) "match") ((5 5) "match")
+  ((1 2) "diff") ((3 5) "diff") ((0 4) "diff"))

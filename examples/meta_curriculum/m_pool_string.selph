@@ -20,6 +20,16 @@
 ;   "unary-l2"     — second-level wraps over L1 entries
 ;   "libs"         — library function calls returning strings
 ;   "constants"    — string atoms extracted via m13's extract-data-atoms
+;   "suffixes"     — boolean derived entries: does each base atom end
+;                    in -ing, -ed, -s, -er, -est, -ly, -tion ?
+;                    (§9.47.3 word-internal features)
+;   "prefixes"     — boolean derived entries: does each base atom start
+;                    with un-, re-, dis-, pre- ? (§9.47.3)
+;   "capital"      — boolean derived entry per atom: is the first char
+;                    uppercase? Useful for proper-noun detection. (§9.47.3)
+;   "numeric"      — include numeric (Int/Num) input positions as atoms
+;                    alongside string atoms. Enables sequence-position
+;                    arithmetic shapes via m8s Form 5. (§9.47.3)
 ;
 ; Defaults: all false. Detect-* must opt in.
 ;
@@ -90,6 +100,32 @@
                   (make-app "nth" (make-symbol "x") (make-int i))
                   col
                   "atom")
+                nil)))
+          (range arity))))))
+
+; Predicate: every value in col is Int or Num. Used by the L0
+; numeric builder to filter to numeric input positions.
+(define m-pool-str-all-numeric?
+  (lambda (col)
+    (reduce (lambda (acc v) (and acc (or (int? v) (num? v)))) col true)))
+
+; L0 numeric atoms: for each input position whose values are all
+; numeric (int or num), build an indexed atom. Output kind tag is
+; "numeric-atom" so detect-* can distinguish from string atoms by
+; pool entry kind without inspecting columns.
+(define m-pool-str-l0-numeric
+  (lambda (s)
+    (let ((arity (m-pool-str-spec-arity s))
+          (inputs (m-pool-str-spec-inputs s)))
+      (filter (lambda (e) (not (nil? e)))
+        (map
+          (lambda (i)
+            (let ((col (map (lambda (row) (nth row i)) inputs)))
+              (if (m-pool-str-all-numeric? col)
+                (m-pool-str-entry
+                  (make-app "nth" (make-symbol "x") (make-int i))
+                  col
+                  "numeric-atom")
                 nil)))
           (range arity))))))
 
@@ -260,6 +296,120 @@
               (concat "const-" s-val)))
           string-atoms)))))
 
+; ── Word-internal feature catalogues (§9.47.3) ───────────────────────
+;
+; Each catalogue is a list of (predicate-name, suffix/prefix-string)
+; pairs. The pool builder iterates over (base-atom × catalogue) and
+; emits one boolean derived entry per combination. The derived
+; column has type list-of-bool; multi-classify and pair-classify
+; consume bool columns natively via the same `=` and `contains`
+; logic that handles strings.
+
+(define m-pool-str-suffix-catalogue
+  (list
+    "ing" "ed" "s" "er" "est" "ly" "tion"))
+
+(define m-pool-str-prefix-catalogue
+  (list
+    "un" "re" "dis" "pre"))
+
+; True iff the first character of `s` is uppercase ASCII (A-Z, code
+; 65-90). Used by the `capital` flag's derived entries.
+(define m-pool-str-first-upper?
+  (lambda (s)
+    (if (= (string-length s) 0)
+      false
+      (let ((c (char-code (string-take s 1))))
+        (and (>= c 65) (<= c 90))))))
+
+; Build a derived boolean entry from a base entry and a (op-name,
+; argument-string) pair. The op-name is a string-* builtin that
+; takes (string, string) → bool, e.g. "string-ends-with".
+
+(define m-pool-str-derived-affix
+  (lambda (entry op-name affix)
+    (let ((wrapped-col
+            (try
+              (map (lambda (v)
+                     (if (= op-name "string-ends-with")
+                       (string-ends-with v affix)
+                       (string-starts-with v affix)))
+                   (m-pool-str-entry-col entry))
+              nil)))
+      (if (nil? wrapped-col)
+        nil
+        (m-pool-str-entry
+          (make-app op-name
+            (m-pool-str-entry-source entry)
+            (make-str affix))
+          wrapped-col
+          (concat (concat op-name "-") affix))))))
+
+; All suffix-derived entries for one base atom: one entry per
+; suffix in the catalogue.
+(define m-pool-str-suffix-entries
+  (lambda (entry)
+    (filter (lambda (e) (not (nil? e)))
+      (map (lambda (suf)
+             (m-pool-str-derived-affix entry "string-ends-with" suf))
+           m-pool-str-suffix-catalogue))))
+
+(define m-pool-str-prefix-entries
+  (lambda (entry)
+    (filter (lambda (e) (not (nil? e)))
+      (map (lambda (pre)
+             (m-pool-str-derived-affix entry "string-starts-with" pre))
+           m-pool-str-prefix-catalogue))))
+
+; The capital flag emits one derived entry per base atom: a column
+; whose value is `true` for rows where the atom's first char is
+; uppercase. The source AST is a comparison wrapping char-code, so
+; the synthesized lambda evaluates the same predicate at runtime.
+;
+; AST shape: (and (>= (char-code (string-take e 1)) 65)
+;                 (<= (char-code (string-take e 1)) 90))
+(define m-pool-str-capital-entry
+  (lambda (entry)
+    (let ((wrapped-col
+            (try
+              (map m-pool-str-first-upper?
+                   (m-pool-str-entry-col entry))
+              nil)))
+      (if (nil? wrapped-col)
+        nil
+        (let ((take1 (make-app "string-take"
+                       (m-pool-str-entry-source entry)
+                       (make-int 1))))
+          (let ((char-code-node (make-app "char-code" take1)))
+            (m-pool-str-entry
+              (make-app "and"
+                (make-app ">=" char-code-node (make-int 65))
+                (make-app "<=" char-code-node (make-int 90)))
+              wrapped-col
+              "first-upper")))))))
+
+(define m-pool-str-capital-entries
+  (lambda (entries)
+    (filter (lambda (e) (not (nil? e)))
+      (map m-pool-str-capital-entry entries))))
+
+(define m-pool-str-derived-features
+  (lambda (entries flags)
+    (let ((with-suffixes
+            (if (m-pool-str-flag? flags "suffixes")
+              (reduce append (map m-pool-str-suffix-entries entries) (list))
+              (list))))
+      (let ((with-prefixes
+              (if (m-pool-str-flag? flags "prefixes")
+                (append with-suffixes
+                  (reduce append (map m-pool-str-prefix-entries entries) (list)))
+                with-suffixes)))
+        (let ((with-capital
+                (if (m-pool-str-flag? flags "capital")
+                  (append with-prefixes (m-pool-str-capital-entries entries))
+                  with-prefixes)))
+          with-capital)))))
+
 ; ── Top-level: make-pool-string ──────────────────────────────────────
 ;
 ; Build a string pool with the requested levels and inclusions. The
@@ -292,7 +442,24 @@
                     (if (m-pool-str-flag? flags "constants")
                       (append with-libs (m-pool-str-constants s))
                       with-libs)))
-              with-constants)))))))
+              ; §9.47.3: word-internal derived features. The features
+              ; are computed from the BASE atoms only (not from
+              ; unary-wrapped or library-derived entries) — running
+              ; suffix predicates on (string-upper x) for example
+              ; would give equivalent information at higher cost.
+              (let ((with-derived
+                      (append with-constants
+                        (m-pool-str-derived-features base flags))))
+                ; §9.47.3 numeric atoms — opt-in via the "numeric"
+                ; flag. Adds atoms for any input position whose values
+                ; are all int/num. Used by m8s Form 5 (sequence-position
+                ; arithmetic) to discover ordering shapes like
+                ; "if target_idx < verb_idx then subject else object".
+                (let ((with-numeric
+                        (if (m-pool-str-flag? flags "numeric")
+                          (append with-derived (m-pool-str-l0-numeric s))
+                          with-derived)))
+                  with-numeric)))))))))
 
 ; ── Smoke test ───────────────────────────────────────────────────────
 
@@ -312,4 +479,12 @@
 (print (concat "  +constants: "
                (to-string (length (make-pool-string m-pool-str-test-spec
                                     (ns ("unary-l1" true) ("constants" true)))))
+               " entries"))
+(print (concat "  +suffixes: "
+               (to-string (length (make-pool-string m-pool-str-test-spec
+                                    (ns ("suffixes" true)))))
+               " entries"))
+(print (concat "  +suffixes+prefixes+capital: "
+               (to-string (length (make-pool-string m-pool-str-test-spec
+                                    (ns ("suffixes" true) ("prefixes" true) ("capital" true)))))
                " entries"))

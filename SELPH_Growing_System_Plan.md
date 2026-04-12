@@ -7977,3 +7977,346 @@ state is "each domain has its own". After two domains with
 overlapping shapes, this is the moment Path D would feel less
 hypothetical — but until a third domain forces the question,
 Path E's "copy when needed" remains the lower-overhead answer.
+
+### 9.47.3 String chain expands: word-internal features, conjunctions, and sequence-position arithmetic (April 11, 2026)
+
+§9.47.2 closed at 17/17 with three documented limits the curriculum
+didn't test:
+
+1. Word-internal features (suffix/prefix/capitalization predicates)
+2. Sequence-position arithmetic (numeric comparison classify)
+3. Feature conjunctions (AND of two predicates)
+
+§9.47.3 adds all three. Headline result: **28/28 on the extended POS
+curriculum, all chain solves, 28 candidates total**. The chain now
+covers six recognizer forms inside `m8s_constant_string.selph` —
+constants, atom-equality, single-feature classify, pair-equality,
+numeric ordering, and feature conjunction.
+
+#### 9.47.3.1 Phase 1 — word-internal features
+
+`m_pool_string.selph` gains three new flags: `suffixes`, `prefixes`,
+and `capital`. Each builds **boolean derived columns** from the base
+string atoms:
+
+- `suffixes` — for each base atom × each suffix in `("ing" "ed" "s"
+  "er" "est" "ly" "tion")`, emit a column where `c[i] = (string-ends-with
+  atom[i] suffix)`. Source AST is `(string-ends-with <atom-source>
+  <suffix>)`.
+- `prefixes` — symmetric, with catalog `("un" "re" "dis" "pre")`.
+- `capital` — single derived entry per base atom: column is
+  `(first-char(atom[i]) ∈ A-Z)`. Source AST is the inline char-code
+  range check `(and (>= (char-code (string-take e 1)) 65)
+  (<= ... 90))` so the synthesized lambda evaluates the same
+  predicate at runtime.
+
+The pool grows from `arity * (1 + 3)` (with `unary-l1`) to roughly
+`arity * (1 + 3 + 7 + 4 + 1)` = ~32 entries on a typical 2-arg
+spec. Iteration cost stays trivial.
+
+m8s enables all three flags by default. Per-task pool size for the
+POS curriculum is ~16-30 entries.
+
+**The "memorization vs generalization" wrinkle.** The first attempt
+returned 23/23 on the morphology tasks but with synthesized lambdas
+that *memorized* the training words instead of using the suffix
+predicates:
+
+```
+gerund_by_ing → (if (contains (list "running" "playing" "swimming"
+                                    "eating" "singing") (nth x 0))
+                  "gerund" "other")
+```
+
+Form 3 stops at the first clean partition, and the base atom
+`(nth x 0)` trivially partitions any spec where every input row is
+unique. The boolean suffix entries also produce clean partitions but
+arrive later in the pool. The chain was happy to memorize.
+
+The fix: **prefer the simplest discriminator**. Form 3 now collects
+*all* matching pool entries, scores each by `length(distinct(col))`,
+and picks the smallest. The boolean suffix predicate has 2 distinct
+values; the base atom has 9. The suffix wins.
+
+```
+gerund_by_ing → (if (contains (list true)
+                              (string-ends-with (nth x 0) "ing"))
+                  "gerund" "other")
+```
+
+This is a generalizing rule. It would correctly classify unseen words
+like "dancing" or "sleeping" because the predicate operates on
+suffix presence, not literal identity. The "simplest discriminator"
+preference is the closest the chain has come to a learning-theoretic
+inductive bias — Occam's razor as scoring rule.
+
+**The bool-emit bug along the way.** Adding boolean pool entries
+broke the existing emit because `m8s-emit-string-list` called
+`make-str` on every value-set element. Fixed by adding
+`m8s-value-to-node` that dispatches on runtime type
+(string/bool/int/num), used by all multi-classify and conjunction
+emits.
+
+#### 9.47.3.2 Phase 2 — Form 6: feature conjunction
+
+The classic motivating case is `verb_form` (3 classes: gerund, past,
+base):
+
+```
+running → gerund    (ends in "ing")
+walked  → past      (ends in "ed")
+run     → base      (neither)
+```
+
+No single suffix discriminates all three classes. `ends-in-ing`
+distinguishes gerund from {past, base}; `ends-in-ed` distinguishes
+past from {gerund, base}. Only the *conjunction* of the two gives a
+clean 3-way partition.
+
+**Form 6** iterates ordered pairs `(e1, e2)` of distinct pool
+entries, builds a "joint column" where each cell is a 2-element
+list `(e1[i], e2[i])`, and runs `fit-multi-classify` on the joint
+column. SELPH list-equality is deep-elementwise via `vals_equal`,
+so multi-classify works on pairs without modification.
+
+Score = number of distinct joint values. For verb_form with the
+suffix pair, score = 3 (the three distinct combinations). The base
+atom alone scores 9. Form 6 wins via the score-based merge.
+
+The emit is a chain of `(if (and (= e1 v1) (= e2 v2)) label ...)`
+tests with the last label as the else fall-through. For verb_form:
+
+```
+(if (and (= (string-ends-with (nth x 0) "ing") true)
+         (= (string-ends-with (nth x 0) "ed") false))
+  "gerund"
+  (if (and (= (string-ends-with (nth x 0) "ing") false)
+           (= (string-ends-with (nth x 0) "ed") true))
+    "past"
+    "base"))
+```
+
+A 2-feature decision tree. Generalizes to unseen verbs.
+
+**The dispatch refactor.** With Form 6 added, `detect-constant-string`
+needed to merge results from multiple forms by score rather than
+take the first hit. The new structure:
+
+1. Form 1 (constant) → wins immediately if it matches.
+2. Form 2 (atom equality) → wins immediately if it matches.
+3. Forms 3, 4, 5, 6 → each runs independently, returns either nil or
+   a scored result. Forms 4 and 5 have implicit score 2 (they're
+   binary classifiers on derived bool columns). The dispatcher
+   picks the smallest-score among non-nil.
+
+The merge uses `m8s-pick-smaller-score` with iteration order as
+tiebreaker. Cost is bounded by the most expensive form (Form 6 at
+O(pool²)) since they all run.
+
+#### 9.47.3.3 Phase 3 — Form 5: sequence-position arithmetic
+
+`m_pool_string.selph` gains a `numeric` flag. When set,
+`m-pool-str-l0-numeric` builds atoms from input positions whose
+column values are all `int` or `num` (in addition to the string-typed
+atoms from the regular L0 builder). Pool entries get a kind tag
+`"numeric-atom"` so detect-* can filter by type.
+
+m8s enables the `numeric` flag in `m8s-build-pool`. Existing
+string-only specs are unaffected: the numeric L0 builder finds zero
+matching positions and contributes nothing.
+
+**Form 5** is structurally parallel to Form 4 (pair-equality) but
+uses `<` instead of `=`:
+
+- Iterate ordered pairs `(e1, e2)` of distinct *numeric* pool
+  entries (filtered via `m8s-pool-col-type`).
+- Build derived col `lt[i] = (e1[i] < e2[i])`.
+- If discriminating (not all-true / all-false), run multi-classify
+  on the bool column, require exactly 2 labels.
+- Emit `(if (< e1-source e2-source) "true-label" "false-label")`.
+
+Form 5 has implicit score 2 (binary). Same dispatch path as Form 4.
+
+The canonical use case: subject/object disambiguation by index
+position rather than by pairwise word equality:
+
+```
+subj_obj_by_idx → (lambda (x) (if (< (nth x 0) (nth x 1))
+                                "subject" "object"))
+before_after   → (lambda (x) (if (< (nth x 0) (nth x 1))
+                                "before" "after"))
+```
+
+A bonus: Form 4 (`=`-based pair equality) now also fires on numeric
+atoms, since the pool includes them. The `pos_match` task ("same
+position → match, different → diff") solves via Form 4 emitting
+`(if (= (nth x 0) (nth x 1)) "match" "diff")`. No new code needed —
+Form 4 already iterated all pairs and the numeric atoms just slot in.
+
+#### 9.47.3.4 Curriculum extensions
+
+`examples/string_pos_curriculum.selph` grows from 17 to 28 tasks
+across three new stages:
+
+| Stage | Tasks added | What it tests |
+|---|---|---|
+| 7: word-internal features | 6 (gerund_by_ing, past_by_ed, plural_by_s, proper_by_capital, negation_by_un, verb_form) | Suffix/prefix/capital discriminators; verb_form is the multi-class case requiring conjunction |
+| 8: feature conjunctions | 2 (gerund_context, capital_morph) | AND of two derived features |
+| 9: sequence-position arithmetic | 3 (subj_obj_by_idx, before_after, pos_match) | Numeric atoms + Form 5 ordering, Form 4 numeric equality |
+
+**Final result: 28/28, all chain solves, 28 candidates total** in
+0.5 seconds. Selected synthesized lambdas:
+
+```
+verb_form         →  decision tree on (ends-in-ing × ends-in-ed)
+capital_morph     →  decision tree on (ends-in-ing × first-upper)
+proper_by_capital →  (if (contains (list true) (and (>= (char-code ...) 65)
+                                                    (<= ... 90)))
+                       "proper" "common")
+subj_obj_by_idx   →  (if (< (nth x 0) (nth x 1)) "subject" "object")
+pos_match         →  (if (= (nth x 0) (nth x 1)) "match" "diff")
+```
+
+Regression check across all curricula passed unchanged: physics
+24/24/8/8/5/5, strings probe 9/9, int control 5/5. The new flags
+default to off for non-m8s consumers; the new forms only fire when
+no earlier form matches with a smaller score.
+
+#### 9.47.3.5 What §9.47.3 demonstrates
+
+The chain now operates as a **multi-shape recognizer with inductive
+bias**. The score-based dispatch implements a primitive Occam's
+razor: among multiple valid discriminators, prefer the one with the
+smallest distinct-value count. This is the difference between
+"memorize the training set" and "find the rule" — and it falls out
+of one helper function (`m8s-pick-smaller-score`) plus a small
+refactor of the dispatch.
+
+The six forms in m8s now parallel a small but complete set of
+inductive primitives:
+
+| Form | Shape | Inductive principle |
+|---|---|---|
+| 1 | constant | trivial identity |
+| 2 | identity-of-atom | trivial copy |
+| 3 | single-feature partition | "find a column whose values cleanly split the labels" |
+| 4 | pair equality | "find two columns that are equal iff the label is X" |
+| 5 | numeric ordering | "find two columns whose ordering determines the label" |
+| 6 | feature conjunction | "find two columns whose joint values cleanly split the labels" |
+
+Forms 3 and 6 cooperate via score: Form 3 wins for clean
+single-feature shapes; Form 6 wins for shapes that require
+conjunction. Forms 4 and 5 are binary specialists for the most
+compact possible discriminators.
+
+#### 9.47.3.6 Documented limit: implicit category sets
+
+The `gerund_context` task exposes a real limit. The training data
+labels:
+
+```
+("the"   "running") → "gerund-noun"
+("a"     "swimming") → "gerund-noun"
+("i"     "running") → "verb-progressive"
+("we"    "swimming") → "verb-progressive"
+...
+```
+
+The ideal discriminator is `(prev_word ∈ articles, target ends in -ing)`
+— a 2-feature conjunction over **derived category membership** and a
+suffix predicate. But "is in articles" isn't a single pool entry —
+it's a Form 3 partition which Form 6 doesn't currently nest.
+
+What Form 6 finds instead: a 9-element joint table over
+`(prev_word, ends-in-ing)` with literal previous-word values:
+
+```
+(if (and (= (nth x 0) "the") (= ends-in-ing true))  "gerund-noun"
+  (if (and (= (nth x 0) "a")   (= ends-in-ing true)) "gerund-noun"
+    (if (and (= (nth x 0) "i")   (= ends-in-ing true)) "verb-progressive"
+      ... 6 more ifs ...)))
+```
+
+This is correct on the training data but **fails to generalize** to
+unseen pronouns or articles ("she swimming" would fall through to
+the wrong default). The failure is silent — there's no test signal
+that distinguishes "memorized" from "learned" except by held-out
+evaluation, which the curriculum format doesn't support.
+
+Three plausible fixes, each pointing in a different direction:
+
+1. **Curriculum-defined word classes**: pre-define `pronouns` and
+   `articles` as library functions and let M7 (library reuse) pick
+   them up. Fits the existing chain architecture; requires
+   curriculum-side work per domain.
+2. **Recursive Form 6**: when Form 6 can't find a small discriminator,
+   recursively apply Form 3 to the value-set of one factor before
+   pairing. This effectively learns "set of X values that map to
+   label A" as an intermediate feature. Bigger algorithm, fits
+   neatly inside m8s.
+3. **Held-out evaluation**: add a curriculum format that distinguishes
+   training rows from test rows so the synth scoring can detect
+   memorization. Fundamental change to the curriculum/synth
+   contract; biggest scope.
+
+Option 1 is the cheapest immediate fix and consistent with the
+"each domain ships its own helpers" pattern. Option 2 is the
+principled answer if we want the chain to do this kind of induction
+without curriculum hints. Option 3 is the right answer eventually
+but warrants its own design pass.
+
+#### 9.47.3.7 What's still beyond the chain
+
+The richer curriculum still doesn't test:
+
+- **Unseen-word generalization with held-out evaluation.** All
+  current tasks verify only on the training rows. We have no
+  signal for "did you learn the rule or memorize the data" except
+  by manual inspection of the synthesized lambda.
+
+- **Conjunction of three or more features.** Form 6 caps at pairs.
+  A morphological case that needs `(article × ing × capital)`
+  would force a Form 7 or a recursive variant.
+
+- **Negation in the discriminator.** Form 3/6 partition by *positive*
+  membership. There's no shape `(not (contains <set> e))` even
+  though `not` is a builtin. Adding it is mechanical.
+
+- **Numeric arithmetic beyond comparison.** Form 5 only does `<`.
+  No `+`, `-`, `*`, modulus. The numeric branch (m_pool +
+  m8/m9/m10/m11/m12) handles arithmetic shapes but only when the
+  *output* is numeric. A numeric expression that produces a string
+  label would need a hybrid Form.
+
+- **Cross-position structural features.** "Target's suffix matches
+  prev word's prefix" would require Form 6 over derived columns
+  that themselves come from cross-position computation. The
+  current pool only has single-position derived features.
+
+These extensions all follow the same pattern: add new pool builders
+or new forms when a curriculum task surfaces the need. None require
+architectural changes — the substrate has been stable since §9.47 P1.
+
+#### 9.47.3.8 What's next
+
+Same answer as §9.47.2.8: **P2 grids** is still the right next
+session. §9.47.3 strengthens the case for "Path E scales by adding
+recognizer forms" — the string chain went from 9/9 (P1) to 17/17
+(P1.5) to 28/28 (P1.6) entirely by adding small recognizer forms
+to one file, with no Rust changes.
+
+The grid story will follow the same shape: a minimal Rust kernel
+(~300-500 LOC), `m_pool_grid.selph`, a grid detect-* family that
+starts with trivial shapes (rotate, flip, color-swap) and grows
+when a curriculum task demands it. The §9.47.3 result raises
+confidence that the recognizer-form-addition pattern is the
+ongoing mode of work, not a temporary scaffold.
+
+Side effect worth noting: m8s now has six forms in one file
+(~700 LOC) and is arguably overdue for a split. The detect-*
+entry name `detect-constant-string` is now misleading. Cleanup is
+deferred — splitting into multiple files would require either
+multiple `__decomposers__` entries or a re-grouping of the chain
+dispatcher, neither of which improves correctness. The
+m_chain.selph file's aggregation logic would also need to update.
+This is on the §9.47.x cleanup list.
