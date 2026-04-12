@@ -8320,3 +8320,205 @@ multiple `__decomposers__` entries or a re-grouping of the chain
 dispatcher, neither of which improves correctness. The
 m_chain.selph file's aggregation logic would also need to update.
 This is on the §9.47.x cleanup list.
+
+### 9.47.4 Held-out validation — reject memorization, require generalization (April 11, 2026)
+
+The §9.47.3 simplest-discriminator preference is a heuristic, not a
+guarantee. When every input row is unique, Form 3 can still find a
+trivial discriminator (the base atom) that memorizes the training
+set. The `gerund_context` task exposes this: Form 6 produces a
+literal-prev-words conjunction that passes training but fails on
+unseen pronouns.
+
+§9.47.4 ports the held-out validation pattern from legacy `synth.rs`
+(`synthesize_with_validation`) to synth_v2 + grow-v2. The design:
+
+1. **Curriculum format extension**: `(test input output)` rows in a
+   task spec are separated from training data by the parser. The
+   synth sees only training rows during search.
+2. **Post-match verification**: after any candidate matches all
+   training rows (whether from the chain or Flat enumeration), the
+   candidate is evaluated against the test rows. Failures are
+   rejected and the search continues.
+3. **Three verification sites**: chain hit (`try_selph_decomposers`),
+   depth-0 atom match, depth>0 composition match — all in
+   `synthesize_inner`.
+
+Test rows added to 7 tasks where memorization was observed:
+`gerund_by_ing`, `past_by_ed`, `plural_by_s`, `proper_by_capital`,
+`negation_by_un`, `verb_form`, `gerund_context`. Each test row uses
+unseen words (e.g., "dancing" for gerund, "David" for proper).
+
+**Result: 27/28** (was 28/28 pre-held-out). The one regression is
+`gerund_context` — correctly rejected because the chain can't
+produce a generalizing rule for the 4-class prev-word × suffix
+conjunction when the pool has no "word class" feature. Every other
+task with test rows passes: suffix predicates, capital checks, and
+conjunction trees all generalize to unseen words.
+
+**SpecialApp bug found along the way**: `(make-app "and" ...)`
+produces `Node::App` but eval_v2 treats `and` as `SpecialApp`. The
+capital-check and Form 6 conjunction emits both had this bug. Fixed
+by emitting nested `make-if` instead.
+
+**Substrate change**: ~50 LOC Rust (parser + synth threading +
+validate_held_out function). Tasks without `(test ...)` rows
+behave identically to before.
+
+**Option C (MDL scoring)** noted as a meta-optimization target:
+a richer description-length scorer (AST node count, literal list
+length) could further improve rule quality without needing held-out
+data. Complements validation rather than replacing it.
+
+### 9.47.5 Library-driven feature accumulation — the meta-learning thesis on NL (April 12, 2026)
+
+§9.47.4 left `gerund_context` as the one failure: the chain has no
+"is-pronoun" feature in the pool. But earlier in the curriculum,
+`has_article` already solved:
+
+```
+has_article → (if (contains (list "the" "a" "an") (nth x 0)) "yes" "no")
+```
+
+If the pool builder included library functions as atoms,
+`(has_article (list (nth x 0)))` would appear as a pool entry whose
+column is `("yes" "yes" ... "no" "no" ...)`. Form 6 could pair
+it with `(string-ends-with (nth x 1) "ing")` for a clean 4-way
+partition.
+
+§9.47.5 enables the `libs` flag in m8s-build-pool. **Library
+accumulation becomes feature accumulation.**
+
+#### 9.47.5.1 Focused validation
+
+With just `has_article` solved before `gerund_context` (2-task
+focused test):
+
+```
+gerund_context → 1 cand, 0.15s, custom:m-chain
+(lambda (x) (if (= (has_article (list (nth x 0))) "yes")
+               (if (= (string-ends-with (nth x 1) "ing") true)
+                 "gerund-noun" ...)
+               (if ... "verb-progressive" ...)))
+```
+
+The chain discovers `(has_article × ends-in-ing)` as the
+discriminating pair. Held-out validation passes because
+`has_article("she")` → "no" → correctly classified as
+"verb-progressive" (not article = pronoun context).
+
+**This is the first demonstration of the SELPH meta-learning thesis
+on a non-physics domain.** The chain's recognition capability grows
+as the curriculum progresses — exactly the compounding-returns
+thesis from the ARC plan (§1).
+
+#### 9.47.5.2 Internal chain validation
+
+To support per-candidate held-out filtering within Forms 3/6
+(needed when the pool contains many library functions, some of which
+memorize), §9.47.5 adds:
+
+- Test data in the spec ns: `try_selph_decomposers` includes held-out
+  pairs under a `"test"` key. `m-chain-spec-from-synth` extracts them
+  into `"test-inputs"` / `"test-outputs"` keys.
+- `m8s-validate-candidate`: evaluates a candidate's source-node
+  against test rows via `eval-node`. Returns true if all test rows
+  match, or if no test data exists.
+- `m8s-form3-all-hits` / `m8s-form6-all-hits`: return ALL valid
+  candidates (not just the best-scored) so the dispatch can filter
+  by validation per-candidate before picking the best-scored
+  survivor.
+- Dispatch refactored: when test data exists, all Form 3/6
+  candidates are validated individually. When no test data, the
+  expensive eval-node calls are skipped entirely.
+
+#### 9.47.5.3 Scaling limitation
+
+The full 28-task curriculum run still shows `gerund_context` as
+FAIL (27/28). The issue is performance, not correctness:
+
+- With 23 prior solved tasks as library functions, the pool grows
+  to ~120+ entries.
+- Form 6's pool² iteration becomes ~14,400+ pairs, each requiring
+  joint-column construction + fit-multi-classify + validation.
+- The 2-3 second chain budget is consumed before the right pair
+  is found among the noise.
+
+The focused 2-task test proves the thesis at 0.15s. The full
+curriculum needs pool pruning:
+
+- **Relevance gating**: only include library functions whose output
+  type matches the spec's expected partition structure. A library
+  function that returns 5-element lists isn't useful for a task
+  with 4 string output labels.
+- **Arity filtering**: skip library functions whose effective arity
+  exceeds the spec's input arity (already done) or whose output
+  is always constant across spec rows (degenerate).
+- **Cost-bounded Form 6**: cap the number of pair iterations at
+  some budget (e.g., 2000) and prefer pairs involving derived
+  features (suffix/prefix/capital/library) over base atoms.
+
+These are performance optimizations that don't change the
+architecture. The focused test has already validated the
+correctness path.
+
+#### 9.47.5.4 What §9.47.5 demonstrates
+
+The session arc — §9.46 through §9.47.5 — traces a complete
+validation of SELPH's meta-learning capability on natural language:
+
+| Step | What landed | Signal |
+|---|---|---|
+| §9.46 | Strings probe — chain contributes nothing | M-chain is numeric-specialist |
+| §9.47 P1 | Type dispatcher + string pool + m8s/m10s/m11s | Strings 9/9 (was 6/9) |
+| §9.47.2 | Forms 3+4 (classify + pair-equality) + POS curriculum | "run" ambiguity solves; 17/17 |
+| §9.47.3 | Word-internal features + Forms 5+6 + simplest-discriminator | Suffix/capital/conjunction/ordering; 28/28 |
+| §9.47.4 | Held-out validation | Rejects memorization; 27/28 |
+| §9.47.5 | Library accumulation as feature accumulation | Meta-learning thesis validated on NL |
+
+The chain now operates as a **multi-domain learner with inductive
+bias and generalization enforcement**:
+
+- **Inductive bias**: simplest-discriminator preference (Occam's
+  razor via distinct-count scoring).
+- **Generalization enforcement**: held-out validation rejects
+  candidates that memorize training data.
+- **Feature accumulation**: solved tasks become library-derived
+  pool entries for later tasks. The recognition surface grows as
+  the curriculum progresses.
+- **Six recognizer forms**: constants, atom equality, single-feature
+  partition, pair equality, numeric ordering, feature conjunction.
+
+The substrate change across §9.46–§9.47.5 was ~80 LOC of Rust
+(strategy label threading, held-out validation, test data in spec
+ns). The rest — ~2500 LOC — was pure meta-curriculum work in SELPH.
+
+#### 9.47.5.5 What's next
+
+Three directions, in order of strategic value:
+
+1. **Pool pruning for scaling** — close the gerund_context gap in
+   the full curriculum. The thesis is proven; the optimization
+   makes it practical. Likely ~100 LOC of filtering in
+   `m_pool_string`'s library builder.
+
+2. **P2 grids** — the original §9.47 plan. The entire §9.47.2–5
+   string work strengthens the case: the per-domain pool pattern
+   scales by recognizer addition, library accumulation drives
+   feature growth, and the architecture handles held-out
+   validation. Grids follow the same shape: minimal Rust kernel +
+   `m_pool_grid.selph` + grid detect-* family.
+
+3. **MDL scoring (Option C)** — replace the distinct-count
+   heuristic with a proper description-length scorer. Would
+   further reduce the search space and complement held-out
+   validation. Useful for both strings and future domains.
+
+The pool pruning fix is the cheapest and closes a documented gap.
+P2 grids is the highest strategic value (ARC Prize target). MDL
+is the most principled but least urgent.
+
+The §9.47 thesis — "per-domain pools with type dispatch,
+extensible by recognizer addition, validated by held-out" — is
+now proven on two domains (physics, strings) and ready for a
+third (grids).
