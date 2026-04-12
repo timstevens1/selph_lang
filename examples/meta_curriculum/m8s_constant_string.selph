@@ -74,7 +74,8 @@
           ("suffixes" true)
           ("prefixes" true)
           ("capital"  true)
-          ("numeric"  true)))))
+          ("numeric"  true)
+          ("libs"     true)))))
 
 (define m8s-pool-source (lambda (e) (ns-get e "source")))
 (define m8s-pool-col    (lambda (e) (ns-get e "col")))
@@ -575,11 +576,16 @@
   (lambda (pool target)
     (let ((hits
             (filter (lambda (e) (not (nil? e)))
-              (reduce append
-                (map
-                  (lambda (e1)
-                    (map (lambda (e2) (m8s-fit-conjunction e1 e2 target)) pool))
-                  pool)
+              (try
+                (reduce append
+                  (map
+                    (lambda (e1)
+                      (filter (lambda (r) (not (nil? r)))
+                        (map (lambda (e2)
+                               (try (m8s-fit-conjunction e1 e2 target) nil))
+                             pool)))
+                    pool)
+                  (list))
                 (list)))))
       (if (= (length hits) 0)
         nil
@@ -622,6 +628,69 @@
       pool
       nil)))
 
+; §9.47.5: internal held-out validation. Evaluate a candidate's
+; source-node (a lambda) against test rows. Returns true iff the
+; lambda produces the expected output for every test row, or if
+; there are no test rows (vacuous success).
+;
+; This runs INSIDE the chain so that Forms 3/6 can filter out
+; memorize-the-training-data candidates before returning to the
+; dispatcher. Without it, the chain returns the best-scored
+; candidate (which may memorize), held-out rejects it externally,
+; and no alternative candidate is tried.
+(define m8s-validate-candidate
+  (lambda (source-node test-inputs test-outputs)
+    (if (= (length test-inputs) 0)
+      true
+      (try
+        (let ((fn (eval-node source-node)))
+          (reduce
+            (lambda (acc i)
+              (if acc
+                (= (fn (nth test-inputs i)) (nth test-outputs i))
+                false))
+            (range (length test-inputs))
+            true))
+        false))))
+
+; §9.47.5: return ALL valid Form 3 hits as a list (not just the best).
+; Used by the dispatch to filter by held-out validation per-candidate
+; before picking the best-scored survivor.
+(define m8s-form3-all-hits
+  (lambda (pool target)
+    (filter (lambda (e) (not (nil? e)))
+      (map
+        (lambda (entry)
+          (let ((fit (fit-multi-classify (m8s-pool-col entry) target)))
+            (if (nil? fit)
+              nil
+              (ns ("kind" "form-3-classify")
+                  ("k"      (length (ns-get fit "labels")))
+                  ("labels" (ns-get fit "labels"))
+                  ("score"  (m8s-distinct-count (m8s-pool-col entry)))
+                  ("source-node"
+                    (m8s-emit-multi-classify
+                      (m8s-pool-source entry)
+                      (ns-get fit "labels")
+                      (ns-get fit "vals-by-label")))))))
+        pool))))
+
+; §9.47.5: return ALL valid Form 6 hits as a list.
+(define m8s-form6-all-hits
+  (lambda (pool target)
+    (filter (lambda (e) (not (nil? e)))
+      (try
+        (reduce append
+          (map
+            (lambda (e1)
+              (filter (lambda (r) (not (nil? r)))
+                (map (lambda (e2)
+                       (try (m8s-fit-conjunction e1 e2 target) nil))
+                     pool)))
+            pool)
+          (list))
+        (list)))))
+
 ; Pick the result with the smallest score among non-nil candidates.
 ; Used to merge Form 3 and Form 6 results: both can succeed on the
 ; same spec, and we want the one whose discriminator has fewest
@@ -639,34 +708,58 @@
     (let ((target (m8s-string-target s)))
       (if (nil? target)
         (ns ("found" false) ("reason" "non-string target"))
-        (let ((pool (m8s-build-pool s)))
-          (let ((r1 (m8s-try-form-1 target)))
-            (if (not (nil? r1))
-              (ns-put r1 "found" true)
-              (let ((r2 (m8s-try-form-2 pool target)))
-                (if (not (nil? r2))
-                  (ns-put r2 "found" true)
-                  ; Score-based merge across Forms 3, 4, 5, 6. Each
-                  ; form returns either nil or an ns with a "score"
-                  ; field. m8s-pick-smaller-score keeps the smaller
-                  ; score; ties go to whichever was earlier in the
-                  ; merge order. Forms 4 and 5 have implicit score
-                  ; 2 (binary equality / ordering). Forms 3 and 6
-                  ; have variable scores tied to discriminator size.
-                  (let ((r3 (m8s-try-form-3 pool target))
-                        (r4 (m8s-try-form-4 pool target))
-                        (r5 (m8s-try-form-5 pool target))
-                        (r6 (m8s-try-form-6 pool target)))
-                    ; Tag Form 4 / Form 5 with their implicit score.
-                    (let ((r4s (if (nil? r4) nil (ns-put r4 "score" 2)))
-                          (r5s (if (nil? r5) nil (ns-put r5 "score" 2))))
-                      (let ((best
-                              (m8s-pick-smaller-score
-                                (m8s-pick-smaller-score
-                                  (m8s-pick-smaller-score r3 r4s) r5s) r6)))
-                        (if (nil? best)
+        (let ((pool (m8s-build-pool s))
+              (test-ins  (try (ns-get s "test-inputs") (list)))
+              (test-outs (try (ns-get s "test-outputs") (list))))
+          (let ((validate (lambda (r)
+                  (if (nil? r) nil
+                    (if (m8s-validate-candidate
+                          (ns-get r "source-node") test-ins test-outs)
+                      r nil)))))
+            (let ((r1 (m8s-try-form-1 target)))
+              (if (and (not (nil? r1))
+                       (or (= (length test-ins) 0)
+                           (m8s-validate-candidate
+                             (ns-get r1 "source-node") test-ins test-outs)))
+                (ns-put r1 "found" true)
+                (let ((r2 (m8s-try-form-2 pool target)))
+                  (if (and (not (nil? r2))
+                           (or (= (length test-ins) 0)
+                               (m8s-validate-candidate
+                                 (ns-get r2 "source-node") test-ins test-outs)))
+                    (ns-put r2 "found" true)
+                    ; §9.47.5: Score-based merge across Forms 3-6 with
+                    ; per-candidate held-out validation. Forms 3 and 6
+                    ; can return multiple valid hits internally — we need
+                    ; the validate filter applied to EACH candidate, not
+                    ; just the final best. Collect all candidates from all
+                    ; forms into one list, validate each, pick the smallest
+                    ; score among survivors.
+                    (let ((all-candidates
+                            (append
+                              (m8s-form3-all-hits pool target)
+                              (append
+                                (let ((r4 (m8s-try-form-4 pool target)))
+                                  (if (nil? r4) (list) (list (ns-put r4 "score" 2))))
+                                (append
+                                  (let ((r5 (m8s-try-form-5 pool target)))
+                                    (if (nil? r5) (list) (list (ns-put r5 "score" 2))))
+                                  (m8s-form6-all-hits pool target))))))
+                      ; Filter by held-out validation (only when test
+                      ; data exists — skip the expensive eval-node calls
+                      ; for tasks without test rows).
+                      (let ((valid (if (= (length test-ins) 0)
+                                     all-candidates
+                                     (filter validate all-candidates))))
+                        (if (= (length valid) 0)
                           (ns ("found" false) ("reason" "no string shape matched"))
-                          (ns-put best "found" true))))))))))))))
+                          (let ((best
+                                  (reduce
+                                    (lambda (acc h)
+                                      (if (or (nil? acc) (< (ns-get h "score") (ns-get acc "score")))
+                                        h acc))
+                                    valid nil)))
+                            (ns-put best "found" true)))))))))))))))
 
 ; ── Smoke tests ──────────────────────────────────────────────────────
 

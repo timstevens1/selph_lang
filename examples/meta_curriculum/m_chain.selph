@@ -32,9 +32,16 @@
       (let ((rows  (map head pairs))
             (outs  (map (lambda (p) (head (tail p))) pairs)))
         (let ((arity (if (list? (head rows)) (length (head rows)) 1)))
-          (ns ("inputs"  rows)
-              ("outputs" outs)
-              ("arity"   arity)))))))
+          ; §9.47.5: include test rows if present in the synth spec.
+          ; The "test" key contains a list of (input, expected) pairs.
+          (let ((test-pairs (try (ns-get synth-spec "test") (list))))
+            (let ((test-inputs  (map head test-pairs))
+                  (test-outputs (map (lambda (p) (head (tail p))) test-pairs)))
+              (ns ("inputs"       rows)
+                  ("outputs"      outs)
+                  ("arity"        arity)
+                  ("test-inputs"  test-inputs)
+                  ("test-outputs" test-outputs)))))))))
 
 ; ── Result format conversion ─────────────────────────────────────────
 ;

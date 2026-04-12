@@ -4749,6 +4749,8 @@ fn try_selph_decomposers(
     expected: &[Value],
     max_depth: usize,
     max_budget: usize,
+    test_inputs: &[Value],
+    test_expected: &[Value],
 ) -> Option<(Vec<Node>, usize, usize, Sym)> {
     let decomp_ns = match env.lookup(intern("__decomposers__")) {
         Some(Value::Ns(map)) => map,
@@ -4937,7 +4939,7 @@ pub fn synthesize_with_strategies(
     // §9.37 Stage A: global SELPH decomposers from `__decomposers__`
     // run BEFORE the hardcoded chain. Curriculum is in charge.
     if let Some((nodes, root, sd_explored, name_sym)) =
-        try_selph_decomposers(env, inputs, expected, max_depth, flat_budget)
+        try_selph_decomposers(env, inputs, expected, max_depth, flat_budget, &[], &[])
     {
         return StrategyResult {
             found: true,
@@ -5944,12 +5946,13 @@ fn synthesize_inner(
     // counts even when the chain itself would be cheap.
     if extra_seeds_was_some {
         if let Some((nodes, root, sd_explored, name_sym)) =
-            try_selph_decomposers(env, inputs, expected, max_depth, max_candidates)
+            try_selph_decomposers(env, inputs, expected, max_depth, max_candidates,
+                                  test_inputs, test_expected)
         {
-            // §9.47.4: held-out validation. If test data exists,
-            // verify the chain's candidate against held-out rows.
-            // A memorize-the-training-data solution fails here if
-            // the test rows contain unseen input values.
+            // §9.47.5: the chain now self-validates against test data
+            // internally (via the spec ns "test" key). The external
+            // validate_held_out is still a safety net for cases where
+            // the chain doesn't implement internal validation.
             if validate_held_out(&nodes, root, test_inputs, test_expected, env) {
                 return SynthResult::success_from_decomposer(
                     nodes, root, sd_explored, name_sym,

@@ -210,16 +210,23 @@
 
 (define m-pool-str-lib-column
   (lambda (lib-fn positions inputs)
-    (let ((cols (map
-                  (lambda (row)
-                    (let ((sub (map (lambda (p) (nth row p)) positions)))
-                      (m-pool-str-safe-apply lib-fn (list sub))))
-                  inputs)))
-      (if (reduce (lambda (acc v) (and acc (and (not (nil? v)) (m-pool-str? v))))
-                  cols
-                  true)
-        cols
-        nil))))
+    ; §9.47.5: wrap the entire column-building map in `try` so that
+    ; library functions that error on some input rows (e.g., nth out
+    ; of bounds when arity doesn't match) don't crash the pool builder.
+    ; Without this, one bad library function kills the entire chain.
+    (let ((cols (try
+                  (map
+                    (lambda (row)
+                      (let ((sub (map (lambda (p) (nth row p)) positions)))
+                        (m-pool-str-safe-apply lib-fn (list sub))))
+                    inputs)
+                  nil)))
+      (if (nil? cols)
+        nil
+        (if (reduce (lambda (acc v) (and acc (and (not (nil? v)) (m-pool-str? v))))
+                    cols true)
+          cols
+          nil)))))
 
 (define m-pool-str-skip-set
   (lambda ()
