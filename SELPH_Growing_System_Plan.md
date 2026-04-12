@@ -8522,3 +8522,140 @@ The §9.47 thesis — "per-domain pools with type dispatch,
 extensible by recognizer addition, validated by held-out" — is
 now proven on two domains (physics, strings) and ready for a
 third (grids).
+
+### 9.47.6 Pool pruning for scaling
+
+Closes the gerund_context gap (27/28 → 28/28) and establishes
+the pattern for learnable pool selection.
+
+**Priority-ordered Form 6**: `m8s-form6-priority-order` is a data
+list ranking pool entry kinds (derived features > libs > atoms >
+wraps > constants). A future meta-learner (M14+) can replace this
+list based on observed solve traces. Budget cap at 2000 pairs.
+
+**Short-circuit validated Form 6**: `m8s-form6-best-validated`
+validates each hit inline via `eval-node`, skips candidates
+dominated by the current best, and early-terminates when a
+validated candidate with optimal score (= label count) is found.
+This eliminates the O(pool²) eval-node cost from the old
+collect-all-then-filter approach.
+
+**Rust test data injection**: `try_selph_decomposers` now includes
+held-out pairs in the spec namespace under `"test"` key. The chain
+can self-validate Form 6 candidates against test rows, returning
+only generalizing solutions.
+
+**`bi_filter` truthy fix**: SELPH's `filter` builtin was matching
+only `Value::Bool(true)`, silently dropping any other truthy return
+value. Fixed to use `is_truthy()` (same semantics as `if`). This
+was latent since §9.47.4 — never triggered because test data was
+never threaded from Rust to the chain until §9.47.6.
+
+**Degenerate library column filter**: `m-pool-str-libs` skips
+library entries whose column has ≤1 distinct value.
+
+Results: 28/28 string POS (was 27/28), 2.9× faster (2.98s → 1.04s),
+55/55 full curriculum unchanged.
+
+### 9.48 P2: Grid domain — ARC Prize target
+
+The third domain instance of the per-domain pool pattern. Grids
+are `List(List(Int))` in types_v2 — no special `Value::Grid`
+variant. Grid-ness is a structural SELPH predicate.
+
+#### 9.48.1 Rust kernel
+
+33 grid builtins ported to eval_v2.rs:
+
+- **Predicates**: `grid?`
+- **Accessors**: `grid-height`, `grid-width`, `grid-size`,
+  `grid-get`, `grid-set`
+- **Transforms**: `grid-rotate-cw/ccw/180`, `grid-flip-h/v`,
+  `grid-transpose`, `grid-trim`
+- **Gravity**: `grid-gravity` (4 directions) + convenience wrappers
+  `grid-gravity-down/right/up/left`
+- **Composition**: `grid-crop`, `grid-overlay`, `grid-hconcat`,
+  `grid-vconcat`
+- **Color ops**: `grid-replace-color`, `grid-colors`,
+  `grid-count-color`, `grid-background`
+- **Logical**: `grid-xor`, `grid-and`, `grid-or`
+- **Drawing**: `grid-fill-rect`
+- **Object detection**: `grid-objects` (4-connected components),
+  `grid-objects-8` (8-connected), `grid-object-count`
+
+The `#grid` reader macro in main.rs was fixed to return
+`List(List(Num))` directly instead of `Value::Grid`, which
+`legacy_value_to_v2` was silently converting to `Nil`.
+
+#### 9.48.2 Pool builder (m_pool_grid.selph)
+
+Mirrors `m_pool_string.selph`. Pool entry shape unchanged:
+`(ns ("source" Node) ("col" list) ("kind" string))`.
+
+- **Unary catalog** (11 ops): rotate-cw/ccw/180, flip-h/v,
+  transpose, trim, gravity in 4 directions
+- **L2 wraps**: depth-2 compositions (e.g., flip-h then trim)
+- **Derived scalar entries**: `grid-object-count`, `grid-width`,
+  `grid-height` (of trimmed object), `grid-background` — produce
+  1×1 grids for Form 2 match or scalar values for Form 5 classify
+- **Library support** with degenerate filtering
+
+#### 9.48.3 Detector (m8g_constant_grid.selph)
+
+Five detector forms, cheap-to-expensive ordering:
+
+| Form | Pattern | Cost |
+|------|---------|------|
+| 1 | Constant grid output | O(n) |
+| 2 | Unary transform / L2 composition | O(pool) |
+| 3 | Binary grid op (xor/and/or of two pool entries) | O(pool² × 3) |
+| 4 | Color mapping (consistent per-cell color swap) | O(cells) |
+| 5 | **Cross-type classify**: scalar grid features partition output | O(features × n²) |
+
+Form 5 is the cross-type bridge. It builds a **scalar feature pool**
+(object-count, width, height, background) from grid inputs, then
+checks if any scalar feature cleanly partitions the output grids
+into groups — emitting an if-chain that maps feature values to
+constant grid outputs. This is the grid analogue of the string
+chain's Form 3 (multi-classify), operating across type boundaries.
+
+#### 9.48.4 ARC-AGI-1 results
+
+14/400 (3.5%) on ARC-AGI-1 training set:
+
+| Tasks | Form | Pattern |
+|-------|------|---------|
+| 7 | F2 | Single transform (rotate/flip/transpose/trim/gravity) |
+| 1 | F2 (L2) | Composition: `grid-trim(grid-flip-h(x))` |
+| 2 | F3 | Binary: `grid-xor(x, grid-rotate-180(x))` |
+| 1 | F5 | Cross-type: classify by object-count → 5 patterns |
+| 3 | F2 | Derived: object-count/width/height as 1×1 grid |
+
+Object curriculum: 8/10 tasks solved (extract, count, classify by
+property, width/height extraction).
+
+No regressions: 28/28 strings, 55/55 full curriculum.
+
+#### 9.48.5 What's next
+
+Three directions, in order of strategic value:
+
+1. **Object selection** — extract largest/smallest from
+   `grid-objects` list. Needs a list-selection form that picks
+   from a list by a comparator (area, color). Would unlock the
+   ~25% of ARC tasks that are "find the special object."
+
+2. **Subgrid splitting** — detect separator lines (constant-color
+   rows/columns), split grid into quadrants, process independently.
+   Common ARC pattern (~15% of tasks).
+
+3. **Learned pool pruning** — replace the hand-coded priority
+   order and per-type pools with a meta-learned pool selector.
+   The infrastructure is in place (Form 5's scalar feature pool
+   demonstrates cross-type pooling). An M14 meta-curriculum module
+   would learn: given spec features, which pool entries to include.
+
+The cross-type Form 5 validates the shared-pool direction: a single
+pool with entries from multiple domains, pruned by a learnable
+criterion. The per-type pools are the initial prior; the meta-learner
+replaces them.
