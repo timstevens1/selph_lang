@@ -5281,6 +5281,44 @@ impl SynthResult {
     }
 }
 
+/// Validate a synthesized lambda against held-out examples. Returns
+/// `true` if the lambda matches every (input, expected) pair in
+/// `test_inputs` / `test_expected`, `false` otherwise. Empty test
+/// vectors count as vacuous success (no held-out data ⇒ skip).
+///
+/// This is the synth_v2 port of the legacy `validate_candidate`
+/// from synth.rs. The candidate is a lambda Node at `root` inside
+/// `nodes`. We evaluate it once to get a closure, then apply to each
+/// test input. Evaluation uses the shared `env` so library functions
+/// from prior tasks are visible — same eval context the training
+/// rows used.
+fn validate_held_out(
+    nodes: &[Node],
+    root: usize,
+    test_inputs: &[Value],
+    test_expected: &[Value],
+    env: &Env,
+) -> bool {
+    if test_inputs.is_empty() {
+        return true; // no held-out data
+    }
+    let nodes_rc: Rc<[Node]> = nodes.to_vec().into();
+    let func = match eval_v2::eval(&nodes_rc, root, env) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    for (inp, exp) in test_inputs.iter().zip(test_expected.iter()) {
+        let got = match eval_v2::apply(&func, &[inp.clone()], env) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if !eval_v2::values_equal(&got, exp) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Lightweight pending-candidate descriptor — stores indices into the
 /// pool, the producing component, the inferred return type, and a score.
 /// Materialized into a real `SynthPool` only when about to be tested.
@@ -5709,6 +5747,7 @@ pub fn synthesize(
     synthesize_inner(
         components, inputs, expected, env, universe,
         max_depth, max_candidates, None,
+        &[], &[],
     )
 }
 
@@ -5731,6 +5770,28 @@ pub fn synthesize_args(
     max_depth: usize,
     max_candidates: usize,
 ) -> SynthResult {
+    synthesize_args_with_test(
+        components, inputs, arg_types, expected, env, universe,
+        max_depth, max_candidates, &[], &[],
+    )
+}
+
+/// Like `synthesize_args` but with optional held-out test data.
+/// When `test_inputs` / `test_expected` are non-empty, candidates that
+/// pass training are additionally verified against the held-out pairs.
+/// Candidates failing held-out are rejected and the search continues.
+pub fn synthesize_args_with_test(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    arg_types: &[Sym],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+    test_inputs: &[Value],
+    test_expected: &[Value],
+) -> SynthResult {
     let seed_atoms: Vec<SynthComponent> = arg_types
         .iter()
         .enumerate()
@@ -5739,6 +5800,7 @@ pub fn synthesize_args(
     synthesize_inner(
         components, inputs, expected, env, universe,
         max_depth, max_candidates, Some(seed_atoms),
+        test_inputs, test_expected,
     )
 }
 
@@ -5751,6 +5813,8 @@ fn synthesize_inner(
     max_depth: usize,
     max_candidates: usize,
     extra_seeds: Option<Vec<SynthComponent>>,
+    test_inputs: &[Value],
+    test_expected: &[Value],
 ) -> SynthResult {
     // Empty examples: nothing to fit. Return failure rather than
     // returning an arbitrary trivial program.
@@ -5882,9 +5946,16 @@ fn synthesize_inner(
         if let Some((nodes, root, sd_explored, name_sym)) =
             try_selph_decomposers(env, inputs, expected, max_depth, max_candidates)
         {
-            return SynthResult::success_from_decomposer(
-                nodes, root, sd_explored, name_sym,
-            );
+            // §9.47.4: held-out validation. If test data exists,
+            // verify the chain's candidate against held-out rows.
+            // A memorize-the-training-data solution fails here if
+            // the test rows contain unseen input values.
+            if validate_held_out(&nodes, root, test_inputs, test_expected, env) {
+                return SynthResult::success_from_decomposer(
+                    nodes, root, sd_explored, name_sym,
+                );
+            }
+            // Chain result failed held-out — fall through to Flat.
         }
     }
 
@@ -5920,7 +5991,10 @@ fn synthesize_inner(
         if let TestOutcome::Solution = outcome {
             let final_entry = hole_sub.as_ref().unwrap_or(entry);
             let (n, r) = wrap_lambda(final_entry);
-            return SynthResult::success(n, r, explored);
+            if validate_held_out(&n, r, test_inputs, test_expected, env) {
+                return SynthResult::success(n, r, explored);
+            }
+            // Failed held-out — continue searching.
         }
     }
 
@@ -6031,7 +6105,10 @@ fn synthesize_inner(
                 TestOutcome::Solution => {
                     let final_entry = hole_sub.as_ref().unwrap_or(&entry);
                     let (n, r) = wrap_lambda(final_entry);
-                    return SynthResult::success(n, r, explored);
+                    if validate_held_out(&n, r, test_inputs, test_expected, env) {
+                        return SynthResult::success(n, r, explored);
+                    }
+                    // Failed held-out — continue searching.
                 }
                 TestOutcome::Tested | TestOutcome::Skipped => {
                     new_entries.push(entry);

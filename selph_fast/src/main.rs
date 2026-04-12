@@ -1115,7 +1115,7 @@ fn cmd_curriculum(args: &[String]) {
         }
     }
 
-    for (name, task_depth, inputs, expected, _arity_hint) in &tasks {
+    for (name, task_depth, inputs, expected, _arity_hint, _test_inputs, _test_expected) in &tasks {
         // The legacy `cmd_curriculum` path doesn't honour the §9.31
         // multi-arg arity hint — only `cmd_grow_v2` does. Tasks
         // tagged `task-args` here fall back to single-input behavior.
@@ -1555,7 +1555,8 @@ fn cmd_grow_v2(args: &[String]) {
     let mut by_strategy: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
 
-    for (name, task_depth, inputs_legacy, expected_legacy, arity_hint) in &tasks {
+    for (name, task_depth, inputs_legacy, expected_legacy, arity_hint,
+         test_inputs_legacy, test_expected_legacy) in &tasks {
         // Convert legacy Values → v2 Values once per task. The legacy
         // parser produces Num(f64) for everything numeric; v2 prefers
         // Int(i64) when integral so the type universe stays Int-biased
@@ -1580,6 +1581,11 @@ fn cmd_grow_v2(args: &[String]) {
             inputs_legacy.iter().map(&convert).collect();
         let expected: Vec<types_v2::Value> =
             expected_legacy.iter().map(&convert).collect();
+        // §9.47.4: convert held-out test rows (if any).
+        let test_inputs: Vec<types_v2::Value> =
+            test_inputs_legacy.iter().map(&convert).collect();
+        let test_expected: Vec<types_v2::Value> =
+            test_expected_legacy.iter().map(&convert).collect();
 
         // Rebuild the catalog per task. Cheap relative to synthesis,
         // and ensures any newly defined library function from a
@@ -1610,7 +1616,7 @@ fn cmd_grow_v2(args: &[String]) {
             let arg_types: Vec<crate::intern::Sym> = first.iter()
                 .map(|v| v.type_sym().unwrap_or_else(types_v2::type_any))
                 .collect();
-            let synth_result = synth_v2::synthesize_args(
+            let synth_result = synth_v2::synthesize_args_with_test(
                 &components,
                 &inputs,
                 &arg_types,
@@ -1619,6 +1625,8 @@ fn cmd_grow_v2(args: &[String]) {
                 &universe,
                 *task_depth,
                 default_budget,
+                &test_inputs,
+                &test_expected,
             );
             // Wrap in a StrategyResult so the success path below stays
             // shape-compatible. §9.46 fix: when synth_v2 reports a
@@ -1856,9 +1864,11 @@ fn legacy_value_has_non_integral(v: &Value) -> bool {
 }
 
 fn parse_curriculum_tasks(source: &str, default_depth: usize)
-    -> Vec<(String, usize, Vec<Value>, Vec<Value>, Option<usize>)>
+    -> Vec<(String, usize, Vec<Value>, Vec<Value>, Option<usize>,
+            Vec<Value>, Vec<Value>)>
 {
-    // Each tuple is (name, depth, inputs, expected, arity_hint).
+    // Each tuple is (name, depth, inputs, expected, arity_hint,
+    //                test_inputs, test_expected).
     //
     // arity_hint = None     → standard `(task ...)`. Single-input synth.
     // arity_hint = Some(N)  → `(task-args ...)`. Each input value is
@@ -1866,6 +1876,11 @@ fn parse_curriculum_tasks(source: &str, default_depth: usize)
     //                         synth uses indexed-atom seeds (§9.31
     //                         multi-arg path) instead of a single
     //                         InputVar.
+    //
+    // test_inputs / test_expected are held-out validation examples
+    // (§9.47.4). Curriculum rows wrapped in `(test input output)`
+    // are separated from training rows and used for post-synthesis
+    // verification. Tasks without `(test ...)` rows have empty vecs.
     let mut tasks = Vec::new();
 
     let (nodes, roots) = match parse_file(source) {
@@ -1907,16 +1922,33 @@ fn parse_curriculum_tasks(source: &str, default_depth: usize)
 
             let mut inputs = Vec::new();
             let mut expected = Vec::new();
+            let mut test_inputs = Vec::new();
+            let mut test_expected = Vec::new();
+            let test_sym = intern("test");
 
             for &child_idx in &children[3..] {
                 if let Node::App(pair) = &nodes[child_idx] {
                     if pair.len() == 2 {
+                        // Regular training pair: (input output)
                         if let (Some(iv), Some(ov)) = (
                             node_to_value(&nodes, pair[0]),
                             node_to_value(&nodes, pair[1]),
                         ) {
                             inputs.push(iv);
                             expected.push(ov);
+                        }
+                    } else if pair.len() == 3 {
+                        // §9.47.4: held-out test pair: (test input output)
+                        if let Node::Symbol(s) = &nodes[pair[0]] {
+                            if *s == test_sym {
+                                if let (Some(iv), Some(ov)) = (
+                                    node_to_value(&nodes, pair[1]),
+                                    node_to_value(&nodes, pair[2]),
+                                ) {
+                                    test_inputs.push(iv);
+                                    test_expected.push(ov);
+                                }
+                            }
                         }
                     }
                 }
@@ -1942,7 +1974,8 @@ fn parse_curriculum_tasks(source: &str, default_depth: usize)
                 } else {
                     None
                 };
-                tasks.push((name, depth, inputs, expected, arity_hint));
+                tasks.push((name, depth, inputs, expected, arity_hint,
+                           test_inputs, test_expected));
             }
         }
     }
@@ -2485,7 +2518,8 @@ fn cmd_meta_optimize(args: &[String]) {
     }
 
     // Load task files to rebuild training examples
-    let mut all_tasks: Vec<(String, usize, Vec<Value>, Vec<Value>, Option<usize>)> = Vec::new();
+    let mut all_tasks: Vec<(String, usize, Vec<Value>, Vec<Value>, Option<usize>,
+                            Vec<Value>, Vec<Value>)> = Vec::new();
     for tf in &task_files {
         match fs::read_to_string(tf) {
             Ok(s) => {
@@ -2516,8 +2550,8 @@ fn cmd_meta_optimize(args: &[String]) {
         .collect();
 
     let training_tasks: Vec<meta::TrainingTask> = all_tasks.iter()
-        .filter(|(name, _, _, _, _)| trace_by_name.contains_key(name))
-        .map(|(name, _, inputs, expected, _)| {
+        .filter(|(name, _, _, _, _, _, _)| trace_by_name.contains_key(name))
+        .map(|(name, _, inputs, expected, _, _, _)| {
             let avail = trace_by_name.get(name)
                 .and_then(|t| if t.all_components_available.is_empty() {
                     None

@@ -494,19 +494,18 @@
         (let ((pv (head pair-vals)))
           (let ((v1 (head pv))
                 (v2 (head (tail pv))))
-            (make-if
-              (make-app "and"
-                (make-app "=" e1-source (m8s-value-to-node v1))
-                (make-app "=" e2-source (m8s-value-to-node v2)))
-              (m8s-value-to-node (head labels))
-              (m8s-build-conjunction-chain
-                e1-source e2-source
-                (tail labels) (tail pair-vals)))))))))
-
-(define m8s-emit-conjunction
-  (lambda (e1-source e2-source labels pair-vals)
-    (m8s-wrap-lambda
-      (m8s-build-conjunction-chain e1-source e2-source labels pair-vals))))
+            ; NOTE: can't use (make-app "and" ...) because eval_v2 treats
+            ; `and` as a SpecialApp, not a regular App. Use nested make-if
+            ; to encode the conjunction: (if test1 (if test2 then else) else).
+            (let ((test1 (make-app "=" e1-source (m8s-value-to-node v1)))
+                  (test2 (make-app "=" e2-source (m8s-value-to-node v2)))
+                  (then-val (m8s-value-to-node (head labels)))
+                  (else-val (m8s-build-conjunction-chain
+                              e1-source e2-source
+                              (tail labels) (tail pair-vals))))
+              (make-if test1
+                (make-if test2 then-val else-val)
+                else-val))))))))
 
 ; For Form 6, vals-by-label[i] is a list of 2-element lists. We need
 ; one representative joint value per label for the emit. Since the
@@ -542,13 +541,14 @@
                 (label (head (tail p))))
             (let ((v1 (head joint))
                   (v2 (head (tail joint))))
-              (make-if
-                (make-app "and"
-                  (make-app "=" e1-source (m8s-value-to-node v1))
-                  (make-app "=" e2-source (m8s-value-to-node v2)))
-                (m8s-value-to-node label)
-                (m8s-build-conjunction-from-pairs
-                  e1-source e2-source (tail pairs))))))))))
+              (let ((test1 (make-app "=" e1-source (m8s-value-to-node v1)))
+                    (test2 (make-app "=" e2-source (m8s-value-to-node v2)))
+                    (then-val (m8s-value-to-node label))
+                    (else-val (m8s-build-conjunction-from-pairs
+                                e1-source e2-source (tail pairs))))
+                (make-if test1
+                  (make-if test2 then-val else-val)
+                  else-val)))))))))
 
 (define m8s-fit-conjunction
   (lambda (e1 e2 target)

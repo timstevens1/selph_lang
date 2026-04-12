@@ -366,8 +366,14 @@
 ; uppercase. The source AST is a comparison wrapping char-code, so
 ; the synthesized lambda evaluates the same predicate at runtime.
 ;
-; AST shape: (and (>= (char-code (string-take e 1)) 65)
-;                 (<= (char-code (string-take e 1)) 90))
+; AST shape: (if (>= (char-code (string-take e 1)) 65)
+;              (if (<= (char-code (string-take e 1)) 90) true false)
+;              false)
+;
+; NOTE: can't use `(make-app "and" ...)` because eval_v2 treats `and`
+; as a SpecialApp, not a regular App. The SpecialApp form is
+; constructed during tree conversion (convert_tree), not by make-app.
+; Using nested make-if instead avoids the mismatch.
 (define m-pool-str-capital-entry
   (lambda (entry)
     (let ((wrapped-col
@@ -382,9 +388,13 @@
                        (make-int 1))))
           (let ((char-code-node (make-app "char-code" take1)))
             (m-pool-str-entry
-              (make-app "and"
+              (make-if
                 (make-app ">=" char-code-node (make-int 65))
-                (make-app "<=" char-code-node (make-int 90)))
+                (make-if
+                  (make-app "<=" char-code-node (make-int 90))
+                  (make-bool true)
+                  (make-bool false))
+                (make-bool false))
               wrapped-col
               "first-upper")))))))
 

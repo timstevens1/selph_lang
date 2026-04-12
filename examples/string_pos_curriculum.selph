@@ -189,34 +189,44 @@
 ; in the pool to discriminate these.
 
 ; Detect gerund by -ing suffix. Single-feature on target.
+; Test rows use unseen words to force generalization via suffix predicate.
 (task-args "gerund_by_ing" 1
   (("running") "gerund") (("playing") "gerund") (("swimming") "gerund")
   (("eating") "gerund") (("singing") "gerund")
-  (("cat") "other") (("dog") "other") (("house") "other") (("tree") "other"))
+  (("cat") "other") (("dog") "other") (("house") "other") (("tree") "other")
+  (test ("dancing") "gerund") (test ("jumping") "gerund")
+  (test ("bird") "other") (test ("table") "other"))
 
 ; Detect past tense by -ed suffix.
 (task-args "past_by_ed" 1
   (("walked") "past") (("played") "past") (("jumped") "past")
   (("kicked") "past") (("opened") "past")
-  (("walk") "present") (("play") "present") (("jump") "present") (("open") "present"))
+  (("walk") "present") (("play") "present") (("jump") "present") (("open") "present")
+  (test ("danced") "past") (test ("closed") "past")
+  (test ("dance") "present") (test ("close") "present"))
 
 ; Detect plural by -s suffix.
 (task-args "plural_by_s" 1
   (("cats") "plural") (("dogs") "plural") (("houses") "plural")
   (("trees") "plural") (("books") "plural")
-  (("cat") "singular") (("dog") "singular") (("house") "singular") (("book") "singular"))
+  (("cat") "singular") (("dog") "singular") (("house") "singular") (("book") "singular")
+  (test ("birds") "plural") (test ("fish") "singular"))
 
 ; Detect proper noun by initial capital.
 (task-args "proper_by_capital" 1
   (("Alice") "proper") (("Bob") "proper") (("Charlie") "proper")
   (("London") "proper") (("Paris") "proper")
-  (("cat") "common") (("dog") "common") (("house") "common") (("river") "common"))
+  (("cat") "common") (("dog") "common") (("house") "common") (("river") "common")
+  (test ("David") "proper") (test ("Tokyo") "proper")
+  (test ("chair") "common") (test ("lamp") "common"))
 
 ; Detect prefix-derived negation.
 (task-args "negation_by_un" 1
   (("undo") "negation") (("untie") "negation") (("unhappy") "negation")
   (("unlock") "negation") (("unfair") "negation")
-  (("happy") "neutral") (("tie") "neutral") (("fair") "neutral") (("lock") "neutral"))
+  (("happy") "neutral") (("tie") "neutral") (("fair") "neutral") (("lock") "neutral")
+  (test ("unseen") "negation") (test ("unclear") "negation")
+  (test ("seen") "neutral") (test ("clear") "neutral"))
 
 ; Three-class morphology: -ing → gerund, -ed → past, otherwise base.
 ; This is the canonical Phase 2 case: no single suffix discriminates
@@ -226,7 +236,8 @@
 (task-args "verb_form" 1
   (("running") "gerund") (("playing") "gerund") (("eating") "gerund")
   (("walked") "past") (("played") "past") (("opened") "past")
-  (("run") "base") (("walk") "base") (("eat") "base"))
+  (("run") "base") (("walk") "base") (("eat") "base")
+  (test ("dancing") "gerund") (test ("closed") "past") (test ("dance") "base"))
 
 ; ── Stage 8: Feature conjunctions (§9.47.3) ──────────────────────────
 ; The label depends on the AND of two features. No single feature
@@ -242,7 +253,9 @@
   (("they" "playing") "verb-progressive")
   (("the" "cat") "common-noun") (("a" "dog") "common-noun")
   (("the" "house") "common-noun")
-  (("i" "cat") "other") (("we" "dog") "other") (("they" "house") "other"))
+  (("i" "cat") "other") (("we" "dog") "other") (("they" "house") "other")
+  (test ("the" "dancing") "gerund-noun") (test ("she" "dancing") "verb-progressive")
+  (test ("a" "bird") "common-noun") (test ("he" "bird") "other"))
 
 ; Capitalization + suffix conjunction. Capital + -land/-burg etc would
 ; be a place name; we test the simpler "capital + -ing" → "proper gerund"
