@@ -257,10 +257,17 @@
                             (let ((col (m-pool-str-lib-column lib-fn positions inputs)))
                               (if (nil? col)
                                 nil
-                                (m-pool-str-entry
-                                  (m-pool-str-build-lib-call name positions)
-                                  col
-                                  (concat "lib-" name)))))
+                                ; §9.47.6: skip degenerate columns (constant across
+                                ; all rows). A library function that maps every input
+                                ; to the same output can't discriminate anything —
+                                ; it's noise in the pool, especially for Form 6's
+                                ; O(pool²) pair iteration.
+                                (if (<= (length (m-pool-str-dedup col)) 1)
+                                  nil
+                                  (m-pool-str-entry
+                                    (m-pool-str-build-lib-call name positions)
+                                    col
+                                    (concat "lib-" name))))))
                           tuples)))))))
             lib-names)
           (list))))))

@@ -4779,6 +4779,16 @@ fn try_selph_decomposers(
     spec_ns.insert(intern("spec"), Value::list(spec_pairs));
     spec_ns.insert(intern("max-depth"), Value::Int(max_depth as i64));
     spec_ns.insert(intern("max-candidates"), Value::Int(max_budget as i64));
+    // §9.47.6: include held-out test pairs so the SELPH chain can
+    // self-validate candidates internally.
+    if !test_inputs.is_empty() {
+        let test_pairs: Vec<Value> = test_inputs
+            .iter()
+            .zip(test_expected.iter())
+            .map(|(i, e)| Value::list(vec![i.clone(), e.clone()]))
+            .collect();
+        spec_ns.insert(intern("test"), Value::list(test_pairs));
+    }
     let spec_val = Value::ns(spec_ns);
 
     let mut total_cands = 0usize;

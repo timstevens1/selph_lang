@@ -1,0 +1,336 @@
+; -------------------------------------------------------------------------
+; m_pool_grid: grid-domain pool builder (§9.48 P2)
+; -------------------------------------------------------------------------
+;
+; Path E from §9.46.4: type-dependent pools. This is the grid analogue
+; of m_pool_string.selph. Same pool entry shape, same flag interface,
+; same skip-set integration — only the value type and the unary catalog
+; differ.
+;
+; Pool entry shape (unchanged from m_pool / m_pool_string):
+;
+;   (ns ("source" Node)           ; AST node for the expression
+;       ("col"    list-of-grid)   ; behavior column over spec inputs
+;       ("kind"   string))        ; tag for diagnostics
+;
+; Flags (in the flags ns):
+;
+;   "unary-l1"  — single-level unary wraps (rotate/flip/transpose/trim)
+;   "unary-l2"  — second-level wraps over L1 entries
+;   "libs"      — library function calls returning grids
+;
+; Defaults: all false.
+
+; ── Spec helpers ─────────────────────────────────────────────────────
+
+(define m-pool-grid-spec-inputs  (lambda (s) (ns-get s "inputs")))
+(define m-pool-grid-spec-outputs (lambda (s) (ns-get s "outputs")))
+(define m-pool-grid-spec-arity   (lambda (s) (ns-get s "arity")))
+
+; ── Type predicates ──────────────────────────────────────────────────
+
+(define m-pool-grid-all-grids?
+  (lambda (col)
+    (reduce (lambda (acc v) (and acc (grid? v))) col true)))
+
+(define m-pool-grid-flag?
+  (lambda (flags key)
+    (if (ns-has flags key)
+      (= (ns-get flags key) true)
+      false)))
+
+; ── Pool entry constructor ───────────────────────────────────────────
+
+(define m-pool-grid-entry
+  (lambda (source col kind)
+    (ns ("source" source) ("col" col) ("kind" kind))))
+
+(define m-pool-grid-entry-source (lambda (e) (ns-get e "source")))
+(define m-pool-grid-entry-col    (lambda (e) (ns-get e "col")))
+(define m-pool-grid-entry-kind   (lambda (e) (ns-get e "kind")))
+
+; ── Unary op catalog (grid version) ─────────────────────────────────
+;
+; Seven grid-preserving unary ops. These are the "Stage 0" transforms
+; from the ARC plan — the building blocks for simple spatial tasks.
+
+(define m-pool-grid-unary-ops
+  (list
+    (list "grid-rotate-cw"  (lambda (v) (grid-rotate-cw v)))
+    (list "grid-rotate-ccw" (lambda (v) (grid-rotate-ccw v)))
+    (list "grid-rotate-180" (lambda (v) (grid-rotate-180 v)))
+    (list "grid-flip-h"     (lambda (v) (grid-flip-h v)))
+    (list "grid-flip-v"     (lambda (v) (grid-flip-v v)))
+    (list "grid-transpose"  (lambda (v) (grid-transpose v)))
+    (list "grid-trim"       (lambda (v) (grid-trim v)))
+    ; §9.48: gravity in all 4 directions — common ARC pattern
+    (list "grid-gravity-down"  (lambda (v) (grid-gravity v 0)))
+    (list "grid-gravity-right" (lambda (v) (grid-gravity v 1)))
+    (list "grid-gravity-up"    (lambda (v) (grid-gravity v 2)))
+    (list "grid-gravity-left"  (lambda (v) (grid-gravity v 3)))
+))
+
+; ���─ Level 0: indexed grid atoms ──────────────────────────────────────
+;
+; For each input position, build `(nth x i)` and the column of that
+; position's values across spec rows. Filter to positions whose values
+; are all grids.
+
+(define m-pool-grid-l0
+  (lambda (s)
+    (let ((arity (m-pool-grid-spec-arity s))
+          (inputs (m-pool-grid-spec-inputs s)))
+      (filter (lambda (e) (not (nil? e)))
+        (map
+          (lambda (i)
+            (let ((col (map (lambda (row) (nth row i)) inputs)))
+              (if (m-pool-grid-all-grids? col)
+                (m-pool-grid-entry
+                  (make-app "nth" (make-symbol "x") (make-int i))
+                  col
+                  "atom")
+                nil)))
+          (range arity))))))
+
+; ── Unary wraps ──────────────────────────────────���───────────────────
+;
+; For each entry x each unary op, apply the op and keep all-grid cols.
+; All 7 ops preserve grid type, so failures are rare (only on empty
+; grids or malformed input).
+
+(define m-pool-grid-wrap-entry
+  (lambda (entry op-pair)
+    (let ((op-name (head op-pair))
+          (op-fn (head (tail op-pair))))
+      (let ((wrapped-col (try (map op-fn (m-pool-grid-entry-col entry)) nil)))
+        (if (or (nil? wrapped-col) (not (m-pool-grid-all-grids? wrapped-col)))
+          nil
+          (m-pool-grid-entry
+            (make-app op-name (m-pool-grid-entry-source entry))
+            wrapped-col
+            (concat "wrap-" op-name)))))))
+
+(define m-pool-grid-unary-wraps
+  (lambda (entries)
+    (filter (lambda (e) (not (nil? e)))
+      (reduce append
+        (map (lambda (entry)
+               (map (lambda (op) (m-pool-grid-wrap-entry entry op))
+                    m-pool-grid-unary-ops))
+             entries)
+        (list)))))
+
+; ── Library function calls ───────────────────────────────────────────
+;
+; Same pattern as m_pool_string's lib builder. Filters to library
+; functions that return grids, with degenerate column filtering.
+
+(define m-pool-grid-safe-apply
+  (lambda (f arg-list)
+    (try (apply f arg-list) nil)))
+
+(define m-pool-grid-effective-arity
+  (lambda (lib-fn parent-inputs)
+    (let ((sample-row (head parent-inputs)))
+      (if (list? sample-row)
+        (let ((max-k (length sample-row)))
+          (reduce
+            (lambda (acc i)
+              (if (not (nil? acc))
+                acc
+                (let ((k (+ i 1)))
+                  (let ((sublist (slice sample-row 0 k)))
+                    (let ((res (m-pool-grid-safe-apply lib-fn (list sublist))))
+                      (if (nil? res) nil k))))))
+            (range max-k)
+            nil))
+        nil))))
+
+(define m-pool-grid-ordered-tuples
+  (lambda (n k)
+    (if (= k 0)
+      (list (list))
+      (let ((shorter (m-pool-grid-ordered-tuples n (- k 1))))
+        (reduce append
+          (map
+            (lambda (tup)
+              (map
+                (lambda (i) (cons i tup))
+                (filter
+                  (lambda (i) (not (contains tup i)))
+                  (range n))))
+            shorter)
+          (list))))))
+
+(define m-pool-grid-build-lib-call
+  (lambda (lib-name positions)
+    (let ((nth-args (map (lambda (i) (make-app "nth" (make-symbol "x") (make-int i))) positions)))
+      (let ((list-node (apply make-app (cons (make-symbol "list") nth-args))))
+        (make-app lib-name list-node)))))
+
+(define m-pool-grid-lib-column
+  (lambda (lib-fn positions inputs)
+    (let ((cols (try
+                  (map
+                    (lambda (row)
+                      (let ((sub (map (lambda (p) (nth row p)) positions)))
+                        (m-pool-grid-safe-apply lib-fn (list sub))))
+                    inputs)
+                  nil)))
+      (if (nil? cols)
+        nil
+        (if (reduce (lambda (acc v) (and acc (and (not (nil? v)) (grid? v))))
+                    cols true)
+          cols
+          nil)))))
+
+(define m-pool-grid-skip-set
+  (lambda ()
+    (try __synth_skip__ (list))))
+
+(define m-pool-grid-in-skip?
+  (lambda (name)
+    (contains (m-pool-grid-skip-set) name)))
+
+(define m-pool-grid-dedup
+  (lambda (xs)
+    (reduce
+      (lambda (acc x)
+        (if (contains acc x) acc (append acc (list x))))
+      xs
+      (list))))
+
+(define m-pool-grid-libs
+  (lambda (s)
+    (let ((parent-arity (m-pool-grid-spec-arity s))
+          (inputs (m-pool-grid-spec-inputs s)))
+      (let ((lib-names
+              (filter (lambda (n) (not (m-pool-grid-in-skip? n)))
+                      (ns-keys (env-functions)))))
+        (reduce append
+          (map
+            (lambda (name)
+              (let ((lib-fn (ns-get (env-functions) name)))
+                (let ((eff-arity (m-pool-grid-effective-arity lib-fn inputs)))
+                  (if (or (nil? eff-arity) (> eff-arity parent-arity))
+                    (list)
+                    (let ((tuples (m-pool-grid-ordered-tuples parent-arity eff-arity)))
+                      (filter (lambda (e) (not (nil? e)))
+                        (map
+                          (lambda (positions)
+                            (let ((col (m-pool-grid-lib-column lib-fn positions inputs)))
+                              (if (nil? col)
+                                nil
+                                ; §9.47.6 degenerate filter
+                                (if (<= (length (m-pool-grid-dedup col)) 1)
+                                  nil
+                                  (m-pool-grid-entry
+                                    (m-pool-grid-build-lib-call name positions)
+                                    col
+                                    (concat "lib-" name))))))
+                          tuples)))))))
+            lib-names)
+          (list))))))
+
+; ── Derived entries (§9.48) ───────────────────────────────────────────
+;
+; Scalar-grid extractors: functions that take a grid and produce a
+; 1×1 grid encoding a property. These go in the pool alongside unary
+; wraps so Form 2 can match them. Each has a hand-built AST source
+; since they compose multiple builtins.
+
+(define m-pool-grid-derived-entries
+  (lambda (base-entries inputs)
+    (reduce append
+      (map
+        (lambda (entry)
+          (let ((src (m-pool-grid-entry-source entry))
+                (col (m-pool-grid-entry-col entry)))
+            (let ((count-col
+                    (try (map (lambda (g) (list (list (grid-object-count g)))) col) nil))
+                  (width-col
+                    (try (map (lambda (g) (list (list (grid-width (grid-trim g))))) col) nil))
+                  (height-col
+                    (try (map (lambda (g) (list (list (grid-height (grid-trim g))))) col) nil)))
+              (filter (lambda (e) (not (nil? e)))
+                (list
+                  (if (nil? count-col) nil
+                    (m-pool-grid-entry
+                      ; AST: (list (list (grid-object-count <src>)))
+                      (make-app "list"
+                        (make-app "list"
+                          (make-app "grid-object-count" src)))
+                      count-col
+                      "derived-object-count"))
+                  (if (nil? width-col) nil
+                    (m-pool-grid-entry
+                      (make-app "list"
+                        (make-app "list"
+                          (make-app "grid-width"
+                            (make-app "grid-trim" src))))
+                      width-col
+                      "derived-width"))
+                  (if (nil? height-col) nil
+                    (m-pool-grid-entry
+                      (make-app "list"
+                        (make-app "list"
+                          (make-app "grid-height"
+                            (make-app "grid-trim" src))))
+                      height-col
+                      "derived-height")))))))
+        base-entries)
+      (list))))
+
+; ── Top-level: make-pool-grid ────────────────────────────────────────
+
+(define make-pool-grid
+  (lambda (s flags)
+    (let ((base (m-pool-grid-l0 s)))
+      (let ((with-unary-l1
+              (if (m-pool-grid-flag? flags "unary-l1")
+                (append base (m-pool-grid-unary-wraps base))
+                base)))
+        (let ((with-unary-l2
+                (if (m-pool-grid-flag? flags "unary-l2")
+                  (let ((l1-wraps
+                          (filter
+                            (lambda (e)
+                              (let ((k (m-pool-grid-entry-kind e)))
+                                (and (>= (string-length k) 5)
+                                     (= (string-take k 5) "wrap-"))))
+                            with-unary-l1)))
+                    (append with-unary-l1 (m-pool-grid-unary-wraps l1-wraps)))
+                  with-unary-l1)))
+          (let ((with-libs
+                  (if (m-pool-grid-flag? flags "libs")
+                    (append with-unary-l2 (m-pool-grid-libs s))
+                    with-unary-l2)))
+            (let ((with-derived
+                    (if (m-pool-grid-flag? flags "derived")
+                      (append with-libs
+                        (m-pool-grid-derived-entries base
+                          (m-pool-grid-spec-inputs s)))
+                      with-libs)))
+              with-derived)))))))
+
+; ── Smoke test ───────────────────────────────────────���───────────────
+
+(define m-pool-grid-test-spec
+  (ns ("inputs"  (list
+                   (list (list (list 1 2) (list 3 4)))
+                   (list (list (list 5 6) (list 7 8)))
+                   (list (list (list 0 1) (list 1 0)))))
+      ("outputs" (list
+                   (list (list 3 1) (list 4 2))
+                   (list (list 7 5) (list 8 6))
+                   (list (list 1 0) (list 0 1))))
+      ("arity"   1)))
+
+(print "--- m_pool_grid smoke test ---")
+(print (concat "  L0 only: "
+               (to-string (length (make-pool-grid m-pool-grid-test-spec (ns))))
+               " entries"))
+(print (concat "  +unary-l1: "
+               (to-string (length (make-pool-grid m-pool-grid-test-spec
+                                    (ns ("unary-l1" true)))))
+               " entries"))

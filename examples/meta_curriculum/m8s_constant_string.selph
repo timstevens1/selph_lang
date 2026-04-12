@@ -79,6 +79,28 @@
 
 (define m8s-pool-source (lambda (e) (ns-get e "source")))
 (define m8s-pool-col    (lambda (e) (ns-get e "col")))
+(define m8s-pool-kind   (lambda (e) (ns-get e "kind")))
+
+(define m8s-form6-priority-order
+  (list "string-ends-with" "string-starts-with" "first-upper"
+        "lib-" "atom" "numeric-atom" "wrap-" "const-"))
+
+(define m8s-form6-budget 2000)
+
+(define m8s-kind-matches-prefix?
+  (lambda (kind pfx)
+    (if (>= (string-length kind) (string-length pfx))
+      (= (string-take kind (string-length pfx)) pfx)
+      false)))
+
+(define m8s-prioritize-pool
+  (lambda (pool)
+    (let ((buckets
+            (map (lambda (pfx)
+                   (filter (lambda (e) (m8s-kind-matches-prefix? (m8s-pool-kind e) pfx))
+                           pool))
+                 m8s-form6-priority-order)))
+      (reduce append buckets (list)))))
 
 ; ── fit-multi-classify primitive ─────────────────────────────────────
 ;
@@ -276,6 +298,15 @@
         (lambda (acc v) (if (contains acc v) acc (append acc (list v))))
         col
         (list)))))
+
+(define m8s-form6-active-pool
+  (lambda (pool)
+    (let ((sorted (m8s-prioritize-pool pool)))
+      (filter
+        (lambda (e)
+          (and (not (m8s-kind-matches-prefix? (m8s-pool-kind e) "const-"))
+               (> (m8s-distinct-count (m8s-pool-col e)) 1)))
+        sorted))))
 
 ; Form 3: multi-classify by atom membership. Iterates the entire
 ; pool, collects all entries that yield a clean partition, and
@@ -574,28 +605,34 @@
 
 (define m8s-try-form-6
   (lambda (pool target)
-    (let ((hits
-            (filter (lambda (e) (not (nil? e)))
-              (try
-                (reduce append
-                  (map
-                    (lambda (e1)
-                      (filter (lambda (r) (not (nil? r)))
-                        (map (lambda (e2)
-                               (try (m8s-fit-conjunction e1 e2 target) nil))
-                             pool)))
-                    pool)
-                  (list))
-                (list)))))
-      (if (= (length hits) 0)
-        nil
-        (reduce
-          (lambda (acc h)
-            (if (or (nil? acc) (< (ns-get h "score") (ns-get acc "score")))
-              h
-              acc))
-          hits
-          nil)))))
+    (let ((active (m8s-form6-active-pool pool)))
+      (let ((result
+              (reduce
+                (lambda (state e1)
+                  (if (>= (nth state 1) m8s-form6-budget)
+                    state
+                    (reduce
+                      (lambda (st e2)
+                        (if (>= (nth st 1) m8s-form6-budget)
+                          st
+                          (let ((hit (try (m8s-fit-conjunction e1 e2 target) nil)))
+                            (list
+                              (if (nil? hit) (nth st 0) (append (nth st 0) (list hit)))
+                              (+ (nth st 1) 1)))))
+                      active
+                      state)))
+                active
+                (list (list) 0))))
+        (let ((hits (nth result 0)))
+          (if (= (length hits) 0)
+            nil
+            (reduce
+              (lambda (acc h)
+                (if (or (nil? acc) (< (ns-get h "score") (ns-get acc "score")))
+                  h
+                  acc))
+              hits
+              nil)))))))
 
 ; Attempt the equality-classify fit for an (e1, e2) pair. Returns the
 ; result ns on success, or nil. Pulled out of m8s-try-form-4 to keep
@@ -675,21 +712,53 @@
                       (ns-get fit "vals-by-label")))))))
         pool))))
 
-; §9.47.5: return ALL valid Form 6 hits as a list.
-(define m8s-form6-all-hits
-  (lambda (pool target)
-    (filter (lambda (e) (not (nil? e)))
-      (try
-        (reduce append
-          (map
-            (lambda (e1)
-              (filter (lambda (r) (not (nil? r)))
-                (map (lambda (e2)
-                       (try (m8s-fit-conjunction e1 e2 target) nil))
-                     pool)))
-            pool)
-          (list))
-        (list)))))
+; §9.47.6: short-circuit Form 6 with inline validation.
+; Returns the single best validated candidate (or nil).
+; State: (best-candidate, pair-count).
+(define m8s-form6-best-validated
+  (lambda (pool target test-ins test-outs)
+    (let ((active (m8s-form6-active-pool pool)))
+      (let ((k (length (m8s-distinct-labels target))))
+        (let ((has-test (> (length test-ins) 0)))
+          (nth
+            (reduce
+              (lambda (state e1)
+                (let ((best (nth state 0))
+                      (count (nth state 1)))
+                  (if (and (not (nil? best)) (= (ns-get best "score") k))
+                    state
+                    (if (>= count m8s-form6-budget)
+                      state
+                      (reduce
+                        (lambda (st e2)
+                          (let ((b (nth st 0))
+                                (c (nth st 1)))
+                            (if (and (not (nil? b)) (= (ns-get b "score") k))
+                              st
+                              (if (>= c m8s-form6-budget)
+                                st
+                                (let ((hit (try (m8s-fit-conjunction e1 e2 target) nil)))
+                                  (if (nil? hit)
+                                    (list b (+ c 1))
+                                    (let ((dominated (and (not (nil? b))
+                                                          (>= (ns-get hit "score")
+                                                              (ns-get b "score")))))
+                                      (if dominated
+                                        (list b (+ c 1))
+                                        (let ((ok (if has-test
+                                                    (try (m8s-validate-candidate
+                                                           (ns-get hit "source-node")
+                                                           test-ins test-outs)
+                                                         false)
+                                                    true)))
+                                          (if ok
+                                            (list hit (+ c 1))
+                                            (list b (+ c 1))))))))))))
+                        active
+                        state)))))
+              active
+              (list nil 0))
+            0))))))
 
 ; Pick the result with the smallest score among non-nil candidates.
 ; Used to merge Form 3 and Form 6 results: both can succeed on the
@@ -711,11 +780,12 @@
         (let ((pool (m8s-build-pool s))
               (test-ins  (try (ns-get s "test-inputs") (list)))
               (test-outs (try (ns-get s "test-outputs") (list))))
+          ; §9.47.6: validate returns Bool for use with `filter`
+          ; (filter requires Bool(true), not just truthy).
           (let ((validate (lambda (r)
-                  (if (nil? r) nil
-                    (if (m8s-validate-candidate
-                          (ns-get r "source-node") test-ins test-outs)
-                      r nil)))))
+                  (if (nil? r) false
+                    (m8s-validate-candidate
+                      (ns-get r "source-node") test-ins test-outs)))))
             (let ((r1 (m8s-try-form-1 target)))
               (if (and (not (nil? r1))
                        (or (= (length test-ins) 0)
@@ -744,22 +814,29 @@
                                 (append
                                   (let ((r5 (m8s-try-form-5 pool target)))
                                     (if (nil? r5) (list) (list (ns-put r5 "score" 2))))
-                                  (m8s-form6-all-hits pool target))))))
-                      ; Filter by held-out validation (only when test
-                      ; data exists — skip the expensive eval-node calls
-                      ; for tasks without test rows).
-                      (let ((valid (if (= (length test-ins) 0)
-                                     all-candidates
-                                     (filter validate all-candidates))))
-                        (if (= (length valid) 0)
-                          (ns ("found" false) ("reason" "no string shape matched"))
-                          (let ((best
-                                  (reduce
-                                    (lambda (acc h)
-                                      (if (or (nil? acc) (< (ns-get h "score") (ns-get acc "score")))
-                                        h acc))
-                                    valid nil)))
-                            (ns-put best "found" true)))))))))))))))
+                                  (list))))))
+                      ; §9.47.6: Form 6 uses short-circuit validated search.
+                      (let ((f6-best (try (m8s-form6-best-validated
+                                            pool target test-ins test-outs) nil)))
+                        (let ((valid-non-f6
+                                (if (= (length test-ins) 0)
+                                  all-candidates
+                                  (filter validate all-candidates))))
+                          (let ((all-valid
+                                  (if (nil? f6-best)
+                                    valid-non-f6
+                                    (append valid-non-f6 (list f6-best)))))
+                            (if (= (length all-valid) 0)
+                              (ns ("found" false) ("reason" "no string shape matched"))
+                              (let ((best
+                                      (reduce
+                                        (lambda (acc h)
+                                          (if (or (nil? acc)
+                                                  (< (ns-get h "score")
+                                                     (ns-get acc "score")))
+                                            h acc))
+                                        all-valid nil)))
+                                (ns-put best "found" true)))))))))))))))))
 
 ; ── Smoke tests ──────────────────────────────────────────────────────
 

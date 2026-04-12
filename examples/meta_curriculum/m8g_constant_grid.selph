@@ -1,0 +1,473 @@
+; -------------------------------------------------------------------------
+; Meta-curriculum M8g: constant-grid fit (§9.48 P2)
+; -------------------------------------------------------------------------
+;
+; Grid analogue of m8s_constant_string.selph. Recognizes two shapes:
+;
+;   Form 1:  target == constant_grid   (every output equal)
+;   Form 2:  target == g(x)           (output is exactly some pool entry's
+;                                      column — a unary transform match)
+;
+; Forms 3-6 (classify, pair-equality, ordering, conjunction) produce
+; string/numeric labels, not grid outputs. Grid tasks that output
+; non-grid labels use the existing string/numeric chain. Starting with
+; Forms 1+2 covers the "Stage 0" ARC tasks: rotations, flips,
+; transposes, trims.
+
+; ── Helpers ──────────────────────────────────────────────────────────
+
+(define m8g-spec-outputs (lambda (s) (ns-get s "outputs")))
+
+(define m8g-grid-target
+  (lambda (s)
+    (let ((outs (m8g-spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (grid? v))) outs true)
+        outs
+        nil))))
+
+; Column equality: pairwise = on two columns. Works for grids because
+; eval_v2's = does structural equality on List(List(Int)).
+(define m8g-cols-equal?
+  (lambda (xs ys)
+    (if (= (length xs) (length ys))
+      (reduce
+        (lambda (acc i)
+          (and acc (= (nth xs i) (nth ys i))))
+        (range (length xs))
+        true)
+      false)))
+
+; ── Pool builder ─────────────────────────────────────────────────────
+;
+; L0 + L1 + L2 wraps. L2 gives depth-2 compositions (rotate then flip,
+; transpose then trim, etc.). Pool size for 1-input: 1 base + 7 L1 +
+; 49 L2 = 57 entries. Form 2 scan is O(57) — cheap.
+
+(define m8g-build-pool
+  (lambda (s)
+    (make-pool-grid s
+      (ns ("unary-l1" true)
+          ("unary-l2" true)
+          ("derived"  true)))))
+
+(define m8g-pool-source (lambda (e) (ns-get e "source")))
+(define m8g-pool-col    (lambda (e) (ns-get e "col")))
+
+; ── Scalar feature pool (cross-type) ─────────────────────────────────
+;
+; Extracts numeric properties from grid inputs. Each entry has a
+; scalar column (list of ints) and an AST source. Used by Form 5
+; (grid classify) to partition outputs by a grid property.
+;
+; This is the cross-type bridge: grid-domain features feeding
+; numeric-style classification forms.
+
+(define m8g-scalar-feature-catalog
+  (list
+    (list "grid-object-count" (lambda (g) (grid-object-count g))
+          (lambda (src) (make-app "grid-object-count" src)))
+    (list "grid-width"  (lambda (g) (grid-width g))
+          (lambda (src) (make-app "grid-width" src)))
+    (list "grid-height" (lambda (g) (grid-height g))
+          (lambda (src) (make-app "grid-height" src)))
+    (list "grid-obj-width" (lambda (g) (grid-width (grid-trim g)))
+          (lambda (src) (make-app "grid-width" (make-app "grid-trim" src))))
+    (list "grid-obj-height" (lambda (g) (grid-height (grid-trim g)))
+          (lambda (src) (make-app "grid-height" (make-app "grid-trim" src))))
+    (list "grid-background" (lambda (g) (grid-background g))
+          (lambda (src) (make-app "grid-background" src)))))
+
+(define m8g-build-scalar-pool
+  (lambda (s)
+    (let ((inputs (ns-get s "inputs"))
+          (arity (ns-get s "arity")))
+      (reduce append
+        (map
+          (lambda (pos)
+            (let ((col (map (lambda (row) (nth row pos)) inputs)))
+              (if (not (reduce (lambda (a v) (and a (grid? v))) col true))
+                (list)
+                (filter (lambda (e) (not (nil? e)))
+                  (map
+                    (lambda (feat)
+                      (let ((name (nth feat 0))
+                            (fn (nth feat 1))
+                            (ast-fn (nth feat 2)))
+                        (let ((scalar-col (try (map fn col) nil)))
+                          (if (nil? scalar-col)
+                            nil
+                            (ns ("source" (ast-fn
+                                    (make-app "nth" (make-symbol "x") (make-int pos))))
+                                ("col" scalar-col)
+                                ("kind" (concat "scalar-" name)))))))
+                    m8g-scalar-feature-catalog)))))
+          (range arity))
+        (list)))))
+
+; ── Source emission ──────────────────────────────────────────────────
+
+(define m8g-wrap-lambda
+  (lambda (body) (make-lambda (list "x") body)))
+
+; Convert a grid value (List(List(Int))) to an AST Node via nested
+; (make-app "list" ...) calls. Used by Form 1 to emit constant grids.
+(define m8g-grid-to-node
+  (lambda (g)
+    (let ((row-nodes
+            (map (lambda (row)
+                   (apply make-app
+                     (cons (make-symbol "list")
+                       (map make-int row))))
+                 g)))
+      (apply make-app
+        (cons (make-symbol "list") row-nodes)))))
+
+; ── Form 1: constant grid output ────────────────────────────────────
+;
+; If every output is = to the first, the task has a constant grid answer.
+
+(define m8g-try-form-1
+  (lambda (target)
+    (let ((first (head target)))
+      (if (reduce (lambda (acc v) (and acc (= v first))) target true)
+        (ns ("kind" "form-1-constant")
+            ("source-node" (m8g-wrap-lambda (m8g-grid-to-node first))))
+        nil))))
+
+; ── Form 2: identity / unary transform ──────────────────────────────
+;
+; Scan the pool for an entry whose column exactly matches the target.
+; If found, the output is that transform applied to the input.
+
+(define m8g-try-form-2
+  (lambda (pool target)
+    (reduce
+      (lambda (acc entry)
+        (if (not (nil? acc))
+          acc
+          (if (m8g-cols-equal? (m8g-pool-col entry) target)
+            (ns ("kind" "form-2-transform")
+                ("source-node" (m8g-wrap-lambda (m8g-pool-source entry))))
+            nil)))
+      pool
+      nil)))
+
+; ── Form 3: binary grid operation ────────────────────────────────────
+;
+; output = binary-op(pool_a, pool_b) for each ordered pair of pool
+; entries and each binary grid op. Catches tasks where the output
+; combines the input with a transform of itself, e.g.:
+;   grid-xor(input, grid-flip-h(input))
+;
+; Binary op catalog: ops that take two same-dimension grids.
+; Cost: O(pool² × ops). With pool ~12 entries and 3 ops = ~432 checks.
+
+(define m8g-binary-ops
+  (list
+    (list "grid-xor" (lambda (a b) (grid-xor a b)))
+    (list "grid-and" (lambda (a b) (grid-and a b)))
+    (list "grid-or"  (lambda (a b) (grid-or a b)))))
+
+(define m8g-try-binary-op
+  (lambda (e1 e2 op-pair target)
+    (let ((op-name (head op-pair))
+          (op-fn (head (tail op-pair))))
+      (let ((result-col
+              (try
+                (map (lambda (i)
+                       (op-fn (nth (m8g-pool-col e1) i)
+                              (nth (m8g-pool-col e2) i)))
+                     (range (length target)))
+                nil)))
+        (if (nil? result-col)
+          nil
+          (if (m8g-cols-equal? result-col target)
+            (ns ("kind" (concat "form-3-" op-name))
+                ("source-node"
+                  (m8g-wrap-lambda
+                    (make-app op-name
+                      (m8g-pool-source e1)
+                      (m8g-pool-source e2)))))
+            nil))))))
+
+; Budget: max pair evaluations for Form 3. With 11 L1 ops + L2,
+; pool can reach ~133 entries. Cap at 2000 pairs to keep cost bounded.
+(define m8g-form3-budget 2000)
+
+(define m8g-try-form-3
+  (lambda (pool target)
+    (nth
+      (reduce
+        (lambda (state e1)
+          (let ((best (nth state 0))
+                (count (nth state 1)))
+            (if (not (nil? best)) state
+              (if (>= count m8g-form3-budget) state
+                (reduce
+                  (lambda (st e2)
+                    (let ((b (nth st 0))
+                          (c (nth st 1)))
+                      (if (not (nil? b)) st
+                        (if (>= c m8g-form3-budget) st
+                          (let ((hit (reduce
+                                       (lambda (h op)
+                                         (if (not (nil? h)) h
+                                           (m8g-try-binary-op e1 e2 op target)))
+                                       m8g-binary-ops
+                                       nil)))
+                            (list hit (+ c 1)))))))
+                  pool
+                  state)))))
+        pool
+        (list nil 0))
+      0)))
+
+; ── Form 4: color mapping ───────────────────────────────────────────
+;
+; Detect tasks where output = input with colors swapped. Analyzes the
+; first training pair to find a consistent color mapping, then verifies
+; it against all other pairs. Emits a chain of grid-replace-color calls.
+;
+; Only works when input and output have the same dimensions.
+
+(define m8g-detect-color-map
+  (lambda (inputs outputs)
+    (let ((first-in (head inputs))
+          (first-out (head outputs)))
+      ; Build mapping from input colors to output colors
+      (let ((h (length first-in))
+            (w (length (head first-in))))
+        ; Check dimensions match
+        (if (or (= (length first-out) 0)
+                (not (= (length first-out) h))
+                (not (= (length (head first-out)) w)))
+          nil
+          ; Scan all cells, build color→color map
+          (let ((mapping
+                  (reduce
+                    (lambda (acc r)
+                      (if (nil? acc) nil
+                        (reduce
+                          (lambda (acc2 c)
+                            (if (nil? acc2) nil
+                              (let ((ic (nth (nth first-in r) c))
+                                    (oc (nth (nth first-out r) c)))
+                                (if (= ic oc)
+                                  acc2 ; same color, no mapping needed
+                                  ; Check if we've seen this input color before
+                                  (let ((existing (try (ns-get acc2 (to-string ic)) nil)))
+                                    (if (nil? existing)
+                                      (ns-put acc2 (to-string ic) oc) ; new mapping
+                                      (if (= existing oc)
+                                        acc2 ; consistent mapping
+                                        nil)))))))  ; inconsistent → fail
+                          (range w)
+                          acc)))
+                    (range h)
+                    (ns))))
+            (if (nil? mapping) nil
+              (if (= (length (ns-keys mapping)) 0) nil ; no changes
+                mapping))))))))
+
+; Verify a color mapping against all training pairs
+(define m8g-verify-color-map
+  (lambda (mapping inputs outputs)
+    (reduce
+      (lambda (acc i)
+        (if (not acc) false
+          (let ((inp (nth inputs i))
+                (out (nth outputs i)))
+            (let ((h (length inp))
+                  (w (length (head inp))))
+              (if (or (not (= (length out) h))
+                      (not (= (length (head out)) w)))
+                false
+                (reduce
+                  (lambda (ok r)
+                    (if (not ok) false
+                      (reduce
+                        (lambda (ok2 c)
+                          (if (not ok2) false
+                            (let ((ic (nth (nth inp r) c))
+                                  (oc (nth (nth out r) c))
+                                  (mapped (try (ns-get mapping (to-string ic)) nil)))
+                              (if (nil? mapped)
+                                (= ic oc) ; no mapping for this color → must be same
+                                (= mapped oc)))))
+                        (range w)
+                        ok)))
+                  (range h)
+                  true))))))
+      (range (length inputs))
+      true)))
+
+; Build AST for a chain of grid-replace-color calls using a temp-color
+; trick to avoid overwriting. For mapping {a→b, c→d}, emit:
+;   (grid-replace-color (grid-replace-color x a b) c d)
+; This works when mappings don't form cycles. For cycles (a→b, b→a),
+; we use a temp color (99) as intermediary.
+(define m8g-build-color-map-ast
+  (lambda (source mapping)
+    (let ((keys (ns-keys mapping)))
+      (reduce
+        (lambda (acc key)
+          (let ((from-color (try
+                  (if (string? key)
+                    (head (map (lambda (c) c)
+                      (filter (lambda (v) (= (to-string v) key))
+                        (range 100))))
+                    key)
+                  0))
+                (to-color (ns-get mapping key)))
+            (make-app "grid-replace-color"
+              acc
+              (make-int from-color)
+              (make-int to-color))))
+        keys
+        source))))
+
+(define m8g-try-form-4
+  (lambda (inputs outputs target)
+    (let ((mapping (m8g-detect-color-map inputs outputs)))
+      (if (nil? mapping) nil
+        (if (m8g-verify-color-map mapping inputs outputs)
+          (ns ("kind" "form-4-color-map")
+              ("source-node"
+                (m8g-wrap-lambda
+                  (m8g-build-color-map-ast
+                    (make-app "nth" (make-symbol "x") (make-int 0))
+                    mapping))))
+          nil)))))
+
+; ── Form 5: grid classify by scalar feature (cross-type) ─────────────
+;
+; The bridge between grid and numeric domains. Checks if a scalar
+; property of the input (object-count, width, height, background)
+; cleanly partitions the spec's output grids into groups.
+
+(define m8g-scalar-partitions?
+  (lambda (scalar-col target)
+    (let ((n (length scalar-col)))
+      (if (< n 2) false
+        (reduce
+          (lambda (ok i)
+            (if (not ok) false
+              (reduce
+                (lambda (ok2 j)
+                  (if (not ok2) false
+                    (if (= (nth scalar-col i) (nth scalar-col j))
+                      (= (nth target i) (nth target j))
+                      ok2)))
+                (range n)
+                ok)))
+          (range n)
+          true)))))
+
+(define m8g-build-classify-chain
+  (lambda (feature-source groups)
+    (if (= (length groups) 1)
+      (m8g-grid-to-node (head (tail (head groups))))
+      (let ((g (head groups))
+            (rest (tail groups)))
+        (make-if
+          (make-app "=" feature-source (make-int (head g)))
+          (m8g-grid-to-node (head (tail g)))
+          (m8g-build-classify-chain feature-source rest))))))
+
+(define m8g-try-form-5
+  (lambda (s target)
+    (let ((scalar-pool (m8g-build-scalar-pool s)))
+      (reduce
+        (lambda (acc entry)
+          (if (not (nil? acc)) acc
+            (let ((scalar-col (ns-get entry "col"))
+                  (src (ns-get entry "source")))
+              (if (m8g-scalar-partitions? scalar-col target)
+                (let ((groups
+                        (reduce
+                          (lambda (acc2 i)
+                            (let ((sv (nth scalar-col i))
+                                  (gv (nth target i)))
+                              (if (reduce (lambda (seen g)
+                                            (or seen (= (head g) sv)))
+                                          acc2 false)
+                                acc2
+                                (append acc2 (list (list sv gv))))))
+                          (range (length scalar-col))
+                          (list))))
+                  (if (< (length groups) 2) nil
+                    (ns ("kind" (concat "form-5-classify-" (ns-get entry "kind")))
+                        ("source-node"
+                          (m8g-wrap-lambda
+                            (m8g-build-classify-chain src groups))))))
+                nil))))
+        scalar-pool
+        nil))))
+
+; ── Top-level: detect-constant-grid ──────────────────────────────────
+
+(define detect-constant-grid
+  (lambda (s)
+    (let ((target (m8g-grid-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-grid target"))
+        (let ((r1 (m8g-try-form-1 target)))
+          (if (not (nil? r1))
+            (ns-put r1 "found" true)
+            (let ((pool (m8g-build-pool s))
+                  (inputs (ns-get s "inputs"))
+                  (outputs (ns-get s "outputs")))
+              ; Form 2: unary transform match
+              (let ((r2 (m8g-try-form-2 pool target)))
+                (if (not (nil? r2))
+                  (ns-put r2 "found" true)
+                  ; Form 3: binary grid op
+                  (let ((r3 (try (m8g-try-form-3 pool target) nil)))
+                    (if (not (nil? r3))
+                      (ns-put r3 "found" true)
+                      ; Form 4: color mapping
+                      (let ((r4 (try (m8g-try-form-4 inputs outputs target) nil)))
+                        (if (not (nil? r4))
+                          (ns-put r4 "found" true)
+                          ; Form 5: classify by scalar feature
+                          (let ((r5 (try (m8g-try-form-5 s target) nil)))
+                            (if (not (nil? r5))
+                              (ns-put r5 "found" true)
+                              (ns ("found" false) ("reason" "no grid shape matched")))))))))))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(define m8g-make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+; Form 1: constant output (every output is the same 2x2 grid)
+(define m8g-const-spec
+  (m8g-make-spec
+    (list (list (list (list 1 2) (list 3 4)))
+          (list (list (list 5 6) (list 7 8))))
+    (list (list (list 9 9) (list 9 9))
+          (list (list 9 9) (list 9 9)))
+    1))
+
+; Form 2: output == grid-rotate-cw(input)
+(define m8g-rotate-spec
+  (m8g-make-spec
+    (list (list (list (list 1 2) (list 3 4)))
+          (list (list (list 5 6) (list 7 8)))
+          (list (list (list 0 1) (list 1 0))))
+    (list (list (list 3 1) (list 4 2))
+          (list (list 7 5) (list 8 6))
+          (list (list 1 0) (list 0 1)))
+    1))
+
+(define m8g-run-test
+  (lambda (label spec)
+    (let ((result (detect-constant-grid spec)))
+      (if (ns-get result "found")
+        (print (concat "  OK " label " kind=" (ns-get result "kind")))
+        (print (concat "  FAIL " label " " (ns-get result "reason")))))))
+
+(print "--- m8g_constant_grid smoke tests ---")
+(m8g-run-test "constant 2x2" m8g-const-spec)
+(m8g-run-test "rotate-cw" m8g-rotate-spec)

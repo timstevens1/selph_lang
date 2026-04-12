@@ -89,9 +89,8 @@
 ;
 ; Inspect the first output value to decide which branch handles this
 ; spec. Numeric (Int/Num) → numeric chain. String → string chain.
-; Anything else (List, Bool, Grid, ...) falls through to "unknown"
-; and the chain returns (found false), letting Flat enumeration take
-; over.
+; Anything else falls through to "unknown" and the chain returns
+; (found false), letting Flat enumeration take over.
 
 (define m-chain-output-kind
   (lambda (spec)
@@ -101,7 +100,8 @@
         (let ((first-out (head outs)))
           (if (or (int? first-out) (num? first-out)) "numeric"
             (if (string? first-out) "string"
-              "unknown")))))))
+              (if (grid? first-out) "grid"
+                "unknown"))))))))
 
 ; ── Numeric branch ───────────────────────────────────────────────────
 
@@ -133,6 +133,15 @@
                 (m-chain-try-or-next detect-library-shape spec
                   (lambda () (ns ("found" false))))))))))))
 
+; ── Grid branch (§9.48 P2) ──────────────────────────────────────────
+
+(define m-chain-grid
+  (lambda (spec)
+    (m-chain-try-or-next detect-constant-grid spec
+      (lambda ()
+        (m-chain-try-or-next detect-library-shape spec
+          (lambda () (ns ("found" false))))))))
+
 ; ── Top-level dispatcher ─────────────────────────────────────────────
 
 (define m-chain-decomposer
@@ -141,7 +150,8 @@
       (let ((kind (m-chain-output-kind spec)))
         (if (= kind "numeric") (m-chain-numeric spec)
           (if (= kind "string") (m-chain-string spec)
-            (ns ("found" false))))))))
+            (if (= kind "grid") (m-chain-grid spec)
+              (ns ("found" false)))))))))
 
 ; ── Register as the global decomposer ────────────────────────────────
 ;

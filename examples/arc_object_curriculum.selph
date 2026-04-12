@@ -1,0 +1,96 @@
+; -------------------------------------------------------------------------
+; ARC object detection curriculum (§9.48)
+; -------------------------------------------------------------------------
+;
+; Builds up object detection capabilities incrementally:
+;   Stage A: Single object extraction (grid-trim — already solved)
+;   Stage B: Object counting via grid-objects
+;   Stage C: Object selection (largest, by color, by position)
+;   Stage D: Object properties (symmetry, dimensions)
+;
+; All tasks are task-args arity 1. Input is a grid, output varies.
+
+; ── Stage A: Single object extraction ────────────────────────────────
+; These tasks have one non-background object. grid-trim extracts it.
+
+(task-args "extract_single_obj" 1
+  ((((0 0 0 0) (0 1 1 0) (0 1 0 0) (0 0 0 0))) ((1 1) (1 0)))
+  ((((0 0 0) (0 2 0) (0 0 0))) ((2)))
+  ((((0 0 0 0 0) (0 0 0 0 0) (0 0 3 3 0) (0 0 3 3 0) (0 0 0 0 0))) ((3 3) (3 3))))
+
+; ── Stage B: Object counting ─────────────────────────────────────────
+; Output is a 1xN grid where N = number of non-background objects.
+; Needs: grid-objects to get the list, length to count.
+; The output encoding: a row of 1s with length = object count.
+
+(task-args "count_objects_row" 1
+  ((((1 0 0 0 2) (0 0 0 0 0) (0 0 3 0 0))) ((1 1 1)))
+  ((((5 0 0) (0 0 6) (0 0 0))) ((1 1)))
+  ((((1 0 2 0 3 0 4))) ((1 1 1 1)))
+  (test ((( 7 0 0 0 8))) ((1 1))))
+
+; Same but output is an integer-valued 1x1 grid
+(task-args "count_objects_scalar" 1
+  ((((1 0 0 0 2) (0 0 0 0 0) (0 0 3 0 0))) ((3)))
+  ((((5 0 0) (0 0 6) (0 0 0))) ((2)))
+  ((((1 0 2 0 3 0 4))) ((4)))
+  (test (((7 0 0 0 8))) ((2))))
+
+; ── Stage C: Largest object extraction ───────────────────────────────
+; Grid has multiple objects. Extract the one with the most cells.
+; Needs: grid-objects, then select by area.
+
+(task-args "extract_largest" 1
+  ((((0 0 0 0 0) (0 1 1 0 0) (0 1 1 0 0) (0 0 0 2 0) (0 0 0 0 0))) ((1 1) (1 1)))
+  ((((3 0 0 0) (0 0 0 0) (0 4 4 0) (0 4 4 0) (0 4 4 0))) ((4 4) (4 4) (4 4)))
+  ((((0 5 0 0) (0 0 0 0) (0 6 6 0) (0 0 0 0))) ((6 6))))
+
+; ── Stage C2: Smallest object extraction ─────────────────────────────
+
+(task-args "extract_smallest" 1
+  ((((0 0 0 0 0) (0 1 1 0 0) (0 1 1 0 0) (0 0 0 2 0) (0 0 0 0 0))) ((2)))
+  ((((3 0 0 0) (0 0 0 0) (0 4 4 0) (0 4 4 0) (0 4 4 0))) ((3)))
+  ((((0 5 0 0) (0 0 0 0) (0 6 6 0) (0 0 0 0))) ((5))))
+
+; ── Stage D: Object properties ───────────────────────────────────────
+; Output encodes a property of the extracted object.
+
+; Width of the single object as a 1x1 grid
+(task-args "object_width" 1
+  ((((0 0 0 0) (0 1 1 1) (0 0 0 0))) ((3)))
+  ((((0 0 0) (2 2 0) (0 0 0))) ((2)))
+  ((((0 0 0 0 0 0) (0 3 3 3 3 0) (0 3 3 3 3 0) (0 0 0 0 0 0))) ((4)))
+  (test (((0 0 0) (0 5 0) (0 0 0))) ((1))))
+
+; Height of the single object
+(task-args "object_height" 1
+  ((((0 0 0) (0 1 0) (0 1 0) (0 1 0) (0 0 0))) ((3)))
+  ((((0 2 0) (0 2 0) (0 0 0))) ((2)))
+  ((((0 0 0 0) (0 3 0 0) (0 0 0 0))) ((1)))
+  (test (((0 0 0) (4 4 0) (4 4 0) (4 4 0) (4 4 0) (0 0 0))) ((4))))
+
+; ── Stage D2: Classify by grid property ───────────────────────────────
+; Output grid depends on a scalar property of the input.
+; Form 5 (cross-type classify) should fire.
+
+; Output depends on object count: 1 obj → solid, 2 obj → stripe
+(task-args "classify_by_count" 1
+  ((((1 0 0) (0 0 0) (0 0 0))) ((5 5) (5 5)))
+  ((((2 0 3) (0 0 0) (0 0 0))) ((5 0) (0 5)))
+  ((((0 0 4) (0 0 0) (0 0 0))) ((5 5) (5 5)))
+  ((((6 0 0) (0 0 7) (0 0 0))) ((5 0) (0 5))))
+
+; Output depends on background color
+(task-args "classify_by_background" 1
+  ((((0 0 1) (0 0 0) (0 0 0))) ((9 9) (9 9)))
+  ((((1 1 0) (1 1 1) (1 1 1))) ((8 8) (8 8)))
+  ((((0 0 0) (0 2 0) (0 0 0))) ((9 9) (9 9)))
+  ((((1 1 1) (1 0 1) (1 1 1))) ((8 8) (8 8))))
+
+; ── Stage E: Multi-object reasoning ──────────────────────────────────
+; Given two objects, output their overlay/combination.
+
+(task-args "overlay_objects" 1
+  ((((1 1 0 0 0) (1 0 0 0 0) (0 0 0 2 2) (0 0 0 0 2))) ((1 1) (1 2)))
+  ((((0 3 0 0 0) (0 3 0 4 0) (0 0 0 4 0))) ((3 0) (3 4)))
+  ((((5 5 0 0) (0 0 0 6) (0 0 0 6))) ((5 5) (0 6))))

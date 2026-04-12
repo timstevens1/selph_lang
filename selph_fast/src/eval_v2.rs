@@ -679,6 +679,41 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("function-arity"), bi_function_arity);
     t.register(intern("function-param-types"), bi_function_param_types);
 
+    // §9.48 P2: grid builtins
+    t.register(intern("grid?"), bi_is_grid);
+    t.register(intern("grid-height"), bi_grid_height);
+    t.register(intern("grid-width"), bi_grid_width);
+    t.register(intern("grid-rotate-cw"), bi_grid_rotate_cw);
+    t.register(intern("grid-rotate-ccw"), bi_grid_rotate_ccw);
+    t.register(intern("grid-rotate-180"), bi_grid_rotate_180);
+    t.register(intern("grid-flip-h"), bi_grid_flip_h);
+    t.register(intern("grid-flip-v"), bi_grid_flip_v);
+    t.register(intern("grid-transpose"), bi_grid_transpose);
+    t.register(intern("grid-background"), bi_grid_background);
+    t.register(intern("grid-trim"), bi_grid_trim);
+    t.register(intern("grid-get"), bi_grid_get);
+    t.register(intern("grid-set"), bi_grid_set);
+    t.register(intern("grid-replace-color"), bi_grid_replace_color);
+    t.register(intern("grid-crop"), bi_grid_crop);
+    t.register(intern("grid-overlay"), bi_grid_overlay);
+    t.register(intern("grid-colors"), bi_grid_colors);
+    t.register(intern("grid-count-color"), bi_grid_count_color);
+    t.register(intern("grid-hconcat"), bi_grid_hconcat);
+    t.register(intern("grid-vconcat"), bi_grid_vconcat);
+    t.register(intern("grid-xor"), bi_grid_xor);
+    t.register(intern("grid-and"), bi_grid_and);
+    t.register(intern("grid-or"), bi_grid_or);
+    t.register(intern("grid-gravity"), bi_grid_gravity);
+    t.register(intern("grid-gravity-down"), bi_grid_gravity_down);
+    t.register(intern("grid-gravity-right"), bi_grid_gravity_right);
+    t.register(intern("grid-gravity-up"), bi_grid_gravity_up);
+    t.register(intern("grid-gravity-left"), bi_grid_gravity_left);
+    t.register(intern("grid-fill-rect"), bi_grid_fill_rect);
+    t.register(intern("grid-size"), bi_grid_size);
+    t.register(intern("grid-objects"), bi_grid_objects);
+    t.register(intern("grid-objects-8"), bi_grid_objects_8);
+    t.register(intern("grid-object-count"), bi_grid_object_count);
+
     t
 }
 
@@ -734,6 +769,18 @@ fn build_default_scope() -> Scope {
         "parse-source", "parse-file",
         // §9.45 P1 — env/function introspection (M7 prerequisites)
         "env-functions", "function-arity", "function-param-types",
+        // §9.48 P2: grid builtins
+        "grid?", "grid-height", "grid-width",
+        "grid-rotate-cw", "grid-rotate-ccw", "grid-rotate-180",
+        "grid-flip-h", "grid-flip-v", "grid-transpose",
+        "grid-background", "grid-trim",
+        "grid-get", "grid-set", "grid-replace-color", "grid-crop",
+        "grid-overlay", "grid-colors", "grid-count-color",
+        "grid-hconcat", "grid-vconcat", "grid-xor", "grid-and", "grid-or",
+        "grid-gravity", "grid-gravity-down", "grid-gravity-right",
+        "grid-gravity-up", "grid-gravity-left",
+        "grid-fill-rect", "grid-size",
+        "grid-objects", "grid-objects-8", "grid-object-count",
     ];
     for name in names {
         let sym = intern(name);
@@ -1393,7 +1440,11 @@ fn bi_filter(args: &[Value], env: &Env) -> Result<Value, String> {
     let l = args[1].as_list()?;
     let mut out = Vec::new();
     for item in l {
-        if let Value::Bool(true) = apply(f, &[item.clone()], env)? {
+        // §9.47.6: use is_truthy (same semantics as `if`) instead of
+        // matching only Bool(true). This matches standard Lisp/Scheme
+        // convention where filter keeps elements for which the predicate
+        // returns any truthy value, not just #t.
+        if is_truthy(&apply(f, &[item.clone()], env)?) {
             out.push(item.clone());
         }
     }
@@ -2563,6 +2614,585 @@ fn bi_stub_synthesize_optimize(_args: &[Value], _env: &Env) -> Result<Value, Str
          or wait for the optimize-synthesis port (deferred work in §9.25.3)."
             .into(),
     )
+}
+
+// ── Grid helpers ────────────────────────────────────────────────────────────
+
+/// Extract a grid (List of List of Int) as Vec<Vec<i64>>.
+fn as_grid(v: &Value) -> Result<Vec<Vec<i64>>, String> {
+    let rows = v.as_list().map_err(|_| "grid: expected list of lists".to_string())?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut grid = Vec::with_capacity(rows.len());
+    let width = match &rows[0] {
+        Value::List(cells) => cells.len(),
+        _ => return Err("grid: rows must be lists".into()),
+    };
+    for row in rows {
+        match row {
+            Value::List(cells) => {
+                if cells.len() != width {
+                    return Err("grid: all rows must have the same length".into());
+                }
+                let mut r = Vec::with_capacity(cells.len());
+                for c in cells.iter() {
+                    match c {
+                        Value::Int(n) => r.push(*n),
+                        _ => return Err("grid: cells must be Int".into()),
+                    }
+                }
+                grid.push(r);
+            }
+            _ => return Err("grid: rows must be lists".into()),
+        }
+    }
+    Ok(grid)
+}
+
+/// Convert Vec<Vec<i64>> back to Value::List(List(Int)).
+fn grid_to_value(g: Vec<Vec<i64>>) -> Value {
+    let rows: Vec<Value> = g
+        .into_iter()
+        .map(|row| {
+            Value::list(row.into_iter().map(Value::Int).collect::<Vec<_>>())
+        })
+        .collect();
+    Value::list(rows)
+}
+
+// ── Grid builtins (§9.48 P2) ──────────────────────────────────────────
+
+fn bi_is_grid(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid?: expected 1 arg, got {}", args.len()));
+    }
+    Ok(Value::Bool(as_grid(&args[0]).is_ok()))
+}
+
+fn bi_grid_height(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-height: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    Ok(Value::Int(g.len() as i64))
+}
+
+fn bi_grid_width(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-width: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    Ok(Value::Int(if g.is_empty() { 0 } else { g[0].len() as i64 }))
+}
+
+fn bi_grid_rotate_cw(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-rotate-cw: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    if g.is_empty() { return Ok(grid_to_value(g)); }
+    let h = g.len();
+    let w = g[0].len();
+    let mut out = vec![vec![0i64; h]; w];
+    for r in 0..h {
+        for c in 0..w {
+            out[c][h - 1 - r] = g[r][c];
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+fn bi_grid_rotate_ccw(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-rotate-ccw: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    if g.is_empty() { return Ok(grid_to_value(g)); }
+    let h = g.len();
+    let w = g[0].len();
+    let mut out = vec![vec![0i64; h]; w];
+    for r in 0..h {
+        for c in 0..w {
+            out[w - 1 - c][r] = g[r][c];
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+fn bi_grid_rotate_180(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-rotate-180: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    if g.is_empty() { return Ok(grid_to_value(g)); }
+    let h = g.len();
+    let w = g[0].len();
+    let mut out = vec![vec![0i64; w]; h];
+    for r in 0..h {
+        for c in 0..w {
+            out[h - 1 - r][w - 1 - c] = g[r][c];
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+fn bi_grid_flip_h(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-flip-h: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let out: Vec<Vec<i64>> = g.into_iter().map(|mut row| { row.reverse(); row }).collect();
+    Ok(grid_to_value(out))
+}
+
+fn bi_grid_flip_v(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-flip-v: expected 1 arg, got {}", args.len()));
+    }
+    let mut g = as_grid(&args[0])?;
+    g.reverse();
+    Ok(grid_to_value(g))
+}
+
+fn bi_grid_transpose(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-transpose: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    if g.is_empty() { return Ok(grid_to_value(g)); }
+    let h = g.len();
+    let w = g[0].len();
+    let mut out = vec![vec![0i64; h]; w];
+    for r in 0..h {
+        for c in 0..w {
+            out[c][r] = g[r][c];
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+fn bi_grid_background(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-background: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let mut counts = std::collections::HashMap::new();
+    for row in &g {
+        for &c in row {
+            *counts.entry(c).or_insert(0usize) += 1;
+        }
+    }
+    let bg = counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or(0);
+    Ok(Value::Int(bg))
+}
+
+fn bi_grid_trim(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-trim: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    if g.is_empty() { return Ok(grid_to_value(g)); }
+    let h = g.len();
+    let w = g[0].len();
+    // Detect background color (most common)
+    let mut counts = std::collections::HashMap::new();
+    for row in &g {
+        for &c in row {
+            *counts.entry(c).or_insert(0usize) += 1;
+        }
+    }
+    let bg = counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or(0);
+    // Find bounding box of non-background cells
+    let mut r0 = h;
+    let mut r1 = 0usize;
+    let mut c0 = w;
+    let mut c1 = 0usize;
+    for r in 0..h {
+        for c in 0..w {
+            if g[r][c] != bg {
+                r0 = r0.min(r);
+                r1 = r1.max(r + 1);
+                c0 = c0.min(c);
+                c1 = c1.max(c + 1);
+            }
+        }
+    }
+    if r0 >= r1 || c0 >= c1 {
+        // All background — return 1x1 grid with background
+        return Ok(grid_to_value(vec![vec![bg]]));
+    }
+    let out: Vec<Vec<i64>> = g[r0..r1].iter().map(|row| row[c0..c1].to_vec()).collect();
+    Ok(grid_to_value(out))
+}
+
+fn bi_grid_get(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(format!("grid-get: expected 3 args, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let r = int_arg(&args[1], "grid-get")? as usize;
+    let c = int_arg(&args[2], "grid-get")? as usize;
+    if r < g.len() && c < g[r].len() {
+        Ok(Value::Int(g[r][c]))
+    } else {
+        Err(format!("grid-get: index ({},{}) out of bounds ({}x{})",
+            r, c, g.len(), g.first().map_or(0, |r| r.len())))
+    }
+}
+
+fn bi_grid_set(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err(format!("grid-set: expected 4 args, got {}", args.len()));
+    }
+    let mut g = as_grid(&args[0])?;
+    let r = int_arg(&args[1], "grid-set")? as usize;
+    let c = int_arg(&args[2], "grid-set")? as usize;
+    let v = int_arg(&args[3], "grid-set")?;
+    if r < g.len() && c < g[r].len() {
+        g[r][c] = v;
+        Ok(grid_to_value(g))
+    } else {
+        Err("grid-set: index out of bounds".into())
+    }
+}
+
+fn bi_grid_replace_color(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(format!("grid-replace-color: expected 3 args, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let from = int_arg(&args[1], "grid-replace-color")?;
+    let to = int_arg(&args[2], "grid-replace-color")?;
+    let out: Vec<Vec<i64>> = g.iter().map(|row| {
+        row.iter().map(|&c| if c == from { to } else { c }).collect()
+    }).collect();
+    Ok(grid_to_value(out))
+}
+
+fn bi_grid_crop(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 5 {
+        return Err(format!("grid-crop: expected 5 args, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let r0 = int_arg(&args[1], "grid-crop")? as usize;
+    let c0 = int_arg(&args[2], "grid-crop")? as usize;
+    let h = int_arg(&args[3], "grid-crop")? as usize;
+    let w = int_arg(&args[4], "grid-crop")? as usize;
+    let out: Vec<Vec<i64>> = g[r0..r0 + h].iter().map(|row| row[c0..c0 + w].to_vec()).collect();
+    Ok(grid_to_value(out))
+}
+
+fn bi_grid_overlay(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err(format!("grid-overlay: expected 4 args, got {}", args.len()));
+    }
+    let mut base = as_grid(&args[0])?;
+    let over = as_grid(&args[1])?;
+    let dr = int_arg(&args[2], "grid-overlay")? as usize;
+    let dc = int_arg(&args[3], "grid-overlay")? as usize;
+    for r in 0..over.len() {
+        for c in 0..over[r].len() {
+            if over[r][c] != 0 {
+                let tr = dr + r;
+                let tc = dc + c;
+                if tr < base.len() && tc < base[tr].len() {
+                    base[tr][tc] = over[r][c];
+                }
+            }
+        }
+    }
+    Ok(grid_to_value(base))
+}
+
+fn bi_grid_colors(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-colors: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let mut seen = std::collections::BTreeSet::new();
+    for row in &g {
+        for &c in row {
+            seen.insert(c);
+        }
+    }
+    let colors: Vec<Value> = seen.into_iter().map(Value::Int).collect();
+    Ok(Value::list(colors))
+}
+
+fn bi_grid_count_color(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-count-color: expected 2 args, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let color = int_arg(&args[1], "grid-count-color")?;
+    let count = g.iter().flat_map(|row| row.iter()).filter(|&&c| c == color).count();
+    Ok(Value::Int(count as i64))
+}
+
+fn bi_grid_hconcat(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-hconcat: expected 2 args, got {}", args.len()));
+    }
+    let a = as_grid(&args[0])?;
+    let b = as_grid(&args[1])?;
+    let h = a.len().max(b.len());
+    let wa = a.first().map_or(0, |r| r.len());
+    let wb = b.first().map_or(0, |r| r.len());
+    let mut out = vec![vec![0i64; wa + wb]; h];
+    for r in 0..h {
+        if r < a.len() { for c in 0..wa { out[r][c] = a[r][c]; } }
+        if r < b.len() { for c in 0..wb { out[r][wa + c] = b[r][c]; } }
+    }
+    Ok(grid_to_value(out))
+}
+
+fn bi_grid_vconcat(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-vconcat: expected 2 args, got {}", args.len()));
+    }
+    let mut a = as_grid(&args[0])?;
+    let b = as_grid(&args[1])?;
+    a.extend(b);
+    Ok(grid_to_value(a))
+}
+
+fn bi_grid_xor(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-xor: expected 2 args, got {}", args.len()));
+    }
+    let a = as_grid(&args[0])?;
+    let b = as_grid(&args[1])?;
+    let h = a.len();
+    let w = a.first().map_or(0, |r| r.len());
+    let mut out = vec![vec![0i64; w]; h];
+    for r in 0..h {
+        for c in 0..w {
+            let va = a[r][c];
+            let vb = if r < b.len() && c < b[r].len() { b[r][c] } else { 0 };
+            let a_fg = va != 0;
+            let b_fg = vb != 0;
+            out[r][c] = if a_fg && !b_fg { va } else if !a_fg && b_fg { vb } else { 0 };
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+fn bi_grid_and(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-and: expected 2 args, got {}", args.len()));
+    }
+    let a = as_grid(&args[0])?;
+    let b = as_grid(&args[1])?;
+    let h = a.len();
+    let w = a.first().map_or(0, |r| r.len());
+    let mut out = vec![vec![0i64; w]; h];
+    for r in 0..h {
+        for c in 0..w {
+            let va = a[r][c];
+            let vb = if r < b.len() && c < b[r].len() { b[r][c] } else { 0 };
+            out[r][c] = if va != 0 && vb != 0 { va } else { 0 };
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+fn bi_grid_or(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-or: expected 2 args, got {}", args.len()));
+    }
+    let a = as_grid(&args[0])?;
+    let b = as_grid(&args[1])?;
+    let h = a.len();
+    let w = a.first().map_or(0, |r| r.len());
+    let mut out = vec![vec![0i64; w]; h];
+    for r in 0..h {
+        for c in 0..w {
+            let va = a[r][c];
+            let vb = if r < b.len() && c < b[r].len() { b[r][c] } else { 0 };
+            out[r][c] = if va != 0 { va } else if vb != 0 { vb } else { 0 };
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+fn bi_grid_gravity(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-gravity: expected 2 args, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let dir = int_arg(&args[1], "grid-gravity")?;
+    let h = g.len();
+    let w = g.first().map_or(0, |r| r.len());
+    if h == 0 || w == 0 { return Ok(grid_to_value(g)); }
+    // Detect background as most common color
+    let mut counts = std::collections::HashMap::new();
+    for row in &g { for &c in row { *counts.entry(c).or_insert(0usize) += 1; } }
+    let bg = counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or(0);
+    let mut out = vec![vec![bg; w]; h];
+    match dir {
+        0 => { // down
+            for c in 0..w {
+                let mut write = h;
+                for r in (0..h).rev() { if g[r][c] != bg { write -= 1; out[write][c] = g[r][c]; } }
+            }
+        }
+        1 => { // right
+            for r in 0..h {
+                let mut write = w;
+                for c in (0..w).rev() { if g[r][c] != bg { write -= 1; out[r][write] = g[r][c]; } }
+            }
+        }
+        2 => { // up
+            for c in 0..w {
+                let mut write = 0;
+                for r in 0..h { if g[r][c] != bg { out[write][c] = g[r][c]; write += 1; } }
+            }
+        }
+        3 => { // left
+            for r in 0..h {
+                let mut write = 0;
+                for c in 0..w { if g[r][c] != bg { out[r][write] = g[r][c]; write += 1; } }
+            }
+        }
+        _ => return Ok(grid_to_value(g)),
+    }
+    Ok(grid_to_value(out))
+}
+
+// §9.48: directional gravity convenience wrappers (unary, for pool catalog)
+fn bi_grid_gravity_down(args: &[Value], env: &Env) -> Result<Value, String> {
+    bi_grid_gravity(&[args[0].clone(), Value::Int(0)], env)
+}
+fn bi_grid_gravity_right(args: &[Value], env: &Env) -> Result<Value, String> {
+    bi_grid_gravity(&[args[0].clone(), Value::Int(1)], env)
+}
+fn bi_grid_gravity_up(args: &[Value], env: &Env) -> Result<Value, String> {
+    bi_grid_gravity(&[args[0].clone(), Value::Int(2)], env)
+}
+fn bi_grid_gravity_left(args: &[Value], env: &Env) -> Result<Value, String> {
+    bi_grid_gravity(&[args[0].clone(), Value::Int(3)], env)
+}
+
+fn bi_grid_fill_rect(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 6 {
+        return Err(format!("grid-fill-rect: expected 6 args, got {}", args.len()));
+    }
+    let mut g = as_grid(&args[0])?;
+    let r0 = int_arg(&args[1], "grid-fill-rect")? as usize;
+    let c0 = int_arg(&args[2], "grid-fill-rect")? as usize;
+    let r1 = int_arg(&args[3], "grid-fill-rect")? as usize;
+    let c1 = int_arg(&args[4], "grid-fill-rect")? as usize;
+    let color = int_arg(&args[5], "grid-fill-rect")?;
+    let h = g.len();
+    let w = g.first().map_or(0, |r| r.len());
+    for r in r0.min(r1)..=r0.max(r1) {
+        for c in c0.min(c1)..=c0.max(c1) {
+            if r < h && c < w { g[r][c] = color; }
+        }
+    }
+    Ok(grid_to_value(g))
+}
+
+fn bi_grid_size(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-size: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let h = g.len() as i64;
+    let w = g.first().map_or(0, |r| r.len()) as i64;
+    Ok(Value::list(vec![Value::Int(h), Value::Int(w)]))
+}
+
+// §9.48: connected components (object detection)
+fn grid_connected_components(g: &[Vec<i64>], eight_connected: bool) -> Vec<Vec<Vec<i64>>> {
+    let h = g.len();
+    let w = g.first().map_or(0, |r| r.len());
+    if h == 0 || w == 0 { return vec![]; }
+
+    // Detect background (most common value)
+    let mut counts = std::collections::HashMap::new();
+    for row in g { for &c in row { *counts.entry(c).or_insert(0usize) += 1; } }
+    let bg = counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or(0);
+
+    let mut labels = vec![vec![0u32; w]; h];
+    let mut next_label = 1u32;
+    let dirs4: &[(i32, i32)] = &[(-1, 0), (1, 0), (0, -1), (0, 1)];
+    let dirs8: &[(i32, i32)] = &[(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)];
+    let dirs = if eight_connected { dirs8 } else { dirs4 };
+
+    for r in 0..h {
+        for c in 0..w {
+            if g[r][c] != bg && labels[r][c] == 0 {
+                let label = next_label;
+                next_label += 1;
+                labels[r][c] = label;
+                let mut queue = vec![(r, c)];
+                while let Some((cr, cc)) = queue.pop() {
+                    for &(dr, dc) in dirs {
+                        let nr = cr as i32 + dr;
+                        let nc = cc as i32 + dc;
+                        if nr >= 0 && nr < h as i32 && nc >= 0 && nc < w as i32 {
+                            let (nr, nc) = (nr as usize, nc as usize);
+                            if labels[nr][nc] == 0 && g[nr][nc] != bg {
+                                labels[nr][nc] = label;
+                                queue.push((nr, nc));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut results = Vec::with_capacity((next_label - 1) as usize);
+    for lbl in 1..next_label {
+        let mut min_r = h; let mut min_c = w;
+        let mut max_r = 0usize; let mut max_c = 0usize;
+        for r in 0..h { for c in 0..w {
+            if labels[r][c] == lbl {
+                min_r = min_r.min(r); min_c = min_c.min(c);
+                max_r = max_r.max(r); max_c = max_c.max(c);
+            }
+        }}
+        if max_r >= min_r {
+            let mut comp = vec![vec![0i64; max_c - min_c + 1]; max_r - min_r + 1];
+            for r in min_r..=max_r { for c in min_c..=max_c {
+                if labels[r][c] == lbl { comp[r - min_r][c - min_c] = g[r][c]; }
+            }}
+            results.push(comp);
+        }
+    }
+    results
+}
+
+fn bi_grid_objects(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-objects: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let objects = grid_connected_components(&g, false);
+    let vals: Vec<Value> = objects.into_iter().map(grid_to_value).collect();
+    Ok(Value::list(vals))
+}
+
+fn bi_grid_objects_8(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-objects-8: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let objects = grid_connected_components(&g, true);
+    let vals: Vec<Value> = objects.into_iter().map(grid_to_value).collect();
+    Ok(Value::list(vals))
+}
+
+fn bi_grid_object_count(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-object-count: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let count = grid_connected_components(&g, false).len();
+    Ok(Value::Int(count as i64))
 }
 
 // ────────────────────────────────────────────────────────────────────────────

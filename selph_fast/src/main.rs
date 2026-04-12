@@ -468,22 +468,13 @@ fn node_to_value(nodes: &[Node], idx: usize) -> Option<Value> {
                     return alts.map(Value::Alt);
                 }
             }
-            // (#grid ((0 1) (1 0))) → Value::Grid
+            // (#grid ((0 1) (1 0))) → List(List(Num))
+            // §9.48: returns List directly (no Value::Grid) so grow-v2's
+            // legacy_value_to_v2 converts to List(List(Int)) naturally.
             if let Node::Symbol(s) = &nodes[children[0]] {
                 if resolve(*s) == "#grid" && children.len() == 2 {
-                    if let Some(Value::List(rows)) = node_to_value(nodes, children[1]) {
-                        let mut grid_rows = Vec::new();
-                        for row_val in &rows {
-                            if let Value::List(cells) = row_val {
-                                let grid_row: Vec<i8> = cells.iter().filter_map(|c| {
-                                    if let Value::Num(n) = c { Some(*n as i8) } else { None }
-                                }).collect();
-                                if grid_row.len() == cells.len() {
-                                    grid_rows.push(grid_row);
-                                } else { return None; }
-                            } else { return None; }
-                        }
-                        return Some(Value::Grid(grid_rows));
+                    if let Some(v @ Value::List(_)) = node_to_value(nodes, children[1]) {
+                        return Some(v);
                     }
                 }
             }

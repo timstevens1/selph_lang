@@ -48,6 +48,8 @@ cat \
     "$META/m8s_constant_string.selph" \
     "$META/m10s_concat_pair.selph" \
     "$META/m11s_string_repeat.selph" \
+    "$META/m_pool_grid.selph" \
+    "$META/m8g_constant_grid.selph" \
     "$META/m_chain.selph" \
     "$CURRICULUM" \
     > "$COMBINED"
