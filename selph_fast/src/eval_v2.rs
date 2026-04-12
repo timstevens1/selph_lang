@@ -713,6 +713,10 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("grid-objects"), bi_grid_objects);
     t.register(intern("grid-objects-8"), bi_grid_objects_8);
     t.register(intern("grid-object-count"), bi_grid_object_count);
+    t.register(intern("grid-scale"), bi_grid_scale);
+    t.register(intern("grid-tile"), bi_grid_tile);
+    t.register(intern("grid-fill-enclosed"), bi_grid_fill_enclosed);
+    t.register(intern("grid-compact"), bi_grid_compact);
 
     t
 }
@@ -781,6 +785,7 @@ fn build_default_scope() -> Scope {
         "grid-gravity-up", "grid-gravity-left",
         "grid-fill-rect", "grid-size",
         "grid-objects", "grid-objects-8", "grid-object-count",
+        "grid-scale", "grid-tile", "grid-fill-enclosed", "grid-compact",
     ];
     for name in names {
         let sym = intern(name);
@@ -2488,6 +2493,11 @@ fn bi_synthesize(args: &[Value], env: &Env) -> Result<Value, String> {
     out.insert(intern("candidates"), Value::Int(result.candidates_explored as i64));
     out.insert(intern("source"), Value::str(source));
     out.insert(intern("strategy"), Value::str(strategy_name));
+    // §9.49 post-mortem diagnostics
+    if let Some(ref otype) = result.output_type {
+        out.insert(intern("output-type"), Value::str(otype.clone()));
+    }
+    out.insert(intern("m-chain-ran"), Value::Bool(result.m_chain_ran));
     Ok(Value::ns(out))
 }
 
@@ -2571,11 +2581,28 @@ fn bi_synthesize_args(args: &[Value], env: &Env) -> Result<Value, String> {
         })
         .unwrap_or(100000);
 
+    // §9.49: read held-out test pairs from the "test" field, same
+    // format as the spec (list of [input, output] pairs). When present,
+    // candidates that pass training are additionally verified against
+    // the held-out pairs — rejecting memorization solutions.
+    let mut test_inputs = Vec::new();
+    let mut test_expected = Vec::new();
+    if let Some(Value::List(test_pairs)) = ns.get(&intern("test")) {
+        for pair in test_pairs.iter() {
+            if let Value::List(p) = pair {
+                if p.len() == 2 {
+                    test_inputs.push(p[0].clone());
+                    test_expected.push(p[1].clone());
+                }
+            }
+        }
+    }
+
     let skip = crate::synth_v2::default_skip_set();
     let components = crate::synth_v2::default_synth_components(env, &skip);
     let universe = crate::synth_v2::TypeUniverse::from_env(env);
 
-    let result = crate::synth_v2::synthesize_args(
+    let result = crate::synth_v2::synthesize_args_with_test(
         &components,
         &inputs,
         &arg_types,
@@ -2584,6 +2611,8 @@ fn bi_synthesize_args(args: &[Value], env: &Env) -> Result<Value, String> {
         &universe,
         max_depth,
         max_candidates,
+        &test_inputs,
+        &test_expected,
     );
 
     let source = if result.found {
@@ -2594,11 +2623,20 @@ fn bi_synthesize_args(args: &[Value], env: &Env) -> Result<Value, String> {
         String::new()
     };
 
+    let strategy_name = if result.found {
+        match result.decomposer_name {
+            Some(name) => crate::intern::resolve(name),
+            None => "Flat".to_string(),
+        }
+    } else {
+        String::new()
+    };
+
     let mut out = NsMap::new();
     out.insert(intern("found"), Value::Bool(result.found));
     out.insert(intern("candidates"), Value::Int(result.candidates_explored as i64));
     out.insert(intern("source"), Value::str(source));
-    out.insert(intern("strategy"), Value::str("Flat".to_string()));
+    out.insert(intern("strategy"), Value::str(strategy_name));
     out.insert(intern("arity"), Value::Int(arity as i64));
     Ok(Value::ns(out))
 }
@@ -2656,6 +2694,16 @@ fn grid_to_value(g: Vec<Vec<i64>>) -> Value {
         .into_iter()
         .map(|row| {
             Value::list(row.into_iter().map(Value::Int).collect::<Vec<_>>())
+        })
+        .collect();
+    Value::list(rows)
+}
+
+fn grid_to_value_ref(g: &[Vec<i64>]) -> Value {
+    let rows: Vec<Value> = g
+        .iter()
+        .map(|row| {
+            Value::list(row.iter().map(|&v| Value::Int(v)).collect::<Vec<_>>())
         })
         .collect();
     Value::list(rows)
@@ -3193,6 +3241,155 @@ fn bi_grid_object_count(args: &[Value], _env: &Env) -> Result<Value, String> {
     let g = as_grid(&args[0])?;
     let count = grid_connected_components(&g, false).len();
     Ok(Value::Int(count as i64))
+}
+
+/// `(grid-scale grid factor)` — scale each cell to a factor×factor block.
+fn bi_grid_scale(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-scale: expected 2 args (grid, factor), got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let factor = match &args[1] {
+        Value::Int(n) => *n as usize,
+        Value::Num(n) => *n as usize,
+        _ => return Err("grid-scale: factor must be a number".into()),
+    };
+    if factor == 0 { return Err("grid-scale: factor must be > 0".into()); }
+    let h = g.len();
+    let w = if h > 0 { g[0].len() } else { 0 };
+    let mut out = vec![vec![0i64; w * factor]; h * factor];
+    for r in 0..h {
+        for c in 0..w {
+            let v = g[r][c];
+            for dr in 0..factor {
+                for dc in 0..factor {
+                    out[r * factor + dr][c * factor + dc] = v;
+                }
+            }
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+/// `(grid-tile grid n m)` — tile the grid into an n×m arrangement.
+/// If called with 2 args, tiles n×n.
+fn bi_grid_tile(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(format!("grid-tile: expected 2-3 args (grid, rows [, cols]), got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let nr = match &args[1] {
+        Value::Int(n) => *n as usize,
+        Value::Num(n) => *n as usize,
+        _ => return Err("grid-tile: rows must be a number".into()),
+    };
+    let nc = if args.len() == 3 {
+        match &args[2] {
+            Value::Int(n) => *n as usize,
+            Value::Num(n) => *n as usize,
+            _ => return Err("grid-tile: cols must be a number".into()),
+        }
+    } else { nr };
+    let h = g.len();
+    let w = if h > 0 { g[0].len() } else { 0 };
+    let mut out = vec![vec![0i64; w * nc]; h * nr];
+    for tr in 0..nr {
+        for tc in 0..nc {
+            for r in 0..h {
+                for c in 0..w {
+                    out[tr * h + r][tc * w + c] = g[r][c];
+                }
+            }
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+/// `(grid-fill-enclosed grid)` — fill interior zeros.
+/// Any 0-cell not reachable from the border via 4-connected 0-cells
+/// is replaced by the nearest non-zero neighbor (simple: use the
+/// grid's background as fill target, non-background as fill value).
+fn bi_grid_fill_enclosed(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-fill-enclosed: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let h = g.len();
+    if h == 0 { return Ok(grid_to_value(g.clone())); }
+    let w = g[0].len();
+
+    // Find the background color (most common).
+    let mut counts = std::collections::HashMap::new();
+    for r in &g { for &c in r { *counts.entry(c).or_insert(0usize) += 1; } }
+    let bg = counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or(0);
+
+    // Flood fill from border to mark exterior bg cells.
+    let mut exterior = vec![vec![false; w]; h];
+    let mut queue = std::collections::VecDeque::new();
+    for r in 0..h {
+        for c in 0..w {
+            if (r == 0 || r == h - 1 || c == 0 || c == w - 1) && g[r][c] == bg {
+                exterior[r][c] = true;
+                queue.push_back((r, c));
+            }
+        }
+    }
+    while let Some((r, c)) = queue.pop_front() {
+        for (dr, dc) in &[(0isize, 1isize), (0, -1), (1, 0), (-1, 0)] {
+            let nr = r as isize + dr;
+            let nc = c as isize + dc;
+            if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
+                let nr = nr as usize;
+                let nc = nc as usize;
+                if !exterior[nr][nc] && g[nr][nc] == bg {
+                    exterior[nr][nc] = true;
+                    queue.push_back((nr, nc));
+                }
+            }
+        }
+    }
+
+    // For each interior bg cell, fill with nearest non-bg neighbor.
+    let mut out = g.clone();
+    for r in 0..h {
+        for c in 0..w {
+            if g[r][c] == bg && !exterior[r][c] {
+                let mut fill = bg;
+                for (dr, dc) in &[(0isize, 1isize), (0, -1), (1, 0), (-1, 0)] {
+                    let nr = r as isize + dr;
+                    let nc = c as isize + dc;
+                    if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
+                        let v = g[nr as usize][nc as usize];
+                        if v != bg { fill = v; break; }
+                    }
+                }
+                out[r][c] = fill;
+            }
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+/// `(grid-compact grid)` — remove all-zero rows and all-zero columns.
+fn bi_grid_compact(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-compact: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let h = g.len();
+    if h == 0 { return Ok(grid_to_value(g.clone())); }
+    let w = g[0].len();
+    // Find non-zero rows and columns.
+    let keep_row: Vec<bool> = (0..h).map(|r| g[r].iter().any(|&c| c != 0)).collect();
+    let keep_col: Vec<bool> = (0..w).map(|c| (0..h).any(|r| g[r][c] != 0)).collect();
+    let out: Vec<Vec<i64>> = (0..h)
+        .filter(|&r| keep_row[r])
+        .map(|r| (0..w).filter(|&c| keep_col[c]).map(|c| g[r][c]).collect())
+        .collect();
+    if out.is_empty() {
+        return Ok(grid_to_value(vec![vec![0i64]]));
+    }
+    Ok(grid_to_value(out))
 }
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -1349,6 +1349,12 @@ pub struct StrategyResult {
     pub root: Option<usize>,
     pub candidates_explored: usize,
     pub strategy: Option<Strategy>,
+    /// §9.49 post-mortem diagnostics: the inferred output type tag
+    /// (e.g. "Int", "Str", "Grid", "Bool"). Set by `synthesize_with_strategies`.
+    pub output_type: Option<String>,
+    /// §9.49 post-mortem diagnostics: whether the SELPH decomposer
+    /// chain (`__decomposers__`) was consulted during this task.
+    pub m_chain_ran: bool,
 }
 
 impl StrategyResult {
@@ -1359,6 +1365,8 @@ impl StrategyResult {
             root: r.root,
             candidates_explored: r.candidates_explored,
             strategy: if r.found { Some(strategy) } else { None },
+            output_type: None,
+            m_chain_ran: false,
         }
     }
 
@@ -1369,6 +1377,8 @@ impl StrategyResult {
             root: None,
             candidates_explored: explored,
             strategy: None,
+            output_type: None,
+            m_chain_ran: false,
         }
     }
 }
@@ -4946,6 +4956,17 @@ pub fn synthesize_with_strategies(
     max_depth: usize,
     flat_budget: usize,
 ) -> StrategyResult {
+    // §9.49 post-mortem diagnostics: infer output type tag once.
+    let output_type_str = infer_uniform_type_sym(expected)
+        .map(|s| resolve(s))
+        .unwrap_or_else(|| "Mixed".to_string());
+
+    // §9.49: check whether __decomposers__ exists and is non-empty.
+    let has_decomposers = matches!(
+        env.lookup(intern("__decomposers__")),
+        Some(Value::Ns(ref m)) if !m.is_empty()
+    );
+
     // §9.37 Stage A: global SELPH decomposers from `__decomposers__`
     // run BEFORE the hardcoded chain. Curriculum is in charge.
     if let Some((nodes, root, sd_explored, name_sym)) =
@@ -4957,6 +4978,8 @@ pub fn synthesize_with_strategies(
             root: Some(root),
             candidates_explored: sd_explored,
             strategy: Some(Strategy::Custom(name_sym)),
+            output_type: Some(output_type_str),
+            m_chain_ran: true,
         };
     }
 
@@ -4977,8 +5000,17 @@ pub fn synthesize_with_strategies(
             root: Some(root),
             candidates_explored: td_explored,
             strategy: Some(Strategy::Custom(name_sym)),
+            output_type: Some(output_type_str),
+            m_chain_ran: has_decomposers,
         };
     }
+
+    // §9.49: helper to stamp diagnostics onto any result from this function.
+    let stamp = |mut r: StrategyResult| -> StrategyResult {
+        r.output_type = Some(output_type_str.clone());
+        r.m_chain_ran = has_decomposers;
+        r
+    };
 
     // Strategy 1: Flat enumerative.
     let flat = synthesize(
@@ -4986,7 +5018,7 @@ pub fn synthesize_with_strategies(
     );
     let mut total_explored = flat.candidates_explored;
     if flat.found {
-        return StrategyResult::from_synth(flat, Strategy::Flat);
+        return stamp(StrategyResult::from_synth(flat, Strategy::Flat));
     }
 
     // Strategy 2: Recursive decomposition. Top-down family prediction +
@@ -5004,13 +5036,15 @@ pub fn synthesize_with_strategies(
         flat_budget,
     ) {
         total_explored += rd_explored;
-        return StrategyResult {
+        return stamp(StrategyResult {
             found: true,
             nodes: Some(nodes),
             root: Some(root),
             candidates_explored: total_explored,
             strategy: Some(Strategy::RecursiveDecomposition),
-        };
+            output_type: None,
+            m_chain_ran: false,
+        });
     }
 
     // Strategy 3: Boolean decomposition. Cheap and only applies to
@@ -5022,13 +5056,15 @@ pub fn synthesize_with_strategies(
         bool_decompose(components, inputs, expected, env)
     {
         total_explored += bd_explored;
-        return StrategyResult {
+        return stamp(StrategyResult {
             found: true,
             nodes: Some(nodes),
             root: Some(root),
             candidates_explored: total_explored,
             strategy: Some(Strategy::BoolDecomp),
-        };
+            output_type: None,
+            m_chain_ran: false,
+        });
     }
 
     // Strategy 3: Higher-order decomposition. Each template is shape-
@@ -5044,13 +5080,15 @@ pub fn synthesize_with_strategies(
         flat_budget,
     ) {
         total_explored += ho_explored;
-        return StrategyResult {
+        return stamp(StrategyResult {
             found: true,
             nodes: Some(nodes),
             root: Some(root),
             candidates_explored: total_explored,
             strategy: Some(Strategy::HigherOrder),
-        };
+            output_type: None,
+            m_chain_ran: false,
+        });
     }
 
     // Strategy 4: Divide-and-conquer. Only meaningful for tasks with
@@ -5067,13 +5105,15 @@ pub fn synthesize_with_strategies(
         flat_budget,
     ) {
         total_explored += dc_explored;
-        return StrategyResult {
+        return stamp(StrategyResult {
             found: true,
             nodes: Some(nodes),
             root: Some(root),
             candidates_explored: total_explored,
             strategy: Some(Strategy::DivideConquer),
-        };
+            output_type: None,
+            m_chain_ran: false,
+        });
     }
 
     // Strategy 5: Induction (intermediate value decomposition). Probes
@@ -5090,27 +5130,31 @@ pub fn synthesize_with_strategies(
         flat_budget,
     ) {
         total_explored += in_explored;
-        return StrategyResult {
+        return stamp(StrategyResult {
             found: true,
             nodes: Some(nodes),
             root: Some(root),
             candidates_explored: total_explored,
             strategy: Some(Strategy::Induction),
-        };
+            output_type: None,
+            m_chain_ran: false,
+        });
     }
 
     // Strategy 6: Memo. Always candidate-cost 0 (no enumeration).
     if let Some((nodes, root)) = memorize_from_examples(inputs, expected) {
-        return StrategyResult {
+        return stamp(StrategyResult {
             found: true,
             nodes: Some(nodes),
             root: Some(root),
             candidates_explored: total_explored,
             strategy: Some(Strategy::Memo),
-        };
+            output_type: None,
+            m_chain_ran: false,
+        });
     }
 
-    StrategyResult::not_found(total_explored)
+    stamp(StrategyResult::not_found(total_explored))
 }
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -68,6 +68,9 @@
     (list "grid-gravity-right" (lambda (v) (grid-gravity v 1)))
     (list "grid-gravity-up"    (lambda (v) (grid-gravity v 2)))
     (list "grid-gravity-left"  (lambda (v) (grid-gravity v 3)))
+    ; §9.49: new extraction/transform ops
+    (list "grid-fill-enclosed" (lambda (v) (grid-fill-enclosed v)))
+    (list "grid-compact"       (lambda (v) (grid-compact v)))
 ))
 
 ; ���─ Level 0: indexed grid atoms ──────────────────────────────────────

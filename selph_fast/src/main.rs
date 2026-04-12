@@ -1546,6 +1546,9 @@ fn cmd_grow_v2(args: &[String]) {
     let mut by_strategy: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
 
+    // §9.49 post-mortem: accumulate per-task result namespaces.
+    let mut curriculum_results: Vec<types_v2::Value> = Vec::new();
+
     for (name, task_depth, inputs_legacy, expected_legacy, arity_hint,
          test_inputs_legacy, test_expected_legacy) in &tasks {
         // Convert legacy Values → v2 Values once per task. The legacy
@@ -1633,12 +1636,22 @@ fn cmd_grow_v2(args: &[String]) {
                     None => synth_v2::Strategy::Flat,
                 })
             } else { None };
+            // §9.49: infer output type for post-mortem diagnostics.
+            let output_type = synth_v2::infer_uniform_type_sym(&expected)
+                .map(|s| crate::intern::resolve(s))
+                .unwrap_or_else(|| "Mixed".to_string());
+            let has_decomposers = matches!(
+                env.lookup(intern("__decomposers__")),
+                Some(types_v2::Value::Ns(ref m)) if !m.is_empty()
+            );
             synth_v2::StrategyResult {
                 found: synth_result.found,
                 nodes: synth_result.nodes,
                 root: synth_result.root,
                 candidates_explored: synth_result.candidates_explored,
                 strategy,
+                output_type: Some(output_type),
+                m_chain_ran: has_decomposers,
             }
         } else {
             synth_v2::synthesize_with_strategies(
@@ -1695,6 +1708,42 @@ fn cmd_grow_v2(args: &[String]) {
                 name, result.candidates_explored, elapsed.as_secs_f64(),
             );
         }
+
+        // §9.49 post-mortem: build per-task result namespace.
+        {
+            let mut rns = types_v2::NsMap::new();
+            rns.insert(intern("name"), types_v2::Value::str(name.clone()));
+            rns.insert(intern("found"), types_v2::Value::Bool(result.found));
+            rns.insert(intern("candidates"), types_v2::Value::Int(result.candidates_explored as i64));
+            if let Some(ref otype) = result.output_type {
+                rns.insert(intern("output-type"), types_v2::Value::str(otype.clone()));
+            }
+            rns.insert(intern("m-chain-ran"), types_v2::Value::Bool(result.m_chain_ran));
+            let strategy_str = result.strategy
+                .map(|s| s.name())
+                .unwrap_or_default();
+            rns.insert(intern("strategy"), types_v2::Value::str(strategy_str));
+            // Include the original spec so post-mortem can retry.
+            let spec_pairs: Vec<types_v2::Value> = inputs.iter()
+                .zip(expected.iter())
+                .map(|(i, e)| types_v2::Value::list(vec![i.clone(), e.clone()]))
+                .collect();
+            rns.insert(intern("spec"), types_v2::Value::list(spec_pairs));
+            rns.insert(intern("max-candidates"), types_v2::Value::Int(default_budget as i64));
+            rns.insert(intern("depth"), types_v2::Value::Int(*task_depth as i64));
+            if let Some(arity) = arity_hint {
+                rns.insert(intern("arity"), types_v2::Value::Int(*arity as i64));
+            }
+            // Include held-out test pairs so post-mortem can validate retries.
+            if !test_inputs.is_empty() {
+                let test_pairs: Vec<types_v2::Value> = test_inputs.iter()
+                    .zip(test_expected.iter())
+                    .map(|(i, e)| types_v2::Value::list(vec![i.clone(), e.clone()]))
+                    .collect();
+                rns.insert(intern("test"), types_v2::Value::list(test_pairs));
+            }
+            curriculum_results.push(types_v2::Value::ns(rns));
+        }
     }
 
     let total_elapsed = total_start.elapsed();
@@ -1707,6 +1756,77 @@ fn cmd_grow_v2(args: &[String]) {
             .map(|(s, n)| format!("{}={}", s, n))
             .collect();
         eprintln!("By strategy: {}", parts.join(", "));
+    }
+
+    // §9.49 post-mortem: bind results and call run-post-mortem if defined.
+    env.define(
+        intern("__curriculum_results__"),
+        types_v2::Value::list(curriculum_results),
+    );
+    if let Some(pm_fn) = env.lookup(intern("run-post-mortem")) {
+        if matches!(pm_fn, types_v2::Value::Function(_) | types_v2::Value::Builtin(_)) {
+            eprintln!();
+            eprintln!("── Post-mortem ──────────────────────────────────────");
+            let results_val = env.lookup(intern("__curriculum_results__")).unwrap();
+            match eval_v2::apply(&pm_fn, &[results_val], &env) {
+                Ok(val) => {
+                    if let types_v2::Value::List(items) = &val {
+                        if items.is_empty() {
+                            eprintln!("  (no failures to analyze)");
+                        } else {
+                            // Tally each diagnostic dimension.
+                            let dimensions = ["size", "colors", "constant-out",
+                                              "dims-consistent", "objects", "scale",
+                                              "probe-1", "probe-2"];
+                            for dim in &dimensions {
+                                let mut tally: std::collections::BTreeMap<String, usize> =
+                                    std::collections::BTreeMap::new();
+                                for item in items.iter() {
+                                    if let types_v2::Value::Ns(ns) = item {
+                                        let val = ns.get(&intern(dim))
+                                            .map(|v| eval_v2::value_to_string(v))
+                                            .unwrap_or_else(|| "?".into());
+                                        *tally.entry(val).or_insert(0) += 1;
+                                    }
+                                }
+                                let parts: Vec<String> = tally.iter()
+                                    .map(|(k, v)| format!("{}={}", k, v))
+                                    .collect();
+                                eprintln!("  {:20} {}", dim, parts.join("  "));
+                            }
+                            eprintln!();
+                            // Print per-task detail (compact).
+                            for item in items.iter() {
+                                if let types_v2::Value::Ns(ns) = item {
+                                    let name = ns.get(&intern("name"))
+                                        .map(|v| eval_v2::value_to_string(v))
+                                        .unwrap_or_else(|| "?".into());
+                                    let size = ns.get(&intern("size"))
+                                        .map(|v| eval_v2::value_to_string(v))
+                                        .unwrap_or_default();
+                                    let colors = ns.get(&intern("colors"))
+                                        .map(|v| eval_v2::value_to_string(v))
+                                        .unwrap_or_default();
+                                    let p1 = ns.get(&intern("probe-1"))
+                                        .map(|v| eval_v2::value_to_string(v))
+                                        .unwrap_or_default();
+                                    let p2 = ns.get(&intern("probe-2"))
+                                        .map(|v| eval_v2::value_to_string(v))
+                                        .unwrap_or_default();
+                                    eprintln!("  {:12}  size={:12} colors={:14} probe={}{}",
+                                        name, size, colors, p1,
+                                        if p2 != "skipped" && p2 != "none" && !p2.is_empty()
+                                            { format!(" d2={}", p2) } else { String::new() });
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  post-mortem error: {}", e);
+                }
+            }
+        }
     }
 }
 

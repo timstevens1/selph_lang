@@ -1,0 +1,301 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Post-mortem spec analysis (§9.49)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; After a curriculum run, grow-v2 binds __curriculum_results__ and calls
+; `run-post-mortem` if defined. Instead of retrying with more budget,
+; this version analyzes each failed task's spec to classify the failure
+; mode — guiding what M-chain forms or builtins to build next.
+;
+; Each result ns has:
+;   "name", "found", "candidates", "output-type", "m-chain-ran",
+;   "strategy", "spec" (list of (input, output) pairs),
+;   "max-candidates", "depth", "arity" (optional)
+
+; ── Helpers ───────────────────────────────────────────────────────────
+
+(define pm-failures
+  (lambda (results)
+    (filter (lambda (r) (not (ns-get r "found"))) results)))
+
+(define pm-member?
+  (lambda (v lst)
+    (if (= (length lst) 0) false
+      (if (= v (head lst)) true
+        (pm-member? v (tail lst))))))
+
+(define pm-unique
+  (lambda (lst)
+    (reduce (lambda (acc v)
+              (if (pm-member? v acc) acc (append acc (list v))))
+            lst (list))))
+
+(define pm-all?
+  (lambda (pred lst)
+    (if (= (length lst) 0) true
+      (if (pred (head lst))
+        (pm-all? pred (tail lst))
+        false))))
+
+(define pm-any?
+  (lambda (pred lst)
+    (if (= (length lst) 0) false
+      (if (pred (head lst)) true
+        (pm-any? pred (tail lst))))))
+
+(define pm-count
+  (lambda (pred lst)
+    (reduce (lambda (acc v) (if (pred v) (+ acc 1) acc)) lst 0)))
+
+; ── Grid spec extractors ─────────────────────────────────────────────
+;
+; For arity-1 task-args, each input is ((grid)), so unwrap with head.
+
+(define pm-get-input-grid
+  (lambda (pair)
+    (let ((inp (head pair)))
+      (if (list? inp)
+        (if (and (= (length inp) 1) (list? (head inp)))
+          (head inp)   ; unwrap arity-1 wrapper
+          inp)
+        inp))))
+
+(define pm-get-output-grid
+  (lambda (pair)
+    (head (tail pair))))
+
+; ── Size analysis ────────────────────────────────────────────────────
+
+(define pm-size-category
+  (lambda (spec)
+    (let ((pairs spec))
+      (let ((size-rels
+              (map (lambda (p)
+                (let ((ig (pm-get-input-grid p))
+                      (og (pm-get-output-grid p)))
+                  (let ((ih (try (length ig) 0))
+                        (iw (try (length (head ig)) 0))
+                        (oh (try (length og) 0))
+                        (ow (try (length (head og)) 0)))
+                    (if (and (= ih oh) (= iw ow)) "same-size"
+                      (if (and (<= oh ih) (<= ow iw)) "shrink"
+                        (if (and (>= oh ih) (>= ow iw)) "grow"
+                          "reshape"))))))
+                pairs)))
+        (let ((u (pm-unique size-rels)))
+          (if (= (length u) 1) (head u)
+            (if (pm-all? (lambda (s) (or (= s "shrink") (= s "same-size"))) u) "shrink"
+              (if (pm-all? (lambda (s) (or (= s "grow") (= s "same-size"))) u) "grow"
+                "mixed-size"))))))))
+
+; ── Color analysis ───────────────────────────────────────────────────
+
+; Extract unique values from a grid (list of list of int).
+(define pm-grid-colors
+  (lambda (g)
+    (pm-unique (reduce append g (list)))))
+
+(define pm-color-category
+  (lambda (spec)
+    (let ((pairs spec))
+      (let ((rels
+              (map (lambda (p)
+                (let ((ig (pm-get-input-grid p))
+                      (og (pm-get-output-grid p)))
+                  (let ((ic (try (pm-grid-colors ig) (list)))
+                        (oc (try (pm-grid-colors og) (list))))
+                    (if (= (length ic) 0) "unknown"
+                      (if (pm-all? (lambda (c) (pm-member? c ic)) oc)
+                        (if (pm-all? (lambda (c) (pm-member? c oc)) ic)
+                          "same-colors"
+                          "color-subset")
+                        (if (pm-all? (lambda (c) (pm-member? c oc)) ic)
+                          "color-superset"
+                          "new-colors"))))))
+                pairs)))
+        (let ((u (pm-unique rels)))
+          (if (= (length u) 1) (head u) "mixed-colors"))))))
+
+; ── Output constancy ─────────────────────────────────────────────────
+
+(define pm-constant-output?
+  (lambda (spec)
+    (if (<= (length spec) 1) false
+      (let ((outs (map pm-get-output-grid spec)))
+        (let ((first-out (head outs)))
+          (pm-all? (lambda (o) (= o first-out)) (tail outs)))))))
+
+; ── Dimension consistency ────────────────────────────────────────────
+
+(define pm-output-dims-consistent?
+  (lambda (spec)
+    (let ((dims (map (lambda (p)
+                  (let ((og (pm-get-output-grid p)))
+                    (list (try (length og) -1)
+                          (try (length (head og)) -1))))
+                spec)))
+      (if (<= (length dims) 1) true
+        (let ((first-d (head dims)))
+          (pm-all? (lambda (d) (= d first-d)) (tail dims)))))))
+
+; ── Object count analysis ────────────────────────────────────────────
+
+; Count unique non-background colors in a grid.
+; Background = most common color (simple heuristic).
+(define pm-grid-fg-color-count
+  (lambda (g)
+    (let ((colors (pm-grid-colors g)))
+      (if (<= (length colors) 1) 0
+        (- (length colors) 1)))))
+
+(define pm-object-category
+  (lambda (spec)
+    (let ((counts
+            (map (lambda (p)
+              (let ((ig (pm-get-input-grid p)))
+                (try (pm-grid-fg-color-count ig) -1)))
+              spec)))
+      (if (pm-any? (lambda (c) (= c -1)) counts) "unknown"
+        (let ((u (pm-unique counts)))
+          (if (= (length u) 1)
+            (concat "fixed-" (head u) "-fg-colors")
+            (concat "varying-" (length u) "-distinct")))))))
+
+; ── Scale detection ──────────────────────────────────────────────────
+
+(define pm-scale-category
+  (lambda (spec)
+    (let ((ratios
+            (map (lambda (p)
+              (let ((ig (pm-get-input-grid p))
+                    (og (pm-get-output-grid p)))
+                (let ((ih (try (length ig) 0))
+                      (oh (try (length og) 0)))
+                  (if (= ih 0) 0
+                    (if (= (modulo oh ih) 0) (/ oh ih) -1)))))
+              spec)))
+      (let ((u (pm-unique ratios)))
+        (if (and (= (length u) 1) (> (head u) 1))
+          (concat "scale-" (head u) "x")
+          (if (and (= (length u) 1) (= (head u) 1))
+            "no-scale"
+            "no-uniform-scale"))))))
+
+; ── Builtin probe: try every unary grid op ────────────────────────────
+;
+; For each failure, try applying each grid builtin to the input and
+; check if it produces the expected output across ALL training pairs.
+; Returns the name of the first matching op, or "none".
+
+(define pm-grid-ops
+  (list
+    (list "grid-rotate-cw"  grid-rotate-cw)
+    (list "grid-rotate-ccw" grid-rotate-ccw)
+    (list "grid-rotate-180" grid-rotate-180)
+    (list "grid-flip-h"     grid-flip-h)
+    (list "grid-flip-v"     grid-flip-v)
+    (list "grid-transpose"  grid-transpose)
+    (list "grid-trim"       grid-trim)
+    (list "grid-gravity-down"  grid-gravity-down)
+    (list "grid-gravity-up"    grid-gravity-up)
+    (list "grid-gravity-left"  grid-gravity-left)
+    (list "grid-gravity-right" grid-gravity-right)))
+
+; Try one op on all spec pairs. Returns true if it matches everywhere.
+(define pm-op-matches-all?
+  (lambda (op spec)
+    (pm-all? (lambda (p)
+      (let ((ig (pm-get-input-grid p))
+            (og (pm-get-output-grid p)))
+        (= (try (op ig) nil) og)))
+      spec)))
+
+; Find first matching unary op, or "none".
+(define pm-probe-unary
+  (lambda (spec)
+    (pm-probe-unary-loop pm-grid-ops spec)))
+
+(define pm-probe-unary-loop
+  (lambda (ops spec)
+    (if (= (length ops) 0) "none"
+      (let ((entry (head ops)))
+        (let ((name (head entry))
+              (op   (head (tail entry))))
+          (if (try (pm-op-matches-all? op spec) false)
+            name
+            (pm-probe-unary-loop (tail ops) spec)))))))
+
+; ── Depth-2 probe: try op1(op2(input)) ───────────────────────────────
+
+(define pm-probe-depth2
+  (lambda (spec)
+    (pm-probe-d2-outer pm-grid-ops spec)))
+
+(define pm-probe-d2-outer
+  (lambda (ops1 spec)
+    (if (= (length ops1) 0) "none"
+      (let ((e1 (head ops1)))
+        (let ((n1 (head e1))
+              (o1 (head (tail e1))))
+          (let ((result (pm-probe-d2-inner o1 n1 pm-grid-ops spec)))
+            (if (= result "none")
+              (pm-probe-d2-outer (tail ops1) spec)
+              result)))))))
+
+(define pm-probe-d2-inner
+  (lambda (op1 name1 ops2 spec)
+    (if (= (length ops2) 0) "none"
+      (let ((e2 (head ops2)))
+        (let ((n2 (head e2))
+              (o2 (head (tail e2))))
+          (if (try (pm-op-matches-all?
+                     (lambda (g) (op1 (o2 g)))
+                     spec) false)
+            (concat name1 "(" n2 ")")
+            (pm-probe-d2-inner op1 name1 (tail ops2) spec)))))))
+
+; ── Build diagnosis for one failure ──────────────────────────────────
+
+(define pm-diagnose-one
+  (lambda (r)
+    (let ((name      (ns-get r "name"))
+          (spec      (ns-get r "spec"))
+          (otype     (try (ns-get r "output-type") "unknown")))
+      (let ((size-cat   (try (pm-size-category spec) "error"))
+            (color-cat  (try (pm-color-category spec) "error"))
+            (const-out  (try (pm-constant-output? spec) false))
+            (dims-cons  (try (pm-output-dims-consistent? spec) false))
+            (obj-cat    (try (pm-object-category spec) "error"))
+            (scale-cat  (try (pm-scale-category spec) "error"))
+            (probe-1    (try (pm-probe-unary spec) "error"))
+            (probe-2    (if (= (try (pm-probe-unary spec) "error") "none")
+                          (try (pm-probe-depth2 spec) "error")
+                          "skipped")))
+        (ns ("name"          name)
+            ("size"          size-cat)
+            ("colors"        color-cat)
+            ("constant-out"  const-out)
+            ("dims-consistent" dims-cons)
+            ("objects"       obj-cat)
+            ("scale"         scale-cat)
+            ("probe-1"       probe-1)
+            ("probe-2"       probe-2))))))
+
+; ── Tally helper ─────────────────────────────────────────────────────
+
+(define pm-tally
+  (lambda (key diagnoses)
+    (let ((vals (map (lambda (d) (ns-get d key)) diagnoses)))
+      (reduce (lambda (acc v)
+                (let ((cur (try (ns-get acc v) 0)))
+                  (ns-put acc v (+ cur 1))))
+              vals (ns)))))
+
+; ── Main entry point ─────────────────────────────────────────────────
+
+(define run-post-mortem
+  (lambda (results)
+    (let ((fails (pm-failures results)))
+      (if (= (length fails) 0)
+        (list)
+        (map pm-diagnose-one fails)))))
