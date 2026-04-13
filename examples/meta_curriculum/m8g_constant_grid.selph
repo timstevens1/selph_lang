@@ -232,7 +232,7 @@
 
 (define m8g-detect-color-map
   (lambda (inputs outputs)
-    (let ((first-in (head inputs))
+    (let ((first-in (head (head inputs)))
           (first-out (head outputs)))
       ; Build mapping from input colors to output colors
       (let ((h (length first-in))
@@ -275,7 +275,7 @@
     (reduce
       (lambda (acc i)
         (if (not acc) false
-          (let ((inp (nth inputs i))
+          (let ((inp (head (nth inputs i)))
                 (out (nth outputs i)))
             (let ((h (length inp))
                   (w (length (head inp))))
@@ -301,30 +301,41 @@
       (range (length inputs))
       true)))
 
-; Build AST for a chain of grid-replace-color calls using a temp-color
-; trick to avoid overwriting. For mapping {a→b, c→d}, emit:
-;   (grid-replace-color (grid-replace-color x a b) c d)
-; This works when mappings don't form cycles. For cycles (a→b, b→a),
-; we use a temp color (99) as intermediary.
+; Build AST for a chain of grid-replace-color calls. Uses a two-pass
+; temp-color trick to avoid overwriting in cycles (a→b, b→a):
+;   Pass 1: replace each from-color with a temp (from + 50)
+;   Pass 2: replace each temp with the final to-color
+; ARC colors are 0-9 so temps 50-59 are collision-free.
+
+(define m8g-parse-color-key
+  (lambda (key)
+    (if (not (string? key)) key
+      (reduce
+        (lambda (found v) (if (not (nil? found)) found
+          (if (= (to-string v) key) v nil)))
+        (range 10) nil))))
+
 (define m8g-build-color-map-ast
   (lambda (source mapping)
     (let ((keys (ns-keys mapping)))
-      (reduce
-        (lambda (acc key)
-          (let ((from-color (try
-                  (if (string? key)
-                    (head (map (lambda (c) c)
-                      (filter (lambda (v) (= (to-string v) key))
-                        (range 100))))
-                    key)
-                  0))
-                (to-color (ns-get mapping key)))
-            (make-app "grid-replace-color"
-              acc
-              (make-int from-color)
-              (make-int to-color))))
-        keys
-        source))))
+      ; Pass 1: from → temp (from + 50)
+      (let ((after-temps
+              (reduce
+                (lambda (acc key)
+                  (let ((from-color (m8g-parse-color-key key)))
+                    (if (nil? from-color) acc
+                      (make-app "grid-replace-color"
+                        acc (make-int from-color) (make-int (+ from-color 50))))))
+                keys source)))
+        ; Pass 2: temp → to-color
+        (reduce
+          (lambda (acc key)
+            (let ((from-color (m8g-parse-color-key key))
+                  (to-color (ns-get mapping key)))
+              (if (nil? from-color) acc
+                (make-app "grid-replace-color"
+                  acc (make-int (+ from-color 50)) (make-int to-color)))))
+          keys after-temps)))))
 
 (define m8g-try-form-4
   (lambda (inputs outputs target)
@@ -502,6 +513,68 @@
                   (make-app "nth" (make-symbol "x") (make-int 0))))))
         nil))))
 
+; ── Form 9: object recomposition — per-object rigid transform ────────
+;
+; Calls grid-probe-recomp to detect per-object transforms (rotate-cw,
+; rotate-ccw, rotate-180, flip-h, flip-v). If a transform maps every
+; object in every training pair, emits
+;   (lambda (x) (grid-recompose (nth x 0) "transform-name"))
+;
+; Also handles obj-select subtypes: if the output is simply
+; grid-object(input, N) or grid-trim(input), emit that directly.
+
+(define m8g-build-recomp-spec
+  (lambda (inputs outputs)
+    (map (lambda (i) (list (nth inputs i) (nth outputs i)))
+         (range (length inputs)))))
+
+(define m8g-try-form-9
+  (lambda (inputs outputs target)
+    (let ((spec (m8g-build-recomp-spec inputs outputs)))
+      (let ((probe (grid-probe-recomp spec)))
+        (let ((xf (ns-get probe "per-obj-transform"))
+              (sel (ns-get probe "obj-select")))
+          (if (not (= xf "none"))
+            ; per-object transform detected
+            (ns ("kind" (concat "form-9-recomp-" xf))
+                ("source-node"
+                  (m8g-wrap-lambda
+                    (make-app "grid-recompose"
+                      (make-app "nth" (make-symbol "x") (make-int 0))
+                      (make-str xf)))))
+            (if (not (= sel "none"))
+              ; object selection detected
+              (m8g-form-9-obj-select sel)
+              nil)))))))
+
+(define m8g-form-9-obj-select
+  (lambda (sel)
+    (if (= sel "grid-trim")
+      (ns ("kind" "form-9-obj-select-trim")
+          ("source-node"
+            (m8g-wrap-lambda
+              (make-app "grid-trim"
+                (make-app "nth" (make-symbol "x") (make-int 0))))))
+      ; sel is "grid-object-N" — match on known indices 0..5
+      (let ((idx (m8g-parse-obj-index sel)))
+        (if (nil? idx) nil
+          (ns ("kind" (concat "form-9-obj-select-" (to-string idx)))
+              ("source-node"
+                (m8g-wrap-lambda
+                  (make-app "grid-object"
+                    (make-app "nth" (make-symbol "x") (make-int 0))
+                    (make-int idx))))))))))
+
+(define m8g-parse-obj-index
+  (lambda (sel)
+    (if (= sel "grid-object-0") 0
+      (if (= sel "grid-object-1") 1
+        (if (= sel "grid-object-2") 2
+          (if (= sel "grid-object-3") 3
+            (if (= sel "grid-object-4") 4
+              (if (= sel "grid-object-5") 5
+                nil))))))))
+
 ; ── Chain helper: try a list of form-thunks in order ─────────────────
 ;
 ; Each thunk returns nil (no match) or a result namespace.
@@ -532,6 +605,7 @@
               (lambda () (m8g-try-form-6 inputs target))
               (lambda () (m8g-try-form-7 inputs target))
               (lambda () (m8g-try-form-8 inputs target))
+              (lambda () (m8g-try-form-9 inputs outputs target))
               (lambda () (m8g-try-form-3 pool target))
               (lambda () (m8g-try-form-4 inputs outputs target))
               (lambda () (m8g-try-form-5 s target)))))))))
@@ -568,6 +642,29 @@
         (print (concat "  OK " label " kind=" (ns-get result "kind")))
         (print (concat "  FAIL " label " " (ns-get result "reason")))))))
 
+; Form 9: per-object recomposition — each object gets flip-h
+; Input has an L-shape at top-left; output has the same L flipped-h in place.
+; Object in input:  row 0: (1 1), row 1: (1 0)  at pos (0,0) in a 3x3 grid
+; Flipped-h:        row 0: (1 1), row 1: (0 1)
+(define m8g-recomp-spec
+  (m8g-make-spec
+    (list (list (list (list 1 1 0) (list 1 0 0) (list 0 0 0)))
+          (list (list (list 0 0 0 0) (list 0 2 2 0) (list 0 2 0 0) (list 0 0 0 0))))
+    (list (list (list 1 1 0) (list 0 1 0) (list 0 0 0))
+          (list (list 0 0 0 0) (list 0 2 2 0) (list 0 0 2 0) (list 0 0 0 0)))
+    1))
+
+; Form 9: object selection — output is largest object extracted
+(define m8g-objsel-spec
+  (m8g-make-spec
+    (list (list (list (list 0 1 0 0) (list 0 1 1 0) (list 0 0 0 2) (list 0 0 0 0)))
+          (list (list (list 3 3 0 0) (list 3 0 0 0) (list 0 0 0 0) (list 0 0 5 5))))
+    (list (list (list 1 0) (list 1 1))
+          (list (list 3 3) (list 3 0)))
+    1))
+
 (print "--- m8g_constant_grid smoke tests ---")
 (m8g-run-test "constant 2x2" m8g-const-spec)
 (m8g-run-test "rotate-cw" m8g-rotate-spec)
+(m8g-run-test "recomp flip-h" m8g-recomp-spec)
+(m8g-run-test "obj-select" m8g-objsel-spec)

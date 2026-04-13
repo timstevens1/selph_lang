@@ -724,6 +724,7 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("grid-find-color"), bi_grid_find_color);
     t.register(intern("grid-mask"), bi_grid_mask);
     t.register(intern("grid-blank"), bi_grid_blank);
+    t.register(intern("grid-recompose"), bi_grid_recompose);
     // §post-mortem: batch probe builtins for auto-recovery
     t.register(intern("grid-probe-recomp"), bi_grid_probe_recomp);
     t.register(intern("grid-probe-extract"), bi_grid_probe_extract);
@@ -800,6 +801,7 @@ fn build_default_scope() -> Scope {
         "grid-scale", "grid-tile", "grid-fill-enclosed", "grid-compact",
         "grid-object", "grid-object-pos", "grid-place", "grid-translate",
         "grid-find-color", "grid-mask", "grid-blank",
+        "grid-recompose",
         "grid-probe-recomp", "grid-probe-extract", "grid-probe-scale",
         "grid-diagnose-spec",
     ];
@@ -3374,6 +3376,39 @@ fn parse_spec_grid_pairs(spec: &Value) -> Result<Vec<(Vec<Vec<i64>>, Vec<Vec<i64
         result.push((input, output));
     }
     Ok(result)
+}
+
+// ── grid-recompose ──────────────────────────────────────────────────────────
+// (grid-recompose grid "rotate-cw") → apply named transform to each object
+// in-place and return the recomposed grid. Objects detected via 4-connected
+// components; background preserved.
+
+fn bi_grid_recompose(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-recompose: expected 2 args (grid, transform-name), got {}", args.len()));
+    }
+    let grid = as_grid(&args[0])?;
+    let xf_name = args[1].as_str().map_err(|_| "grid-recompose: 2nd arg must be a string".to_string())?;
+
+    let xf: fn(&[Vec<i64>]) -> Vec<Vec<i64>> = match xf_name.as_ref() {
+        "rotate-cw"  => grid_rotate_cw_raw,
+        "rotate-ccw" => grid_rotate_ccw_raw,
+        "rotate-180" => grid_rotate_180_raw,
+        "flip-h"     => grid_flip_h_raw,
+        "flip-v"     => grid_flip_v_raw,
+        _ => return Err(format!("grid-recompose: unknown transform '{}'", xf_name)),
+    };
+
+    let objs = grid_cc_with_pos(&grid, false);
+    let bg = grid_background(&grid);
+    let h = grid.len();
+    let w = if h > 0 { grid[0].len() } else { 0 };
+    let mut canvas = vec![vec![bg; w]; h];
+    for obj_info in &objs {
+        let transformed = xf(&obj_info.grid);
+        canvas = grid_place_raw(&canvas, &transformed, obj_info.row as i64, obj_info.col as i64);
+    }
+    Ok(grid_to_value(canvas))
 }
 
 // ── grid-probe-recomp ───────────────────────────────────────────────────────

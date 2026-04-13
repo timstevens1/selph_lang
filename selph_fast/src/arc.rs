@@ -62,14 +62,24 @@ pub fn arc_task_to_spec(task: &ArcTask) -> (Vec<Value>, Vec<Value>) {
 }
 
 /// Generate a .selph curriculum file from a directory of ARC JSON tasks.
+/// Emits task-args format with arity 1, plain nested lists (no #grid),
+/// and held-out test data. Compatible with grow-v2 + M-chain.
 pub fn arc_dir_to_curriculum(tasks: &[ArcTask], depth: usize) -> String {
     let mut out = String::new();
-    out.push_str(";; ARC-AGI curriculum (auto-generated)\n\n");
+    out.push_str(";; ARC-AGI curriculum (auto-generated, task-args format)\n\n");
     for task in tasks {
         out.push_str(&format!(";; Task: {}\n", task.id));
-        out.push_str(&format!("(task \"{}\" {}\n", task.id, depth));
+        out.push_str(&format!("(task-args \"{}\" 1\n", task.id));
         for (input, output) in &task.train {
-            out.push_str(&format!("  ({} {})\n", grid_to_selph(input), grid_to_selph(output)));
+            out.push_str(&format!("  (({}) {})\n", grid_to_plain(input), grid_to_plain(output)));
+        }
+        // Held-out test data (only pairs that have known outputs).
+        // Format: (test input output) — 3-element tuple starting with
+        // the `test` symbol, matching parse_curriculum_tasks expectations.
+        for (input, output) in &task.test {
+            if let Some(out_grid) = output {
+                out.push_str(&format!("  (test ({}) {})\n", grid_to_plain(input), grid_to_plain(out_grid)));
+            }
         }
         out.push_str(")\n\n");
     }
@@ -84,6 +94,21 @@ fn grid_to_selph(v: &Value) -> String {
                 format!("({})", cells.join(" "))
             }).collect();
             format!("(#grid ({}))", row_strs.join(" "))
+        }
+        _ => format!("{:?}", v),
+    }
+}
+
+/// Plain nested list format (no #grid reader macro). Compatible with
+/// the standard parser and grow-v2. Grid → ((r0c0 r0c1 ...) (r1c0 ...))
+fn grid_to_plain(v: &Value) -> String {
+    match v {
+        Value::Grid(rows) => {
+            let row_strs: Vec<String> = rows.iter().map(|row| {
+                let cells: Vec<String> = row.iter().map(|c| c.to_string()).collect();
+                format!("({})", cells.join(" "))
+            }).collect();
+            format!("({})", row_strs.join(" "))
         }
         _ => format!("{:?}", v),
     }
