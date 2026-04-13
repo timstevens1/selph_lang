@@ -717,6 +717,13 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("grid-tile"), bi_grid_tile);
     t.register(intern("grid-fill-enclosed"), bi_grid_fill_enclosed);
     t.register(intern("grid-compact"), bi_grid_compact);
+    t.register(intern("grid-object"), bi_grid_object);
+    t.register(intern("grid-object-pos"), bi_grid_object_pos);
+    t.register(intern("grid-place"), bi_grid_place);
+    t.register(intern("grid-translate"), bi_grid_translate);
+    t.register(intern("grid-find-color"), bi_grid_find_color);
+    t.register(intern("grid-mask"), bi_grid_mask);
+    t.register(intern("grid-blank"), bi_grid_blank);
 
     t
 }
@@ -786,6 +793,8 @@ fn build_default_scope() -> Scope {
         "grid-fill-rect", "grid-size",
         "grid-objects", "grid-objects-8", "grid-object-count",
         "grid-scale", "grid-tile", "grid-fill-enclosed", "grid-compact",
+        "grid-object", "grid-object-pos", "grid-place", "grid-translate",
+        "grid-find-color", "grid-mask", "grid-blank",
     ];
     for name in names {
         let sym = intern(name);
@@ -3269,6 +3278,203 @@ fn bi_grid_object_count(args: &[Value], _env: &Env) -> Result<Value, String> {
     let g = as_grid(&args[0])?;
     let count = grid_connected_components(&g, false).len();
     Ok(Value::Int(count as i64))
+}
+
+/// `(grid-object grid n)` — return the nth object (0-indexed), sorted by
+/// size (largest first). Each object is a trimmed bounding-box grid.
+fn bi_grid_object(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-object: expected 2 args (grid, index), got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let idx = match &args[1] {
+        Value::Int(n) => *n as usize,
+        Value::Num(n) => *n as usize,
+        _ => return Err("grid-object: index must be a number".into()),
+    };
+    let mut objects = grid_connected_components(&g, false);
+    // Sort by size (cell count), largest first
+    objects.sort_by(|a, b| {
+        let sa: usize = a.iter().flat_map(|r| r.iter()).filter(|&&c| c != 0).count();
+        let sb: usize = b.iter().flat_map(|r| r.iter()).filter(|&&c| c != 0).count();
+        sb.cmp(&sa)
+    });
+    if idx >= objects.len() {
+        return Err(format!("grid-object: index {} out of range (have {} objects)", idx, objects.len()));
+    }
+    Ok(grid_to_value(objects.remove(idx)))
+}
+
+/// `(grid-object-pos grid n)` — return (row, col) of the nth object's
+/// top-left corner in the original grid. Objects sorted by size (largest first).
+fn bi_grid_object_pos(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-object-pos: expected 2 args, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let idx = match &args[1] {
+        Value::Int(n) => *n as usize,
+        Value::Num(n) => *n as usize,
+        _ => return Err("grid-object-pos: index must be a number".into()),
+    };
+    let h = g.len();
+    let w = g.first().map_or(0, |r| r.len());
+    // Detect background
+    let mut counts = std::collections::HashMap::new();
+    for row in &g { for &c in row { *counts.entry(c).or_insert(0usize) += 1; } }
+    let bg = counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or(0);
+    // Find objects with positions
+    let mut labels = vec![vec![0u32; w]; h];
+    let mut next_label = 1u32;
+    let dirs: &[(i32,i32)] = &[(-1,0),(1,0),(0,-1),(0,1)];
+    for r in 0..h { for c in 0..w {
+        if g[r][c] != bg && labels[r][c] == 0 {
+            let label = next_label; next_label += 1;
+            labels[r][c] = label;
+            let mut queue = vec![(r, c)];
+            while let Some((cr, cc)) = queue.pop() {
+                for &(dr, dc) in dirs {
+                    let nr = cr as i32 + dr; let nc = cc as i32 + dc;
+                    if nr >= 0 && nr < h as i32 && nc >= 0 && nc < w as i32 {
+                        let (nr, nc) = (nr as usize, nc as usize);
+                        if labels[nr][nc] == 0 && g[nr][nc] != bg {
+                            labels[nr][nc] = label; queue.push((nr, nc));
+                        }
+                    }
+                }
+            }
+        }
+    }}
+    // Collect per-label: (min_r, min_c, cell_count)
+    let mut info: Vec<(u32, usize, usize, usize)> = Vec::new();
+    for lbl in 1..next_label {
+        let mut min_r = h; let mut min_c = w; let mut count = 0;
+        for r in 0..h { for c in 0..w {
+            if labels[r][c] == lbl { min_r = min_r.min(r); min_c = min_c.min(c); count += 1; }
+        }}
+        info.push((lbl, min_r, min_c, count));
+    }
+    // Sort by size (largest first)
+    info.sort_by(|a, b| b.3.cmp(&a.3));
+    if idx >= info.len() {
+        return Err(format!("grid-object-pos: index {} out of range", idx));
+    }
+    Ok(Value::list(vec![Value::Int(info[idx].1 as i64), Value::Int(info[idx].2 as i64)]))
+}
+
+/// `(grid-place canvas obj row col)` — overlay obj onto canvas at (row,col).
+/// Non-zero cells in obj overwrite canvas cells.
+fn bi_grid_place(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err(format!("grid-place: expected 4 args (canvas, obj, row, col), got {}", args.len()));
+    }
+    let canvas = as_grid(&args[0])?;
+    let obj = as_grid(&args[1])?;
+    let row = match &args[2] { Value::Int(n) => *n, Value::Num(n) => *n as i64, _ => return Err("grid-place: row must be a number".into()) };
+    let col = match &args[3] { Value::Int(n) => *n, Value::Num(n) => *n as i64, _ => return Err("grid-place: col must be a number".into()) };
+    let ch = canvas.len();
+    let cw = if ch > 0 { canvas[0].len() } else { 0 };
+    let oh = obj.len();
+    let ow = if oh > 0 { obj[0].len() } else { 0 };
+    let mut out = canvas.clone();
+    for r in 0..oh {
+        for c in 0..ow {
+            if obj[r][c] != 0 {
+                let tr = row as isize + r as isize;
+                let tc = col as isize + c as isize;
+                if tr >= 0 && (tr as usize) < ch && tc >= 0 && (tc as usize) < cw {
+                    out[tr as usize][tc as usize] = obj[r][c];
+                }
+            }
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+/// `(grid-translate grid dr dc)` — shift all non-background cells by (dr, dc).
+/// Cells that move out of bounds are clipped.
+fn bi_grid_translate(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(format!("grid-translate: expected 3 args (grid, dr, dc), got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let dr = match &args[1] { Value::Int(n) => *n, Value::Num(n) => *n as i64, _ => return Err("grid-translate: dr must be a number".into()) };
+    let dc = match &args[2] { Value::Int(n) => *n, Value::Num(n) => *n as i64, _ => return Err("grid-translate: dc must be a number".into()) };
+    let h = g.len();
+    let w = if h > 0 { g[0].len() } else { 0 };
+    // Detect background
+    let mut counts = std::collections::HashMap::new();
+    for row in &g { for &c in row { *counts.entry(c).or_insert(0usize) += 1; } }
+    let bg = counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or(0);
+    let mut out = vec![vec![bg; w]; h];
+    for r in 0..h {
+        for c in 0..w {
+            if g[r][c] != bg {
+                let nr = r as i64 + dr;
+                let nc = c as i64 + dc;
+                if nr >= 0 && (nr as usize) < h && nc >= 0 && (nc as usize) < w {
+                    out[nr as usize][nc as usize] = g[r][c];
+                }
+            }
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+/// `(grid-find-color grid color)` — return list of (row, col) pairs where
+/// the given color appears.
+fn bi_grid_find_color(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-find-color: expected 2 args (grid, color), got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let color = match &args[1] { Value::Int(n) => *n, Value::Num(n) => *n as i64, _ => return Err("grid-find-color: color must be a number".into()) };
+    let mut positions = Vec::new();
+    for (r, row) in g.iter().enumerate() {
+        for (c, &cell) in row.iter().enumerate() {
+            if cell == color {
+                positions.push(Value::list(vec![Value::Int(r as i64), Value::Int(c as i64)]));
+            }
+        }
+    }
+    Ok(Value::list(positions))
+}
+
+/// `(grid-mask grid mask color)` — for every non-zero cell in mask,
+/// set the corresponding cell in grid to color.
+fn bi_grid_mask(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(format!("grid-mask: expected 3 args (grid, mask, color), got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let mask = as_grid(&args[1])?;
+    let color = match &args[2] { Value::Int(n) => *n, Value::Num(n) => *n as i64, _ => return Err("grid-mask: color must be a number".into()) };
+    let h = g.len();
+    let w = if h > 0 { g[0].len() } else { 0 };
+    let mut out = g.clone();
+    for r in 0..h.min(mask.len()) {
+        let mw = if mask[r].len() > 0 { mask[r].len() } else { 0 };
+        for c in 0..w.min(mw) {
+            if mask[r][c] != 0 {
+                out[r][c] = color;
+            }
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+/// `(grid-blank rows cols [color])` — create a uniform grid filled with color (default 0).
+fn bi_grid_blank(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(format!("grid-blank: expected 2-3 args (rows, cols [, color]), got {}", args.len()));
+    }
+    let rows = match &args[0] { Value::Int(n) => *n as usize, Value::Num(n) => *n as usize, _ => return Err("grid-blank: rows must be a number".into()) };
+    let cols = match &args[1] { Value::Int(n) => *n as usize, Value::Num(n) => *n as usize, _ => return Err("grid-blank: cols must be a number".into()) };
+    let color = if args.len() == 3 {
+        match &args[2] { Value::Int(n) => *n, Value::Num(n) => *n as i64, _ => 0 }
+    } else { 0 };
+    if rows > 100 || cols > 100 { return Err("grid-blank: max 100x100".into()); }
+    Ok(grid_to_value(vec![vec![color; cols]; rows]))
 }
 
 /// `(grid-scale grid factor)` — scale each cell to a factor×factor block.

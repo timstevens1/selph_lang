@@ -983,6 +983,15 @@ pub fn primitive_components() -> Vec<SynthComponent> {
     comps.push(SynthComponent::named(
         "grid-tile", intern("grid-tile"), vec![list_, int], list_, 15.0,
     ));
+    // Object access: (Grid, Int) → Grid
+    comps.push(SynthComponent::named(
+        "grid-object", intern("grid-object"), vec![list_, int], list_, 10.0,
+    ));
+    // Translation: (Grid, Int, Int) → Grid
+    comps.push(SynthComponent::named(
+        "grid-translate", intern("grid-translate"), vec![list_, int, int], list_, 10.0,
+    ));
+
     // Binary Grid × Grid → Grid ops stay out of the primitive catalog
     // to avoid combinatorial explosion at depth 2. The M-chain handles
     // them via targeted probing in the grid pool builder.
