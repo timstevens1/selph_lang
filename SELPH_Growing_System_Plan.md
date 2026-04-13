@@ -31,6 +31,8 @@ The architecture IS the curriculum. Change the curriculum, change the architectu
 - `Value` enum: Int(i64), Num(f64), Str(Rc<str>), Bool, List(Rc<[Value]>), Ns(Rc<NsMap>), Function(Rc<FunctionData>), Builtin(Sym), Nil
 - Value::Node for AST homoiconicity (§9.36) — SELPH programs construct, inspect, and evaluate AST trees as first-class data
 - Macro system via `defmacro` (desugared to `define` + `lambda`)
+- Threading macros `->` (thread-first) and `->>` (thread-last) — desugared at parse time to nested applications, eliminating deep nesting in pipeline-style code
+- `let` bindings with letrec semantics (mutual recursion via literal lambdas)
 - First-class namespaces with `__types__` and `__decomposers__` registries
 
 ### 2.3 Synthesis (synth_v2.rs)
@@ -541,6 +543,43 @@ All via M-chain at 1 candidate each.
 3. **Object sort options.** `grid-objects` currently returns objects in scan order, `grid-object` sorts by size. Adding sort-by-position (topmost, leftmost) would handle tasks that reference objects spatially.
 4. **Soft reachability.** When the search space exhausts at ~1200 candidates (hard type wall), the post-mortem could retry with a wider component set. Currently all retries find 0 additional tasks — the gap is in operation vocabulary, not type filtering.
 5. **Close the meta-learning loop.** The post-mortem classifies failures but doesn't automatically propose new forms. The next step: "80 tasks are same-size + same-colors → try object-recomposition Form 9" — curriculum-driven form generation.
+
+---
+
+### 9.51 Threading macros and let bindings for LLM-friendly code (April 13, 2026)
+
+Deeply nested S-expressions are hard for LLMs to read and generate correctly. Two syntax features address this without changing the evaluator or AST node types.
+
+#### Threading macros (`->`, `->>`)
+
+Desugared in `convert_tree` (same pass as `defmacro`). No new `SpecialForm` or `Node` variants.
+
+```
+;; thread-first: value threaded as first arg of each step
+(-> (grid-new 3 3 0)
+    (grid-fill 1 1 5)
+    (grid-set 0 0 2))
+;; desugars to: (grid-set (grid-fill (grid-new 3 3 0) 1 1 5) 0 0 2)
+
+;; thread-last: value threaded as last arg of each step
+(->> x (f a) (g b c))
+;; desugars to: (g b c (f a x))
+```
+
+Bare symbols work: `(-> x f g)` → `(g (f x))`. Mixed bare and applied forms work freely.
+
+#### `let` bindings
+
+Already a first-class `Node::Let` with letrec semantics — mutually recursive lambdas in the same binding block see each other. Combined with threading:
+
+```
+(let ((base (grid-new 3 3 0)))
+  (-> base
+      (grid-fill 1 1 5)
+      (grid-set 0 0 2)))
+```
+
+**Impact:** Pipeline-style SELPH code (M-chain dispatchers, pool builders, post-mortem analysis) can now be written as flat threading pipelines instead of deeply nested calls. This directly improves LLM code generation accuracy for SELPH.
 
 ---
 

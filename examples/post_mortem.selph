@@ -254,9 +254,311 @@
             (concat name1 "(" n2 ")")
             (pm-probe-d2-inner op1 name1 (tail ops2) spec)))))))
 
+; ── Object-level probes ───────────────────────────────────────────────
+;
+; Deeper probes that operate at the object level rather than whole-grid.
+; These fire for the "object-recomposition" and "object-extraction"
+; prescription buckets to sub-classify failures.
+
+; -- Helpers --
+
+; Safe object extraction: returns list of objects or empty list on error.
+(define pm-safe-objects
+  (lambda (g)
+    (try (grid-objects g) (list))))
+
+; Count objects in a grid (connected components, 4-connected).
+(define pm-object-count
+  (lambda (g)
+    (length (pm-safe-objects g))))
+
+; -- Object-recomposition sub-classification --
+;
+; For same-size + same-colors tasks. Probes:
+;   1. Object count conservation (same # objects in/out?)
+;   2. Per-object unary transform (extract each obj, transform, place back)
+;   3. Object repositioning (same objects, different positions)
+;   4. Single-object change (only one object differs)
+
+(define pm-subtype-recomp
+  (lambda (spec)
+    (let ((pairs spec))
+      ; Step 1: Check object count conservation across all pairs
+      (let ((obj-counts
+              (map (lambda (p)
+                (let ((ig (pm-get-input-grid p))
+                      (og (pm-get-output-grid p)))
+                  (list (try (pm-object-count ig) -1)
+                        (try (pm-object-count og) -1))))
+                pairs)))
+        (let ((counts-conserved
+                (pm-all? (lambda (c) (= (nth c 0) (nth c 1))) obj-counts))
+              (in-counts (map (lambda (c) (nth c 0)) obj-counts))
+              (typical-count (nth (head obj-counts) 0)))
+
+          ; Step 2: Try per-object unary transforms
+          (let ((per-obj-result (try (pm-probe-per-object-transform spec) "none")))
+
+            ; Step 3: Try direct object extraction match (output = one of input's objects?)
+            (let ((obj-extract-result (try (pm-probe-object-index spec) "none")))
+
+              ; Step 4: Check if only one object differs between input and output
+              (let ((single-change (try (pm-probe-single-object-change spec) false)))
+
+                ; Classify
+                (if (not (= per-obj-result "none"))
+                  (concat "per-object-transform:" per-obj-result)
+                  (if (not (= obj-extract-result "none"))
+                    (concat "object-select:" obj-extract-result)
+                    (if single-change
+                      (if counts-conserved
+                        (concat "single-object-change:n=" typical-count)
+                        "object-count-change")
+                      (if counts-conserved
+                        (if (and (> typical-count 0) (<= typical-count 2))
+                          (concat "few-objects-recomp:n=" typical-count)
+                          (if (> typical-count 2)
+                            (concat "many-objects-recomp:n=" typical-count)
+                            "no-objects-detected"))
+                        "object-count-change"))))))))))))
+
+; Try each unary transform on each object individually, place back, check match.
+; Returns the transform name or "none".
+(define pm-per-object-transforms
+  (list
+    (list "rotate-cw"   grid-rotate-cw)
+    (list "rotate-ccw"  grid-rotate-ccw)
+    (list "rotate-180"  grid-rotate-180)
+    (list "flip-h"      grid-flip-h)
+    (list "flip-v"      grid-flip-v)))
+
+(define pm-probe-per-object-transform
+  (lambda (spec)
+    (pm-probe-pot-loop pm-per-object-transforms spec)))
+
+(define pm-probe-pot-loop
+  (lambda (ops spec)
+    (if (= (length ops) 0) "none"
+      (let ((entry (head ops)))
+        (let ((name (head entry))
+              (op   (head (tail entry))))
+          (if (try (pm-pot-matches-all? op spec) false)
+            name
+            (pm-probe-pot-loop (tail ops) spec)))))))
+
+; Check if applying `op` to every object in input and placing back gives output.
+(define pm-pot-matches-all?
+  (lambda (op spec)
+    (pm-all? (lambda (p)
+      (let ((ig (pm-get-input-grid p))
+            (og (pm-get-output-grid p)))
+        (let ((objs (pm-safe-objects ig)))
+          (if (= (length objs) 0) false
+            (let ((bg (grid-background ig)))
+              ; Start from a blank grid of same dims, place transformed objects
+              (let ((result (pm-apply-to-all-objects ig objs op bg)))
+                (= result og)))))))
+      spec)))
+
+; Apply op to each object, place at its original position on a bg-filled grid.
+(define pm-apply-to-all-objects
+  (lambda (grid objs op bg)
+    (let ((h (grid-height grid))
+          (w (grid-width grid)))
+      (let ((base (grid-blank h w bg)))
+        (reduce
+          (lambda (acc i)
+            (let ((obj (nth objs i))
+                  (transformed (op (nth objs i))))
+              ; Find position of this object in the original grid
+              (let ((pos (try (pm-find-object-pos grid obj bg) nil)))
+                (if (nil? pos)
+                  acc  ; skip if can't find position
+                  (try (grid-place acc transformed (nth pos 0) (nth pos 1)) acc)))))
+          (range (length objs))
+          base)))))
+
+; Find the top-left position of an object within a grid.
+; Object is a sub-grid with bg=0; find where its non-bg cells map.
+(define pm-find-object-pos
+  (lambda (grid obj bg)
+    (let ((oh (grid-height obj))
+          (ow (grid-width obj)))
+      ; Scan for first non-bg cell in obj, find its position in grid
+      (pm-find-obj-pos-scan grid obj bg 0 0 oh ow))))
+
+(define pm-find-obj-pos-scan
+  (lambda (grid obj bg r c oh ow)
+    (if (>= r oh) nil
+      (if (>= c ow)
+        (pm-find-obj-pos-scan grid obj bg (+ r 1) 0 oh ow)
+        (let ((cell (grid-get obj r c)))
+          (if (= cell bg)
+            (pm-find-obj-pos-scan grid obj bg r (+ c 1) oh ow)
+            ; Found first non-bg cell at (r, c) in obj
+            ; Search grid for this cell value and check if obj fits there
+            (pm-find-obj-in-grid grid obj bg r c)))))))
+
+(define pm-find-obj-in-grid
+  (lambda (grid obj bg obj-r obj-c)
+    (let ((gh (grid-height grid))
+          (gw (grid-width grid))
+          (oh (grid-height obj))
+          (ow (grid-width obj))
+          (target (grid-get obj obj-r obj-c)))
+      ; The object's top-left in the grid would be at (gr - obj-r, gc - obj-c)
+      ; Try each position where target appears
+      (pm-find-obj-grid-scan grid obj bg obj-r obj-c target 0 0 gh gw oh ow))))
+
+(define pm-find-obj-grid-scan
+  (lambda (grid obj bg or oc target r c gh gw oh ow)
+    (if (>= r gh) nil
+      (if (>= c gw)
+        (pm-find-obj-grid-scan grid obj bg or oc target (+ r 1) 0 gh gw oh ow)
+        (if (= (grid-get grid r c) target)
+          ; Candidate: obj top-left would be at (r - or, c - oc)
+          (let ((tr (- r or))
+                (tc (- c oc)))
+            (if (and (>= tr 0) (>= tc 0)
+                     (<= (+ tr oh) gh) (<= (+ tc ow) gw))
+              (if (pm-obj-fits-at? grid obj bg tr tc oh ow)
+                (list tr tc)
+                (pm-find-obj-grid-scan grid obj bg or oc target r (+ c 1) gh gw oh ow))
+              (pm-find-obj-grid-scan grid obj bg or oc target r (+ c 1) gh gw oh ow)))
+          (pm-find-obj-grid-scan grid obj bg or oc target r (+ c 1) gh gw oh ow))))))
+
+; Check if obj placed at (tr, tc) matches grid for all non-bg cells.
+(define pm-obj-fits-at?
+  (lambda (grid obj bg tr tc oh ow)
+    (pm-all?
+      (lambda (r)
+        (pm-all?
+          (lambda (c)
+            (let ((cell (grid-get obj r c)))
+              (if (= cell bg) true
+                (= (grid-get grid (+ tr r) (+ tc c)) cell))))
+          (range ow)))
+      (range oh))))
+
+; -- Object index probe (for extraction bucket too) --
+;
+; Try grid-object(input, 0..3) and grid-trim(input) against output.
+
+(define pm-probe-object-index
+  (lambda (spec)
+    (let ((result
+            (reduce
+              (lambda (acc idx)
+                (if (not (= acc "none")) acc
+                  (if (pm-all? (lambda (p)
+                        (let ((ig (pm-get-input-grid p))
+                              (og (pm-get-output-grid p)))
+                          (= (try (grid-object ig idx) nil) og)))
+                        spec)
+                    (concat "grid-object-" idx)
+                    acc)))
+              (list 0 1 2 3)
+              "none")))
+      ; Also try grid-trim
+      (if (not (= result "none")) result
+        (if (pm-all? (lambda (p)
+              (let ((ig (pm-get-input-grid p))
+                    (og (pm-get-output-grid p)))
+                (= (try (grid-trim ig) nil) og)))
+              spec)
+          "grid-trim"
+          result)))))
+
+; -- Single-object-change probe --
+;
+; Check if exactly one object differs between input and output
+; (all others are identical). Indicates a targeted edit.
+
+(define pm-probe-single-object-change
+  (lambda (spec)
+    (pm-all? (lambda (p)
+      (let ((ig (pm-get-input-grid p))
+            (og (pm-get-output-grid p)))
+        (let ((in-objs (pm-safe-objects ig))
+              (out-objs (pm-safe-objects og)))
+          (if (not (= (length in-objs) (length out-objs))) false
+            (if (= (length in-objs) 0) false
+              (let ((diffs (pm-count (lambda (i)
+                      (not (= (nth in-objs i) (nth out-objs i))))
+                      (range (length in-objs)))))
+                (= diffs 1)))))))
+      spec)))
+
+; -- Object-extraction sub-classification --
+;
+; For shrink tasks. Probes:
+;   1. Direct object index match (grid-object(x, 0..3))
+;   2. grid-trim match
+;   3. Color-based extraction (extract cells of one non-bg color)
+;   4. Smallest/largest object
+;   5. Crop to bounding box of non-bg content
+
+(define pm-subtype-extract
+  (lambda (spec)
+    ; Use Rust builtin for fast probing
+    (let ((result (try (grid-probe-extract spec) (ns ("found" false) ("method" "none")))))
+      (if (ns-get result "found")
+        (concat "direct:" (ns-get result "source"))
+        (concat "complex:" (try (pm-extract-obj-info spec) "unknown"))))))
+
+; Try extracting objects of each non-background color and check vs output.
+(define pm-probe-color-extract
+  (lambda (spec)
+    (let ((first-in (pm-get-input-grid (head spec))))
+      (let ((bg (try (grid-background first-in) 0))
+            (colors (try (pm-grid-colors first-in) (list))))
+        (let ((non-bg (filter (lambda (c) (not (= c bg))) colors)))
+          (pm-probe-color-loop non-bg bg spec))))))
+
+(define pm-probe-color-loop
+  (lambda (colors bg spec)
+    (if (= (length colors) 0) "none"
+      (let ((color (head colors)))
+        (if (pm-all? (lambda (p)
+              (let ((ig (pm-get-input-grid p))
+                    (og (pm-get-output-grid p)))
+                (let ((extracted (try (pm-extract-by-color ig color bg) nil)))
+                  (= extracted og))))
+              spec)
+          (concat "color-" color)
+          (pm-probe-color-loop (tail colors) bg spec))))))
+
+; Extract cells of a specific color from grid, trim to bounding box.
+(define pm-extract-by-color
+  (lambda (grid color bg)
+    (let ((h (grid-height grid))
+          (w (grid-width grid)))
+      ; Build a mask: keep only `color` cells, rest = bg
+      (let ((masked (map (lambda (r)
+                      (map (lambda (c)
+                        (if (= (grid-get grid r c) color) color bg))
+                        (range w)))
+                    (range h))))
+        (grid-trim masked)))))
+
+; Summarize the extraction shape for complex cases.
+(define pm-extract-obj-info
+  (lambda (spec)
+    (let ((first-p (head spec)))
+      (let ((ig (pm-get-input-grid first-p))
+            (og (pm-get-output-grid first-p)))
+        (let ((in-objs  (length (pm-safe-objects ig)))
+              (out-objs (length (pm-safe-objects og)))
+              (ih (try (length ig) 0))
+              (iw (try (length (head ig)) 0))
+              (oh (try (length og) 0))
+              (ow (try (length (head og)) 0)))
+          (concat "in=" in-objs "obj-" ih "x" iw
+                  ">out=" out-objs "obj-" oh "x" ow))))))
+
 ; ── Constant discovery ────────────────────────────────────────────────
 ;
-; Analyze a failing spec to discover implicit constants — values that
+; Analyze a failing spec to discover implicit constants -- values that
 ; are consistent across all training examples but not present as inputs.
 ; These become extra-seeds for retry synthesis.
 
@@ -335,41 +637,26 @@
 
 (define pm-diagnose-one
   (lambda (r)
-    (let ((name      (ns-get r "name"))
-          (spec      (ns-get r "spec"))
-          (otype     (try (ns-get r "output-type") "unknown")))
-      (let ((size-cat   (try (pm-size-category spec) "error"))
-            (color-cat  (try (pm-color-category spec) "error"))
-            (const-out  (try (pm-constant-output? spec) false))
-            (dims-cons  (try (pm-output-dims-consistent? spec) false))
-            (obj-cat    (try (pm-object-category spec) "error"))
-            (scale-cat  (try (pm-scale-category spec) "error"))
-            (probe-1    (try (pm-probe-unary spec) "error"))
-            (probe-2    (if (= (try (pm-probe-unary spec) "error") "none")
-                          (try (pm-probe-depth2 spec) "error")
-                          "skipped"))
-            (constants  (try (pm-discover-constants spec) (list))))
-        ; Try extra-seeds retry if we found constants
-        (let ((retry-result
-                (if (> (length constants) 0)
-                  (try (pm-retry-with-seeds r constants) (ns ("found" false)))
-                  (ns ("found" false)))))
-          (let ((retry-found (try (ns-get retry-result "found") false)))
-            (ns ("name"          name)
-                ("size"          size-cat)
-                ("colors"        color-cat)
-                ("constant-out"  const-out)
-                ("dims-consistent" dims-cons)
-                ("objects"       obj-cat)
-                ("scale"         scale-cat)
-                ("probe-1"       probe-1)
-                ("probe-2"       probe-2)
-                ("constants"     constants)
-                ("retry-found"   retry-found)
-                ("retry-source"
-                  (if retry-found
-                    (try (ns-get retry-result "source") "")
-                    "")))))))))
+    (let ((name (ns-get r "name"))
+          (spec (ns-get r "spec")))
+      ; Use Rust builtin for fast grid classification
+      (let ((diag (try (grid-diagnose-spec spec)
+                    (ns ("size" "error") ("colors" "error") ("scale" "error")
+                        ("constant-out" false) ("dims-consistent" false)
+                        ("subtype" "error")))))
+        (ns ("name"            name)
+            ("size"            (ns-get diag "size"))
+            ("colors"          (ns-get diag "colors"))
+            ("constant-out"    (ns-get diag "constant-out"))
+            ("dims-consistent" (ns-get diag "dims-consistent"))
+            ("objects"         "n/a")
+            ("scale"           (ns-get diag "scale"))
+            ("probe-1"         "none")
+            ("probe-2"         "skipped")
+            ("constants"       (list))
+            ("retry-found"     false)
+            ("subtype"         (ns-get diag "subtype"))
+            ("retry-source"    ""))))))
 
 ; ── Tally helper ─────────────────────────────────────────────────────
 
@@ -381,11 +668,896 @@
                   (ns-put acc v (+ cur 1))))
               vals (ns)))))
 
+; ── Prescription: diagnosis → actionable form recommendation ─────────
+;
+; Maps each failure's diagnosis signature to a concrete prescription:
+; what M-chain form (existing or new) would cover this task pattern.
+;
+; Priority 1 = highest leverage (bug in existing coverage).
+; Priority 2–4 = new forms by estimated impact.
+; Priority 5–6 = hard / unclassified.
+
+(define pm-prescribe
+  (lambda (diag)
+    (let ((size    (ns-get diag "size"))
+          (colors  (ns-get diag "colors"))
+          (scale   (ns-get diag "scale"))
+          (p1      (ns-get diag "probe-1"))
+          (p2      (ns-get diag "probe-2"))
+          (const   (ns-get diag "constant-out"))
+          (dims    (ns-get diag "dims-consistent"))
+          (objs    (ns-get diag "objects"))
+          (retry   (ns-get diag "retry-found"))
+          (subtype (try (ns-get diag "subtype") "n/a")))
+
+      ; If extra-seeds retry already solved it, no prescription needed.
+      (if retry
+        (ns ("rx" "recovered-by-retry")
+            ("priority" 0)
+            ("rationale" "extra-seeds retry solved this; no new form needed"))
+
+      ; If a unary/depth-2 probe matched, the M-chain should have caught it.
+      (if (not (= p1 "none"))
+        (ns ("rx" "m-chain-coverage-gap")
+            ("priority" 1)
+            ("rationale" (concat "probe found " p1 " but M-chain missed it - check Form 2 pool")))
+
+      (if (and (not (= p2 "none")) (not (= p2 "skipped")) (not (= p2 "error")))
+        (ns ("rx" "m-chain-depth2-gap")
+            ("priority" 1)
+            ("rationale" (concat "depth-2 probe found " p2 " - check Form 2 L2 pool coverage")))
+
+      ; Constant output -> Form 1 should have caught it.
+      (if const
+        (ns ("rx" "constant-output-gap")
+            ("priority" 1)
+            ("rationale" "constant output not caught by Form 1 - check grid? guard"))
+
+      ; === Object-recomposition bucket: use subtype for finer classification ===
+      (if (and (= size "same-size") (= colors "same-colors"))
+        (pm-prescribe-recomp subtype)
+
+      ; === Object-extraction bucket: use subtype for finer classification ===
+      (if (= size "shrink")
+        (pm-prescribe-extract subtype colors)
+
+      ; Same-size + color-subset: masking / filtering
+      (if (and (= size "same-size") (= colors "color-subset"))
+        (ns ("rx" "color-filtering")
+            ("priority" 3)
+            ("rationale" "same dims + fewer colors -> color mask or object removal"))
+
+      ; Same-size + new/superset colors: color introduction / overlay
+      (if (and (= size "same-size")
+               (or (= colors "color-superset") (= colors "new-colors")))
+        (ns ("rx" "color-introduction")
+            ("priority" 4)
+            ("rationale" "same dims + new colors -> annotate/highlight/overlay pattern"))
+
+      ; Grow + uniform scale: scaling / tiling
+      (if (and (= size "grow") (not (= scale "no-uniform-scale")) (not (= scale "no-scale")))
+        (ns ("rx" "scaling-or-tiling")
+            ("priority" 3)
+            ("rationale" (concat "output grows by " scale " -> grid-scale/grid-tile + transform")))
+
+      ; Grow + non-uniform: composition (mirror, concat, border)
+      (if (and (= size "grow") (or (= scale "no-uniform-scale") (= scale "no-scale")))
+        (ns ("rx" "grid-composition")
+            ("priority" 4)
+            ("rationale" "output grows non-uniformly -> concat/border/pad/mirror variant"))
+
+      ; Reshape (different aspect ratio): structural rearrangement
+      (if (= size "mixed-size")
+        (ns ("rx" "structural-rearrangement")
+            ("priority" 5)
+            ("rationale" "inconsistent size changes across examples -> conditional/branching transform"))
+
+      ; Fallback: unclassified
+      (ns ("rx" "unclassified")
+          ("priority" 6)
+          ("rationale" (concat "size=" size " colors=" colors " scale=" scale
+                               " - needs manual inspection")))
+      ))))))))))))))
+
+; Sub-prescribe for the object-recomposition bucket based on subtype probes.
+(define pm-prescribe-recomp
+  (lambda (subtype)
+    ; Check prefix patterns in the subtype string
+    (if (try (string-starts-with subtype "per-object-transform:") false)
+      (ns ("rx" (concat "recomp/per-object-" (string-drop subtype 21)))
+          ("priority" 2)
+          ("rationale" (concat "per-object transform detected: " (string-drop subtype 21)
+                               " - auto-solvable via Form 9")))
+
+    (if (try (string-starts-with subtype "object-select:") false)
+      (ns ("rx" (concat "recomp/select-" (string-drop subtype 14)))
+          ("priority" 1)
+          ("rationale" (concat "object selection matched: " (string-drop subtype 14)
+                               " - M-chain gap, should already solve")))
+
+    (if (try (string-starts-with subtype "single-object-change:") false)
+      (ns ("rx" "recomp/single-obj-edit")
+          ("priority" 2)
+          ("rationale" "exactly one object changes between input/output - targeted edit form"))
+
+    (if (= subtype "object-count-change")
+      (ns ("rx" "recomp/obj-count-change")
+          ("priority" 3)
+          ("rationale" "object count differs in/out - merge/split/create objects"))
+
+    (if (try (string-starts-with subtype "few-objects-recomp:") false)
+      (ns ("rx" "recomp/few-objects")
+          ("priority" 3)
+          ("rationale" (concat "conserved few objects (" subtype ") - spatial/relational transform")))
+
+    (if (try (string-starts-with subtype "many-objects-recomp:") false)
+      (ns ("rx" "recomp/many-objects")
+          ("priority" 4)
+          ("rationale" (concat "conserved many objects (" subtype ") - pattern/rule-based transform")))
+
+    ; Fallback for error/no-objects/n/a
+    (ns ("rx" "recomp/unclassified")
+        ("priority" 4)
+        ("rationale" (concat "object-recomp subtype=" subtype " - needs deeper probing")))
+    ))))))))
+
+; Sub-prescribe for the object-extraction bucket based on subtype probes.
+(define pm-prescribe-extract
+  (lambda (subtype colors)
+    (if (try (string-starts-with subtype "direct:") false)
+      (ns ("rx" (concat "extract/" (string-drop subtype 7)))
+          ("priority" 1)
+          ("rationale" (concat "direct extraction matched: " (string-drop subtype 7)
+                               " - M-chain gap, should already solve")))
+
+    (if (try (string-starts-with subtype "by-color:") false)
+      (ns ("rx" (concat "extract/by-color"))
+          ("priority" 2)
+          ("rationale" (concat "color-based extraction: " (string-drop subtype 9)
+                               " - add color-filter form")))
+
+    ; Complex extraction
+    (ns ("rx" "extract/complex")
+        ("priority" 3)
+        ("rationale" (concat "complex extraction (colors=" colors " sub=" subtype
+                             ") - crop/select by property")))))))
+
+; ── Aggregate prescriptions: tally + rank ────────────────────────────
+;
+; Takes a list of diagnoses (each with a "prescription" field) and
+; returns a sorted list of (rx-name, count, priority, rationale),
+; ordered by priority tier then count descending.
+
+(define pm-aggregate-prescriptions
+  (lambda (diagnoses)
+    (let ((with-names
+            (map (lambda (d)
+              (list (ns-get (ns-get d "prescription") "rx")
+                    (ns-get (ns-get d "prescription") "priority")
+                    (ns-get (ns-get d "prescription") "rationale")
+                    (ns-get d "name")))
+              diagnoses)))
+      ; Build tally: rx-name → ns with count, priority, rationale, examples
+      (let ((tally
+              (reduce
+                (lambda (acc entry)
+                  (let ((name (nth entry 0))
+                        (pri  (nth entry 1))
+                        (rat  (nth entry 2))
+                        (task (nth entry 3)))
+                    (let ((existing (try (ns-get acc name) nil)))
+                      (if (nil? existing)
+                        (ns-put acc name
+                          (ns ("count" 1) ("priority" pri)
+                              ("rationale" rat) ("examples" (list task))))
+                        (ns-put acc name
+                          (ns ("count" (+ (ns-get existing "count") 1))
+                              ("priority" pri) ("rationale" rat)
+                              ("examples"
+                                (if (< (length (ns-get existing "examples")) 5)
+                                  (append (ns-get existing "examples") (list task))
+                                  (ns-get existing "examples")))))))))
+                with-names
+                (ns))))
+        ; Convert to sorted list
+        (let ((keys (ns-keys tally)))
+          (let ((entries (map (lambda (k)
+                    (let ((v (ns-get tally k)))
+                      (ns ("rx" k)
+                          ("count" (ns-get v "count"))
+                          ("priority" (ns-get v "priority"))
+                          ("rationale" (ns-get v "rationale"))
+                          ("examples" (ns-get v "examples")))))
+                  keys)))
+            (pm-sort-by-priority entries)))))))
+
+; Simple insertion sort for prescription ranking
+(define pm-sort-by-priority
+  (lambda (lst)
+    (reduce
+      (lambda (sorted item)
+        (pm-insert-sorted sorted item))
+      lst
+      (list))))
+
+(define pm-insert-sorted
+  (lambda (sorted item)
+    (if (= (length sorted) 0)
+      (list item)
+      (let ((a item) (b (head sorted)))
+        (let ((pa (ns-get a "priority"))
+              (pb (ns-get b "priority")))
+          (if (< pa pb) (cons a sorted)
+            (if (> pa pb) (cons b (pm-insert-sorted (tail sorted) a))
+              ; Same priority: higher count first
+              (if (> (ns-get a "count") (ns-get b "count"))
+                (cons a sorted)
+                (cons b (pm-insert-sorted (tail sorted) a))))))))))
+
+; ── Auto-recovery: targeted re-synthesis from diagnosis ───────────────
+;
+; For each diagnosed failure, attempt recovery using diagnosis-specific
+; strategies. Each strategy builds a targeted synthesis spec with:
+;   - Discovered constants as extra-seeds
+;   - Higher depth for composition chains
+;   - Object-level decomposition for extraction tasks
+;
+; Returns the diagnosis with "auto-found" and "auto-source" fields added.
+
+(define pm-auto-recover-one
+  (lambda (r diag)
+    (let ((rx (ns-get (ns-get diag "prescription") "rx"))
+          (spec (ns-get r "spec"))
+          (test (try (ns-get r "test") (list)))
+          (subtype (try (ns-get diag "subtype") "n/a")))
+
+      ; Dispatch to recovery strategy based on prescription.
+      ; Only attempt cheap probes: extraction (grid-object/trim/compact/color)
+      ; and scaling (direct grid-scale). Skip expensive object-recomposition
+      ; probes (grid-objects + transform + place-back) for now.
+      (let ((result
+              (if (try (string-starts-with rx "extract/") false)
+                (try (grid-probe-extract (ns-get r "spec")) (ns ("found" false)))
+              (if (= rx "scaling-or-tiling")
+                (try (grid-probe-scale (ns-get r "spec")
+                       (try (ns-get diag "constants") (list 2 3)))
+                     (ns ("found" false)))
+                (ns ("found" false))))))
+
+        (let ((found (try (ns-get result "found") false)))
+          (ns-put (ns-put diag
+            "auto-found" found)
+            "auto-source" (if found
+              (try (ns-get result "source") "")
+              "")))))))
+
+; -- Recovery: extraction tasks --
+;
+; Broader object selection: try grid-object with more indices,
+; try grid-compact, try extracting unique non-bg color regions.
+
+(define pm-recover-extract
+  (lambda (r diag)
+    (let ((spec (ns-get r "spec"))
+          (test (try (ns-get r "test") (list))))
+
+      ; Strategy 1: grid-compact (remove empty rows/cols)
+      (if (pm-all? (lambda (p)
+            (let ((ig (pm-get-input-grid p))
+                  (og (pm-get-output-grid p)))
+              (= (try (grid-compact ig) nil) og)))
+            spec)
+        (ns ("found" true)
+            ("source" "grid-compact(x)")
+            ("source-node"
+              (make-lambda (list "x")
+                (make-app "grid-compact" (make-app "nth" (make-symbol "x") (make-int 0))))))
+
+      ; Strategy 2: try grid-object 0..5 with grid-trim wrapper
+      (let ((obj-trim-result (pm-try-obj-trim-extract spec 0)))
+        (if (not (nil? obj-trim-result))
+          obj-trim-result
+
+        ; Color extraction probe skipped (too slow in interpreted SELPH)
+        (ns ("found" false))))))))
+
+; Try grid-trim(grid-object(x, idx)) for idx 0..5
+(define pm-try-obj-trim-extract
+  (lambda (spec idx)
+    (if (> idx 5) nil
+      (if (pm-all? (lambda (p)
+            (let ((ig (pm-get-input-grid p))
+                  (og (pm-get-output-grid p)))
+              (= (try (grid-trim (grid-object ig idx)) nil) og)))
+            spec)
+        (ns ("found" true)
+            ("source" (concat "grid-trim(grid-object(x," idx "))"))
+            ("source-node"
+              (make-lambda (list "x")
+                (make-app "grid-trim"
+                  (make-app "grid-object"
+                    (make-app "nth" (make-symbol "x") (make-int 0))
+                    (make-int idx))))))
+        (pm-try-obj-trim-extract spec (+ idx 1))))))
+
+; Extract by the majority non-background color (trim result)
+(define pm-recover-extract-by-majority-color
+  (lambda (spec)
+    (let ((first-in (pm-get-input-grid (head spec))))
+      (let ((bg (grid-background first-in))
+            (colors (pm-grid-colors first-in)))
+        (let ((non-bg (filter (lambda (c) (not (= c bg))) colors)))
+          (pm-try-majority-color-loop non-bg bg spec))))))
+
+(define pm-try-majority-color-loop
+  (lambda (colors bg spec)
+    (if (= (length colors) 0) nil
+      (let ((color (head colors)))
+        (if (pm-all? (lambda (p)
+              (let ((ig (pm-get-input-grid p))
+                    (og (pm-get-output-grid p)))
+                (let ((mask (pm-mask-to-color ig color bg)))
+                  (= (try (grid-trim mask) nil) og))))
+              spec)
+          (ns ("found" true)
+              ("source" (concat "trim(mask-to-color(x," color "))"))
+              ("source-node"
+                (make-lambda (list "x")
+                  (make-app "grid-trim"
+                    (make-app "grid-mask"
+                      (make-app "nth" (make-symbol "x") (make-int 0))
+                      (make-app "grid-blank"
+                        (make-app "grid-height" (make-app "nth" (make-symbol "x") (make-int 0)))
+                        (make-app "grid-width" (make-app "nth" (make-symbol "x") (make-int 0)))
+                        (make-int bg))
+                      (make-int color))))))
+          (pm-try-majority-color-loop (tail colors) bg spec))))))
+
+; Build a grid with only cells of `color`, rest = bg
+(define pm-mask-to-color
+  (lambda (grid color bg)
+    (let ((h (grid-height grid))
+          (w (grid-width grid)))
+      (map (lambda (r)
+        (map (lambda (c)
+          (if (= (grid-get grid r c) color) color bg))
+          (range w)))
+        (range h)))))
+
+; -- Recovery: single-object edit --
+;
+; Identify the changed object, try known transforms on just that object.
+
+(define pm-recover-single-edit
+  (lambda (r diag)
+    (let ((spec (ns-get r "spec")))
+      ; For each pair, find which object changed and what the change is
+      (let ((first-p (head spec)))
+        (let ((ig (pm-get-input-grid first-p))
+              (og (pm-get-output-grid first-p)))
+          (let ((in-objs (pm-safe-objects ig))
+                (out-objs (pm-safe-objects og)))
+            (if (not (= (length in-objs) (length out-objs)))
+              (ns ("found" false))
+              ; Find the changed object index
+              (let ((changed-idx (pm-find-changed-obj in-objs out-objs 0)))
+                (if (< changed-idx 0)
+                  (ns ("found" false))
+                  ; Try transforms on the changed object
+                  (pm-try-single-obj-transforms spec changed-idx))))))))))
+
+(define pm-find-changed-obj
+  (lambda (in-objs out-objs idx)
+    (if (>= idx (length in-objs)) -1
+      (if (not (= (nth in-objs idx) (nth out-objs idx)))
+        idx
+        (pm-find-changed-obj in-objs out-objs (+ idx 1))))))
+
+(define pm-single-obj-transforms
+  (list
+    (list "rotate-cw"   grid-rotate-cw)
+    (list "rotate-ccw"  grid-rotate-ccw)
+    (list "rotate-180"  grid-rotate-180)
+    (list "flip-h"      grid-flip-h)
+    (list "flip-v"      grid-flip-v)
+    (list "fill-enclosed" grid-fill-enclosed)))
+
+(define pm-try-single-obj-transforms
+  (lambda (spec changed-idx)
+    (pm-try-sot-loop pm-single-obj-transforms spec changed-idx)))
+
+(define pm-try-sot-loop
+  (lambda (ops spec changed-idx)
+    (if (= (length ops) 0) (ns ("found" false))
+      (let ((entry (head ops)))
+        (let ((name (head entry))
+              (op   (head (tail entry))))
+          (if (try (pm-sot-matches-all? op spec changed-idx) false)
+            (ns ("found" true)
+                ("source" (concat "single-obj-edit:" name "@" changed-idx)))
+            (pm-try-sot-loop (tail ops) spec changed-idx)))))))
+
+; Check if applying op to object at changed-idx and placing back gives output
+(define pm-sot-matches-all?
+  (lambda (op spec changed-idx)
+    (pm-all? (lambda (p)
+      (let ((ig (pm-get-input-grid p))
+            (og (pm-get-output-grid p)))
+        (let ((objs (pm-safe-objects ig))
+              (bg (grid-background ig)))
+          (if (<= (length objs) changed-idx) false
+            (let ((obj (nth objs changed-idx))
+                  (transformed (try (op (nth objs changed-idx)) nil)))
+              (if (nil? transformed) false
+                (let ((pos (try (pm-find-object-pos ig obj bg) nil)))
+                  (if (nil? pos) false
+                    (let ((result (try (grid-place
+                            (grid-blank (grid-height ig) (grid-width ig) bg)
+                            ig 0 0) nil)))
+                      ; Rebuild: place all objects, but replace changed one
+                      (let ((rebuilt (try (pm-rebuild-with-edit ig objs op changed-idx bg) nil)))
+                        (if (nil? rebuilt) false
+                          (= rebuilt og))))))))))))
+      spec)))
+
+; Rebuild grid with one object transformed
+(define pm-rebuild-with-edit
+  (lambda (grid objs op changed-idx bg)
+    (let ((h (grid-height grid))
+          (w (grid-width grid)))
+      (let ((base (grid-blank h w bg)))
+        (reduce
+          (lambda (acc i)
+            (let ((obj (nth objs i))
+                  (actual (if (= i changed-idx) (op (nth objs i)) (nth objs i))))
+              (let ((pos (try (pm-find-object-pos grid obj bg) nil)))
+                (if (nil? pos) acc
+                  (try (grid-place acc actual (nth pos 0) (nth pos 1)) acc)))))
+          (range (length objs))
+          base)))))
+
+; -- Recovery: few-objects recomposition --
+;
+; Try spatial relationship probes: sort objects by position, try
+; known arrangements (top-to-bottom, left-to-right).
+
+(define pm-recover-few-objects
+  (lambda (r diag)
+    ; TODO: spatial relationship probes (sort by position, try arrangements)
+    (ns ("found" false))))
+
+; -- Recovery: scaling/tiling --
+;
+; Inject scale factor as extra-seed and retry.
+
+(define pm-recover-scaling
+  (lambda (r diag)
+    ; Try direct grid-scale(x, N) for N in discovered constants
+    (let ((spec (ns-get r "spec"))
+          (constants (try (ns-get diag "constants") (list))))
+      (pm-try-direct-scale spec constants))))
+
+(define pm-try-direct-scale
+  (lambda (spec constants)
+    (if (= (length constants) 0) (ns ("found" false))
+      (let ((n (head constants)))
+        (if (pm-all? (lambda (p)
+              (let ((ig (pm-get-input-grid p))
+                    (og (pm-get-output-grid p)))
+                (= (try (grid-scale ig n) nil) og)))
+              spec)
+          (ns ("found" true)
+              ("source" (concat "grid-scale(x," n ")"))
+              ("source-node"
+                (make-lambda (list "x")
+                  (make-app "grid-scale"
+                    (make-app "nth" (make-symbol "x") (make-int 0))
+                    (make-int n)))))
+          (pm-try-direct-scale spec (tail constants)))))))
+
+; -- Shared: targeted re-synthesis --
+
+(define pm-targeted-resynth
+  (lambda (r seeds depth budget)
+    (let ((spec   (ns-get r "spec"))
+          (test   (try (ns-get r "test") (list)))
+          (arity  (try (ns-get r "arity") false)))
+      (let ((synth-ns
+              (if (= (length test) 0)
+                (ns ("spec" spec) ("max-depth" depth)
+                    ("max-candidates" budget)
+                    ("extra-seeds" seeds))
+                (ns ("spec" spec) ("max-depth" depth)
+                    ("max-candidates" budget)
+                    ("extra-seeds" seeds) ("test" test)))))
+        (if arity
+          (synthesize-args synth-ns)
+          (synthesize synth-ns))))))
+
+; Derive useful seeds from input/output dimensions
+(define pm-derive-dim-seeds
+  (lambda (spec)
+    (let ((first-p (head spec)))
+      (let ((ig (pm-get-input-grid first-p))
+            (og (pm-get-output-grid first-p)))
+        (let ((ih (try (length ig) 0))
+              (iw (try (length (head ig)) 0))
+              (oh (try (length og) 0))
+              (ow (try (length (head og)) 0))
+              (in-obj-count (try (pm-object-count ig) 0))
+              (out-obj-count (try (pm-object-count og) 0))
+              (bg (try (grid-background ig) 0)))
+          ; Collect potentially useful constants
+          (let ((candidates (list)))
+            (let ((candidates (if (and (> ih 0) (> oh 0) (= (modulo ih oh) 0) (> (/ ih oh) 1))
+                    (append candidates (list (/ ih oh)))
+                    candidates)))
+              (let ((candidates (if (and (> in-obj-count 0) (not (pm-member? in-obj-count candidates)))
+                      (append candidates (list in-obj-count))
+                      candidates)))
+                (let ((candidates (if (and (> bg 0) (not (pm-member? bg candidates)))
+                        (append candidates (list bg))
+                        candidates)))
+                  ; Always include 2, 3 as common ARC constants
+                  (reduce (lambda (acc c)
+                    (if (pm-member? c acc) acc (append acc (list c))))
+                    (list 2 3) candidates))))))))))
+
+; ── Scaffolding generator: prescription → synthetic tasks ─────────────
+;
+; For each prescription bucket, generate trivially-solvable tasks whose
+; solutions become library functions. M7 then composes these against the
+; hard tasks. This closes the meta-learning loop:
+;   diagnose → prescribe → scaffold → solve → library-enrich → re-attempt
+;
+; Each scaffold is a list: (name spec) where spec = ((input output) ...).
+; We use small grids (3x3, 4x4) so synthesis is fast.
+
+(define pm-sample-grids
+  (list
+    (list (list 1 2 3) (list 4 5 6) (list 7 8 9))
+    (list (list 0 1 0) (list 1 0 1) (list 0 1 0))
+    (list (list 3 3 0 0) (list 3 0 0 0) (list 0 0 0 2) (list 0 0 2 2))))
+
+(define pm-generate-scaffolding
+  (lambda (prescriptions)
+    (reduce append
+      (map pm-scaffold-for-rx prescriptions)
+      (list))))
+
+(define pm-scaffold-for-rx
+  (lambda (rx-entry)
+    (let ((rx-name (ns-get rx-entry "rx"))
+          (count   (ns-get rx-entry "count")))
+      ; Only generate scaffolding for buckets with enough tasks to matter
+      (if (< count 2) (list)
+        (if (= rx-name "scaling-or-tiling")
+          (append (pm-scaffold-scaling) (pm-scaffold-tile-mirror))
+        (if (= rx-name "extract/complex")
+          (append (pm-scaffold-extraction) (pm-scaffold-extract-by-position))
+        (if (or (= rx-name "recomp/obj-count-change")
+                (= rx-name "recomp/few-objects")
+                (= rx-name "recomp/single-obj-edit"))
+          (append (pm-scaffold-recomp) (pm-scaffold-object-compositions))
+        (if (= rx-name "color-filtering")
+          (append (pm-scaffold-color-filter) (pm-scaffold-color-swap-extract))
+        (if (= rx-name "grid-composition")
+          (pm-scaffold-grid-compose)
+          (list))))))))))
+
+; ── Scaling scaffolds: grid-tile with various patterns ───────────────
+
+(define pm-scaffold-scaling
+  (lambda ()
+    (let ((g1 (nth pm-sample-grids 0))
+          (g2 (nth pm-sample-grids 1)))
+      (list
+        ; tile 2x2
+        (list "scaffold_tile_2x2"
+          (list (list (list g1) (grid-tile g1 2 2))
+                (list (list g2) (grid-tile g2 2 2))))
+        ; tile 3x1 (horizontal)
+        (list "scaffold_tile_3x1"
+          (list (list (list g1) (grid-tile g1 1 3))
+                (list (list g2) (grid-tile g2 1 3))))
+        ; tile 1x3 (vertical)
+        (list "scaffold_tile_1x3"
+          (list (list (list g1) (grid-tile g1 3 1))
+                (list (list g2) (grid-tile g2 3 1))))
+        ; scale 2x
+        (list "scaffold_scale_2"
+          (list (list (list g1) (grid-scale g1 2))
+                (list (list g2) (grid-scale g2 2))))
+        ; scale 3x
+        (list "scaffold_scale_3"
+          (list (list (list g1) (grid-scale g1 3))
+                (list (list g2) (grid-scale g2 3))))))))
+
+; ── Extraction scaffolds: grid-object, grid-trim, grid-compact ───────
+
+(define pm-scaffold-extraction
+  (lambda ()
+    (let ((g1 (nth pm-sample-grids 0))
+          (g2 (nth pm-sample-grids 1))
+          (g3 (nth pm-sample-grids 2)))
+      (list
+        ; grid-trim
+        (list "scaffold_trim"
+          (list (list (list (list (list 0 0 0 0) (list 0 1 2 0) (list 0 3 4 0) (list 0 0 0 0)))
+                      (list (list 1 2) (list 3 4)))
+                (list (list (list (list 0 0 0 0 0) (list 0 0 5 0 0) (list 0 5 5 5 0) (list 0 0 5 0 0) (list 0 0 0 0 0)))
+                      (list (list 0 5 0) (list 5 5 5) (list 0 5 0)))))
+        ; grid-compact
+        (list "scaffold_compact"
+          (list (list (list (list (list 1 0 2) (list 0 0 0) (list 3 0 4)))
+                      (list (list 1 2) (list 3 4)))
+                (list (list (list (list 5 0 6 0) (list 0 0 0 0) (list 7 0 8 0) (list 0 0 0 0)))
+                      (list (list 5 6) (list 7 8)))))
+        ; grid-object (largest)
+        (list "scaffold_object_0"
+          (let ((big (list (list 0 1 1 0 0) (list 0 1 1 0 0) (list 0 0 0 2 0) (list 0 0 0 0 0)))
+                (big2 (list (list 0 0 3 3 3) (list 0 0 3 3 3) (list 0 0 3 3 3) (list 4 0 0 0 0))))
+            (list (list (list big) (grid-object big 0))
+                  (list (list big2) (grid-object big2 0)))))))))
+
+; ── Recomposition scaffolds: object-level transforms ─────────────────
+
+(define pm-scaffold-recomp
+  (lambda ()
+    (let ((g1 (list (list 0 1 0 0 2 0) (list 0 1 0 0 2 0) (list 0 0 0 0 0 0)
+                    (list 0 0 3 0 0 0) (list 0 3 3 0 0 0) (list 0 0 0 0 0 0)))
+          (g2 (list (list 0 0 4 0 0 0) (list 0 4 4 0 0 0) (list 0 0 0 0 0 0)
+                    (list 0 0 0 5 5 0) (list 0 0 0 0 5 0) (list 0 0 0 0 0 0))))
+      (list
+        ; fill-enclosed on the whole grid
+        (list "scaffold_fill_enclosed"
+          (list (list (list (list (list 1 1 1) (list 1 0 1) (list 1 1 1)))
+                      (grid-fill-enclosed (list (list 1 1 1) (list 1 0 1) (list 1 1 1))))
+                (list (list (list (list 2 2 2 2) (list 2 0 0 2) (list 2 0 0 2) (list 2 2 2 2)))
+                      (grid-fill-enclosed (list (list 2 2 2 2) (list 2 0 0 2) (list 2 0 0 2) (list 2 2 2 2))))))
+        ; gravity-down
+        (list "scaffold_gravity_down"
+          (list (list (list (list (list 0 1 0) (list 0 0 0) (list 0 0 0)))
+                      (list (list 0 0 0) (list 0 0 0) (list 0 1 0)))
+                (list (list (list (list 2 0 3) (list 0 0 0) (list 0 0 0)))
+                      (list (list 0 0 0) (list 0 0 0) (list 2 0 3)))))))))
+
+; ── Color filter scaffolds ───────────────────────────────────────────
+
+(define pm-scaffold-color-filter
+  (lambda ()
+    (list
+      ; replace-color (remove a color by setting to bg)
+      (list "scaffold_remove_color"
+        (list (list (list (list (list 1 2 1) (list 2 1 2) (list 1 2 1)))
+                    (list (list 1 0 1) (list 0 1 0) (list 1 0 1)))
+              (list (list (list (list 3 4 3) (list 4 3 4) (list 3 4 3)))
+                    (list (list 3 0 3) (list 0 3 0) (list 3 0 3))))))))
+
+; ── Composition scaffolds: 2-op combinations ─────────────────────────
+
+; Tile-with-mirror: checkerboard tiling (common ARC pattern ~5% of grow tasks)
+(define pm-scaffold-tile-mirror
+  (lambda ()
+    (let ((g1 (list (list 1 2) (list 3 4)))
+          (g2 (list (list 5 6) (list 7 8))))
+      (list
+        ; hconcat with flip-h: (x | flip-h(x))
+        (list "scaffold_mirror_h"
+          (list (list (list g1) (grid-hconcat g1 (grid-flip-h g1)))
+                (list (list g2) (grid-hconcat g2 (grid-flip-h g2)))))
+        ; vconcat with flip-v: (x / flip-v(x))
+        (list "scaffold_mirror_v"
+          (list (list (list g1) (grid-vconcat g1 (grid-flip-v g1)))
+                (list (list g2) (grid-vconcat g2 (grid-flip-v g2)))))
+        ; tile 2x2 then flip-h alternate cols (checkerboard)
+        (list "scaffold_tile_flip_h"
+          (let ((t1 (grid-hconcat g1 (grid-flip-h g1)))
+                (t2 (grid-hconcat g2 (grid-flip-h g2))))
+            (list (list (list g1) (grid-vconcat t1 (grid-flip-v t1)))
+                  (list (list g2) (grid-vconcat t2 (grid-flip-v t2))))))
+        ; scale 2 then flip-h
+        (list "scaffold_scale2_flip_h"
+          (list (list (list g1) (grid-flip-h (grid-scale g1 2)))
+                (list (list g2) (grid-flip-h (grid-scale g2 2)))))))))
+
+; Object + transform compositions
+(define pm-scaffold-object-compositions
+  (lambda ()
+    (let ((g1 (list (list 0 1 0 0 2 0) (list 0 1 0 0 2 0) (list 0 0 0 0 0 0)
+                    (list 0 0 3 0 0 0) (list 0 3 3 0 0 0) (list 0 0 0 0 0 0)))
+          (g2 (list (list 0 0 4 0 0 0) (list 0 4 4 0 0 0) (list 0 0 0 0 0 0)
+                    (list 0 0 0 5 5 0) (list 0 0 0 0 5 0) (list 0 0 0 0 0 0))))
+      (list
+        ; extract largest object then rotate
+        (list "scaffold_obj0_rotate_cw"
+          (list (list (list g1) (grid-rotate-cw (grid-object g1 0)))
+                (list (list g2) (grid-rotate-cw (grid-object g2 0)))))
+        ; extract largest then flip-h
+        (list "scaffold_obj0_flip_h"
+          (list (list (list g1) (grid-flip-h (grid-object g1 0)))
+                (list (list g2) (grid-flip-h (grid-object g2 0)))))
+        ; extract then scale
+        (list "scaffold_obj0_scale2"
+          (list (list (list g1) (grid-scale (grid-object g1 0) 2))
+                (list (list g2) (grid-scale (grid-object g2 0) 2))))))))
+
+; Extract by object position (2nd largest, smallest)
+(define pm-scaffold-extract-by-position
+  (lambda ()
+    (let ((g1 (list (list 0 1 1 0 0) (list 0 1 1 0 0) (list 0 0 0 2 0) (list 0 0 0 0 0)))
+          (g2 (list (list 0 0 3 3 3) (list 0 0 3 3 3) (list 0 0 3 3 3) (list 4 0 0 0 0))))
+      (list
+        ; 2nd largest object
+        (list "scaffold_object_1"
+          (list (list (list g1) (grid-object g1 1))
+                (list (list g2) (grid-object g2 1))))
+        ; trim then compact
+        (list "scaffold_trim_compact"
+          (let ((padded1 (list (list 0 0 0 0 0) (list 0 1 0 2 0) (list 0 0 0 0 0) (list 0 3 0 0 0) (list 0 0 0 0 0)))
+                (padded2 (list (list 0 0 0 0 0) (list 0 5 0 0 0) (list 0 0 0 6 0) (list 0 0 0 0 0))))
+            (list (list (list padded1) (grid-compact padded1))
+                  (list (list padded2) (grid-compact padded2)))))))))
+
+; Color-swap + extraction
+(define pm-scaffold-color-swap-extract
+  (lambda ()
+    (list
+      ; replace one color with another
+      (list "scaffold_replace_color_1_to_2"
+        (list (list (list (list (list 1 0 1) (list 0 1 0) (list 1 0 1)))
+                    (list (list 2 0 2) (list 0 2 0) (list 2 0 2)))
+              (list (list (list (list 1 0 0 1) (list 0 0 0 0) (list 1 0 0 1)))
+                    (list (list 2 0 0 2) (list 0 0 0 0) (list 2 0 0 2)))))
+      ; keep only background (invert: remove all non-bg)
+      (list "scaffold_keep_bg_only"
+        (list (list (list (list (list 0 1 0) (list 1 0 1) (list 0 1 0)))
+                    (list (list 0 0 0) (list 0 0 0) (list 0 0 0)))
+              (list (list (list (list 0 2 3) (list 4 0 5) (list 6 7 0)))
+                    (list (list 0 0 0) (list 0 0 0) (list 0 0 0))))))))
+
+; Grid composition: hconcat, vconcat of input with itself
+(define pm-scaffold-grid-compose
+  (lambda ()
+    (let ((g1 (list (list 1 2) (list 3 4)))
+          (g2 (list (list 5 6) (list 7 8))))
+      (list
+        (list "scaffold_hconcat_self"
+          (list (list (list g1) (grid-hconcat g1 g1))
+                (list (list g2) (grid-hconcat g2 g2))))
+        (list "scaffold_vconcat_self"
+          (list (list (list g1) (grid-vconcat g1 g1))
+                (list (list g2) (grid-vconcat g2 g2))))
+        ; hconcat with rotate-cw
+        (list "scaffold_hconcat_rotate"
+          (list (list (list g1) (grid-hconcat g1 (grid-rotate-cw g1)))
+                (list (list g2) (grid-hconcat g2 (grid-rotate-cw g2)))))))))
+
+; ── Solve scaffolding and bind as library ────────────────────────────
+;
+; Takes list of (name, spec) pairs. For each, calls synthesize-args.
+; If solved, evals the source and binds it via eval-source (define ...).
+; Returns count of successfully solved + bound scaffolds.
+
+(define pm-solve-scaffolding
+  (lambda (scaffolds)
+    (reduce
+      (lambda (count scaffold)
+        (let ((name (nth scaffold 0))
+              (spec (nth scaffold 1)))
+          (let ((result (try
+                  (synthesize-args
+                    (ns ("spec" spec)
+                        ("max-depth" 2)
+                        ("max-candidates" 50000)))
+                  (ns ("found" false)))))
+            (if (try (ns-get result "found") false)
+              (let ((source (ns-get result "source")))
+                ; Bind the solution as a named function
+                (do (try (eval-source (concat "(define " name " " source ")")) nil)
+                    (+ count 1)))
+              count))))
+      scaffolds
+      0)))
+
+; ── Re-attempt failures with expanded library ────────────────────────
+;
+; After scaffolding enriches the library, re-run synthesis on original
+; failed tasks. Returns list of (name, found, source) for any recovered.
+
+; Buckets that have scaffolding support (matching pm-scaffold-for-rx)
+(define pm-scaffolded-rx-prefixes
+  (list "scaling-or-tiling" "extract/" "recomp/" "color-filtering" "grid-composition"))
+
+(define pm-rx-has-scaffolding?
+  (lambda (rx)
+    (pm-any? (lambda (prefix) (try (string-starts-with rx prefix) false))
+      pm-scaffolded-rx-prefixes)))
+
+(define pm-retry-with-library
+  (lambda (fails diagnoses)
+    ; Only retry tasks whose prescription matches a scaffolded bucket
+    (let ((targeted (filter (lambda (r)
+            (let ((name (ns-get r "name")))
+              (let ((diag (head (filter (lambda (d) (= (ns-get d "name") name)) diagnoses))))
+                (let ((rx (ns-get (ns-get diag "prescription") "rx")))
+                  (pm-rx-has-scaffolding? rx)))))
+            fails)))
+      (filter (lambda (r) (ns-get r "found"))
+        (map (lambda (r)
+          (let ((name (ns-get r "name"))
+                (spec (ns-get r "spec"))
+                (test (try (ns-get r "test") (list))))
+            (let ((result (try
+                    (synthesize-args
+                      (ns ("spec" spec)
+                          ("max-depth" 2)
+                          ("max-candidates" 50000)
+                          ("test" test)))
+                    (ns ("found" false)))))
+              (let ((found (try (ns-get result "found") false))
+                    (source (try (ns-get result "source") "")))
+                (do (if found
+                      (print (concat "  LIBRARY-RECOVERED  " name "  " source))
+                      nil)
+                    (ns ("name" name)
+                        ("found" found)
+                        ("source" source)))))))
+          targeted)))))
+
 ; ── Main entry point ─────────────────────────────────────────────────
 
 (define run-post-mortem
   (lambda (results)
     (let ((fails (pm-failures results)))
       (if (= (length fails) 0)
-        (list)
-        (map pm-diagnose-one fails)))))
+        (ns ("diagnoses" (list))
+            ("prescriptions" (list))
+            ("recovered" 0)
+            ("total-failures" 0)
+            ("total-results" (length results)))
+        (let ((diagnoses (map pm-diagnose-one fails)))
+          ; Attach prescription to each diagnosis
+          (let ((with-rx (map (lambda (d)
+                    (ns-put d "prescription" (pm-prescribe d)))
+                  diagnoses)))
+            ; Auto-recovery pass (skip if __pm_skip_recovery__ is set)
+            (let ((with-recovery
+                    (if (try __pm_skip_recovery__ false)
+                      with-rx
+                      (map (lambda (d)
+                        (let ((r-entry (head (filter (lambda (r)
+                                (= (ns-get r "name") (ns-get d "name")))
+                              fails))))
+                          (pm-auto-recover-one r-entry d)))
+                        with-rx))))
+              (let ((recovered-count
+                      (pm-count (lambda (d) (try (ns-get d "auto-found") false))
+                        with-recovery))
+                    (prescriptions (pm-aggregate-prescriptions with-recovery)))
+                ; Phase 2: Scaffolding loop (skip if __pm_skip_scaffolding__)
+                (let ((scaffolding-result
+                        (if (try __pm_skip_scaffolding__ false)
+                          (ns ("scaffolds-solved" 0) ("library-recovered" 0))
+                          (pm-run-scaffolding-loop prescriptions fails with-recovery))))
+                  (ns ("diagnoses" with-recovery)
+                      ("prescriptions" prescriptions)
+                      ("recovered" recovered-count)
+                      ("scaffolds-solved" (ns-get scaffolding-result "scaffolds-solved"))
+                      ("library-recovered" (ns-get scaffolding-result "library-recovered"))
+                      ("total-failures" (length fails))
+                      ("total-results" (length results))))))))))))
+
+; Phase 2: generate scaffolding -> solve -> retry
+(define pm-run-scaffolding-loop
+  (lambda (prescriptions fails diagnoses)
+    (let ((scaffolds (pm-generate-scaffolding prescriptions)))
+      (if (= (length scaffolds) 0)
+        (ns ("scaffolds-solved" 0) ("library-recovered" 0))
+        (let ((solved-count (pm-solve-scaffolding scaffolds)))
+          (if (= solved-count 0)
+            (ns ("scaffolds-solved" 0) ("library-recovered" 0))
+            ; Re-attempt only tasks whose bucket has scaffolding
+            (let ((recovered (pm-retry-with-library fails diagnoses)))
+              (ns ("scaffolds-solved" solved-count)
+                  ("library-recovered" (length recovered))))))))))

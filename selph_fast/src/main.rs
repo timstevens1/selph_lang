@@ -1770,14 +1770,52 @@ fn cmd_grow_v2(args: &[String]) {
             let results_val = env.lookup(intern("__curriculum_results__")).unwrap();
             match eval_v2::apply(&pm_fn, &[results_val], &env) {
                 Ok(val) => {
-                    if let types_v2::Value::List(items) = &val {
+                    // New format: val is a ns with "diagnoses", "prescriptions",
+                    // "total-failures", "total-results".
+                    // Fall back to legacy list format for backwards compat.
+                    let (diagnoses, prescriptions) = if let types_v2::Value::Ns(top_ns) = &val {
+                        let diags = top_ns.get(&intern("diagnoses"))
+                            .and_then(|v| if let types_v2::Value::List(l) = v { Some(l.as_ref()) } else { None });
+                        let rxs = top_ns.get(&intern("prescriptions"))
+                            .and_then(|v| if let types_v2::Value::List(l) = v { Some(l.as_ref()) } else { None });
+                        let total_f = top_ns.get(&intern("total-failures"))
+                            .and_then(|v| if let types_v2::Value::Int(n) = v { Some(*n) } else { None })
+                            .unwrap_or(0);
+                        let total_r = top_ns.get(&intern("total-results"))
+                            .and_then(|v| if let types_v2::Value::Int(n) = v { Some(*n) } else { None })
+                            .unwrap_or(0);
+                        let recovered = top_ns.get(&intern("recovered"))
+                            .and_then(|v| if let types_v2::Value::Int(n) = v { Some(*n) } else { None })
+                            .unwrap_or(0);
+                        let scaffolds = top_ns.get(&intern("scaffolds-solved"))
+                            .and_then(|v| if let types_v2::Value::Int(n) = v { Some(*n) } else { None })
+                            .unwrap_or(0);
+                        let lib_recovered = top_ns.get(&intern("library-recovered"))
+                            .and_then(|v| if let types_v2::Value::Int(n) = v { Some(*n) } else { None })
+                            .unwrap_or(0);
+                        eprintln!("  {}/{} failed", total_f, total_r);
+                        if recovered > 0 {
+                            eprintln!("  {} auto-recovered (probe)", recovered);
+                        }
+                        eprintln!("  scaffolding: {} solved, {} tasks recovered via library", scaffolds, lib_recovered);
+                        (diags, rxs)
+                    } else if let types_v2::Value::List(items) = &val {
+                        // Legacy: flat list of diagnoses, no prescriptions
+                        (Some(items.as_ref()), None)
+                    } else {
+                        (None, None)
+                    };
+
+                    if let Some(items) = diagnoses {
                         if items.is_empty() {
                             eprintln!("  (no failures to analyze)");
                         } else {
                             // Tally each diagnostic dimension.
+                            eprintln!();
                             let dimensions = ["size", "colors", "constant-out",
                                               "dims-consistent", "objects", "scale",
-                                              "probe-1", "probe-2", "retry-found"];
+                                              "probe-1", "probe-2", "retry-found",
+                                              "subtype"];
                             for dim in &dimensions {
                                 let mut tally: std::collections::BTreeMap<String, usize> =
                                     std::collections::BTreeMap::new();
@@ -1819,15 +1857,72 @@ fn cmd_grow_v2(args: &[String]) {
                                     let retry_src = ns.get(&intern("retry-source"))
                                         .map(|v| eval_v2::value_to_string(v))
                                         .unwrap_or_default();
-                                    if retried {
+                                    // Show prescription if available.
+                                    let rx = ns.get(&intern("prescription"))
+                                        .and_then(|v| if let types_v2::Value::Ns(rxns) = v {
+                                            rxns.get(&intern("rx")).map(|r| eval_v2::value_to_string(r))
+                                        } else { None })
+                                        .unwrap_or_default();
+                                    let sub = ns.get(&intern("subtype"))
+                                        .map(|v| eval_v2::value_to_string(v))
+                                        .unwrap_or_default();
+                                    let auto_found = ns.get(&intern("auto-found"))
+                                        .map(|v| matches!(v, types_v2::Value::Bool(true)))
+                                        .unwrap_or(false);
+                                    let auto_src = ns.get(&intern("auto-source"))
+                                        .map(|v| eval_v2::value_to_string(v))
+                                        .unwrap_or_default();
+                                    if auto_found {
+                                        eprintln!("  {:12}  AUTO-RECOVERED  {}",
+                                            name, auto_src);
+                                    } else if retried {
                                         eprintln!("  {:12}  RECOVERED  {}",
                                             name, retry_src);
                                     } else {
-                                        eprintln!("  {:12}  size={:12} colors={:14} probe={}{}",
-                                            name, size, colors, p1,
+                                        let sub_str = if !sub.is_empty() && sub != "n/a"
+                                            { format!(" sub={}", sub) } else { String::new() };
+                                        eprintln!("  {:12}  rx={:28} size={:12} colors={:14} probe={}{}{}",
+                                            name, rx, size, colors, p1,
                                             if p2 != "skipped" && p2 != "none" && !p2.is_empty()
-                                                { format!(" d2={}", p2) } else { String::new() });
+                                                { format!(" d2={}", p2) } else { String::new() },
+                                            sub_str);
                                     }
+                                }
+                            }
+                        }
+                    }
+
+                    // Print prescription summary (ranked).
+                    if let Some(rxs) = prescriptions {
+                        if !rxs.is_empty() {
+                            eprintln!();
+                            eprintln!("── Prescriptions (ranked) ───────────────────────────");
+                            for rx_item in rxs.iter() {
+                                if let types_v2::Value::Ns(rx_ns) = rx_item {
+                                    let rx_name = rx_ns.get(&intern("rx"))
+                                        .map(|v| eval_v2::value_to_string(v))
+                                        .unwrap_or_default();
+                                    let count = rx_ns.get(&intern("count"))
+                                        .and_then(|v| if let types_v2::Value::Int(n) = v { Some(*n) } else { None })
+                                        .unwrap_or(0);
+                                    let priority = rx_ns.get(&intern("priority"))
+                                        .and_then(|v| if let types_v2::Value::Int(n) = v { Some(*n) } else { None })
+                                        .unwrap_or(99);
+                                    let rationale = rx_ns.get(&intern("rationale"))
+                                        .map(|v| eval_v2::value_to_string(v))
+                                        .unwrap_or_default();
+                                    let examples = rx_ns.get(&intern("examples"))
+                                        .and_then(|v| if let types_v2::Value::List(l) = v {
+                                            Some(l.iter()
+                                                .take(3)
+                                                .map(|e| eval_v2::value_to_string(e))
+                                                .collect::<Vec<_>>()
+                                                .join(", "))
+                                        } else { None })
+                                        .unwrap_or_default();
+                                    eprintln!("  P{} {:30} {:>3} tasks  e.g. {}",
+                                        priority, rx_name, count, examples);
+                                    eprintln!("     {}", rationale);
                                 }
                             }
                         }

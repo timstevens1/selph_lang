@@ -724,6 +724,11 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("grid-find-color"), bi_grid_find_color);
     t.register(intern("grid-mask"), bi_grid_mask);
     t.register(intern("grid-blank"), bi_grid_blank);
+    // §post-mortem: batch probe builtins for auto-recovery
+    t.register(intern("grid-probe-recomp"), bi_grid_probe_recomp);
+    t.register(intern("grid-probe-extract"), bi_grid_probe_extract);
+    t.register(intern("grid-probe-scale"), bi_grid_probe_scale);
+    t.register(intern("grid-diagnose-spec"), bi_grid_diagnose_spec);
 
     t
 }
@@ -795,6 +800,8 @@ fn build_default_scope() -> Scope {
         "grid-scale", "grid-tile", "grid-fill-enclosed", "grid-compact",
         "grid-object", "grid-object-pos", "grid-place", "grid-translate",
         "grid-find-color", "grid-mask", "grid-blank",
+        "grid-probe-recomp", "grid-probe-extract", "grid-probe-scale",
+        "grid-diagnose-spec",
     ];
     for name in names {
         let sym = intern(name);
@@ -3191,6 +3198,559 @@ fn bi_grid_size(args: &[Value], _env: &Env) -> Result<Value, String> {
 }
 
 // §9.48: connected components (object detection)
+// ── Raw grid helpers for probe builtins ──────────────────────────────────────
+// These operate on Vec<Vec<i64>> directly, avoiding Value conversion overhead.
+// Used by the grid-probe-* builtins for batch analysis.
+
+fn grid_background(g: &[Vec<i64>]) -> i64 {
+    let mut counts = std::collections::HashMap::new();
+    for row in g { for &c in row { *counts.entry(c).or_insert(0usize) += 1; } }
+    counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or(0)
+}
+
+fn grids_equal(a: &[Vec<i64>], b: &[Vec<i64>]) -> bool {
+    if a.len() != b.len() { return false; }
+    a.iter().zip(b.iter()).all(|(ra, rb)| ra == rb)
+}
+
+fn grid_rotate_cw_raw(g: &[Vec<i64>]) -> Vec<Vec<i64>> {
+    let (h, w) = (g.len(), g.first().map_or(0, |r| r.len()));
+    if h == 0 { return g.to_vec(); }
+    let mut out = vec![vec![0i64; h]; w];
+    for r in 0..h { for c in 0..w { out[c][h - 1 - r] = g[r][c]; } }
+    out
+}
+
+fn grid_rotate_ccw_raw(g: &[Vec<i64>]) -> Vec<Vec<i64>> {
+    let (h, w) = (g.len(), g.first().map_or(0, |r| r.len()));
+    if h == 0 { return g.to_vec(); }
+    let mut out = vec![vec![0i64; h]; w];
+    for r in 0..h { for c in 0..w { out[w - 1 - c][r] = g[r][c]; } }
+    out
+}
+
+fn grid_rotate_180_raw(g: &[Vec<i64>]) -> Vec<Vec<i64>> {
+    let (h, w) = (g.len(), g.first().map_or(0, |r| r.len()));
+    if h == 0 { return g.to_vec(); }
+    let mut out = vec![vec![0i64; w]; h];
+    for r in 0..h { for c in 0..w { out[h - 1 - r][w - 1 - c] = g[r][c]; } }
+    out
+}
+
+fn grid_flip_h_raw(g: &[Vec<i64>]) -> Vec<Vec<i64>> {
+    g.iter().map(|row| { let mut r = row.clone(); r.reverse(); r }).collect()
+}
+
+fn grid_flip_v_raw(g: &[Vec<i64>]) -> Vec<Vec<i64>> {
+    let mut out = g.to_vec(); out.reverse(); out
+}
+
+fn grid_trim_raw(g: &[Vec<i64>]) -> Vec<Vec<i64>> {
+    let (h, w) = (g.len(), g.first().map_or(0, |r| r.len()));
+    if h == 0 { return g.to_vec(); }
+    let bg = grid_background(g);
+    let (mut r0, mut r1, mut c0, mut c1) = (h, 0usize, w, 0usize);
+    for r in 0..h { for c in 0..w {
+        if g[r][c] != bg { r0 = r0.min(r); r1 = r1.max(r + 1); c0 = c0.min(c); c1 = c1.max(c + 1); }
+    }}
+    if r0 >= r1 || c0 >= c1 { return vec![vec![bg]]; }
+    g[r0..r1].iter().map(|row| row[c0..c1].to_vec()).collect()
+}
+
+fn grid_compact_raw(g: &[Vec<i64>]) -> Vec<Vec<i64>> {
+    let (h, w) = (g.len(), g.first().map_or(0, |r| r.len()));
+    if h == 0 { return g.to_vec(); }
+    let keep_row: Vec<bool> = (0..h).map(|r| g[r].iter().any(|&c| c != 0)).collect();
+    let keep_col: Vec<bool> = (0..w).map(|c| (0..h).any(|r| g[r][c] != 0)).collect();
+    let out: Vec<Vec<i64>> = (0..h).filter(|&r| keep_row[r])
+        .map(|r| (0..w).filter(|&c| keep_col[c]).map(|c| g[r][c]).collect()).collect();
+    if out.is_empty() { vec![vec![0i64]] } else { out }
+}
+
+fn grid_scale_raw(g: &[Vec<i64>], factor: usize) -> Vec<Vec<i64>> {
+    let (h, w) = (g.len(), g.first().map_or(0, |r| r.len()));
+    let mut out = vec![vec![0i64; w * factor]; h * factor];
+    for r in 0..h { for c in 0..w {
+        let v = g[r][c];
+        for dr in 0..factor { for dc in 0..factor { out[r * factor + dr][c * factor + dc] = v; } }
+    }}
+    out
+}
+
+fn grid_place_raw(canvas: &[Vec<i64>], obj: &[Vec<i64>], row: i64, col: i64) -> Vec<Vec<i64>> {
+    let ch = canvas.len();
+    let cw = if ch > 0 { canvas[0].len() } else { 0 };
+    let oh = obj.len();
+    let ow = if oh > 0 { obj[0].len() } else { 0 };
+    let mut out = canvas.to_vec();
+    for r in 0..oh { for c in 0..ow {
+        if obj[r][c] != 0 {
+            let (tr, tc) = (row as isize + r as isize, col as isize + c as isize);
+            if tr >= 0 && (tr as usize) < ch && tc >= 0 && (tc as usize) < cw {
+                out[tr as usize][tc as usize] = obj[r][c];
+            }
+        }
+    }}
+    out
+}
+
+// ── Connected components with position info ─────────────────────────────────
+
+struct ObjectInfo {
+    grid: Vec<Vec<i64>>,
+    row: usize,
+    col: usize,
+    size: usize,
+}
+
+fn grid_cc_with_pos(g: &[Vec<i64>], eight_connected: bool) -> Vec<ObjectInfo> {
+    let h = g.len();
+    let w = g.first().map_or(0, |r| r.len());
+    if h == 0 || w == 0 { return vec![]; }
+    let bg = grid_background(g);
+    let mut labels = vec![vec![0u32; w]; h];
+    let mut next_label = 1u32;
+    let dirs4: &[(i32, i32)] = &[(-1, 0), (1, 0), (0, -1), (0, 1)];
+    let dirs8: &[(i32, i32)] = &[(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)];
+    let dirs = if eight_connected { dirs8 } else { dirs4 };
+    for r in 0..h { for c in 0..w {
+        if g[r][c] != bg && labels[r][c] == 0 {
+            labels[r][c] = next_label;
+            next_label += 1;
+            let mut queue = vec![(r, c)];
+            while let Some((cr, cc)) = queue.pop() {
+                for &(dr, dc) in dirs {
+                    let (nr, nc) = (cr as i32 + dr, cc as i32 + dc);
+                    if nr >= 0 && nr < h as i32 && nc >= 0 && nc < w as i32 {
+                        let (nr, nc) = (nr as usize, nc as usize);
+                        if labels[nr][nc] == 0 && g[nr][nc] != bg {
+                            labels[nr][nc] = labels[r][c]; // use same label
+                            // BUG: should use current label, not labels[r][c] which may differ
+                            // Actually labels[r][c] == next_label - 1, which is correct
+                            // because we set it above. But let's use the captured variable:
+                            labels[nr][nc] = next_label - 1;
+                            queue.push((nr, nc));
+                        }
+                    }
+                }
+            }
+        }
+    }}
+    let mut results = Vec::with_capacity((next_label - 1) as usize);
+    for lbl in 1..next_label {
+        let (mut min_r, mut min_c, mut max_r, mut max_c, mut count) = (h, w, 0usize, 0usize, 0usize);
+        for r in 0..h { for c in 0..w {
+            if labels[r][c] == lbl {
+                min_r = min_r.min(r); min_c = min_c.min(c);
+                max_r = max_r.max(r); max_c = max_c.max(c);
+                count += 1;
+            }
+        }}
+        if max_r >= min_r {
+            let mut comp = vec![vec![0i64; max_c - min_c + 1]; max_r - min_r + 1];
+            for r in min_r..=max_r { for c in min_c..=max_c {
+                if labels[r][c] == lbl { comp[r - min_r][c - min_c] = g[r][c]; }
+            }}
+            results.push(ObjectInfo { grid: comp, row: min_r, col: min_c, size: count });
+        }
+    }
+    results
+}
+
+// ── Spec parsing helper ─────────────────────────────────────────────────────
+
+fn parse_spec_grid_pairs(spec: &Value) -> Result<Vec<(Vec<Vec<i64>>, Vec<Vec<i64>>)>, String> {
+    let pairs = spec.as_list().map_err(|_| "spec must be a list of pairs".to_string())?;
+    let mut result = Vec::with_capacity(pairs.len());
+    for pair in pairs.iter() {
+        let items = pair.as_list().map_err(|_| "spec pair must be a list".to_string())?;
+        if items.len() < 2 { return Err("spec pair must have input and output".into()); }
+        // Unwrap arity-1 wrapper: ((grid)) -> grid
+        let input = match &items[0] {
+            Value::List(l) if l.len() == 1 && matches!(&l[0], Value::List(_)) => as_grid(&l[0])?,
+            v => as_grid(v)?,
+        };
+        let output = as_grid(&items[1])?;
+        result.push((input, output));
+    }
+    Ok(result)
+}
+
+// ── grid-probe-recomp ───────────────────────────────────────────────────────
+// Batch object-level analysis for the object-recomposition task bucket.
+
+fn bi_grid_probe_recomp(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-probe-recomp: expected 1 arg (spec), got {}", args.len()));
+    }
+    let pairs = parse_spec_grid_pairs(&args[0])?;
+    if pairs.is_empty() {
+        return Ok(Value::ns(probe_recomp_result(false, 0, 0, "none", "none", false, "error:empty-spec")));
+    }
+
+    // Analyze objects across all pairs
+    let mut all_in_counts = Vec::new();
+    let mut all_out_counts = Vec::new();
+    let mut in_objects: Vec<Vec<ObjectInfo>> = Vec::new();
+    let mut out_objects: Vec<Vec<ObjectInfo>> = Vec::new();
+
+    for (inp, outp) in &pairs {
+        let in_objs = grid_cc_with_pos(inp, false);
+        let out_objs = grid_cc_with_pos(outp, false);
+        all_in_counts.push(in_objs.len());
+        all_out_counts.push(out_objs.len());
+        in_objects.push(in_objs);
+        out_objects.push(out_objs);
+    }
+
+    let typical_in = all_in_counts.first().copied().unwrap_or(0);
+    let typical_out = all_out_counts.first().copied().unwrap_or(0);
+    let counts_conserved = all_in_counts.iter().zip(all_out_counts.iter()).all(|(a, b)| a == b);
+
+    // Try per-object transform: for each transform, check if applying it to every
+    // object in input and placing back reproduces the output.
+    let transforms: &[(&str, fn(&[Vec<i64>]) -> Vec<Vec<i64>>)] = &[
+        ("rotate-cw", grid_rotate_cw_raw),
+        ("rotate-ccw", grid_rotate_ccw_raw),
+        ("rotate-180", grid_rotate_180_raw),
+        ("flip-h", grid_flip_h_raw),
+        ("flip-v", grid_flip_v_raw),
+    ];
+
+    let mut per_obj_transform = "none".to_string();
+    'xform: for &(name, xf) in transforms {
+        let mut all_match = true;
+        for (pair_idx, (inp, outp)) in pairs.iter().enumerate() {
+            let in_objs = &in_objects[pair_idx];
+            let bg = grid_background(inp);
+            let h = inp.len();
+            let w = if h > 0 { inp[0].len() } else { 0 };
+            let mut canvas = vec![vec![bg; w]; h];
+            for obj_info in in_objs {
+                let transformed = xf(&obj_info.grid);
+                canvas = grid_place_raw(&canvas, &transformed, obj_info.row as i64, obj_info.col as i64);
+            }
+            if !grids_equal(&canvas, outp) {
+                all_match = false;
+                break;
+            }
+        }
+        if all_match {
+            per_obj_transform = name.to_string();
+            break 'xform;
+        }
+    }
+
+    // Try object-index match: output == grid-object(input, idx) for idx 0..5
+    // Also try grid-trim(input)
+    let mut obj_select = "none".to_string();
+    for idx in 0..6 {
+        let mut all_match = true;
+        for (pair_idx, (inp, outp)) in pairs.iter().enumerate() {
+            let in_objs = &in_objects[pair_idx];
+            // Sort by size (largest first) to match grid-object behavior
+            let mut sorted: Vec<&ObjectInfo> = in_objs.iter().collect();
+            sorted.sort_by(|a, b| b.size.cmp(&a.size));
+            if idx >= sorted.len() { all_match = false; break; }
+            if !grids_equal(&sorted[idx].grid, outp) { all_match = false; break; }
+        }
+        if all_match {
+            obj_select = format!("grid-object-{}", idx);
+            break;
+        }
+    }
+    if obj_select == "none" {
+        // Try grid-trim
+        let all_trim = pairs.iter().all(|(inp, outp)| grids_equal(&grid_trim_raw(inp), outp));
+        if all_trim { obj_select = "grid-trim".to_string(); }
+    }
+
+    // Single-object-change: exactly one object differs between input and output
+    let single_change = counts_conserved && pairs.iter().enumerate().all(|(pair_idx, _)| {
+        let in_objs = &in_objects[pair_idx];
+        let out_objs = &out_objects[pair_idx];
+        if in_objs.len() != out_objs.len() || in_objs.is_empty() { return false; }
+        let diffs = in_objs.iter().zip(out_objs.iter())
+            .filter(|(a, b)| !grids_equal(&a.grid, &b.grid))
+            .count();
+        diffs == 1
+    });
+
+    // Assemble subtype string (matches the SELPH pm-subtype-recomp logic)
+    let subtype = if per_obj_transform != "none" {
+        format!("per-object-transform:{}", per_obj_transform)
+    } else if obj_select != "none" {
+        format!("object-select:{}", obj_select)
+    } else if single_change {
+        format!("single-object-change:n={}", typical_in)
+    } else if !counts_conserved {
+        "object-count-change".to_string()
+    } else if typical_in > 0 && typical_in <= 2 {
+        format!("few-objects-recomp:n={}", typical_in)
+    } else if typical_in > 2 {
+        format!("many-objects-recomp:n={}", typical_in)
+    } else {
+        "no-objects-detected".to_string()
+    };
+
+    Ok(Value::ns(probe_recomp_result(
+        counts_conserved, typical_in, typical_out,
+        &per_obj_transform, &obj_select, single_change, &subtype,
+    )))
+}
+
+fn probe_recomp_result(counts_conserved: bool, in_count: usize, out_count: usize,
+    per_obj: &str, obj_sel: &str, single_change: bool, subtype: &str) -> NsMap {
+    let mut map = NsMap::new();
+    map.insert(intern("counts-conserved"), Value::Bool(counts_conserved));
+    map.insert(intern("in-count"), Value::Int(in_count as i64));
+    map.insert(intern("out-count"), Value::Int(out_count as i64));
+    map.insert(intern("per-obj-transform"), Value::str(per_obj));
+    map.insert(intern("obj-select"), Value::str(obj_sel));
+    map.insert(intern("single-change"), Value::Bool(single_change));
+    map.insert(intern("subtype"), Value::str(subtype));
+    map
+}
+
+// ── grid-probe-extract ──────────────────────────────────────────────────────
+// Batch extraction probing: try compact, object-index+trim, color extraction.
+
+fn bi_grid_probe_extract(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-probe-extract: expected 1 arg (spec), got {}", args.len()));
+    }
+    let pairs = parse_spec_grid_pairs(&args[0])?;
+    if pairs.is_empty() {
+        return Ok(Value::ns(probe_extract_result(false, "", "")));
+    }
+
+    // Strategy 1: grid-compact
+    if pairs.iter().all(|(inp, outp)| grids_equal(&grid_compact_raw(inp), outp)) {
+        return Ok(Value::ns(probe_extract_result(true, "grid-compact(x)", "compact")));
+    }
+
+    // Strategy 2: grid-trim(grid-object(input, idx)) for idx 0..5
+    for idx in 0..6usize {
+        let all_match = pairs.iter().all(|(inp, outp)| {
+            let objs = grid_cc_with_pos(inp, false);
+            let mut sorted: Vec<&ObjectInfo> = objs.iter().collect();
+            sorted.sort_by(|a, b| b.size.cmp(&a.size));
+            if idx >= sorted.len() { return false; }
+            grids_equal(&grid_trim_raw(&sorted[idx].grid), outp)
+        });
+        if all_match {
+            return Ok(Value::ns(probe_extract_result(
+                true, &format!("grid-trim(grid-object(x,{}))", idx), "object-trim")));
+        }
+    }
+
+    // Strategy 3: grid-trim(input) directly
+    if pairs.iter().all(|(inp, outp)| grids_equal(&grid_trim_raw(inp), outp)) {
+        return Ok(Value::ns(probe_extract_result(true, "grid-trim(x)", "trim")));
+    }
+
+    // Strategy 4: color-based extraction — for each non-bg color, mask + trim
+    let first_inp = &pairs[0].0;
+    let bg = grid_background(first_inp);
+    let mut colors: Vec<i64> = Vec::new();
+    for row in first_inp { for &c in row {
+        if c != bg && !colors.contains(&c) { colors.push(c); }
+    }}
+    for color in &colors {
+        let all_match = pairs.iter().all(|(inp, outp)| {
+            let ibg = grid_background(inp);
+            let h = inp.len();
+            let w = if h > 0 { inp[0].len() } else { 0 };
+            let masked: Vec<Vec<i64>> = (0..h).map(|r|
+                (0..w).map(|c| if inp[r][c] == *color { *color } else { ibg }).collect()
+            ).collect();
+            grids_equal(&grid_trim_raw(&masked), outp)
+        });
+        if all_match {
+            return Ok(Value::ns(probe_extract_result(
+                true, &format!("trim(mask-to-color(x,{}))", color), "color-extract")));
+        }
+    }
+
+    // Strategy 5: try grid-object(input, idx) directly (without trim)
+    for idx in 0..6usize {
+        let all_match = pairs.iter().all(|(inp, outp)| {
+            let objs = grid_cc_with_pos(inp, false);
+            let mut sorted: Vec<&ObjectInfo> = objs.iter().collect();
+            sorted.sort_by(|a, b| b.size.cmp(&a.size));
+            if idx >= sorted.len() { return false; }
+            grids_equal(&sorted[idx].grid, outp)
+        });
+        if all_match {
+            return Ok(Value::ns(probe_extract_result(
+                true, &format!("grid-object(x,{})", idx), "object-direct")));
+        }
+    }
+
+    Ok(Value::ns(probe_extract_result(false, "", "none")))
+}
+
+fn probe_extract_result(found: bool, source: &str, method: &str) -> NsMap {
+    let mut map = NsMap::new();
+    map.insert(intern("found"), Value::Bool(found));
+    map.insert(intern("source"), Value::str(source));
+    map.insert(intern("method"), Value::str(method));
+    map
+}
+
+// ── grid-probe-scale ────────────────────────────────────────────────────────
+// Try grid-scale(input, N) for each constant N.
+
+fn bi_grid_probe_scale(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-probe-scale: expected 2 args (spec, constants), got {}", args.len()));
+    }
+    let pairs = parse_spec_grid_pairs(&args[0])?;
+    let constants = args[1].as_list().map_err(|_| "grid-probe-scale: constants must be a list".to_string())?;
+
+    for cv in constants.iter() {
+        let n = match cv {
+            Value::Int(n) => *n as usize,
+            Value::Num(n) => *n as usize,
+            _ => continue,
+        };
+        if n == 0 || n > 10 { continue; }
+        let all_match = pairs.iter().all(|(inp, outp)| grids_equal(&grid_scale_raw(inp, n), outp));
+        if all_match {
+            let mut map = NsMap::new();
+            map.insert(intern("found"), Value::Bool(true));
+            map.insert(intern("source"), Value::str(format!("grid-scale(x,{})", n)));
+            map.insert(intern("factor"), Value::Int(n as i64));
+            return Ok(Value::ns(map));
+        }
+    }
+
+    let mut map = NsMap::new();
+    map.insert(intern("found"), Value::Bool(false));
+    map.insert(intern("source"), Value::str(""));
+    map.insert(intern("factor"), Value::Int(0));
+    Ok(Value::ns(map))
+}
+
+// ── grid-diagnose-spec: fast full diagnosis in Rust ─────────────────────────
+// Replaces the slow SELPH pm-diagnose-one classification: size, colors, scale,
+// constant-out, dims-consistent, plus subtype via grid-probe-recomp/extract.
+
+fn bi_grid_diagnose_spec(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-diagnose-spec: expected 1 arg (spec), got {}", args.len()));
+    }
+    let pairs = parse_spec_grid_pairs(&args[0])?;
+    if pairs.is_empty() {
+        let mut m = NsMap::new();
+        m.insert(intern("size"), Value::str("error"));
+        m.insert(intern("colors"), Value::str("error"));
+        m.insert(intern("scale"), Value::str("error"));
+        m.insert(intern("constant-out"), Value::Bool(false));
+        m.insert(intern("dims-consistent"), Value::Bool(false));
+        m.insert(intern("subtype"), Value::str("error:empty"));
+        return Ok(Value::ns(m));
+    }
+
+    // Size category
+    let size_rels: Vec<&str> = pairs.iter().map(|(inp, outp)| {
+        let (ih, iw) = (inp.len(), inp.first().map_or(0, |r| r.len()));
+        let (oh, ow) = (outp.len(), outp.first().map_or(0, |r| r.len()));
+        if ih == oh && iw == ow { "same-size" }
+        else if oh <= ih && ow <= iw { "shrink" }
+        else if oh >= ih && ow >= iw { "grow" }
+        else { "reshape" }
+    }).collect();
+    let size_cat = if size_rels.iter().all(|s| *s == size_rels[0]) {
+        size_rels[0].to_string()
+    } else if size_rels.iter().all(|s| *s == "shrink" || *s == "same-size") {
+        "shrink".to_string()
+    } else if size_rels.iter().all(|s| *s == "grow" || *s == "same-size") {
+        "grow".to_string()
+    } else { "mixed-size".to_string() };
+
+    // Color category
+    fn unique_colors(g: &[Vec<i64>]) -> Vec<i64> {
+        let mut c = Vec::new();
+        for row in g { for &v in row { if !c.contains(&v) { c.push(v); } } }
+        c
+    }
+    let color_rels: Vec<&str> = pairs.iter().map(|(inp, outp)| {
+        let ic = unique_colors(inp);
+        let oc = unique_colors(outp);
+        let out_in_in = oc.iter().all(|c| ic.contains(c));
+        let in_in_out = ic.iter().all(|c| oc.contains(c));
+        if out_in_in && in_in_out { "same-colors" }
+        else if out_in_in { "color-subset" }
+        else if in_in_out { "color-superset" }
+        else { "new-colors" }
+    }).collect();
+    let color_cat = if color_rels.iter().all(|s| *s == color_rels[0]) {
+        color_rels[0].to_string()
+    } else { "mixed-colors".to_string() };
+
+    // Scale category
+    let h_ratios: Vec<i64> = pairs.iter().map(|(inp, outp)| {
+        let ih = inp.len() as i64;
+        let oh = outp.len() as i64;
+        if ih > 0 && oh > 0 && oh % ih == 0 { oh / ih } else { -1 }
+    }).collect();
+    let scale_cat = if h_ratios.iter().all(|r| *r == h_ratios[0]) && h_ratios[0] > 1 {
+        format!("scale-{}x", h_ratios[0])
+    } else if h_ratios.iter().all(|r| *r == 1) {
+        "no-scale".to_string()
+    } else { "no-uniform-scale".to_string() };
+
+    // Constant output
+    let constant_out = if pairs.len() > 1 {
+        let first_out = &pairs[0].1;
+        pairs[1..].iter().all(|(_, outp)| grids_equal(first_out, outp))
+    } else { false };
+
+    // Dims consistent
+    let dims: Vec<(usize, usize)> = pairs.iter().map(|(_, outp)| {
+        (outp.len(), outp.first().map_or(0, |r| r.len()))
+    }).collect();
+    let dims_consistent = dims.iter().all(|d| *d == dims[0]);
+
+    // Subtype: dispatch to probe builtins based on size/color
+    let subtype = if size_cat == "same-size" && color_cat == "same-colors" {
+        // Use recomp probe
+        let probe_result = bi_grid_probe_recomp(args, _env)?;
+        if let Value::Ns(ns) = &probe_result {
+            ns.get(&intern("subtype")).map(|v| value_to_string(v)).unwrap_or_else(|| "error".into())
+        } else { "error".into() }
+    } else if size_cat == "shrink" {
+        // Use extract probe for subtype
+        let probe_result = bi_grid_probe_extract(args, _env)?;
+        if let Value::Ns(ns) = &probe_result {
+            let found = ns.get(&intern("found")).map(|v| matches!(v, Value::Bool(true))).unwrap_or(false);
+            let source = ns.get(&intern("source")).map(|v| value_to_string(v)).unwrap_or_default();
+            if found { format!("direct:{}", source) }
+            else {
+                // Object info summary
+                let (inp, outp) = &pairs[0];
+                let in_objs = grid_cc_with_pos(inp, false);
+                let out_objs = grid_cc_with_pos(outp, false);
+                format!("complex:in={}obj-{}x{}>out={}obj-{}x{}",
+                    in_objs.len(), inp.len(), inp.first().map_or(0, |r| r.len()),
+                    out_objs.len(), outp.len(), outp.first().map_or(0, |r| r.len()))
+            }
+        } else { "error".into() }
+    } else { "n/a".into() };
+
+    let mut m = NsMap::new();
+    m.insert(intern("size"), Value::str(&size_cat));
+    m.insert(intern("colors"), Value::str(&color_cat));
+    m.insert(intern("scale"), Value::str(&scale_cat));
+    m.insert(intern("constant-out"), Value::Bool(constant_out));
+    m.insert(intern("dims-consistent"), Value::Bool(dims_consistent));
+    m.insert(intern("subtype"), Value::str(&subtype));
+    Ok(Value::ns(m))
+}
+
+// ── Original connected components (kept for existing callers) ───────────────
+
 fn grid_connected_components(g: &[Vec<i64>], eight_connected: bool) -> Vec<Vec<Vec<i64>>> {
     let h = g.len();
     let w = g.first().map_or(0, |r| r.len());
@@ -3680,6 +4240,8 @@ fn bi_grid_compact(args: &[Value], _env: &Env) -> Result<Value, String> {
 pub fn convert_tree(old: &[OldNode]) -> Vec<Node> {
     init_special_forms_lazy();
     let defmacro_sym = intern("defmacro");
+    let thread_first_sym = intern("->");
+    let thread_last_sym = intern("->>");
     let mut new: Vec<Node> = Vec::with_capacity(old.len());
 
     // First pass: convert each node in place, preserving indices. Defmacro
@@ -3745,6 +4307,73 @@ pub fn convert_tree(old: &[OldNode]) -> Vec<Node> {
 
         // Replace this App with SpecialApp(Define, [name, lambda_idx]).
         new[i] = Node::SpecialApp(SpecialForm::Define, vec![name_idx, lambda_idx]);
+    }
+
+    // Third pass: desugar threading macros (-> and ->>).
+    //
+    // (-> x (f a) (g b c))   →  (g (f x a) b c)     thread-first
+    // (->> x (f a) (g b c))  →  (g b c (f a x))     thread-last
+    //
+    // Bare symbols are wrapped: (-> x f) → (f x)
+    // Single-step is valid:     (-> x (f a)) → (f x a)
+    //
+    // We iterate the original index range; newly appended nodes from this
+    // pass are threading results and won't themselves be -> / ->> forms.
+    let thread_pass_len = new.len();
+    for i in 0..thread_pass_len {
+        let (initial_idx, steps, is_first) = match &new[i] {
+            Node::App(children) if children.len() >= 3 => {
+                if let Node::Symbol(s) = &new[children[0]] {
+                    if *s == thread_first_sym {
+                        (children[1], children[2..].to_vec(), true)
+                    } else if *s == thread_last_sym {
+                        (children[1], children[2..].to_vec(), false)
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+
+        // Build nested applications from left to right. `acc` is the index
+        // of the "threaded" value so far.
+        let mut acc = initial_idx;
+        for step_idx in steps {
+            // Each step is either a bare symbol or an App (f arg1 arg2 ...).
+            let new_app_children = match &new[step_idx] {
+                Node::Symbol(_) => {
+                    // (-> x f) → (f x)
+                    vec![step_idx, acc]
+                }
+                Node::App(step_children) if !step_children.is_empty() => {
+                    // Thread-first: insert acc after the head (position 1).
+                    // Thread-last:  append acc at the end.
+                    let mut children = Vec::with_capacity(step_children.len() + 1);
+                    if is_first {
+                        children.push(step_children[0]); // head
+                        children.push(acc);               // threaded value
+                        children.extend_from_slice(&step_children[1..]); // rest
+                    } else {
+                        children.extend_from_slice(step_children); // all original
+                        children.push(acc);                        // threaded value
+                    }
+                    children
+                }
+                _ => {
+                    // Anything else (literal, etc.): treat as a unary call.
+                    vec![step_idx, acc]
+                }
+            };
+            let app_idx = new.len();
+            new.push(Node::App(new_app_children));
+            acc = app_idx;
+        }
+
+        // Replace the original threading form with the final accumulated App.
+        new[i] = new[acc].clone();
     }
 
     new
@@ -5735,5 +6364,105 @@ mod tests {
         "#;
         let r = run_file(src).unwrap();
         assert!(matches!(r, Value::Bool(true)));
+    }
+
+    // ── Threading macros (-> and ->>) ─────────────────────────────────
+
+    #[test]
+    fn thread_first_two_steps() {
+        // (-> 1 (add 2) (multiply 3)) → (multiply (add 1 2) 3) → 9
+        let src = r#"(-> 1 (add 2) (multiply 3))"#;
+        let (old, root) = crate::parser::parse_source(src).unwrap();
+        let new = rc(convert_tree(&old));
+        let env = make_default_env();
+        let r = eval(&new, root, &env).unwrap();
+        assert!(matches!(r, Value::Int(9)), "got {:?}", r);
+    }
+
+    #[test]
+    fn thread_last_two_steps() {
+        // (->> 1 (add 2) (multiply 3)) → (multiply 3 (add 2 1)) → 9
+        let src = r#"(->> 1 (add 2) (multiply 3))"#;
+        let (old, root) = crate::parser::parse_source(src).unwrap();
+        let new = rc(convert_tree(&old));
+        let env = make_default_env();
+        let r = eval(&new, root, &env).unwrap();
+        assert!(matches!(r, Value::Int(9)), "got {:?}", r);
+    }
+
+    #[test]
+    fn thread_first_bare_symbols() {
+        // (-> -3 abs) → (abs -3) → 3
+        // Use a known unary function.
+        let src = r#"(-> -3 abs)"#;
+        let (old, root) = crate::parser::parse_source(src).unwrap();
+        let new = rc(convert_tree(&old));
+        let env = make_default_env();
+        let r = eval(&new, root, &env).unwrap();
+        assert!(matches!(r, Value::Int(3)), "got {:?}", r);
+    }
+
+    #[test]
+    fn thread_first_single_step() {
+        // (-> 5 (add 10)) → (add 5 10) → 15
+        let src = r#"(-> 5 (add 10))"#;
+        let (old, root) = crate::parser::parse_source(src).unwrap();
+        let new = rc(convert_tree(&old));
+        let env = make_default_env();
+        let r = eval(&new, root, &env).unwrap();
+        assert!(matches!(r, Value::Int(15)), "got {:?}", r);
+    }
+
+    #[test]
+    fn thread_first_many_steps() {
+        // (-> 0 (add 1) (add 2) (add 3) (add 4)) → 10
+        let src = r#"(-> 0 (add 1) (add 2) (add 3) (add 4))"#;
+        let (old, root) = crate::parser::parse_source(src).unwrap();
+        let new = rc(convert_tree(&old));
+        let env = make_default_env();
+        let r = eval(&new, root, &env).unwrap();
+        assert!(matches!(r, Value::Int(10)), "got {:?}", r);
+    }
+
+    #[test]
+    fn thread_first_with_let_and_lambda() {
+        // Combine threading with let bindings.
+        let src = r#"
+            (let ((base 10))
+              (-> base (add 5) (multiply 2)))
+        "#;
+        let r = run_file(src).unwrap();
+        // (multiply (add 10 5) 2) → 30
+        assert!(matches!(r, Value::Int(30)), "got {:?}", r);
+    }
+
+    #[test]
+    fn thread_first_with_string_ops() {
+        // (-> "hello" (string-concat " world") string-length) → 11
+        let src = r#"(-> "hello" (string-concat " world") string-length)"#;
+        let (old, root) = crate::parser::parse_source(src).unwrap();
+        let new = rc(convert_tree(&old));
+        let env = make_default_env();
+        let r = eval(&new, root, &env).unwrap();
+        assert!(matches!(r, Value::Int(11)), "got {:?}", r);
+    }
+
+    #[test]
+    fn thread_last_differs_from_first() {
+        // (-> 10 (subtract 3))  → (subtract 10 3) → 7   (thread-first)
+        // (->> 10 (subtract 3)) → (subtract 3 10) → -7  (thread-last)
+        let src_first = r#"(-> 10 (subtract 3))"#;
+        let src_last = r#"(->> 10 (subtract 3))"#;
+
+        let (old1, root1) = crate::parser::parse_source(src_first).unwrap();
+        let new1 = rc(convert_tree(&old1));
+        let env = make_default_env();
+        let r1 = eval(&new1, root1, &env).unwrap();
+        assert!(matches!(r1, Value::Int(7)), "thread-first got {:?}", r1);
+
+        let (old2, root2) = crate::parser::parse_source(src_last).unwrap();
+        let new2 = rc(convert_tree(&old2));
+        let r2 = eval(&new2, root2, &env).unwrap();
+        assert!(matches!(r2, Value::Int(-7)), "thread-last got {:?}", r2);
     }
 }
