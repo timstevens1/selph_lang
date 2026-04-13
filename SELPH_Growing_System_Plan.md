@@ -100,12 +100,8 @@ The M-chain is a set of recognition stages that run before enumeration. Each sta
 ```
 selph eval       Evaluate SELPH files or expressions
 selph parse      Parse and print AST
-selph synth      Synthesize from examples
-selph grow       Run curriculum (legacy core)
-selph grow-v2    Run curriculum (v2 core, primary)
-selph bench      Run stochastic benchmark suite
-selph generate   Generate a curriculum in .selph format
-selph verify     Verify a program against a spec
+selph grow       Run curriculum (synth_v2 core)
+selph arc        Convert ARC JSON to curriculum format
 selph repl       Interactive REPL
 selph help       Show usage
 ```
@@ -805,6 +801,18 @@ Directly reduces the cost of writing new M-chain forms and rx-guided decomposers
 #### Tests
 
 18 new tests (all passing): atoms, unquote, splicing, mixed, nested QQ, if/lambda/let in QQ, practical grid patterns. 449 existing tests unaffected.
+
+#### V1 engine removal + Python layer deletion
+
+Removed the entire v1 engine and Python layer in the same session:
+
+**Rust v1 modules deleted (13 files, ~16,000 lines):** `eval.rs`, `synth.rs`, `vm.rs`, `hm.rs`, `meta.rs`, `verify.rs`, `stochastic.rs`, `multitree.rs`, `abstraction.rs`, `library.rs`, `namespace.rs`, `taskgen.rs`, `trace.rs`.
+
+**V1 CLI commands removed (8):** `synth`, `grow`/`curriculum` (legacy), `bench`, `generate`, `verify`, `multi-synth`, `meta-opt`, `arc --synth`. The `eval` and `repl` commands were ported to eval_v2; `grow` now aliases `grow-v2`; `arc` retained as a curriculum converter only.
+
+**Python layer deleted:** `lib.rs` (1,872 lines PyO3 bindings), `selph/` package (19 modules), `tests/` (15 test files), `experiments/` (10 scripts), `pyproject.toml`, pyo3 dependency from Cargo.toml.
+
+**Result:** 38,774 → 18,896 lines of Rust (51% reduction). 9 pre-existing multitree test failures eliminated. 251 tests pass, 0 fail. The codebase is now purely: Rust kernel (9 files) + SELPH curriculum scripts.
 
 ---
 
