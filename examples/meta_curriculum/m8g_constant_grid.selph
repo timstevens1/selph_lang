@@ -404,6 +404,117 @@
         scalar-pool
         nil))))
 
+; ── Form 6: translation — grid-translate(x, dr, dc) ──────────────────
+;
+; Probe small integer offsets. Covers shift-right, shift-left, shift-up,
+; shift-down, and diagonal translations. O(25) probes for offsets -2..+2.
+
+(define m8g-try-form-6
+  (lambda (inputs target)
+    (let ((offsets (list -2 -1 0 1 2)))
+      (m8g-try-form-6-loop inputs target offsets offsets))))
+
+(define m8g-try-form-6-loop
+  (lambda (inputs target drs dcs)
+    (if (= (length drs) 0) nil
+      (let ((dr (head drs)))
+        (let ((result (m8g-try-form-6-dc inputs target dr dcs)))
+          (if (not (nil? result)) result
+            (m8g-try-form-6-loop inputs target (tail drs) dcs)))))))
+
+(define m8g-try-form-6-dc
+  (lambda (inputs target dr dcs)
+    (if (= (length dcs) 0) nil
+      (let ((dc (head dcs)))
+        (if (and (= dr 0) (= dc 0)) ; skip identity
+          (m8g-try-form-6-dc inputs target dr (tail dcs))
+          (let ((col (map (lambda (inp) (try (grid-translate (head inp) dr dc) nil)) inputs)))
+            (if (reduce (lambda (acc i) (and acc (not (nil? (nth col i))) (= (nth col i) (nth target i)))) (range (length target)) true)
+              (ns ("kind" (concat "form-6-translate-" dr "-" dc))
+                  ("source-node"
+                    (m8g-wrap-lambda
+                      (make-app "grid-translate"
+                        (make-app "nth" (make-symbol "x") (make-int 0))
+                        (make-int dr)
+                        (make-int dc)))))
+              (m8g-try-form-6-dc inputs target dr (tail dcs)))))))))
+
+; ── Form 7: mirror — hconcat/vconcat with flip ──────────────────────
+;
+; Probes:
+;   grid-hconcat(x, grid-flip-h(x))   — horizontal mirror
+;   grid-vconcat(x, grid-flip-v(x))   — vertical mirror
+;   grid-hconcat(grid-flip-h(x), x)   — reverse horizontal mirror
+;   grid-vconcat(grid-flip-v(x), x)   — reverse vertical mirror
+
+(define m8g-try-form-7
+  (lambda (inputs target)
+    (m8g-try-form-7-loop inputs target
+      (list
+        (list "mirror-h"
+          (lambda (g) (grid-hconcat g (grid-flip-h g)))
+          (lambda () (m8g-wrap-lambda
+            (make-app "grid-hconcat"
+              (make-app "nth" (make-symbol "x") (make-int 0))
+              (make-app "grid-flip-h" (make-app "nth" (make-symbol "x") (make-int 0)))))))
+        (list "mirror-v"
+          (lambda (g) (grid-vconcat g (grid-flip-v g)))
+          (lambda () (m8g-wrap-lambda
+            (make-app "grid-vconcat"
+              (make-app "nth" (make-symbol "x") (make-int 0))
+              (make-app "grid-flip-v" (make-app "nth" (make-symbol "x") (make-int 0)))))))
+        (list "mirror-h-rev"
+          (lambda (g) (grid-hconcat (grid-flip-h g) g))
+          (lambda () (m8g-wrap-lambda
+            (make-app "grid-hconcat"
+              (make-app "grid-flip-h" (make-app "nth" (make-symbol "x") (make-int 0)))
+              (make-app "nth" (make-symbol "x") (make-int 0))))))
+        (list "mirror-v-rev"
+          (lambda (g) (grid-vconcat (grid-flip-v g) g))
+          (lambda () (m8g-wrap-lambda
+            (make-app "grid-vconcat"
+              (make-app "grid-flip-v" (make-app "nth" (make-symbol "x") (make-int 0)))
+              (make-app "nth" (make-symbol "x") (make-int 0))))))))))
+
+(define m8g-try-form-7-loop
+  (lambda (inputs target candidates)
+    (if (= (length candidates) 0) nil
+      (let ((entry (head candidates)))
+        (let ((name (nth entry 0))
+              (op   (nth entry 1))
+              (emit (nth entry 2)))
+          (let ((col (map (lambda (inp) (try (op (head inp)) nil)) inputs)))
+            (if (reduce (lambda (acc i) (and acc (not (nil? (nth col i))) (= (nth col i) (nth target i)))) (range (length target)) true)
+              (ns ("kind" (concat "form-7-" name))
+                  ("source-node" (emit)))
+              (m8g-try-form-7-loop inputs target (tail candidates)))))))))
+
+; ── Form 8: fill enclosed ────────────────────────────────────────────
+
+(define m8g-try-form-8
+  (lambda (inputs target)
+    (let ((col (map (lambda (inp) (try (grid-fill-enclosed (head inp)) nil)) inputs)))
+      (if (reduce (lambda (acc i) (and acc (not (nil? (nth col i))) (= (nth col i) (nth target i)))) (range (length target)) true)
+        (ns ("kind" "form-8-fill-enclosed")
+            ("source-node"
+              (m8g-wrap-lambda
+                (make-app "grid-fill-enclosed"
+                  (make-app "nth" (make-symbol "x") (make-int 0))))))
+        nil))))
+
+; ── Chain helper: try a list of form-thunks in order ─────────────────
+;
+; Each thunk returns nil (no match) or a result namespace.
+
+(define m8g-try-chain
+  (lambda (forms)
+    (if (= (length forms) 0)
+      (ns ("found" false) ("reason" "no grid shape matched"))
+      (let ((result (try ((head forms)) nil)))
+        (if (not (nil? result))
+          (ns-put result "found" true)
+          (m8g-try-chain (tail forms)))))))
+
 ; ── Top-level: detect-constant-grid ──────────────────────────────────
 
 (define detect-constant-grid
@@ -411,30 +522,19 @@
     (let ((target (m8g-grid-target s)))
       (if (nil? target)
         (ns ("found" false) ("reason" "non-grid target"))
-        (let ((r1 (m8g-try-form-1 target)))
-          (if (not (nil? r1))
-            (ns-put r1 "found" true)
-            (let ((pool (m8g-build-pool s))
-                  (inputs (ns-get s "inputs"))
-                  (outputs (ns-get s "outputs")))
-              ; Form 2: unary transform match
-              (let ((r2 (m8g-try-form-2 pool target)))
-                (if (not (nil? r2))
-                  (ns-put r2 "found" true)
-                  ; Form 3: binary grid op
-                  (let ((r3 (try (m8g-try-form-3 pool target) nil)))
-                    (if (not (nil? r3))
-                      (ns-put r3 "found" true)
-                      ; Form 4: color mapping
-                      (let ((r4 (try (m8g-try-form-4 inputs outputs target) nil)))
-                        (if (not (nil? r4))
-                          (ns-put r4 "found" true)
-                          ; Form 5: classify by scalar feature
-                          (let ((r5 (try (m8g-try-form-5 s target) nil)))
-                            (if (not (nil? r5))
-                              (ns-put r5 "found" true)
-                              (ns ("found" false) ("reason" "no grid shape matched")))))))))))))))))
-
+        (let ((pool (m8g-build-pool s))
+              (inputs (ns-get s "inputs"))
+              (outputs (ns-get s "outputs")))
+          (m8g-try-chain
+            (list
+              (lambda () (m8g-try-form-1 target))
+              (lambda () (m8g-try-form-2 pool target))
+              (lambda () (m8g-try-form-6 inputs target))
+              (lambda () (m8g-try-form-7 inputs target))
+              (lambda () (m8g-try-form-8 inputs target))
+              (lambda () (m8g-try-form-3 pool target))
+              (lambda () (m8g-try-form-4 inputs outputs target))
+              (lambda () (m8g-try-form-5 s target)))))))))
 ; ── Smoke tests ──────────────────────────────────────────────────────
 
 (define m8g-make-spec
