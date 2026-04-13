@@ -86,9 +86,9 @@ The M-chain is a set of recognition stages that run before enumeration. Each sta
 |--------|-------|--------|---------------|
 | Physics (Stages 1–7) | 37 | **37/37** | M-chain + affine fit + separability decomposers |
 | Strings / POS | 28 | **28/28** | Type-dependent pools + Forms 1–6 recognizers |
-| Grids (ARC) | 9 | **9/9** | Grid builtins + detector Forms 1+2 + chain dispatch |
+| Grids (ARC scaffolding) | 13 | **13/13** | Forms 1–8, cross-type bridges, object indexing |
 | Original 3-domain chain | 55 | **55/55** | Sequence → CF → NL, library cascade |
-| ARC-AGI-1 (eval) | 400 | **14/400** | Grid synthesis + pool pruning |
+| ARC-AGI-1 (eval) | 400 | **23/400** | Grid Forms 1–8 + object-level primitives |
 
 ### 2.7 CLI Commands
 
@@ -442,55 +442,105 @@ Next steps:
 
 ---
 
-### 9.50 Post-mortem meta-learning — diagnostic-driven curriculum (April 12, 2026)
+### 9.50 Post-mortem meta-learning + object-level grid primitives (April 12, 2026)
 
-Infrastructure for the system to analyze its own failures after a curriculum run and guide what to build next.
+Two threads: (1) infrastructure for the system to analyze its own failures and guide what to build next, and (2) expanding the grid primitive vocabulary to cover ARC task patterns beyond simple spatial transforms.
 
 #### Kernel changes
 
-- **`StrategyResult` diagnostics:** `output_type` and `m_chain_ran` fields on every synthesis result. Surfaces what type the task wanted and whether the M-chain was consulted.
-- **`__curriculum_results__` binding:** `cmd_grow_v2` accumulates per-task result namespaces (name, found, candidates, output-type, m-chain-ran, strategy, spec, test, arity, depth) and binds them into the env after the task loop.
-- **`run-post-mortem` hook:** If defined in env, grow-v2 calls it with the results list and prints the returned diagnostics.
-- **`synthesize-args` test forwarding fix:** The builtin was not forwarding held-out test pairs to `synthesize_args_with_test`, allowing memorization solutions to pass. Fixed to read the `"test"` field from the spec namespace.
+- **`StrategyResult` diagnostics:** `output_type` and `m_chain_ran` fields on every synthesis result.
+- **`__curriculum_results__` binding:** grow-v2 accumulates per-task result namespaces and binds them into the env after the task loop.
+- **`run-post-mortem` hook:** If defined in env, grow-v2 calls it with the results list and prints diagnostics.
+- **`synthesize-args` test forwarding fix:** The builtin was not forwarding held-out test pairs, allowing memorization to pass. Fixed.
+- **`extra-seeds` field:** Both `synthesize` and `synthesize-args` builtins accept an `"extra-seeds"` list of literal values injected as depth-0 constants. Widens the reachable type set for cross-type compositions.
+- **`as_grid` type loosening:** Grid builtins now accept both `Value::Int` and `Value::Num` cells.
 
-#### `post_mortem.selph` — pure SELPH spec analysis
+#### New grid builtins (11 total)
 
-Classifies each failed task across 6 dimensions:
-- **size:** same-size / shrink / grow / reshape / mixed
-- **colors:** same-colors / color-subset / color-superset / new-colors
-- **constant-out:** whether all training outputs are identical
-- **dims-consistent:** whether all outputs share the same dimensions
-- **objects:** foreground color count (proxy for object complexity)
-- **scale:** integer height ratio between input/output
+| Builtin | Signature | Purpose |
+|---------|-----------|---------|
+| `grid-scale` | Grid × Int → Grid | Scale each cell to N×N block |
+| `grid-tile` | Grid × Int [× Int] → Grid | Tile grid N×M times |
+| `grid-fill-enclosed` | Grid → Grid | Fill interior holes |
+| `grid-compact` | Grid → Grid | Remove all-zero rows/cols |
+| `grid-object` | Grid × Int → Grid | Nth object (sorted by size, 0=largest) |
+| `grid-object-pos` | Grid × Int → (row, col) | Position of nth object |
+| `grid-place` | Grid × Grid × Int × Int → Grid | Overlay object at position |
+| `grid-translate` | Grid × Int × Int → Grid | Shift non-bg cells by (dr, dc) |
+| `grid-find-color` | Grid × Int → List | Positions of a color |
+| `grid-mask` | Grid × Grid × Int → Grid | Apply mask with fill color |
+| `grid-blank` | Int × Int [× Int] → Grid | Create uniform grid |
 
-Also probes every unary grid builtin (depth 1) and depth-2 compositions against each failure's spec data.
+Size guards on `grid-scale` (max 10×) and `grid-tile` (max 100×100) prevent memory explosion during enumeration.
 
-#### Key findings
+#### Primitive catalog: cross-type bridges
 
-- **ARC-AGI-1 (400 training):** 14/400 solved (M-chain spatial transforms). Post-mortem: same-size=251, shrink=98, grow=36. 20 tasks have integer scaling (2x/3x). Zero tasks solvable by depth-1 or depth-2 builtin probing beyond what M-chain already catches.
-- **ARC-AGI-2 (120 eval):** 0/120 solved. Post-mortem: same-size=81, shrink=27, same-colors=60, color-subset=38.
-- **Bug found:** `synthesize-args` builtin was not forwarding held-out test data, allowing M-chain Form 5 memorization to pass. The post-mortem's retry loop exposed this — 266 "recovered" tasks were all training-data memorization that failed held-out validation.
+Added to `primitive_components()` for Flat enumeration:
+- **Grid → Int:** `grid-height`, `grid-width`, `grid-object-count`
+- **(Grid, Int) → Grid:** `grid-scale`, `grid-tile`, `grid-object`
+- **(Grid, Int, Int) → Grid:** `grid-translate`
 
-#### New grid builtins
+Binary Grid × Grid → Grid ops (`grid-hconcat`, `grid-vconcat`, `grid-xor`) stay out of the primitive catalog to avoid combinatorial explosion. The M-chain handles them via targeted probing.
 
-- `grid-scale` — scale grid by integer factor
-- `grid-tile` — tile grid NxM times
-- `grid-fill-enclosed` — fill interior background cells
-- `grid-compact` — remove all-zero rows and columns
+#### M-chain Forms 6–8 (pure SELPH, `m8g_constant_grid.selph`)
 
-Added to `m_pool_grid` unary catalog: `grid-fill-enclosed`, `grid-compact`.
+- **Form 6 — Translation.** Probes `grid-translate(x, dr, dc)` for offsets −2..+2. O(25) probes. Catches shift-right, shift-down, diagonal translations.
+- **Form 7 — Mirror.** Probes `grid-hconcat(x, grid-flip-h(x))` and `grid-vconcat(x, grid-flip-v(x))` in both orders. 4 probes.
+- **Form 8 — Fill enclosed.** Probes `grid-fill-enclosed(x)`.
+
+Refactored m8g dispatcher to use `m8g-try-chain` helper (list of thunks, first match wins). Eliminates deeply nested let/if chains.
+
+#### `post_mortem.selph` — diagnostic spec analysis
+
+Classifies each failed task across 6 dimensions (size, colors, constant-out, dims-consistent, objects, scale). Probes unary grid builtins at depth 1+2. Discovers implicit constants (dimension ratios) and retries with `extra-seeds`.
 
 #### Scaffolding curriculum (`arc_scaffolding_curriculum.selph`)
 
-8 tasks for grid operations the M-chain doesn't cover: extract_object, scale_2x, scale_3x, tile_2x2, mirror_h, mirror_v, fill_enclosed, compact. With held-out validation to reject memorization.
+13 tasks across 5 stages, all with held-out test data:
 
-**Results:** 2/8 solve (extract_object via `grid-trim`, compact via `grid-compact`). Remaining 6 need multi-arg builtins (scale/tile need a factor arg not reachable from arity-1 spec) or depth-2 compositions (mirror needs `grid-hconcat(x, grid-flip-h(x))`).
+| Stage | Tasks | Solved | Solution pattern |
+|-------|-------|--------|------------------|
+| A: Extractors | grid_height, grid_width | 2/2 | `grid-height(x)`, `grid-width(x)` via Flat |
+| B: Single-op | extract_object, compact, scale_2x, scale_3x | 4/4 | `grid-trim`, `grid-compact`, `grid-scale(x,2/3)` |
+| C: Object access | largest_object, smallest_object | 2/2 | `grid-object(x,0)`, `grid-object(x,1)` via Flat |
+| D: Translation | shift_right, shift_down | 2/2 | `grid-translate(x,0,1)`, `grid-translate(x,1,0)` via Form 6 |
+| E: Composition | fill_enclosed, mirror_h, mirror_v | 3/3 | Form 8 + Form 7 (hconcat/vconcat + flip) |
 
-#### Status
+**13/13 solved.** All become library functions for M7 to compose against ARC tasks.
 
-The post-mortem pipeline works end-to-end: run → diagnose → probe → report. The diagnostic breakdown is actionable — it identifies exactly which operation families to prioritize. The scaffolding curriculum demonstrates the pattern: hand-write tasks for needed primitives, solve them to build library, compose for harder tasks.
+#### ARC-AGI-1 results
 
-**Next:** Depth-2 composition probing in the M-chain (binary ops like `grid-hconcat` applied to two unary results). Multi-arg scaffolding for scale/tile. Fill-enclosed bug fix.
+**23/400** (was 14/400). 9 new tasks solved:
+
+| Pattern | Tasks | Solution |
+|---------|-------|----------|
+| Object extraction | 2 | `grid-object(x, 0)` |
+| Translation | 1 | `grid-translate(x, 1, 0)` |
+| Mirror (h+v) | 4 | `grid-hconcat(x, grid-flip-h(x))` etc. |
+| Scaling | 2 | `grid-scale(x, 2)`, `grid-scale(x, 3)` |
+
+All via M-chain at 1 candidate each.
+
+#### Bug fixes
+
+- `synthesize-args`: held-out test forwarding (exposed 266 false memorization recoveries)
+- `grid-fill-enclosed`: separate per-value flood fills + fill with nearest differing neighbor (handles bg≠0 cases)
+- `as_grid`: accepts Num cells alongside Int
+
+#### Key architectural insights
+
+1. **The type system was the bottleneck, not search depth.** Grid-scale needed Int constants alongside Grid values. Adding cross-type bridges to the primitive catalog unlocked scale/tile tasks immediately.
+2. **Binary ops in primitives cause combinatorial explosion.** Grid × Grid compositions must stay in the M-chain as targeted probes, not in the enumerator's catalog.
+3. **Object indexing works.** `grid-object(x, 0)` for "extract largest" is the right abstraction — sorted access by size makes objects first-class without complex selection logic.
+4. **M-chain forms are cheap and high-leverage.** Forms 6–8 added 5 ARC solves at 0 enumeration cost (1 candidate each). Each form is ~30 lines of pure SELPH.
+
+#### Next steps
+
+1. **Form 9 — object recomposition.** For each object in the input, try known transforms (rotate, flip, translate) and check if placing the result back reproduces the output. Covers the biggest unsolved bucket (same-size + same-colors structural transforms).
+2. **Pattern repetition detection.** Inverse of `grid-tile`: find the minimal repeating unit in a grid. Catches self-tiling tasks like 007bbfb7.
+3. **Object sort options.** `grid-objects` currently returns objects in scan order, `grid-object` sorts by size. Adding sort-by-position (topmost, leftmost) would handle tasks that reference objects spatially.
+4. **Soft reachability.** When the search space exhausts at ~1200 candidates (hard type wall), the post-mortem could retry with a wider component set. Currently all retries find 0 additional tasks — the gap is in operation vocabulary, not type filtering.
+5. **Close the meta-learning loop.** The post-mortem classifies failures but doesn't automatically propose new forms. The next step: "80 tasks are same-size + same-colors → try object-recomposition Form 9" — curriculum-driven form generation.
 
 ---
 
