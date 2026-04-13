@@ -90,7 +90,8 @@ The M-chain is a set of recognition stages that run before enumeration. Each sta
 | Strings / POS | 28 | **28/28** | Type-dependent pools + Forms 1–6 recognizers |
 | Grids (ARC scaffolding) | 13 | **13/13** | Forms 1–8, cross-type bridges, object indexing |
 | Original 3-domain chain | 55 | **55/55** | Sequence → CF → NL, library cascade |
-| ARC-AGI-1 (eval) | 400 | **23/400** | Grid Forms 1–8 + object-level primitives |
+| ARC-AGI-1 (eval) | 400 | **23/400** | Grid Forms 1-8 + object-level primitives |
+| ARC-AGI-1 (cold, no scaffold curriculum) | 400 | **4/400** | M-chain + auto-scaffolding loop recovers 1 task |
 
 ### 2.7 CLI Commands
 
@@ -538,11 +539,11 @@ All via M-chain at 1 candidate each.
 
 #### Next steps
 
-1. **Form 9 — object recomposition.** For each object in the input, try known transforms (rotate, flip, translate) and check if placing the result back reproduces the output. Covers the biggest unsolved bucket (same-size + same-colors structural transforms).
-2. **Pattern repetition detection.** Inverse of `grid-tile`: find the minimal repeating unit in a grid. Catches self-tiling tasks like 007bbfb7.
+1. **Form 9 — object recomposition.** For each object in the input, try known transforms (rotate, flip, translate) and check if placing the result back reproduces the output. Covers the biggest unsolved bucket (same-size + same-colors structural transforms). **Partially addressed** by `grid-probe-recomp` Rust builtin (§9.52) which does per-object transform probing; not yet wired as an M-chain form.
+2. **Pattern repetition detection.** Inverse of `grid-tile`: find the minimal repeating unit in a grid. Catches self-tiling tasks like 007bbfb7. **Addressed as §9.52 next step 3** (inverse scaffolds).
 3. **Object sort options.** `grid-objects` currently returns objects in scan order, `grid-object` sorts by size. Adding sort-by-position (topmost, leftmost) would handle tasks that reference objects spatially.
 4. **Soft reachability.** When the search space exhausts at ~1200 candidates (hard type wall), the post-mortem could retry with a wider component set. Currently all retries find 0 additional tasks — the gap is in operation vocabulary, not type filtering.
-5. **Close the meta-learning loop.** The post-mortem classifies failures but doesn't automatically propose new forms. The next step: "80 tasks are same-size + same-colors → try object-recomposition Form 9" — curriculum-driven form generation.
+5. ~~Close the meta-learning loop.~~ **Done (§9.52).** Post-mortem now generates scaffolding tasks, solves them, binds solutions as library functions, and re-attempts failures. First auto-recovery: `ccd554ac`.
 
 ---
 
@@ -580,6 +581,97 @@ Already a first-class `Node::Let` with letrec semantics — mutually recursive l
 ```
 
 **Impact:** Pipeline-style SELPH code (M-chain dispatchers, pool builders, post-mortem analysis) can now be written as flat threading pipelines instead of deeply nested calls. This directly improves LLM code generation accuracy for SELPH.
+
+---
+
+### 9.52 Closed meta-learning loop: post-mortem to scaffolding to recovery (April 13, 2026)
+
+The meta-learning loop that was outlined in §9.50 step 5 ("close the meta-learning loop") is now implemented end-to-end. The post-mortem no longer just classifies failures — it acts on them.
+
+#### Architecture
+
+```
+curriculum -> synthesis (3/400)
+  -> diagnose (Rust: grid-diagnose-spec)
+  -> prescribe (SELPH: 11 ranked buckets)
+  -> scaffold (SELPH: generate synthetic tasks from prescriptions)
+  -> solve scaffolds -> bind as library functions
+  -> targeted re-attempt (only buckets matching scaffolded families)
+  = 4/400 total
+```
+
+#### Rust builtins for fast diagnosis (eval_v2.rs, +729 lines)
+
+| Builtin | Purpose |
+|---------|---------|
+| `grid-diagnose-spec` | Full spec classification: size, colors, scale, dims, subtype |
+| `grid-probe-recomp` | Object count conservation, per-object transforms, single-edit |
+| `grid-probe-extract` | Compact, object-trim, color-mask extraction probes |
+| `grid-probe-scale` | Scale factor detection against constant list |
+
+Plus internal helpers: `grid_cc_with_pos` (CC with position data), `grids_equal`, `parse_spec_grid_pairs`, raw grid transform functions. These replaced interpreted SELPH probes that took 10+ minutes on 400 tasks — now <3 seconds.
+
+#### Prescription system (post_mortem.selph)
+
+`pm-prescribe` maps diagnosis signatures to 11 fine-grained action buckets:
+
+| Priority | Prescription | Tasks (of 397) |
+|----------|-------------|----------------|
+| P2 | recomp/single-obj-edit | 14 |
+| P3 | recomp/obj-count-change | 97 |
+| P3 | extract/complex | 90 |
+| P3 | color-filtering | 38 |
+| P3 | scaling-or-tiling | 22 |
+| P3 | recomp/few-objects | 12 |
+| P4 | color-introduction | 87 |
+| P4 | recomp/many-objects | 14 |
+| P4 | grid-composition | 12 |
+| P5 | structural-rearrangement | 2 |
+| P6 | unclassified | 9 |
+
+Sub-classification uses `grid-probe-recomp` to distinguish object-count-change, single-object-edit, few-objects, many-objects, and per-object-transform patterns within the recomposition bucket.
+
+#### Scaffolding generator
+
+`pm-generate-scaffolding` creates synthetic training tasks from prescriptions. 7 scaffold families:
+
+1. **Scaling:** grid-tile (2x2, 3x1, 1x3), grid-scale (2x, 3x)
+2. **Tile-mirror:** hconcat+flip-h, vconcat+flip-v, checkerboard, scale+flip
+3. **Extraction:** grid-trim, grid-compact, grid-object (largest, 2nd)
+4. **Object compositions:** object+rotate, object+flip, object+scale
+5. **Extract by position:** 2nd-largest object, trim+compact
+6. **Color swap:** replace-color, keep-bg-only
+7. **Grid composition:** hconcat-self, vconcat-self, hconcat+rotate
+
+Each scaffold uses small synthetic grids (2x2, 3x3) and is designed to be trivially solvable. Solutions become library functions discoverable by M7.
+
+#### First auto-recovery
+
+Task `ccd554ac` solved with `(lambda (x) (grid-tile (nth x 0) (grid-height (nth x 0))))` — tile a grid N times where N is its height. The scaffolding taught `grid-tile` as a library function; synthesis composed it with the built-in `grid-height` to solve a task that the initial synthesis couldn't reach.
+
+#### Performance
+
+- Post-mortem diagnosis: <3s on 400 tasks (was 10+ min before Rust builtins)
+- 35 scaffolds generated and solved
+- Targeted re-attempt: ~5 min (filters to ~280 tasks matching scaffolded buckets)
+- Total wall time: 5:40 for full 400-task eval with closed loop
+
+#### Flags
+
+- `__pm_skip_recovery__` — skip probe-based auto-recovery phase
+- `__pm_skip_scaffolding__` — skip scaffolding generation + re-attempt
+
+#### Next steps
+
+1. **Task-data scaffolds.** Use failing tasks' own training inputs as scaffold inputs instead of synthetic grids. The task knows what grid shapes it needs — a scaffold built from the actual data is more likely to produce a library function that M7 can compose for the original task.
+
+2. **Depth-3 composition scaffolds.** Current scaffolds are depth 1-2 (single ops or 2-op combos). Many ARC tasks need 3-step chains (e.g., extract object, transform it, place it back). Generate scaffolds with 3-operation compositions.
+
+3. **Inverse scaffolds.** Many extraction tasks are inversions of grow operations. "Given a tiled grid, extract the tile" is the inverse of `grid-tile`. Generating both forward and inverse scaffolds for each operation doubles coverage.
+
+4. **Iterative scaffold refinement.** After the first scaffolding pass recovers some tasks, the recovered solutions become library functions for a second pass. Multiple scaffold-solve-retry iterations could compound recoveries.
+
+5. **Prescription-guided M-chain form generation.** The prescription system knows "97 tasks need object-count-change handling." Instead of scaffolding, generate a new M-chain form (as a SELPH function) that directly probes for the pattern and registers it via `__decomposers__`. This is deeper than scaffolding — it extends the recognition chain itself.
 
 ---
 
