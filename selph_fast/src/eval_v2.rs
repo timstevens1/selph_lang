@@ -2714,7 +2714,8 @@ fn as_grid(v: &Value) -> Result<Vec<Vec<i64>>, String> {
                 for c in cells.iter() {
                     match c {
                         Value::Int(n) => r.push(*n),
-                        _ => return Err("grid: cells must be Int".into()),
+                        Value::Num(n) => r.push(*n as i64),
+                        _ => return Err("grid: cells must be Int or Num".into()),
                     }
                 }
                 grid.push(r);
@@ -3565,44 +3566,60 @@ fn bi_grid_fill_enclosed(args: &[Value], _env: &Env) -> Result<Value, String> {
     for r in &g { for &c in r { *counts.entry(c).or_insert(0usize) += 1; } }
     let bg = counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or(0);
 
-    // Flood fill from border to mark exterior bg cells.
+    // Determine which values can be "hole" values — the bg color,
+    // plus 0 (the universal empty in ARC). Both can represent
+    // interior holes that need filling.
+    let hole_values: Vec<i64> = if bg == 0 { vec![0] } else { vec![bg, 0] };
+
+    // For each hole value, flood from border independently. A cell is
+    // "exterior" if it's reachable from the border via 4-connected cells
+    // of the SAME hole value. This prevents cross-value flooding that
+    // would mark truly interior cells as exterior.
     let mut exterior = vec![vec![false; w]; h];
-    let mut queue = std::collections::VecDeque::new();
-    for r in 0..h {
-        for c in 0..w {
-            if (r == 0 || r == h - 1 || c == 0 || c == w - 1) && g[r][c] == bg {
-                exterior[r][c] = true;
-                queue.push_back((r, c));
+    for &hv in &hole_values {
+        let mut queue = std::collections::VecDeque::new();
+        for r in 0..h {
+            for c in 0..w {
+                if (r == 0 || r == h - 1 || c == 0 || c == w - 1)
+                    && g[r][c] == hv && !exterior[r][c]
+                {
+                    exterior[r][c] = true;
+                    queue.push_back((r, c));
+                }
             }
         }
-    }
-    while let Some((r, c)) = queue.pop_front() {
-        for (dr, dc) in &[(0isize, 1isize), (0, -1), (1, 0), (-1, 0)] {
-            let nr = r as isize + dr;
-            let nc = c as isize + dc;
-            if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
-                let nr = nr as usize;
-                let nc = nc as usize;
-                if !exterior[nr][nc] && g[nr][nc] == bg {
-                    exterior[nr][nc] = true;
-                    queue.push_back((nr, nc));
+        while let Some((r, c)) = queue.pop_front() {
+            for (dr, dc) in &[(0isize, 1isize), (0, -1), (1, 0), (-1, 0)] {
+                let nr = r as isize + dr;
+                let nc = c as isize + dc;
+                if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
+                    let nr = nr as usize;
+                    let nc = nc as usize;
+                    if !exterior[nr][nc] && g[nr][nc] == hv {
+                        exterior[nr][nc] = true;
+                        queue.push_back((nr, nc));
+                    }
                 }
             }
         }
     }
 
-    // For each interior bg cell, fill with nearest non-bg neighbor.
+    // For each interior hole cell, fill with the nearest neighbor that
+    // differs from the cell's own value. This handles both cases:
+    // - Interior 0 surrounded by bg (fills with bg)
+    // - Interior bg surrounded by fg (fills with fg)
     let mut out = g.clone();
     for r in 0..h {
         for c in 0..w {
-            if g[r][c] == bg && !exterior[r][c] {
-                let mut fill = bg;
+            if hole_values.contains(&g[r][c]) && !exterior[r][c] {
+                let cell = g[r][c];
+                let mut fill = cell;
                 for (dr, dc) in &[(0isize, 1isize), (0, -1), (1, 0), (-1, 0)] {
                     let nr = r as isize + dr;
                     let nc = c as isize + dc;
                     if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
                         let v = g[nr as usize][nc as usize];
-                        if v != bg { fill = v; break; }
+                        if v != cell { fill = v; break; }
                     }
                 }
                 out[r][c] = fill;
