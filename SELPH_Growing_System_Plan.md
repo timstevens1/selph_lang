@@ -2,7 +2,7 @@
 
 ## From Enumerative Solver to Self-Building Architecture
 
-**Version 0.13 — April 12, 2026**
+**Version 0.14 — April 13, 2026**
 
 Cleaned up from v0.12 to reflect the project's current state. Detailed implementation logs from §9.1–§9.43 have been condensed into summaries; the full history is preserved in git. Sections 3–5 and 7–8 from the original plan have been collapsed — the project vision shifted significantly per §9.38 (symbolic-first, neural-contingent).
 
@@ -32,6 +32,7 @@ The architecture IS the curriculum. Change the curriculum, change the architectu
 - Value::Node for AST homoiconicity (§9.36) — SELPH programs construct, inspect, and evaluate AST trees as first-class data
 - Macro system via `defmacro` (desugared to `define` + `lambda`)
 - Threading macros `->` (thread-first) and `->>` (thread-last) — desugared at parse time to nested applications, eliminating deep nesting in pipeline-style code
+- Quasiquote (`` ` ``), unquote (`,`), and unquote-splicing (`,@`) — desugared to `make-*` and `quote` calls, enabling concise AST template construction for M-chain forms and decomposers
 - `let` bindings with letrec semantics (mutual recursion via literal lambdas)
 - First-class namespaces with `__types__` and `__decomposers__` registries
 
@@ -47,7 +48,7 @@ The architecture IS the curriculum. Change the curriculum, change the architectu
 - Auto-constant extraction, probe-and-filter, observational equivalence dedup
 - Epsilon-equivalence for float dedup
 
-**Strategy pipeline:** SELPH decomposers (M-chain) → RD → Flat → BD → HO → D&C → Memo
+**Strategy pipeline:** SELPH decomposers (M-chain + rx-guided forms) → RD → Flat → BD → HO → D&C → Memo
 
 - **Recursive Decomposition (RD):** Top-down prediction — classify outermost function family, invert to derive subspecs, recursively solve. 6 family inversions (arithmetic, string-op, count, compare, HO, if-expr). Macro-aware bridge decomposition.
 - **Boolean Decomposition (BD):** Tries `(and P Q)`, `(or P Q)`, `(not P)` compositions of bool-returning macros.
@@ -92,6 +93,7 @@ The M-chain is a set of recognition stages that run before enumeration. Each sta
 | Original 3-domain chain | 55 | **55/55** | Sequence → CF → NL, library cascade |
 | ARC-AGI-1 (eval) | 400 | **27/400** | Grid Forms 1-9 + object-level primitives + color-map |
 | ARC-AGI-1 (cold, no scaffold curriculum) | 400 | **4/400** | M-chain + auto-scaffolding loop recovers 1 task |
+| ARC-AGI-1 (with post-mortem pipeline) | 400 | **TBD** | §9.54: task-data/depth-3/inverse scaffolds + iterative refinement + rx-color-probe |
 
 ### 2.7 CLI Commands
 
@@ -706,6 +708,101 @@ Fixed to emit `(test input output)` — 3-element tuples matching `parse_curricu
 #### Form 8 — fill-enclosed (no bug)
 
 Form 8 correctly unwraps inputs and probes `grid-fill-enclosed`. Confirmed 0 ARC-AGI-1 training tasks where `grid-fill-enclosed(input) == output`. ARC "fill holes" tasks (e.g., `00d62c1b`) introduce new colors (0→4), not adjacent-neighbor fill. Form 8 is correct but targets a pattern absent from this dataset.
+
+---
+
+### 9.54 Scaffold pipeline + prescription-guided form generation (April 13, 2026)
+
+Six improvements to the post-mortem meta-learning loop, targeting higher ARC-AGI-1 coverage through richer scaffolding and dynamic M-chain extension.
+
+#### Items 1-4: Scaffold pipeline improvements (post_mortem.selph)
+
+**Item 1 — Task-data scaffolds.** New `pm-task-data-scaffolds-for-rx`: instead of only using synthetic 3x3/4x4 grids (`pm-sample-grids`), extracts training inputs from failing tasks themselves and applies the same operation families. Scaffolds built from actual task data are more likely to produce library functions that M7 can compose. Size guard filters grids >10x10. Names use `td_<op>_<task>` to avoid collisions. 5 op-family lists cover scaling, extraction, recomp, color-filter, and composition. `pm-generate-scaffolding` now takes `(prescriptions fails)` and appends task-data scaffolds after synthetic + inverse scaffolds.
+
+**Item 2 — Depth-3 composition scaffolds.** Scaffold tuple format changed from `(name spec)` to `(name spec depth)` with backward-compatible default depth 2. New `pm-scaffold-depth3-compositions` generates 7 three-step chain scaffolds (e.g., `grid-trim(grid-rotate-cw(grid-object(x, 0)))`). `pm-solve-scaffolding` reads depth from each tuple, uses budget 100000 for depth>=3 (vs 50000 for depth-2). Wired into `extract/complex` and `recomp/` prescription buckets.
+
+**Item 3 — Inverse scaffolds.** New `pm-scaffold-invertible?` whitelist (tiling, scaling, concat, mirror — NOT extraction or color-swap). `pm-scaffold-inverse-pair` swaps inputs/outputs, bumps depth for compositions. `pm-generate-inverse-scaffolds` filters and maps forward scaffolds to inverses. Appended after forward scaffolds in `pm-generate-scaffolding`.
+
+**Item 4 — Iterative scaffold refinement.** `pm-run-scaffolding-loop` now iterates up to `__pm_max_iterations__` times (default 3). Each iteration: generate scaffolds -> solve -> bind solutions as `pm-lib-<name>` via `eval-source` -> retry failures -> re-diagnose remaining -> re-prescribe -> recurse. New helper `pm-bind-recovered` binds solutions as library functions. `pm-prepare-next-iteration` uses `->` threading macro for clean re-diagnosis pipeline. Early termination on: no scaffolds generated, none solved, none recovered, or max iterations.
+
+#### Item 5: Prescription-guided M-chain form generation (post_mortem.selph)
+
+New capability: the post-mortem generates decomposer functions from failure analysis and registers them dynamically in `__decomposers__`. Runs as "Phase 1.5" between prescription aggregation and scaffolding.
+
+**Color-probe decomposer.** `pm-rx-color-decomposer` probes each task spec for single-color removal patterns: for each non-background color c in training inputs, checks if `grid-replace-color(input, c, background)` matches the output across all pairs (including test validation). Targets `recomp/obj-count-change` (97 tasks), `color-filtering`, and `recomp/single-obj-edit` buckets. Registered via `eval-source` into `__decomposers__` namespace.
+
+Supporting functions: `pm-grid-colors` (extract non-background colors), `pm-try-color-keep` (probe keep/remove per color), `pm-probe-color-form` (full spec probe with test validation), `pm-check-color-all-pairs` (verify across all training pairs), `pm-generate-rx-forms` (orchestrator that inspects prescription buckets and registers decomposers for high-count gaps).
+
+#### Item 6: Arity-1 unwrap cleanup (m8g_constant_grid.selph) — REVERTED
+
+Attempted to unwrap `(list grid) -> grid` once at the top of `detect-constant-grid` and remove ad-hoc `(head inp)` unwraps from Forms 4, 6, 7, 8. Caused 27->24 regression. Investigation needed: likely interaction with `parse_spec_grid_pairs` which has its own unwrap logic that mishandles 1-row grids when receiving already-unwrapped input. Reverted; Forms still use per-form `(head inp)` unwrapping.
+
+#### Infrastructure: grid-untile builtin + 64MB stack (eval_v2.rs, main.rs)
+
+**`grid-untile` Rust builtin.** Given a grid, tries all factor pairs (nr, nc) dividing (height, width). If all sub-grids are identical, returns the smallest tile; otherwise nil. Added to `m_pool_grid.selph` unary ops. Supports inverse scaffolds for tiling tasks.
+
+**64MB default stack.** `main()` now spawns `real_main()` on a thread with 64MB stack (was system default 8MB). The tree-walking evaluator's recursion depth exceeds 8MB when the M-chain + post-mortem functions are loaded together (~2000 define statements in env). Configurable via `RUST_MIN_STACK` env var.
+
+#### Results
+
+ARC-AGI-1 baseline (no post-mortem): 27/400 (unchanged from §9.53). Full pipeline with post-mortem: evaluation in progress.
+
+#### Next steps
+
+1. **Investigate Item 6 regression.** Identify the 3 tasks that break when Forms 4/6/7/8 receive unwrapped grids. Likely `parse_spec_grid_pairs`'s auto-unwrap heuristic (1-row grids look like arity-1 wrappers). Fix in Rust or keep per-form unwrapping.
+
+2. **Expand rx-guided forms.** Current color-probe covers single-color removal. Add: multi-color removal, color-keep (retain only one color), background swap, object-count-based branching.
+
+3. **Reduce stack usage.** The 64MB stack is a band-aid. Consider trampolining or iterative evaluation for deep SELPH recursion. `pm-member?` is O(n) recursive — replace with a hash-based builtin for large lists.
+
+4. **Profile scaffold iteration.** Measure per-iteration yield to determine if 3 iterations is optimal or if 2 suffices.
+
+---
+
+### 9.55 Quasiquote for AST template construction (April 13, 2026)
+
+Every M-chain form and post-mortem decomposer spent ~30-40% of its code manually constructing AST nodes via `make-app`, `make-symbol`, `make-int`, etc. Added quasiquote (`` ` ``), unquote (`,`), and unquote-splicing (`,@`) as syntactic sugar that desugars entirely into existing constructs.
+
+#### Parser changes (parser.rs)
+
+Three new token kinds (`Backtick`, `Comma`, `CommaAt`) recognized in the tokenizer. The parser wraps them as `App([quasiquote, child])`, `App([unquote, child])`, `App([unquote-splicing, child])` — standard Lisp reader-macro approach. `` ` `` added to `is_delimiter`.
+
+#### Desugaring (eval_v2.rs, fourth pass in `convert_tree`)
+
+Recursive `desugar_qq` function with depth tracking for nested quasiquotes:
+
+| Pattern | Desugars to |
+|---|---|
+| `` `atom `` | `(quote atom)` |
+| `` `,expr `` at depth 1 | `expr` (evaluated at runtime) |
+| `` `(f ,x y) `` | `(make-app (quote f) x (quote y))` |
+| `` `(f ,@xs y) `` | `(apply make-app (append (append (list (quote f)) xs) (list (quote y))))` |
+| `` `(if ,c t e) `` | `(make-if c (quote t) (quote e))` |
+| `` `(lambda (x) ,body) `` | `(make-lambda (list "x") body)` |
+| `` `(let ((a ,v)) ,b) `` | `(make-let (list (list "a" v)) b)` |
+
+**No new builtins, no new Node variants, no new SpecialForms.** Uses existing `quote`, `make-app`, `make-if`, `make-lambda`, `make-let`, `list`, `append`, `apply`.
+
+#### Practical impact
+
+Before:
+```
+(make-lambda (list "x")
+  (make-app "grid-replace-color"
+    (make-app "nth" (make-symbol "x") (make-int 0))
+    (make-int c) (make-int bg)))
+```
+
+After:
+```
+`(lambda (x) (grid-replace-color (nth x 0) ,(make-int c) ,(make-int bg)))
+```
+
+Directly reduces the cost of writing new M-chain forms and rx-guided decomposers. The analysis logic (the hard, unique part of each form) stays unchanged; the AST emission that follows it becomes near-free.
+
+#### Tests
+
+18 new tests (all passing): atoms, unquote, splicing, mixed, nested QQ, if/lambda/let in QQ, practical grid patterns. 449 existing tests unaffected.
 
 ---
 

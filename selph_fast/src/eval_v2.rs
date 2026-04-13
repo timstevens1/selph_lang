@@ -715,6 +715,7 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("grid-object-count"), bi_grid_object_count);
     t.register(intern("grid-scale"), bi_grid_scale);
     t.register(intern("grid-tile"), bi_grid_tile);
+    t.register(intern("grid-untile"), bi_grid_untile);
     t.register(intern("grid-fill-enclosed"), bi_grid_fill_enclosed);
     t.register(intern("grid-compact"), bi_grid_compact);
     t.register(intern("grid-object"), bi_grid_object);
@@ -798,7 +799,7 @@ fn build_default_scope() -> Scope {
         "grid-gravity-up", "grid-gravity-left",
         "grid-fill-rect", "grid-size",
         "grid-objects", "grid-objects-8", "grid-object-count",
-        "grid-scale", "grid-tile", "grid-fill-enclosed", "grid-compact",
+        "grid-scale", "grid-tile", "grid-untile", "grid-fill-enclosed", "grid-compact",
         "grid-object", "grid-object-pos", "grid-place", "grid-translate",
         "grid-find-color", "grid-mask", "grid-blank",
         "grid-recompose",
@@ -4143,6 +4144,63 @@ fn bi_grid_tile(args: &[Value], _env: &Env) -> Result<Value, String> {
     Ok(grid_to_value(out))
 }
 
+/// `(grid-untile grid)` — inverse of grid-tile.
+/// Try all factor pairs (nr, nc) of (height, width). For each, check if
+/// the grid is composed of nr×nc identical sub-grids. If so, return the
+/// sub-grid; otherwise return nil. Tries smallest sub-grids first
+/// (largest factor products first) so we get the minimal tile.
+fn bi_grid_untile(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-untile: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let h = g.len();
+    if h == 0 { return Ok(Value::Nil); }
+    let w = g[0].len();
+    if w == 0 { return Ok(Value::Nil); }
+
+    // Collect factor pairs (nr, nc) where nr divides h and nc divides w,
+    // excluding (1,1) which is trivially the whole grid.
+    // Sort by sub-grid size ascending (= nr*nc descending) to prefer smallest tile.
+    let mut factors: Vec<(usize, usize)> = Vec::new();
+    for nr in 1..=h {
+        if h % nr != 0 { continue; }
+        for nc in 1..=w {
+            if w % nc != 0 { continue; }
+            if nr == 1 && nc == 1 { continue; }
+            factors.push((nr, nc));
+        }
+    }
+    // Sort by nr*nc descending (largest tiling factor = smallest sub-grid)
+    factors.sort_by(|a, b| (b.0 * b.1).cmp(&(a.0 * a.1)));
+
+    for (nr, nc) in factors {
+        let sh = h / nr;
+        let sw = w / nc;
+        // Extract the top-left sub-grid as the reference tile
+        let tile: Vec<Vec<i64>> = (0..sh).map(|r| g[r][..sw].to_vec()).collect();
+        // Check all sub-grids match
+        let mut all_match = true;
+        'outer: for tr in 0..nr {
+            for tc in 0..nc {
+                if tr == 0 && tc == 0 { continue; }
+                for r in 0..sh {
+                    for c in 0..sw {
+                        if g[tr * sh + r][tc * sw + c] != tile[r][c] {
+                            all_match = false;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        if all_match {
+            return Ok(grid_to_value(tile));
+        }
+    }
+    Ok(Value::Nil)
+}
+
 /// `(grid-fill-enclosed grid)` — fill interior zeros.
 /// Any 0-cell not reachable from the border via 4-connected 0-cells
 /// is replaced by the nearest non-zero neighbor (simple: use the
@@ -4411,6 +4469,38 @@ pub fn convert_tree(old: &[OldNode]) -> Vec<Node> {
         new[i] = new[acc].clone();
     }
 
+    // Fourth pass: quasiquote desugaring.
+    //
+    // `(f ,x y)  →  (make-app (quote f) x (quote y))
+    // `(f ,@xs y) → (apply make-app (append (append (list (quote f)) xs) (list (quote y))))
+    //
+    // Nested quasiquotes increment depth; unquotes at depth > 1 are
+    // reconstructed rather than evaluated. Same index-space-append
+    // pattern as the threading pass.
+    let quasiquote_sym = intern("quasiquote");
+    let unquote_sym = intern("unquote");
+    let unquote_splicing_sym = intern("unquote-splicing");
+    let qq_pass_len = new.len();
+    for i in 0..qq_pass_len {
+        let is_qq = match &new[i] {
+            Node::App(children) if children.len() == 2 => {
+                matches!(&new[children[0]], Node::Symbol(s) if *s == quasiquote_sym)
+            }
+            _ => false,
+        };
+        if is_qq {
+            let body_idx = match &new[i] {
+                Node::App(children) => children[1],
+                _ => unreachable!(),
+            };
+            let result = desugar_qq(
+                &mut new, body_idx, 1,
+                quasiquote_sym, unquote_sym, unquote_splicing_sym,
+            );
+            new[i] = new[result].clone();
+        }
+    }
+
     new
 }
 
@@ -4449,6 +4539,300 @@ fn convert_one(
         OldNode::Lambda(params, body) => Node::Lambda(params.clone(), *body),
         OldNode::Let(bindings, body) => Node::Let(bindings.clone(), *body),
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Quasiquote desugaring helpers
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Desugar a quasiquoted expression at the given nesting `depth`.
+/// Returns the index of a node in `nodes` that, when evaluated at runtime,
+/// produces the `Value::Node` for the original quoted expression.
+fn desugar_qq(
+    nodes: &mut Vec<Node>,
+    idx: usize,
+    depth: usize,
+    quasiquote_sym: Sym,
+    unquote_sym: Sym,
+    unquote_splicing_sym: Sym,
+) -> usize {
+    // Snapshot the node to avoid borrow issues when appending.
+    let node = nodes[idx].clone();
+    match node {
+        // Atoms: wrap in (quote atom)
+        Node::Int(_) | Node::Num(_) | Node::Str(_) | Node::Bool(_) | Node::Symbol(_) => {
+            qq_emit_quote(nodes, idx)
+        }
+
+        // App: check for unquote, unquote-splicing, nested quasiquote, or general app
+        Node::App(ref children) => {
+            let children = children.clone();
+            if children.len() == 2 {
+                if let Node::Symbol(s) = &nodes[children[0]] {
+                    let s = *s;
+                    // (unquote expr)
+                    if s == unquote_sym {
+                        if depth == 1 {
+                            // Depth 1: evaluate the expression (return it as-is)
+                            return children[1];
+                        } else {
+                            // Depth > 1: reconstruct (make-app (quote unquote) <desugared>)
+                            let inner = desugar_qq(
+                                nodes, children[1], depth - 1,
+                                quasiquote_sym, unquote_sym, unquote_splicing_sym,
+                            );
+                            let uq_quoted = qq_emit_quote(nodes, children[0]);
+                            return qq_emit_make_app(nodes, &[uq_quoted, inner]);
+                        }
+                    }
+                    // (unquote-splicing expr) at top level — error, handled by parent
+                    if s == unquote_splicing_sym {
+                        if depth == 1 {
+                            // Splicing outside an app context — just return expr
+                            // (this is technically an error in Scheme, but being lenient)
+                            return children[1];
+                        } else {
+                            let inner = desugar_qq(
+                                nodes, children[1], depth - 1,
+                                quasiquote_sym, unquote_sym, unquote_splicing_sym,
+                            );
+                            let us_quoted = qq_emit_quote(nodes, children[0]);
+                            return qq_emit_make_app(nodes, &[us_quoted, inner]);
+                        }
+                    }
+                    // Nested (quasiquote expr)
+                    if s == quasiquote_sym {
+                        let inner = desugar_qq(
+                            nodes, children[1], depth + 1,
+                            quasiquote_sym, unquote_sym, unquote_splicing_sym,
+                        );
+                        let qq_quoted = qq_emit_quote(nodes, children[0]);
+                        return qq_emit_make_app(nodes, &[qq_quoted, inner]);
+                    }
+                }
+            }
+
+            // General App: check if any child is (unquote-splicing ...) at this depth
+            let has_splicing = children.iter().any(|&c| {
+                if let Node::App(ref cc) = nodes[c] {
+                    if cc.len() == 2 {
+                        if let Node::Symbol(s) = nodes[cc[0]] {
+                            return s == unquote_splicing_sym && depth == 1;
+                        }
+                    }
+                }
+                false
+            });
+
+            if has_splicing {
+                // Build list segments and fold with append, then (apply make-app ...)
+                qq_desugar_app_with_splicing(
+                    nodes, &children, depth,
+                    quasiquote_sym, unquote_sym, unquote_splicing_sym,
+                )
+            } else {
+                // No splicing: (make-app <desugared child0> <desugared child1> ...)
+                let desugared: Vec<usize> = children.iter().map(|&c| {
+                    desugar_qq(
+                        nodes, c, depth,
+                        quasiquote_sym, unquote_sym, unquote_splicing_sym,
+                    )
+                }).collect();
+                qq_emit_make_app(nodes, &desugared)
+            }
+        }
+
+        // SpecialApp(Quote, [x]): a literal (quote ...) inside quasiquote.
+        // Produce the quote node itself as data.
+        Node::SpecialApp(SpecialForm::Quote, ref children) => {
+            let children = children.clone();
+            // The inner expression is already quoted — wrap the whole thing in quote
+            // so we get a Node representing (quote x).
+            // Emit: (make-app (quote quote) (quote <inner>))
+            let quote_sym_idx = nodes.len();
+            nodes.push(Node::Symbol(intern("quote")));
+            let quote_sym_quoted = qq_emit_quote(nodes, quote_sym_idx);
+            let inner_quoted = qq_emit_quote(nodes, children[0]);
+            qq_emit_make_app(nodes, &[quote_sym_quoted, inner_quoted])
+        }
+
+        // Other SpecialApp: treat like App([form_symbol, children...])
+        Node::SpecialApp(ref form, ref children) => {
+            let form_name = match form {
+                SpecialForm::Define => "define",
+                SpecialForm::Do => "do",
+                SpecialForm::Quote => unreachable!(), // handled above
+                SpecialForm::And => "and",
+                SpecialForm::Or => "or",
+                SpecialForm::Try => "try",
+                SpecialForm::EvalIn => "eval-in",
+                SpecialForm::Dispatch => "dispatch",
+                SpecialForm::Ns => "ns",
+            };
+            let children = children.clone();
+            let form_sym_idx = nodes.len();
+            nodes.push(Node::Symbol(intern(form_name)));
+            let mut all_children = vec![form_sym_idx];
+            all_children.extend_from_slice(&children);
+            let desugared: Vec<usize> = all_children.iter().map(|&c| {
+                desugar_qq(
+                    nodes, c, depth,
+                    quasiquote_sym, unquote_sym, unquote_splicing_sym,
+                )
+            }).collect();
+            qq_emit_make_app(nodes, &desugared)
+        }
+
+        // If(c, t, e) → (make-if <desugar c> <desugar t> <desugar e>)
+        Node::If(c, t, e) => {
+            let dc = desugar_qq(nodes, c, depth, quasiquote_sym, unquote_sym, unquote_splicing_sym);
+            let dt = desugar_qq(nodes, t, depth, quasiquote_sym, unquote_sym, unquote_splicing_sym);
+            let de = desugar_qq(nodes, e, depth, quasiquote_sym, unquote_sym, unquote_splicing_sym);
+            let make_if_sym = nodes.len();
+            nodes.push(Node::Symbol(intern("make-if")));
+            let app_idx = nodes.len();
+            nodes.push(Node::App(vec![make_if_sym, dc, dt, de]));
+            app_idx
+        }
+
+        // Lambda(params, body) → (make-lambda (list "p1" "p2" ...) <desugar body>)
+        Node::Lambda(ref params, body) => {
+            let params = params.clone();
+            let db = desugar_qq(nodes, body, depth, quasiquote_sym, unquote_sym, unquote_splicing_sym);
+            // Build (list "p1" "p2" ...) for the params
+            let list_sym = nodes.len();
+            nodes.push(Node::Symbol(intern("list")));
+            let mut list_children = vec![list_sym];
+            for p in &params {
+                let s_idx = nodes.len();
+                nodes.push(Node::Str(resolve(*p).to_string()));
+                list_children.push(s_idx);
+            }
+            let params_list_idx = nodes.len();
+            nodes.push(Node::App(list_children));
+            let make_lambda_sym = nodes.len();
+            nodes.push(Node::Symbol(intern("make-lambda")));
+            let app_idx = nodes.len();
+            nodes.push(Node::App(vec![make_lambda_sym, params_list_idx, db]));
+            app_idx
+        }
+
+        // Let(bindings, body) → (make-let (list (list "n" <desugar v>) ...) <desugar body>)
+        Node::Let(ref bindings, body) => {
+            let bindings = bindings.clone();
+            let db = desugar_qq(nodes, body, depth, quasiquote_sym, unquote_sym, unquote_splicing_sym);
+            let list_sym_outer = nodes.len();
+            nodes.push(Node::Symbol(intern("list")));
+            let mut outer_children = vec![list_sym_outer];
+            for (name_sym, val_idx) in &bindings {
+                let dv = desugar_qq(nodes, *val_idx, depth, quasiquote_sym, unquote_sym, unquote_splicing_sym);
+                let name_str_idx = nodes.len();
+                nodes.push(Node::Str(resolve(*name_sym).to_string()));
+                let list_sym_inner = nodes.len();
+                nodes.push(Node::Symbol(intern("list")));
+                let binding_list_idx = nodes.len();
+                nodes.push(Node::App(vec![list_sym_inner, name_str_idx, dv]));
+                outer_children.push(binding_list_idx);
+            }
+            let bindings_list_idx = nodes.len();
+            nodes.push(Node::App(outer_children));
+            let make_let_sym = nodes.len();
+            nodes.push(Node::Symbol(intern("make-let")));
+            let app_idx = nodes.len();
+            nodes.push(Node::App(vec![make_let_sym, bindings_list_idx, db]));
+            app_idx
+        }
+    }
+}
+
+/// Emit (quote <idx>) — wraps an existing node in a Quote special form.
+fn qq_emit_quote(nodes: &mut Vec<Node>, idx: usize) -> usize {
+    let q_idx = nodes.len();
+    nodes.push(Node::SpecialApp(SpecialForm::Quote, vec![idx]));
+    q_idx
+}
+
+/// Emit (make-app child0 child1 ...) — constructs a make-app call node.
+fn qq_emit_make_app(nodes: &mut Vec<Node>, children: &[usize]) -> usize {
+    let make_app_sym = nodes.len();
+    nodes.push(Node::Symbol(intern("make-app")));
+    let mut app_children = vec![make_app_sym];
+    app_children.extend_from_slice(children);
+    let idx = nodes.len();
+    nodes.push(Node::App(app_children));
+    idx
+}
+
+/// Emit (list item) — a singleton list call.
+fn qq_emit_list1(nodes: &mut Vec<Node>, item: usize) -> usize {
+    let list_sym = nodes.len();
+    nodes.push(Node::Symbol(intern("list")));
+    let idx = nodes.len();
+    nodes.push(Node::App(vec![list_sym, item]));
+    idx
+}
+
+/// Emit (append a b) — binary append call.
+fn qq_emit_append(nodes: &mut Vec<Node>, a: usize, b: usize) -> usize {
+    let append_sym = nodes.len();
+    nodes.push(Node::Symbol(intern("append")));
+    let idx = nodes.len();
+    nodes.push(Node::App(vec![append_sym, a, b]));
+    idx
+}
+
+/// Desugar an App that contains unquote-splicing children.
+/// Builds segments, folds with append, wraps in (apply make-app ...).
+fn qq_desugar_app_with_splicing(
+    nodes: &mut Vec<Node>,
+    children: &[usize],
+    depth: usize,
+    quasiquote_sym: Sym,
+    unquote_sym: Sym,
+    unquote_splicing_sym: Sym,
+) -> usize {
+    // Build segments: each is either a singleton (list desugared) or a spliced list
+    let mut segments: Vec<usize> = Vec::new();
+    for &child in children {
+        let is_splice = if let Node::App(ref cc) = nodes[child] {
+            if cc.len() == 2 {
+                if let Node::Symbol(s) = nodes[cc[0]] {
+                    s == unquote_splicing_sym && depth == 1
+                } else { false }
+            } else { false }
+        } else { false };
+
+        if is_splice {
+            // Extract the expression from (unquote-splicing expr)
+            let expr_idx = match &nodes[child] {
+                Node::App(cc) => cc[1],
+                _ => unreachable!(),
+            };
+            segments.push(expr_idx);
+        } else {
+            let desugared = desugar_qq(
+                nodes, child, depth,
+                quasiquote_sym, unquote_sym, unquote_splicing_sym,
+            );
+            let singleton = qq_emit_list1(nodes, desugared);
+            segments.push(singleton);
+        }
+    }
+
+    // Fold segments with binary append
+    let mut acc = segments[0];
+    for &seg in &segments[1..] {
+        acc = qq_emit_append(nodes, acc, seg);
+    }
+
+    // Wrap in (apply make-app folded)
+    let apply_sym = nodes.len();
+    nodes.push(Node::Symbol(intern("apply")));
+    let make_app_sym = nodes.len();
+    nodes.push(Node::Symbol(intern("make-app")));
+    let idx = nodes.len();
+    nodes.push(Node::App(vec![apply_sym, make_app_sym, acc]));
+    idx
 }
 
 /// Lazy initialization of the special-form Sym table. Idempotent.
@@ -6499,5 +6883,164 @@ mod tests {
         let new2 = rc(convert_tree(&old2));
         let r2 = eval(&new2, root2, &env).unwrap();
         assert!(matches!(r2, Value::Int(-7)), "thread-last got {:?}", r2);
+    }
+
+    // ── §9.54 quasiquote tests ────────────────────────────────────────────
+
+    #[test]
+    fn quasiquote_atom_int() {
+        // `42 → (quote 42) → Value::Node of Int(42)
+        let r = run_file("`42").unwrap();
+        assert_node_renders(&r, "42");
+    }
+
+    #[test]
+    fn quasiquote_atom_symbol() {
+        let r = run_file("`foo").unwrap();
+        assert_node_renders(&r, "foo");
+    }
+
+    #[test]
+    fn quasiquote_atom_string() {
+        let r = run_file(r#"`"hello""#).unwrap();
+        assert_node_renders(&r, r#""hello""#);
+    }
+
+    #[test]
+    fn quasiquote_simple_app() {
+        // `(add 1 2) → (make-app (quote add) (quote 1) (quote 2)) → Node for (add 1 2)
+        let r = run_file("`(add 1 2)").unwrap();
+        assert_node_renders(&r, "(add 1 2)");
+    }
+
+    #[test]
+    fn quasiquote_unquote_basic() {
+        // ,x inside ` evaluates x at runtime
+        let r = run_file(r#"
+            (let ((x (make-int 5)))
+              `(add ,x 1))
+        "#).unwrap();
+        assert_node_renders(&r, "(add 5 1)");
+    }
+
+    #[test]
+    fn quasiquote_unquote_eval() {
+        // Build AST and eval it
+        let r = run_file(r#"
+            (let ((x (make-int 5)))
+              (eval-node `(add ,x 3)))
+        "#).unwrap();
+        assert!(matches!(r, Value::Int(8)), "expected 8, got {:?}", r);
+    }
+
+    #[test]
+    fn quasiquote_mixed_quote_and_unquote() {
+        // `(f ,x y) — x is unquoted, y stays as symbol
+        let r = run_file(r#"
+            (let ((x (make-int 99)))
+              `(f ,x y))
+        "#).unwrap();
+        assert_node_renders(&r, "(f 99 y)");
+    }
+
+    #[test]
+    fn quasiquote_splicing() {
+        // `(add ,@args) where args is a list of nodes
+        let r = run_file(r#"
+            (let ((args (list (make-int 1) (make-int 2) (make-int 3))))
+              `(add ,@args))
+        "#).unwrap();
+        assert_node_renders(&r, "(add 1 2 3)");
+    }
+
+    #[test]
+    fn quasiquote_splicing_mixed() {
+        // `(f ,@xs y) — splice xs then append quoted y
+        let r = run_file(r#"
+            (let ((xs (list (make-int 2) (make-int 3))))
+              `(f ,@xs y))
+        "#).unwrap();
+        assert_node_renders(&r, "(f 2 3 y)");
+    }
+
+    #[test]
+    fn quasiquote_splicing_eval() {
+        // Build and eval a spliced expression
+        let r = run_file(r#"
+            (let ((args (list (make-int 10) (make-int 20))))
+              (eval-node `(add ,@args)))
+        "#).unwrap();
+        assert!(matches!(r, Value::Int(30)), "expected 30, got {:?}", r);
+    }
+
+    #[test]
+    fn quasiquote_if() {
+        // `(if ,c 1 0) → (make-if c (quote 1) (quote 0))
+        let r = run_file(r#"
+            (let ((c (make-bool true)))
+              (eval-node `(if ,c 1 0)))
+        "#).unwrap();
+        assert!(matches!(r, Value::Int(1)), "expected 1, got {:?}", r);
+    }
+
+    #[test]
+    fn quasiquote_lambda() {
+        // `(lambda (x) ,body) → (make-lambda (list "x") body)
+        let r = run_file(r#"
+            (let ((body `(add x 1)))
+              (let ((f (eval-node `(lambda (x) ,body))))
+                (f 10)))
+        "#).unwrap();
+        assert!(matches!(r, Value::Int(11)), "expected 11, got {:?}", r);
+    }
+
+    #[test]
+    fn quasiquote_let() {
+        // `(let ((a ,val)) ,body)
+        let r = run_file(r#"
+            (let ((val (make-int 42))
+                  (body `(add a 1)))
+              (eval-node `(let ((a ,val)) ,body)))
+        "#).unwrap();
+        assert!(matches!(r, Value::Int(43)), "expected 43, got {:?}", r);
+    }
+
+    #[test]
+    fn quasiquote_nested_preserves_inner() {
+        // `(f `(g ,y)) — inner quasiquote at depth 2, ,y stays quoted
+        // Result should be an App node (f (quasiquote (g (unquote y))))
+        let r = run_file(r#"`(f `(g ,y))"#).unwrap();
+        // Just verify it produces a node without error
+        match &r {
+            Value::Node(_) => {}
+            other => panic!("expected Node, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn quasiquote_practical_grid_pattern() {
+        // Simulates the real use case: building a grid-replace-color AST
+        let r = run_file(r#"
+            (let ((c (make-int 5))
+                  (bg (make-int 0)))
+              `(grid-replace-color (nth x 0) ,c ,bg))
+        "#).unwrap();
+        assert_node_renders(&r, "(grid-replace-color (nth x 0) 5 0)");
+    }
+
+    #[test]
+    fn quasiquote_practical_lambda_wrap() {
+        // Build (lambda (x) (grid-rotate-cw (nth x 0))) via quasiquote
+        let r = run_file(r#"
+            `(lambda (x) (grid-rotate-cw (nth x 0)))
+        "#).unwrap();
+        // Should produce a lambda node
+        match &r {
+            Value::Node(nr) => {
+                assert!(matches!(&nr.nodes[nr.idx], Node::Lambda(params, _) if params.len() == 1),
+                    "expected Lambda node, got {:?}", &nr.nodes[nr.idx]);
+            }
+            other => panic!("expected Node, got {:?}", other),
+        }
     }
 }

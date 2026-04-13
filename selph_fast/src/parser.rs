@@ -34,6 +34,9 @@ enum TokenKind {
     String,
     Symbol,
     Keyword,   // :keyword
+    Backtick,  // ` (quasiquote reader macro)
+    Comma,     // , (unquote reader macro)
+    CommaAt,   // ,@ (unquote-splicing reader macro)
 }
 
 // ── Tokenizer ───────────────────────────────────────────────────────
@@ -159,6 +162,25 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
             continue;
         }
 
+        // Backtick (quasiquote reader macro)
+        if c == '`' {
+            tokens.push(Token { kind: TokenKind::Backtick, value: "`".into(), line, col });
+            i += 1; col += 1;
+            continue;
+        }
+
+        // Comma: ,@ (unquote-splicing) or , (unquote)
+        if c == ',' {
+            if i + 1 < chars.len() && chars[i + 1] == '@' {
+                tokens.push(Token { kind: TokenKind::CommaAt, value: ",@".into(), line, col });
+                i += 2; col += 2;
+            } else {
+                tokens.push(Token { kind: TokenKind::Comma, value: ",".into(), line, col });
+                i += 1; col += 1;
+            }
+            continue;
+        }
+
         return Err(ParseError {
             message: format!("unexpected character: {:?}", c),
             line, col,
@@ -169,7 +191,7 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
 }
 
 fn is_delimiter(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\r' | '\n' | '(' | ')' | '"' | ',')
+    matches!(c, ' ' | '\t' | '\r' | '\n' | '(' | ')' | '"' | ',' | '`')
 }
 
 fn is_symbol_start(c: char) -> bool {
@@ -289,6 +311,33 @@ impl Parser {
                 let idx = nodes.len();
                 nodes.push(Node::App(children));
                 Ok(idx)
+            }
+            TokenKind::Backtick => {
+                self.advance();
+                let child = self.parse_expr(nodes)?;
+                let sym_idx = nodes.len();
+                nodes.push(Node::Symbol(intern("quasiquote")));
+                let app_idx = nodes.len();
+                nodes.push(Node::App(vec![sym_idx, child]));
+                Ok(app_idx)
+            }
+            TokenKind::Comma => {
+                self.advance();
+                let child = self.parse_expr(nodes)?;
+                let sym_idx = nodes.len();
+                nodes.push(Node::Symbol(intern("unquote")));
+                let app_idx = nodes.len();
+                nodes.push(Node::App(vec![sym_idx, child]));
+                Ok(app_idx)
+            }
+            TokenKind::CommaAt => {
+                self.advance();
+                let child = self.parse_expr(nodes)?;
+                let sym_idx = nodes.len();
+                nodes.push(Node::Symbol(intern("unquote-splicing")));
+                let app_idx = nodes.len();
+                nodes.push(Node::App(vec![sym_idx, child]));
+                Ok(app_idx)
             }
             TokenKind::RParen => {
                 Err(ParseError {
@@ -464,5 +513,65 @@ mod tests {
     fn test_parse_defmacro() {
         let (nodes, root) = parse_source("(defmacro double (x) (add x x))").unwrap();
         assert!(matches!(&nodes[root], Node::App(children) if children.len() == 4));
+    }
+
+    #[test]
+    fn test_parse_quasiquote() {
+        // `(f x) → (quasiquote (f x))
+        let (nodes, root) = parse_source("`(f x)").unwrap();
+        match &nodes[root] {
+            Node::App(children) => {
+                assert_eq!(children.len(), 2);
+                assert!(matches!(&nodes[children[0]], Node::Symbol(s) if *s == intern("quasiquote")));
+                assert!(matches!(&nodes[children[1]], Node::App(inner) if inner.len() == 2));
+            }
+            _ => panic!("expected App"),
+        }
+    }
+
+    #[test]
+    fn test_parse_unquote() {
+        // ,x → (unquote x)
+        let (nodes, root) = parse_source(",x").unwrap();
+        match &nodes[root] {
+            Node::App(children) => {
+                assert_eq!(children.len(), 2);
+                assert!(matches!(&nodes[children[0]], Node::Symbol(s) if *s == intern("unquote")));
+                assert!(matches!(&nodes[children[1]], Node::Symbol(s) if *s == intern("x")));
+            }
+            _ => panic!("expected App"),
+        }
+    }
+
+    #[test]
+    fn test_parse_unquote_splicing() {
+        // ,@xs → (unquote-splicing xs)
+        let (nodes, root) = parse_source(",@xs").unwrap();
+        match &nodes[root] {
+            Node::App(children) => {
+                assert_eq!(children.len(), 2);
+                assert!(matches!(&nodes[children[0]], Node::Symbol(s) if *s == intern("unquote-splicing")));
+                assert!(matches!(&nodes[children[1]], Node::Symbol(s) if *s == intern("xs")));
+            }
+            _ => panic!("expected App"),
+        }
+    }
+
+    #[test]
+    fn test_parse_quasiquote_with_unquote() {
+        // `(f ,x y) → (quasiquote (f (unquote x) y))
+        let (nodes, root) = parse_source("`(f ,x y)").unwrap();
+        match &nodes[root] {
+            Node::App(children) => {
+                assert_eq!(children.len(), 2);
+                assert!(matches!(&nodes[children[0]], Node::Symbol(s) if *s == intern("quasiquote")));
+                // inner: (f (unquote x) y) — 3 children
+                match &nodes[children[1]] {
+                    Node::App(inner) => assert_eq!(inner.len(), 3),
+                    _ => panic!("expected inner App"),
+                }
+            }
+            _ => panic!("expected App"),
+        }
     }
 }
