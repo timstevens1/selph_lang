@@ -90,7 +90,7 @@ The M-chain is a set of recognition stages that run before enumeration. Each sta
 | Strings / POS | 28 | **28/28** | Type-dependent pools + Forms 1–6 recognizers |
 | Grids (ARC scaffolding) | 13 | **13/13** | Forms 1–8, cross-type bridges, object indexing |
 | Original 3-domain chain | 55 | **55/55** | Sequence → CF → NL, library cascade |
-| ARC-AGI-1 (eval) | 400 | **23/400** | Grid Forms 1-8 + object-level primitives |
+| ARC-AGI-1 (eval) | 400 | **27/400** | Grid Forms 1-9 + object-level primitives + color-map |
 | ARC-AGI-1 (cold, no scaffold curriculum) | 400 | **4/400** | M-chain + auto-scaffolding loop recovers 1 task |
 
 ### 2.7 CLI Commands
@@ -539,7 +539,7 @@ All via M-chain at 1 candidate each.
 
 #### Next steps
 
-1. **Form 9 — object recomposition.** For each object in the input, try known transforms (rotate, flip, translate) and check if placing the result back reproduces the output. Covers the biggest unsolved bucket (same-size + same-colors structural transforms). **Partially addressed** by `grid-probe-recomp` Rust builtin (§9.52) which does per-object transform probing; not yet wired as an M-chain form.
+1. ~~Form 9 — object recomposition.~~ **Done (§9.53).** `grid-recompose` Rust builtin + M-chain Form 9 with two sub-forms: per-object rigid transform (via `grid-probe-recomp`) and object selection (`grid-object`/`grid-trim`). Per-obj-transform found 0 ARC-AGI-1 tasks (rigid per-object transforms are rare); obj-select added 2 tasks. Also fixed Form 4 arity-1 unwrap bug and cycle handling (+2 tasks), and ARC curriculum test-data format (test rows were leaking into training). **27/400 ARC-AGI-1.**
 2. **Pattern repetition detection.** Inverse of `grid-tile`: find the minimal repeating unit in a grid. Catches self-tiling tasks like 007bbfb7. **Addressed as §9.52 next step 3** (inverse scaffolds).
 3. **Object sort options.** `grid-objects` currently returns objects in scan order, `grid-object` sorts by size. Adding sort-by-position (topmost, leftmost) would handle tasks that reference objects spatially.
 4. **Soft reachability.** When the search space exhausts at ~1200 candidates (hard type wall), the post-mortem could retry with a wider component set. Currently all retries find 0 additional tasks — the gap is in operation vocabulary, not type filtering.
@@ -672,6 +672,40 @@ Task `ccd554ac` solved with `(lambda (x) (grid-tile (nth x 0) (grid-height (nth 
 4. **Iterative scaffold refinement.** After the first scaffolding pass recovers some tasks, the recovered solutions become library functions for a second pass. Multiple scaffold-solve-retry iterations could compound recoveries.
 
 5. **Prescription-guided M-chain form generation.** The prescription system knows "97 tasks need object-count-change handling." Instead of scaffolding, generate a new M-chain form (as a SELPH function) that directly probes for the pattern and registers it via `__decomposers__`. This is deeper than scaffolding — it extends the recognition chain itself.
+
+6. **Unwrap arity-1 inputs once in `detect-constant-grid`.** Currently each form must remember to `(head inp)` to unwrap the arity-1 wrapper `(list grid)` → `grid`. Pool-based forms get this for free from `make-pool-grid`; direct-probe forms do it ad-hoc (Form 4 had a bug here). Unwrap once at the top of `detect-constant-grid` — `(let ((grids (map head inputs)) ...)` — and pass raw grids to all forms. Eliminates a class of silent bugs.
+
+---
+
+### 9.53 Form 9, Form 4 fixes, ARC curriculum format (April 13, 2026)
+
+Three changes, 23→27/400 ARC-AGI-1 with proper held-out test validation.
+
+#### Form 9 — object recomposition (m8g_constant_grid.selph)
+
+New `grid-recompose` Rust builtin: `(grid-recompose grid "rotate-cw")` applies a named rigid transform to each connected-component object in-place. Extracts existing CC detection + transform + place-back logic from `grid-probe-recomp`.
+
+M-chain Form 9 has two sub-forms:
+- **Per-object transform:** calls `grid-probe-recomp` on the spec, emits `grid-recompose` if a rigid transform matches all pairs. Found 0 ARC-AGI-1 tasks (rigid per-object transforms are rare in the dataset).
+- **Object selection:** if `grid-probe-recomp` detects obj-select (output = nth-largest object or trim), emits `grid-object(x, N)` or `grid-trim(x)`. +2 tasks (`1f85a75f`, `be94b721`).
+
+#### Form 4 — color-map bug fixes
+
+1. **Arity-1 unwrap bug.** `m8g-detect-color-map` used `(head inputs)` which returns the arity-1 wrapper `(list grid)`, not the grid. `(length first-in)` returned 1 instead of the grid height, breaking dimension checks and cell iteration. Fixed to `(head (head inputs))`. Same fix in `m8g-verify-color-map`.
+
+2. **Cycle handling.** Chained `grid-replace-color` calls fail on bidirectional swaps (e.g., 5↔8): the second replacement undoes the first. Fixed with two-pass temp-color approach: pass 1 moves each from-color to temp (from+50), pass 2 moves each temp to final to-color. ARC colors 0-9, temps 50-59.
+
++2 tasks (`b1948b0a`: 6→2, `c8f0f002`: 7→5). +1 more with cycles (`d511f180`: 5↔8). Task `0d3d703e` (8 cyclic remaps) solves standalone but fails in full 400-task run — likely silent error from an earlier task corrupting M-chain state.
+
+#### ARC curriculum format fix (arc.rs)
+
+`arc_dir_to_curriculum` previously emitted `:test` as a bare separator between training and test rows. The parser silently ignored `:test` (not a recognized symbol in App context) and parsed test rows as additional training pairs. Result: Form 5 (classify-by-scalar) memorized all examples including test data, and `validate_held_out` got empty test lists (returning true unconditionally). This inflated scores to 209/400.
+
+Fixed to emit `(test input output)` — 3-element tuples matching `parse_curriculum_tasks` expectations. Also switched from `#grid` reader macro to plain nested lists for grow-v2 compatibility.
+
+#### Form 8 — fill-enclosed (no bug)
+
+Form 8 correctly unwraps inputs and probes `grid-fill-enclosed`. Confirmed 0 ARC-AGI-1 training tasks where `grid-fill-enclosed(input) == output`. ARC "fill holes" tasks (e.g., `00d62c1b`) introduce new colors (0→4), not adjacent-neighbor fill. Form 8 is correct but targets a pattern absent from this dataset.
 
 ---
 
