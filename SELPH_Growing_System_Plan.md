@@ -91,9 +91,9 @@ The M-chain is a set of recognition stages that run before enumeration. Each sta
 | Strings / POS | 28 | **28/28** | Type-dependent pools + Forms 1–6 recognizers |
 | Grids (ARC scaffolding) | 13 | **13/13** | Forms 1–8, cross-type bridges, object indexing |
 | Original 3-domain chain | 55 | **55/55** | Sequence → CF → NL, library cascade |
-| ARC-AGI-1 (eval) | 400 | **27/400** | Grid Forms 1-9 + object-level primitives + color-map |
+| ARC-AGI-1 (eval) | 400 | **28/400** | Grid Forms 1-9 + grid-untile + object-level primitives + color-map |
 | ARC-AGI-1 (cold, no scaffold curriculum) | 400 | **4/400** | M-chain + auto-scaffolding loop recovers 1 task |
-| ARC-AGI-1 (with post-mortem pipeline) | 400 | **TBD** | §9.54: task-data/depth-3/inverse scaffolds + iterative refinement + rx-color-probe |
+| ARC-AGI-1 (with post-mortem pipeline) | 400 | **28/400** | §9.54: 176 scaffolds solved, 0 additional tasks recovered |
 
 ### 2.7 CLI Commands
 
@@ -743,9 +743,11 @@ Attempted to unwrap `(list grid) -> grid` once at the top of `detect-constant-gr
 
 **64MB default stack.** `main()` now spawns `real_main()` on a thread with 64MB stack (was system default 8MB). The tree-walking evaluator's recursion depth exceeds 8MB when the M-chain + post-mortem functions are loaded together (~2000 define statements in env). Configurable via `RUST_MIN_STACK` env var.
 
+**Deferred post-mortem loading.** New `--post-mortem <file>` flag for `grow-v2`. Loads the post-mortem SELPH file AFTER the curriculum completes, just before calling `run-post-mortem`. Loading ~190 post-mortem defines into the preamble caused OOM: SELPH closures capture the full env chain, so every M-chain call during synthesis bloated by the post-mortem functions. Deferred loading keeps the synthesis env lean (~30s for 400 tasks, same as baseline).
+
 #### Results
 
-ARC-AGI-1 baseline (no post-mortem): 27/400 (unchanged from §9.53). Full pipeline with post-mortem: evaluation in progress.
+ARC-AGI-1: **27->28/400**. The +1 (`7b7f7511`) is from `grid-untile` in the M-chain pool -- directly solves "extract repeating tile" via `(lambda (x) (grid-untile (nth x 0)))`. Post-mortem scaffolding generated 176 scaffold solutions in iteration 1, but 0 ARC tasks recovered (M7 library detection couldn't compose scaffolded functions to match failing tasks). Iterative loop correctly stopped after 0 recoveries.
 
 #### Next steps
 

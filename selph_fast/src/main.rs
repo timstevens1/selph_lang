@@ -48,6 +48,20 @@ use parser::*;
 use eval::*;
 
 fn main() {
+    // Tree-walking eval can recurse deeply with large SELPH environments
+    // (e.g., M-chain + post-mortem). Spawn on a thread with 64MB stack.
+    let stack_size = std::env::var("RUST_MIN_STACK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64 * 1024 * 1024);
+    let builder = std::thread::Builder::new().stack_size(stack_size);
+    let handler = builder.spawn(real_main).expect("failed to spawn main thread");
+    if let Err(e) = handler.join() {
+        std::panic::resume_unwind(e);
+    }
+}
+
+fn real_main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
@@ -1483,6 +1497,7 @@ fn cmd_grow_v2(args: &[String]) {
     let mut task_file = String::new();
     let mut default_budget: usize = 200000;
     let mut default_depth: usize = 2;
+    let mut post_mortem_file: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1492,6 +1507,10 @@ fn cmd_grow_v2(args: &[String]) {
             }
             "--depth" => {
                 default_depth = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(default_depth);
+                i += 2;
+            }
+            "--post-mortem" => {
+                post_mortem_file = args.get(i + 1).map(|s| s.to_string());
                 i += 2;
             }
             other => { task_file = other.to_string(); i += 1; }
@@ -1756,6 +1775,20 @@ fn cmd_grow_v2(args: &[String]) {
             .map(|(s, n)| format!("{}={}", s, n))
             .collect();
         eprintln!("By strategy: {}", parts.join(", "));
+    }
+
+    // §9.54: deferred post-mortem loading. If --post-mortem <file> was given,
+    // load it NOW (after curriculum, before post-mortem call) so the ~190
+    // post-mortem defines don't bloat the env during synthesis.
+    if let Some(ref pm_path) = post_mortem_file {
+        match fs::read_to_string(pm_path) {
+            Ok(pm_source) => {
+                if let Err(e) = eval_curriculum_preamble(&pm_source, &env) {
+                    eprintln!("warning: post-mortem load failed: {}", e);
+                }
+            }
+            Err(e) => eprintln!("warning: could not read post-mortem file {}: {}", pm_path, e),
+        }
     }
 
     // §9.49 post-mortem: bind results and call run-post-mortem if defined.

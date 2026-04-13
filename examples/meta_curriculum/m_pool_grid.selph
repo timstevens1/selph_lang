@@ -71,6 +71,8 @@
     ; §9.49: new extraction/transform ops
     (list "grid-fill-enclosed" (lambda (v) (grid-fill-enclosed v)))
     (list "grid-compact"       (lambda (v) (grid-compact v)))
+    ; §9.53: inverse of grid-tile — extract repeated sub-grid
+    (list "grid-untile"        (lambda (v) (grid-untile v)))
 ))
 
 ; ���─ Level 0: indexed grid atoms ──────────────────────────────────────

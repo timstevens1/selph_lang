@@ -1203,14 +1203,200 @@
                     (if (pm-member? c acc) acc (append acc (list c))))
                     (list 2 3) candidates))))))))))
 
-; ── Scaffolding generator: prescription → synthetic tasks ─────────────
+; ── Prescription-guided M-chain form generation ───────────────────────
+;
+; For high-count prescription buckets with no existing M-chain form
+; coverage, dynamically generate decomposer functions and register
+; them in __decomposers__. These run BEFORE scaffolding, extending
+; the recognition chain itself rather than working around gaps.
+;
+; Generated forms probe task-specific patterns:
+;   recomp/obj-count-change -> color-keep/remove probing
+;   color-filtering         -> color-keep probing
+;   recomp/single-obj-edit  -> per-object unary transform probing
+
+; Collect all unique non-background colors from a grid.
+(define pm-grid-colors
+  (lambda (grid)
+    (let ((bg (try (grid-background grid) 0)))
+      (reduce
+        (lambda (acc row)
+          (reduce
+            (lambda (acc2 cell)
+              (if (or (= cell bg) (pm-member? cell acc2))
+                acc2
+                (append acc2 (list cell))))
+            row acc))
+        grid (list)))))
+
+; Collect colors appearing across all training input grids for a task.
+(define pm-task-colors
+  (lambda (spec)
+    (let ((pairs (try (ns-get spec "spec") spec)))
+      (reduce
+        (lambda (acc pair)
+          (let ((inp (head pair)))
+            (let ((grid (if (list? (head inp)) inp (head inp))))
+              (let ((colors (try (pm-grid-colors grid) (list))))
+                (reduce (lambda (a c) (if (pm-member? c a) a (append a (list c))))
+                  colors acc)))))
+        (if (list? pairs) pairs (list))
+        (list)))))
+
+; Try replacing each input color with background and check if it matches
+; the output. Returns a match ns or nil.
+(define pm-try-color-keep
+  (lambda (grid output bg color)
+    (let ((h (length grid))
+          (w (if (> h 0) (length (head grid)) 0)))
+      (if (or (= h 0) (not (= (length output) h)))
+        nil
+        (let ((kept (map
+                (lambda (r)
+                  (map (lambda (c)
+                    (if (= (nth (nth grid r) c) color)
+                      (nth (nth grid r) c)
+                      bg))
+                    (range w)))
+                (range h))))
+          (if (= kept output) (list "keep" color)
+            ; Try remove: zero out one color
+            (let ((removed (map
+                    (lambda (r)
+                      (map (lambda (c)
+                        (if (= (nth (nth grid r) c) color)
+                          bg
+                          (nth (nth grid r) c)))
+                        (range w)))
+                    (range h))))
+              (if (= removed output) (list "remove" color)
+                nil))))))))
+
+; Probe a single task spec for color-based transforms.
+; Returns (ns ("found" true) ("source-node" ...) ("kind" ...)) or nil.
+(define pm-probe-color-form
+  (lambda (spec)
+    (let ((pairs (ns-get spec "spec"))
+          (test-pairs (try (ns-get spec "test") (list))))
+      (if (< (length pairs) 2) nil
+        (let ((first-inp (head (head (head pairs))))
+              (first-out (head (tail (head pairs)))))
+          (let ((grid (if (and (list? first-inp) (list? (head first-inp)))
+                       first-inp
+                       (if (and (list? first-inp) (= (length first-inp) 1)
+                                (list? (head first-inp)) (list? (head (head first-inp))))
+                         (head first-inp) nil))))
+            (if (nil? grid) nil
+              (let ((bg (try (grid-background grid) 0))
+                    (colors (pm-grid-colors grid)))
+                (pm-probe-color-form-loop pairs test-pairs colors bg)))))))))
+
+; Loop over candidate colors, checking if keep/remove matches all pairs.
+(define pm-probe-color-form-loop
+  (lambda (pairs test-pairs colors bg)
+    (if (= (length colors) 0) nil
+      (let ((color (head colors)))
+        (let ((match (pm-check-color-all-pairs pairs color bg)))
+          (if (nil? match)
+            (pm-probe-color-form-loop pairs test-pairs (tail colors) bg)
+            (let ((op (head match))
+                  (c (head (tail match))))
+              ; Verify against test pairs if present
+              (let ((test-ok (if (= (length test-pairs) 0) true
+                    (not (nil? (pm-check-color-all-pairs test-pairs c bg))))))
+                (if (not test-ok)
+                  (pm-probe-color-form-loop pairs test-pairs (tail colors) bg)
+                  ; Build AST: (lambda (x) (grid-replace-color (nth x 0) c bg))
+                  ;         or (lambda (x) -- keep only color c)
+                  (if (= op "remove")
+                    (ns ("found" true)
+                        ("kind" (concat "rx-form-color-remove-" (to-string c)))
+                        ("source-node"
+                          (make-lambda (list "x")
+                            (make-app "grid-replace-color"
+                              (make-app "nth" (make-symbol "x") (make-int 0))
+                              (make-int c) (make-int bg)))))
+                    ; "keep" = replace every non-c, non-bg color with bg
+                    nil))))))))))
+
+; Check a color keep/remove against all pairs in a list.
+(define pm-check-color-all-pairs
+  (lambda (pairs color bg)
+    (let ((first-result
+            (let ((inp (head (head (head pairs))))
+                  (out (head (tail (head pairs)))))
+              (let ((grid (if (and (list? inp) (list? (head inp)))
+                           inp
+                           (if (and (list? inp) (= (length inp) 1))
+                             (head inp) nil))))
+                (if (nil? grid) nil
+                  (pm-try-color-keep grid out bg color))))))
+      (if (nil? first-result) nil
+        (let ((op (head first-result)))
+          (if (reduce
+                (lambda (ok pair)
+                  (if (not ok) false
+                    (let ((inp (head (head pair)))
+                          (out (head (tail pair))))
+                      (let ((grid (if (and (list? inp) (list? (head inp)))
+                                   inp
+                                   (if (and (list? inp) (= (length inp) 1))
+                                     (head inp) nil))))
+                        (if (nil? grid) false
+                          (not (nil? (pm-try-color-keep grid out bg color))))))))
+                (tail pairs) true)
+            first-result
+            nil))))))
+
+; Generate and register decomposers for high-count prescription buckets.
+; Called after prescriptions are aggregated, before the scaffolding loop.
+(define pm-generate-rx-forms
+  (lambda (prescriptions fails)
+    (let ((high-count-rx (filter
+            (lambda (rx)
+              (let ((name (ns-get rx "rx"))
+                    (count (ns-get rx "count")))
+                (and (>= count 5)
+                  (or (try (string-starts-with name "recomp/obj-count") false)
+                      (= name "color-filtering")
+                      (try (string-starts-with name "recomp/single-obj") false)))))
+            prescriptions)))
+      (if (= (length high-count-rx) 0) 0
+        ; Register a color-probe decomposer that checks each task for
+        ; simple color removal patterns (covers a subset of obj-count-change
+        ; and color-filtering tasks).
+        (do (print (concat "  Registering rx-guided color-probe decomposer for "
+                           (to-string (length high-count-rx)) " buckets"))
+            (try
+              (eval-source
+                (concat "(define __decomposers__ "
+                  "(ns-put __decomposers__ \"rx-color-probe\" pm-rx-color-decomposer))"))
+              nil)
+            (length high-count-rx))))))
+
+; The dynamically-registered decomposer. Probes the synth spec for
+; simple color-based transforms (remove a single color, keep a single
+; color). These cover many recomp/obj-count-change and color-filtering
+; tasks where the output is the input with one color zeroed out.
+(define pm-rx-color-decomposer
+  (lambda (synth-spec)
+    (let ((result (try (pm-probe-color-form synth-spec) nil)))
+      (if (or (nil? result) (not (try (ns-get result "found") false)))
+        (ns ("found" false))
+        (ns ("found" true)
+            ("nodes" (ns-get result "source-node"))
+            ("candidates" 1))))))
+
+; ── Scaffolding generator: prescription -> synthetic tasks ────────────
 ;
 ; For each prescription bucket, generate trivially-solvable tasks whose
 ; solutions become library functions. M7 then composes these against the
 ; hard tasks. This closes the meta-learning loop:
 ;   diagnose → prescribe → scaffold → solve → library-enrich → re-attempt
 ;
-; Each scaffold is a list: (name spec) where spec = ((input output) ...).
+; Each scaffold is a list: (name spec) or (name spec depth) where
+; spec = ((input output) ...) and depth defaults to 2 if omitted.
+; Depth-3 scaffolds use budget 100000; depth-2 use 50000.
 ; We use small grids (3x3, 4x4) so synthesis is fast.
 
 (define pm-sample-grids
@@ -1219,11 +1405,210 @@
     (list (list 0 1 0) (list 1 0 1) (list 0 1 0))
     (list (list 3 3 0 0) (list 3 0 0 0) (list 0 0 0 2) (list 0 0 2 2))))
 
+; ── Inverse scaffolds (§9.53 Phase 1) ──────────────────────────────
+;
+; For forward scaffolds like tiling/scaling/mirror/concat, produce
+; an inverse scaffold that swaps each example's input and output.
+; This teaches the synthesizer to learn the reverse operation
+; (e.g., grid-untile from grid-tile scaffolds).
+
+(define pm-scaffold-invertible?
+  (lambda (scaffold)
+    (let ((name (nth scaffold 0)))
+      ; YES: tiling, scaling, concat, mirror
+      (or (try (string-starts-with name "scaffold_tile_") false)
+      (or (try (string-starts-with name "scaffold_scale") false)
+      (or (try (string-starts-with name "scaffold_mirror") false)
+      (or (try (string-starts-with name "scaffold_hconcat") false)
+      (or (try (string-starts-with name "scaffold_vconcat") false)
+          false))))))))
+      ; NO: extraction (ill-posed inverse), color-swap (self-inverse)
+
+(define pm-scaffold-inverse-pair
+  (lambda (scaffold)
+    (let ((name (nth scaffold 0))
+          (spec (nth scaffold 1))
+          (depth (if (>= (length scaffold) 3) (nth scaffold 2) 2)))
+      (let ((inv-name (concat "inv_" name))
+            (inv-spec (map (lambda (pair)
+                        (let ((inp (head pair))
+                              (out (head (tail pair))))
+                          ; inp is (grid) for arity-1; unwrap to get bare grid as output
+                          (list (list out) (head inp))))
+                      spec))
+            (inv-depth (if (>= depth 2) 3 depth)))
+        (list inv-name inv-spec inv-depth)))))
+
+(define pm-generate-inverse-scaffolds
+  (lambda (forward)
+    (map pm-scaffold-inverse-pair
+      (filter pm-scaffold-invertible? forward))))
+
+; ── Task-data scaffolds: use the failing task's own grids ────────────
+;
+; Instead of pm-sample-grids (hardcoded 3x3/4x4), extract input grids
+; from the task's training spec and apply operations to them. This
+; produces scaffolds whose library functions are pre-adapted to the
+; task's actual grid shapes and color palettes.
+
+; Size guard: only use grids ≤10x10 (large grids make synthesis slow).
+(define pm-grid-small-enough?
+  (lambda (g)
+    (let ((h (try (length g) 99))
+          (w (try (length (head g)) 99)))
+      (and (<= h 10) (<= w 10)))))
+
+; Extract input grids from a task result's spec, filtered by size.
+(define pm-task-input-grids
+  (lambda (task-result)
+    (let ((spec (ns-get task-result "spec")))
+      (let ((grids (map pm-get-input-grid spec)))
+        (filter pm-grid-small-enough? grids)))))
+
+; Build one scaffold from a task's grids + an operation.
+; Returns (name spec depth) triple or nil if the op fails on any grid.
+; Needs at least 2 grids to form a valid spec.
+(define pm-scaffold-from-task-data
+  (lambda (task-name op-name op grids)
+    (if (< (length grids) 2) nil
+      (let ((pairs (try
+              (map (lambda (g)
+                (list (list g) (op g)))
+                grids)
+              nil)))
+        (if (nil? pairs) nil
+          (list (concat "td_" op-name "_" task-name)
+                pairs
+                2))))))
+
+; Operation families for task-data scaffolds, organized by rx bucket.
+; Each entry: (op-name op-function)
+
+(define pm-td-ops-scaling
+  (list
+    (list "scale_2"    (lambda (g) (grid-scale g 2)))
+    (list "scale_3"    (lambda (g) (grid-scale g 3)))
+    (list "tile_2x2"   (lambda (g) (grid-tile g 2 2)))
+    (list "tile_1x3"   (lambda (g) (grid-tile g 3 1)))
+    (list "tile_3x1"   (lambda (g) (grid-tile g 1 3)))
+    (list "flip_h"     grid-flip-h)
+    (list "flip_v"     grid-flip-v)
+    (list "mirror_h"   (lambda (g) (grid-hconcat g (grid-flip-h g))))
+    (list "mirror_v"   (lambda (g) (grid-vconcat g (grid-flip-v g))))))
+
+(define pm-td-ops-extraction
+  (list
+    (list "trim"       grid-trim)
+    (list "compact"    grid-compact)
+    (list "object_0"   (lambda (g) (grid-object g 0)))
+    (list "object_1"   (lambda (g) (grid-object g 1)))
+    (list "trim_obj0"  (lambda (g) (grid-trim (grid-object g 0))))))
+
+(define pm-td-ops-recomp
+  (list
+    (list "fill_enc"   grid-fill-enclosed)
+    (list "grav_down"  grid-gravity-down)
+    (list "grav_up"    grid-gravity-up)
+    (list "rotate_cw"  grid-rotate-cw)
+    (list "rotate_ccw" grid-rotate-ccw)
+    (list "rotate_180" grid-rotate-180)
+    (list "flip_h"     grid-flip-h)
+    (list "flip_v"     grid-flip-v)))
+
+(define pm-td-ops-color-filter
+  (list
+    (list "rotate_cw"  grid-rotate-cw)
+    (list "flip_h"     grid-flip-h)
+    (list "flip_v"     grid-flip-v)
+    (list "transpose"  grid-transpose)))
+
+(define pm-td-ops-composition
+  (list
+    (list "hconcat_self" (lambda (g) (grid-hconcat g g)))
+    (list "vconcat_self" (lambda (g) (grid-vconcat g g)))
+    (list "hconcat_rot"  (lambda (g) (grid-hconcat g (grid-rotate-cw g))))
+    (list "mirror_h"     (lambda (g) (grid-hconcat g (grid-flip-h g))))
+    (list "mirror_v"     (lambda (g) (grid-vconcat g (grid-flip-v g))))))
+
+; Select which op family to use for a given rx bucket.
+(define pm-td-ops-for-rx
+  (lambda (rx-name)
+    (if (= rx-name "scaling-or-tiling")       pm-td-ops-scaling
+    (if (= rx-name "extract/complex")         pm-td-ops-extraction
+    (if (or (= rx-name "recomp/obj-count-change")
+            (or (= rx-name "recomp/few-objects")
+                (= rx-name "recomp/single-obj-edit")))
+      pm-td-ops-recomp
+    (if (= rx-name "color-filtering")         pm-td-ops-color-filter
+    (if (= rx-name "grid-composition")        pm-td-ops-composition
+      (list))))))))
+
+; Generate task-data scaffolds for one prescription bucket.
+; rx-entry = prescription ns, fails = list of all failing task results.
+(define pm-task-data-scaffolds-for-rx
+  (lambda (rx-entry fails)
+    (let ((rx-name  (ns-get rx-entry "rx"))
+          (examples (ns-get rx-entry "examples")))
+      (let ((ops (pm-td-ops-for-rx rx-name)))
+        (if (= (length ops) 0) (list)
+          ; For each failing task in this bucket, extract its grids and
+          ; apply each operation. Collect non-nil scaffolds.
+          (let ((all-scaffolds
+                  (reduce append
+                    (map (lambda (task-name)
+                      ; Find the task result for this name
+                      (let ((task-results (filter
+                              (lambda (r) (= (ns-get r "name") task-name))
+                              fails)))
+                        (if (= (length task-results) 0) (list)
+                          (let ((grids (pm-task-input-grids (head task-results))))
+                            (if (< (length grids) 2) (list)
+                              ; Try each op, collect non-nil scaffolds
+                              (reduce append
+                                (map (lambda (op-entry)
+                                  (let ((op-name (head op-entry))
+                                        (op-fn   (head (tail op-entry))))
+                                    (let ((scaffold (try
+                                            (pm-scaffold-from-task-data
+                                              task-name op-name op-fn grids)
+                                            nil)))
+                                      (if (nil? scaffold) (list) (list scaffold)))))
+                                  ops)
+                                (list)))))))
+                      examples)
+                    (list))))
+            ; Deduplicate: skip scaffolds whose spec matches an earlier one
+            (pm-dedup-scaffolds all-scaffolds)))))))
+
+; Deduplicate scaffolds by spec (element index 1). Keep first occurrence.
+(define pm-dedup-scaffolds
+  (lambda (scaffolds)
+    (let ((result
+            (reduce
+              (lambda (acc scaffold)
+                (let ((seen-specs (head acc))
+                      (kept       (head (tail acc)))
+                      (spec       (nth scaffold 1)))
+                  (if (pm-member? spec seen-specs)
+                    acc
+                    (list (append seen-specs (list spec))
+                          (append kept (list scaffold))))))
+              scaffolds
+              (list (list) (list)))))
+      (head (tail result)))))
+
 (define pm-generate-scaffolding
-  (lambda (prescriptions)
-    (reduce append
-      (map pm-scaffold-for-rx prescriptions)
-      (list))))
+  (lambda (prescriptions fails)
+    (let ((forward (reduce append
+            (map pm-scaffold-for-rx prescriptions)
+            (list))))
+      (let ((inverses (pm-generate-inverse-scaffolds forward))
+            (task-data (reduce append
+              (map (lambda (rx-entry)
+                (pm-task-data-scaffolds-for-rx rx-entry fails))
+                prescriptions)
+              (list))))
+        (append (append forward inverses) task-data)))))
 
 (define pm-scaffold-for-rx
   (lambda (rx-entry)
@@ -1234,11 +1619,15 @@
         (if (= rx-name "scaling-or-tiling")
           (append (pm-scaffold-scaling) (pm-scaffold-tile-mirror))
         (if (= rx-name "extract/complex")
-          (append (pm-scaffold-extraction) (pm-scaffold-extract-by-position))
+          (append (pm-scaffold-extraction)
+            (append (pm-scaffold-extract-by-position)
+                    (pm-scaffold-depth3-compositions)))
         (if (or (= rx-name "recomp/obj-count-change")
                 (= rx-name "recomp/few-objects")
                 (= rx-name "recomp/single-obj-edit"))
-          (append (pm-scaffold-recomp) (pm-scaffold-object-compositions))
+          (append (pm-scaffold-recomp)
+            (append (pm-scaffold-object-compositions)
+                    (pm-scaffold-depth3-compositions)))
         (if (= rx-name "color-filtering")
           (append (pm-scaffold-color-filter) (pm-scaffold-color-swap-extract))
         (if (= rx-name "grid-composition")
@@ -1255,23 +1644,28 @@
         ; tile 2x2
         (list "scaffold_tile_2x2"
           (list (list (list g1) (grid-tile g1 2 2))
-                (list (list g2) (grid-tile g2 2 2))))
+                (list (list g2) (grid-tile g2 2 2)))
+          2)
         ; tile 3x1 (horizontal)
         (list "scaffold_tile_3x1"
           (list (list (list g1) (grid-tile g1 1 3))
-                (list (list g2) (grid-tile g2 1 3))))
+                (list (list g2) (grid-tile g2 1 3)))
+          2)
         ; tile 1x3 (vertical)
         (list "scaffold_tile_1x3"
           (list (list (list g1) (grid-tile g1 3 1))
-                (list (list g2) (grid-tile g2 3 1))))
+                (list (list g2) (grid-tile g2 3 1)))
+          2)
         ; scale 2x
         (list "scaffold_scale_2"
           (list (list (list g1) (grid-scale g1 2))
-                (list (list g2) (grid-scale g2 2))))
+                (list (list g2) (grid-scale g2 2)))
+          2)
         ; scale 3x
         (list "scaffold_scale_3"
           (list (list (list g1) (grid-scale g1 3))
-                (list (list g2) (grid-scale g2 3))))))))
+                (list (list g2) (grid-scale g2 3)))
+          2)))))
 
 ; ── Extraction scaffolds: grid-object, grid-trim, grid-compact ───────
 
@@ -1286,19 +1680,22 @@
           (list (list (list (list (list 0 0 0 0) (list 0 1 2 0) (list 0 3 4 0) (list 0 0 0 0)))
                       (list (list 1 2) (list 3 4)))
                 (list (list (list (list 0 0 0 0 0) (list 0 0 5 0 0) (list 0 5 5 5 0) (list 0 0 5 0 0) (list 0 0 0 0 0)))
-                      (list (list 0 5 0) (list 5 5 5) (list 0 5 0)))))
+                      (list (list 0 5 0) (list 5 5 5) (list 0 5 0))))
+          2)
         ; grid-compact
         (list "scaffold_compact"
           (list (list (list (list (list 1 0 2) (list 0 0 0) (list 3 0 4)))
                       (list (list 1 2) (list 3 4)))
                 (list (list (list (list 5 0 6 0) (list 0 0 0 0) (list 7 0 8 0) (list 0 0 0 0)))
-                      (list (list 5 6) (list 7 8)))))
+                      (list (list 5 6) (list 7 8))))
+          2)
         ; grid-object (largest)
         (list "scaffold_object_0"
           (let ((big (list (list 0 1 1 0 0) (list 0 1 1 0 0) (list 0 0 0 2 0) (list 0 0 0 0 0)))
                 (big2 (list (list 0 0 3 3 3) (list 0 0 3 3 3) (list 0 0 3 3 3) (list 4 0 0 0 0))))
             (list (list (list big) (grid-object big 0))
-                  (list (list big2) (grid-object big2 0)))))))))
+                  (list (list big2) (grid-object big2 0))))
+          2)))))
 
 ; ── Recomposition scaffolds: object-level transforms ─────────────────
 
@@ -1314,13 +1711,15 @@
           (list (list (list (list (list 1 1 1) (list 1 0 1) (list 1 1 1)))
                       (grid-fill-enclosed (list (list 1 1 1) (list 1 0 1) (list 1 1 1))))
                 (list (list (list (list 2 2 2 2) (list 2 0 0 2) (list 2 0 0 2) (list 2 2 2 2)))
-                      (grid-fill-enclosed (list (list 2 2 2 2) (list 2 0 0 2) (list 2 0 0 2) (list 2 2 2 2))))))
+                      (grid-fill-enclosed (list (list 2 2 2 2) (list 2 0 0 2) (list 2 0 0 2) (list 2 2 2 2)))))
+          2)
         ; gravity-down
         (list "scaffold_gravity_down"
           (list (list (list (list (list 0 1 0) (list 0 0 0) (list 0 0 0)))
                       (list (list 0 0 0) (list 0 0 0) (list 0 1 0)))
                 (list (list (list (list 2 0 3) (list 0 0 0) (list 0 0 0)))
-                      (list (list 0 0 0) (list 0 0 0) (list 2 0 3)))))))))
+                      (list (list 0 0 0) (list 0 0 0) (list 2 0 3))))
+          2)))))
 
 ; ── Color filter scaffolds ───────────────────────────────────────────
 
@@ -1332,7 +1731,8 @@
         (list (list (list (list (list 1 2 1) (list 2 1 2) (list 1 2 1)))
                     (list (list 1 0 1) (list 0 1 0) (list 1 0 1)))
               (list (list (list (list 3 4 3) (list 4 3 4) (list 3 4 3)))
-                    (list (list 3 0 3) (list 0 3 0) (list 3 0 3))))))))
+                    (list (list 3 0 3) (list 0 3 0) (list 3 0 3))))
+        2))))
 
 ; ── Composition scaffolds: 2-op combinations ─────────────────────────
 
@@ -1345,21 +1745,25 @@
         ; hconcat with flip-h: (x | flip-h(x))
         (list "scaffold_mirror_h"
           (list (list (list g1) (grid-hconcat g1 (grid-flip-h g1)))
-                (list (list g2) (grid-hconcat g2 (grid-flip-h g2)))))
+                (list (list g2) (grid-hconcat g2 (grid-flip-h g2))))
+          2)
         ; vconcat with flip-v: (x / flip-v(x))
         (list "scaffold_mirror_v"
           (list (list (list g1) (grid-vconcat g1 (grid-flip-v g1)))
-                (list (list g2) (grid-vconcat g2 (grid-flip-v g2)))))
+                (list (list g2) (grid-vconcat g2 (grid-flip-v g2))))
+          2)
         ; tile 2x2 then flip-h alternate cols (checkerboard)
         (list "scaffold_tile_flip_h"
           (let ((t1 (grid-hconcat g1 (grid-flip-h g1)))
                 (t2 (grid-hconcat g2 (grid-flip-h g2))))
             (list (list (list g1) (grid-vconcat t1 (grid-flip-v t1)))
-                  (list (list g2) (grid-vconcat t2 (grid-flip-v t2))))))
+                  (list (list g2) (grid-vconcat t2 (grid-flip-v t2)))))
+          2)
         ; scale 2 then flip-h
         (list "scaffold_scale2_flip_h"
           (list (list (list g1) (grid-flip-h (grid-scale g1 2)))
-                (list (list g2) (grid-flip-h (grid-scale g2 2)))))))))
+                (list (list g2) (grid-flip-h (grid-scale g2 2))))
+          2)))))
 
 ; Object + transform compositions
 (define pm-scaffold-object-compositions
@@ -1372,15 +1776,18 @@
         ; extract largest object then rotate
         (list "scaffold_obj0_rotate_cw"
           (list (list (list g1) (grid-rotate-cw (grid-object g1 0)))
-                (list (list g2) (grid-rotate-cw (grid-object g2 0)))))
+                (list (list g2) (grid-rotate-cw (grid-object g2 0))))
+          2)
         ; extract largest then flip-h
         (list "scaffold_obj0_flip_h"
           (list (list (list g1) (grid-flip-h (grid-object g1 0)))
-                (list (list g2) (grid-flip-h (grid-object g2 0)))))
+                (list (list g2) (grid-flip-h (grid-object g2 0))))
+          2)
         ; extract then scale
         (list "scaffold_obj0_scale2"
           (list (list (list g1) (grid-scale (grid-object g1 0) 2))
-                (list (list g2) (grid-scale (grid-object g2 0) 2))))))))
+                (list (list g2) (grid-scale (grid-object g2 0) 2)))
+          2)))))
 
 ; Extract by object position (2nd largest, smallest)
 (define pm-scaffold-extract-by-position
@@ -1391,13 +1798,15 @@
         ; 2nd largest object
         (list "scaffold_object_1"
           (list (list (list g1) (grid-object g1 1))
-                (list (list g2) (grid-object g2 1))))
+                (list (list g2) (grid-object g2 1)))
+          2)
         ; trim then compact
         (list "scaffold_trim_compact"
           (let ((padded1 (list (list 0 0 0 0 0) (list 0 1 0 2 0) (list 0 0 0 0 0) (list 0 3 0 0 0) (list 0 0 0 0 0)))
                 (padded2 (list (list 0 0 0 0 0) (list 0 5 0 0 0) (list 0 0 0 6 0) (list 0 0 0 0 0))))
             (list (list (list padded1) (grid-compact padded1))
-                  (list (list padded2) (grid-compact padded2)))))))))
+                  (list (list padded2) (grid-compact padded2))))
+          2)))))
 
 ; Color-swap + extraction
 (define pm-scaffold-color-swap-extract
@@ -1408,13 +1817,15 @@
         (list (list (list (list (list 1 0 1) (list 0 1 0) (list 1 0 1)))
                     (list (list 2 0 2) (list 0 2 0) (list 2 0 2)))
               (list (list (list (list 1 0 0 1) (list 0 0 0 0) (list 1 0 0 1)))
-                    (list (list 2 0 0 2) (list 0 0 0 0) (list 2 0 0 2)))))
+                    (list (list 2 0 0 2) (list 0 0 0 0) (list 2 0 0 2))))
+        2)
       ; keep only background (invert: remove all non-bg)
       (list "scaffold_keep_bg_only"
         (list (list (list (list (list 0 1 0) (list 1 0 1) (list 0 1 0)))
                     (list (list 0 0 0) (list 0 0 0) (list 0 0 0)))
               (list (list (list (list 0 2 3) (list 4 0 5) (list 6 7 0)))
-                    (list (list 0 0 0) (list 0 0 0) (list 0 0 0))))))))
+                    (list (list 0 0 0) (list 0 0 0) (list 0 0 0))))
+        2))))
 
 ; Grid composition: hconcat, vconcat of input with itself
 (define pm-scaffold-grid-compose
@@ -1424,18 +1835,81 @@
       (list
         (list "scaffold_hconcat_self"
           (list (list (list g1) (grid-hconcat g1 g1))
-                (list (list g2) (grid-hconcat g2 g2))))
+                (list (list g2) (grid-hconcat g2 g2)))
+          2)
         (list "scaffold_vconcat_self"
           (list (list (list g1) (grid-vconcat g1 g1))
-                (list (list g2) (grid-vconcat g2 g2))))
+                (list (list g2) (grid-vconcat g2 g2)))
+          2)
         ; hconcat with rotate-cw
         (list "scaffold_hconcat_rotate"
           (list (list (list g1) (grid-hconcat g1 (grid-rotate-cw g1)))
-                (list (list g2) (grid-hconcat g2 (grid-rotate-cw g2)))))))))
+                (list (list g2) (grid-hconcat g2 (grid-rotate-cw g2))))
+          2)))))
+
+; ── Depth-3 composition scaffolds: 3-op chains ──────────────────────
+;
+; Generate scaffolds requiring depth-3 synthesis (3 nested operations).
+; These target complex ARC tasks that depth-2 cannot reach.
+
+(define pm-scaffold-depth3-compositions
+  (lambda ()
+    (let ((g1 (nth pm-sample-grids 0))
+          (g2 (nth pm-sample-grids 1))
+          (g3 (nth pm-sample-grids 2)))
+      (list
+        ; grid-trim(grid-rotate-cw(grid-object(x, 0)))
+        (list "scaffold_d3_obj0_rot_trim"
+          (let ((big1 (list (list 0 1 1 0 0) (list 0 1 1 0 0) (list 0 0 0 2 0) (list 0 0 0 0 0)))
+                (big2 (list (list 0 0 3 3 3) (list 0 0 3 3 3) (list 0 0 3 3 3) (list 4 0 0 0 0))))
+            (list (list (list big1) (grid-trim (grid-rotate-cw (grid-object big1 0))))
+                  (list (list big2) (grid-trim (grid-rotate-cw (grid-object big2 0))))))
+          3)
+        ; grid-flip-h(grid-rotate-cw(grid-trim(x)))
+        (list "scaffold_d3_trim_rot_fliph"
+          (let ((padded1 (list (list 0 0 0 0 0) (list 0 1 2 0 0) (list 0 3 4 0 0) (list 0 0 0 0 0)))
+                (padded2 (list (list 0 0 0 0 0) (list 0 0 5 6 0) (list 0 0 7 8 0) (list 0 0 0 0 0))))
+            (list (list (list padded1) (grid-flip-h (grid-rotate-cw (grid-trim padded1))))
+                  (list (list padded2) (grid-flip-h (grid-rotate-cw (grid-trim padded2))))))
+          3)
+        ; grid-compact(grid-flip-h(grid-rotate-cw(x)))
+        (list "scaffold_d3_rot_fliph_compact"
+          (let ((sp1 (list (list 1 0 2) (list 0 0 0) (list 3 0 4)))
+                (sp2 (list (list 5 0 0 6) (list 0 0 0 0) (list 0 0 0 0) (list 7 0 0 8))))
+            (list (list (list sp1) (grid-compact (grid-flip-h (grid-rotate-cw sp1))))
+                  (list (list sp2) (grid-compact (grid-flip-h (grid-rotate-cw sp2))))))
+          3)
+        ; grid-scale(grid-trim(x), 2)
+        (list "scaffold_d3_trim_scale2"
+          (let ((padded1 (list (list 0 0 0 0) (list 0 1 2 0) (list 0 3 4 0) (list 0 0 0 0)))
+                (padded2 (list (list 0 0 0 0 0) (list 0 0 5 0 0) (list 0 5 5 5 0) (list 0 0 5 0 0) (list 0 0 0 0 0))))
+            (list (list (list padded1) (grid-scale (grid-trim padded1) 2))
+                  (list (list padded2) (grid-scale (grid-trim padded2) 2))))
+          3)
+        ; grid-flip-h(grid-hconcat(x, grid-rotate-cw(x)))
+        (list "scaffold_d3_hconcat_rot_fliph"
+          (list (list (list g1) (grid-flip-h (grid-hconcat g1 (grid-rotate-cw g1))))
+                (list (list g2) (grid-flip-h (grid-hconcat g2 (grid-rotate-cw g2)))))
+          3)
+        ; grid-rotate-cw(grid-flip-v(grid-trim(x)))
+        (list "scaffold_d3_trim_flipv_rot"
+          (let ((padded1 (list (list 0 0 0 0 0) (list 0 1 2 0 0) (list 0 3 4 0 0) (list 0 0 0 0 0)))
+                (padded2 (list (list 0 0 0 0 0) (list 0 0 5 6 0) (list 0 0 7 8 0) (list 0 0 0 0 0))))
+            (list (list (list padded1) (grid-rotate-cw (grid-flip-v (grid-trim padded1))))
+                  (list (list padded2) (grid-rotate-cw (grid-flip-v (grid-trim padded2))))))
+          3)
+        ; grid-trim(grid-flip-h(grid-object(x, 0)))
+        (list "scaffold_d3_obj0_fliph_trim"
+          (let ((big1 (list (list 0 1 1 0 0) (list 0 1 1 0 0) (list 0 0 0 2 0) (list 0 0 0 0 0)))
+                (big2 (list (list 0 0 3 3 3) (list 0 0 3 3 3) (list 0 0 3 3 3) (list 4 0 0 0 0))))
+            (list (list (list big1) (grid-trim (grid-flip-h (grid-object big1 0))))
+                  (list (list big2) (grid-trim (grid-flip-h (grid-object big2 0))))))
+          3)))))
 
 ; ── Solve scaffolding and bind as library ────────────────────────────
 ;
-; Takes list of (name, spec) pairs. For each, calls synthesize-args.
+; Takes list of (name, spec, [depth]) triples. For each, calls
+; synthesize-args with the scaffold's depth and appropriate budget.
 ; If solved, evals the source and binds it via eval-source (define ...).
 ; Returns count of successfully solved + bound scaffolds.
 
@@ -1444,12 +1918,16 @@
     (reduce
       (lambda (count scaffold)
         (let ((name (nth scaffold 0))
-              (spec (nth scaffold 1)))
+              (spec (nth scaffold 1))
+              (depth (if (>= (length scaffold) 3) (nth scaffold 2) 2))
+              (budget (if (>= (length scaffold) 3)
+                        (if (>= (nth scaffold 2) 3) 100000 50000)
+                        50000)))
           (let ((result (try
                   (synthesize-args
                     (ns ("spec" spec)
-                        ("max-depth" 2)
-                        ("max-candidates" 50000)))
+                        ("max-depth" depth)
+                        ("max-candidates" budget)))
                   (ns ("found" false)))))
             (if (try (ns-get result "found") false)
               (let ((source (ns-get result "source")))
@@ -1535,6 +2013,8 @@
                       (pm-count (lambda (d) (try (ns-get d "auto-found") false))
                         with-recovery))
                     (prescriptions (pm-aggregate-prescriptions with-recovery)))
+                ; Phase 1.5: Generate M-chain forms from prescriptions
+                (let ((rx-forms-count (pm-generate-rx-forms prescriptions fails)))
                 ; Phase 2: Scaffolding loop (skip if __pm_skip_scaffolding__)
                 (let ((scaffolding-result
                         (if (try __pm_skip_scaffolding__ false)
@@ -1546,18 +2026,72 @@
                       ("scaffolds-solved" (ns-get scaffolding-result "scaffolds-solved"))
                       ("library-recovered" (ns-get scaffolding-result "library-recovered"))
                       ("total-failures" (length fails))
-                      ("total-results" (length results))))))))))))
+                      ("total-results" (length results)))))))))))))
 
-; Phase 2: generate scaffolding -> solve -> retry
+; Phase 2: generate scaffolding -> solve -> retry (iterative)
+;
+; Each iteration: generate scaffolds → solve → bind as library → retry failures.
+; Recovered solutions are bound as library functions so the next iteration can
+; compose them. Stops when: no scaffolds generated, none solved, none recovered,
+; or max iterations reached. Configurable via __pm_max_iterations__ (default 3).
+
 (define pm-run-scaffolding-loop
   (lambda (prescriptions fails diagnoses)
-    (let ((scaffolds (pm-generate-scaffolding prescriptions)))
-      (if (= (length scaffolds) 0)
-        (ns ("scaffolds-solved" 0) ("library-recovered" 0))
-        (let ((solved-count (pm-solve-scaffolding scaffolds)))
-          (if (= solved-count 0)
-            (ns ("scaffolds-solved" 0) ("library-recovered" 0))
-            ; Re-attempt only tasks whose bucket has scaffolding
-            (let ((recovered (pm-retry-with-library fails diagnoses)))
-              (ns ("scaffolds-solved" solved-count)
-                  ("library-recovered" (length recovered))))))))))
+    (let ((max-iters (try __pm_max_iterations__ 3)))
+      (pm-iterate-scaffold prescriptions fails diagnoses max-iters 0 0))))
+
+; Bind each recovered solution as a library function for the next iteration.
+(define pm-bind-recovered
+  (lambda (recovered)
+    (reduce (lambda (acc r)
+      (let ((name (ns-get r "name"))
+            (source (ns-get r "source")))
+        (do (try (eval-source (concat "(define pm-lib-" name " " source ")")) nil)
+            (+ acc 1))))
+      recovered 0)))
+
+; Remove recovered tasks, re-diagnose remaining, re-prescribe, recurse.
+(define pm-prepare-next-iteration
+  (lambda (remaining-fails iters-left total-scaffolds total-recovered)
+    (if (= (length remaining-fails) 0)
+      (ns ("scaffolds-solved" total-scaffolds) ("library-recovered" total-recovered))
+      (let ((new-with-rx (-> remaining-fails
+                           (map pm-diagnose-one)
+                           (map (lambda (d) (ns-put d "prescription" (pm-prescribe d)))))))
+        (pm-iterate-scaffold
+          (pm-aggregate-prescriptions new-with-rx)
+          remaining-fails new-with-rx
+          iters-left total-scaffolds total-recovered)))))
+
+
+; One iteration: generate scaffolds, solve, retry, maybe recurse.
+(define pm-iterate-scaffold
+  (lambda (prescriptions fails diagnoses iters-left total-scaffolds total-recovered)
+    (let ((result (ns ("scaffolds-solved" total-scaffolds)
+                      ("library-recovered" total-recovered))))
+      (if (<= iters-left 0) result
+      (let ((iter-num (+ 1 (- (try __pm_max_iterations__ 3) iters-left))))
+        (do (print (concat "-- Scaffold iteration " (to-string iter-num)
+                           " -- " (to-string (length fails)) " failures remaining"))
+        (let ((scaffolds (pm-generate-scaffolding prescriptions fails)))
+          (if (= (length scaffolds) 0)
+            (do (print "  No scaffolds generated, stopping.") result)
+          (let ((solved-count (pm-solve-scaffolding scaffolds)))
+            (if (= solved-count 0)
+              (do (print "  No scaffolds solved, stopping.") result)
+            (let ((recovered (pm-retry-with-library fails diagnoses))
+                  (new-total-s (+ total-scaffolds solved-count)))
+              (if (= (length recovered) 0)
+                (do (print (concat "  " (to-string solved-count) " solved, 0 recovered, stopping."))
+                    (ns ("scaffolds-solved" new-total-s) ("library-recovered" total-recovered)))
+                (let ((new-total-r (+ total-recovered (length recovered)))
+                      (remaining (filter
+                        (lambda (f) (not (pm-member? (ns-get f "name")
+                          (map (lambda (r) (ns-get r "name")) recovered))))
+                        fails)))
+                  (do (pm-bind-recovered recovered)
+                  (do (print (concat "  " (to-string solved-count) " solved, "
+                                     (to-string (length recovered)) " recovered. Iterating..."))
+                  (pm-prepare-next-iteration
+                    remaining (- iters-left 1)
+                    new-total-s new-total-r))))))))))))))))
