@@ -959,10 +959,7 @@ pub fn primitive_components() -> Vec<SynthComponent> {
         15.0,
     ));
 
-    // ── Grid cross-type bridges (§9.50) ────────────────────────────
-    // Only the ops that bridge types (List↔Int). Unary grid→grid
-    // transforms stay out of enumeration — the M-chain handles them
-    // without polluting the search space.
+    // ── Grid operations ─────────────────────────────────────────────
     //
     // Grid → Int extractors:
     comps.push(SynthComponent::named(
@@ -990,6 +987,36 @@ pub fn primitive_components() -> Vec<SynthComponent> {
     // Translation: (Grid, Int, Int) → Grid
     comps.push(SynthComponent::named(
         "grid-translate", intern("grid-translate"), vec![list_, int, int], list_, 10.0,
+    ));
+
+    // Unary Grid → Grid transforms. Previously excluded from the
+    // catalog (M-chain handled them via pool probing). Now needed
+    // for sub-synthesis in the m-ho decomposer: when HO detects
+    // map-over-objects, it sub-synthesizes the per-object transform
+    // F, which needs these operations as candidates. Priority 10
+    // keeps them behind simple arithmetic but ahead of expensive ops.
+    for name in &[
+        "grid-rotate-cw", "grid-rotate-ccw", "grid-rotate-180",
+        "grid-flip-h", "grid-flip-v", "grid-transpose",
+        "grid-trim", "grid-compact",
+        "grid-fill-enclosed",
+    ] {
+        comps.push(SynthComponent::named(
+            *name, intern(name), vec![list_], list_, 10.0,
+        ));
+    }
+    // Color operations: (Grid, Int, Int) → Grid
+    comps.push(SynthComponent::named(
+        "grid-replace-color", intern("grid-replace-color"),
+        vec![list_, int, int], list_, 12.0,
+    ));
+    // Grid background: Grid → Int
+    comps.push(SynthComponent::named(
+        "grid-background", intern("grid-background"), vec![list_], int, 10.0,
+    ));
+    // Grid colors: Grid → List
+    comps.push(SynthComponent::named(
+        "grid-colors", intern("grid-colors"), vec![list_], list_, 10.0,
     ));
 
     // Binary Grid × Grid → Grid ops stay out of the primitive catalog
@@ -1608,7 +1635,7 @@ pub fn higher_order_decompose(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     strategy_depth: usize,
 ) -> Option<(Vec<Node>, usize, usize)> {
@@ -1630,7 +1657,7 @@ pub fn higher_order_decompose(
             expected,
             env,
             universe,
-            max_depth,
+            flat_depth,
             budget_per_template,
             strategy_depth,
         );
@@ -1739,7 +1766,7 @@ fn ho_try_list_map(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     strategy_depth: usize,
 ) -> HoResult {
@@ -1768,7 +1795,7 @@ fn ho_try_list_map(
         &sub_expected,
         env,
         universe,
-        max_depth,
+        flat_depth,
         max_candidates,
         strategy_depth,
     );
@@ -1814,7 +1841,7 @@ fn ho_try_list_filter(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     strategy_depth: usize,
 ) -> HoResult {
@@ -1854,7 +1881,7 @@ fn ho_try_list_filter(
         &sub_expected,
         env,
         universe,
-        max_depth,
+        flat_depth,
         max_candidates,
         strategy_depth,
     );
@@ -1904,7 +1931,7 @@ fn ho_try_split_map_join(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     strategy_depth: usize,
 ) -> HoResult {
@@ -1946,7 +1973,7 @@ fn ho_try_split_map_join(
             &sub_expected,
             env,
             universe,
-            max_depth,
+            flat_depth,
             max_candidates,
             strategy_depth,
         );
@@ -2037,7 +2064,7 @@ fn ho_try_char_map_join(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     strategy_depth: usize,
 ) -> HoResult {
@@ -2068,7 +2095,7 @@ fn ho_try_char_map_join(
         &sub_expected,
         env,
         universe,
-        max_depth,
+        flat_depth,
         max_candidates,
         strategy_depth,
     );
@@ -2433,7 +2460,7 @@ pub fn divide_and_conquer(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     strategy_depth: usize,
 ) -> Option<(Vec<Node>, usize, usize)> {
@@ -2484,7 +2511,7 @@ pub fn divide_and_conquer(
         components,
         env,
         universe,
-        max_depth,
+        flat_depth,
         max_candidates,
         &mut total_explored,
         strategy_depth,
@@ -2539,7 +2566,7 @@ fn dc_build_nested_if(
     components: &[SynthComponent],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     total_explored: &mut usize,
     strategy_depth: usize,
@@ -2554,7 +2581,7 @@ fn dc_build_nested_if(
             components,
             env,
             universe,
-            max_depth,
+            flat_depth,
             max_candidates,
             total_explored,
             strategy_depth,
@@ -2576,7 +2603,7 @@ fn dc_build_nested_if(
         components,
         env,
         universe,
-        max_depth,
+        flat_depth,
         max_candidates,
         total_explored,
         strategy_depth,
@@ -2589,7 +2616,7 @@ fn dc_build_nested_if(
             components,
             env,
             universe,
-            max_depth,
+            flat_depth,
             max_candidates,
             total_explored,
             strategy_depth,
@@ -2601,7 +2628,7 @@ fn dc_build_nested_if(
             components,
             env,
             universe,
-            max_depth,
+            flat_depth,
             max_candidates,
             total_explored,
             strategy_depth,
@@ -2617,7 +2644,7 @@ fn dc_build_nested_if(
         components,
         env,
         universe,
-        max_depth,
+        flat_depth,
         max_candidates,
         total_explored,
         strategy_depth,
@@ -2629,7 +2656,7 @@ fn dc_build_nested_if(
             components,
             env,
             universe,
-            max_depth,
+            flat_depth,
             max_candidates,
             total_explored,
             strategy_depth,
@@ -2642,7 +2669,7 @@ fn dc_build_nested_if(
             components,
             env,
             universe,
-            max_depth,
+            flat_depth,
             max_candidates,
             total_explored,
             strategy_depth,
@@ -2696,7 +2723,7 @@ fn dc_find_separator(
     components: &[SynthComponent],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     total_explored: &mut usize,
     strategy_depth: usize,
@@ -2719,7 +2746,7 @@ fn dc_find_separator(
         &sub_expected,
         env,
         universe,
-        max_depth,
+        flat_depth,
         max_candidates,
         strategy_depth,
     );
@@ -2749,7 +2776,7 @@ fn dc_synthesize_branch(
     components: &[SynthComponent],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     total_explored: &mut usize,
     strategy_depth: usize,
@@ -2781,7 +2808,7 @@ fn dc_synthesize_branch(
         &group_expected,
         env,
         universe,
-        max_depth,
+        flat_depth,
         max_candidates,
         strategy_depth,
     );
@@ -2867,7 +2894,7 @@ pub fn induce_decomposition(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     strategy_depth: usize,
 ) -> Option<(Vec<Node>, usize, usize)> {
@@ -2902,7 +2929,7 @@ pub fn induce_decomposition(
             expected,
             env,
             universe,
-            max_depth,
+            flat_depth,
             budget_per_step,
             strategy_depth,
         );
@@ -2918,7 +2945,7 @@ pub fn induce_decomposition(
             &mid.values,
             env,
             universe,
-            max_depth,
+            flat_depth,
             budget_per_step,
             strategy_depth,
         );
@@ -3863,7 +3890,7 @@ fn rd_sub_synthesize(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     rd_depth: usize,
     strategy_depth: usize,
@@ -3876,7 +3903,7 @@ fn rd_sub_synthesize(
             expected,
             env,
             universe,
-            max_depth,
+            flat_depth,
             rd_budget,
             rd_depth - 1,
             strategy_depth,
@@ -3896,13 +3923,13 @@ fn rd_sub_synthesize(
             };
         }
         let remaining = max_candidates.saturating_sub(rd.candidates_explored);
-        let sr = sub_synthesize(components, inputs, expected, env, universe, max_depth, remaining, strategy_depth);
+        let sr = sub_synthesize(components, inputs, expected, env, universe, flat_depth, remaining, strategy_depth);
         return SynthResult {
             candidates_explored: sr.candidates_explored + rd.candidates_explored,
             ..sr
         };
     }
-    sub_synthesize(components, inputs, expected, env, universe, max_depth, max_candidates, strategy_depth)
+    sub_synthesize(components, inputs, expected, env, universe, flat_depth, max_candidates, strategy_depth)
 }
 
 // ── Per-function dispatch ──────────────────────────────────────────────────
@@ -3917,7 +3944,7 @@ fn rd_try_single_function(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     features: &RdSpecFeatures,
     rd_depth: usize,
@@ -3935,7 +3962,7 @@ fn rd_try_single_function(
                     &subspec.expected,
                     env,
                     universe,
-                    max_depth,
+                    flat_depth,
                     max_candidates,
                     rd_depth,
                     strategy_depth,
@@ -3963,7 +3990,7 @@ fn rd_try_single_function(
                     &subspec.expected,
                     env,
                     universe,
-                    max_depth,
+                    flat_depth,
                     max_candidates / 2,
                     rd_depth,
                     strategy_depth,
@@ -3991,7 +4018,7 @@ fn rd_try_single_function(
                     &subspec.expected,
                     env,
                     universe,
-                    max_depth,
+                    flat_depth,
                     remaining.min(max_candidates / 2),
                     rd_depth,
                     strategy_depth,
@@ -4022,7 +4049,7 @@ fn rd_try_single_function(
                     &subspec.expected,
                     env,
                     universe,
-                    max_depth,
+                    flat_depth,
                     max_candidates,
                     rd_depth,
                     strategy_depth,
@@ -4051,7 +4078,7 @@ fn rd_try_single_function(
                     &subspec.expected,
                     env,
                     universe,
-                    max_depth,
+                    flat_depth,
                     max_candidates,
                     rd_depth,
                     strategy_depth,
@@ -4086,7 +4113,7 @@ fn rd_try_single_function(
                     &subspec.expected,
                     env,
                     universe,
-                    max_depth,
+                    flat_depth,
                     remaining / 2,
                     rd_depth,
                     strategy_depth,
@@ -4143,7 +4170,7 @@ fn rd_try_single_function(
                     &subspec.expected,
                     env,
                     universe,
-                    max_depth,
+                    flat_depth,
                     max_candidates,
                     rd_depth,
                     strategy_depth,
@@ -4294,7 +4321,7 @@ fn rd_try_single_function(
                 expected,
                 env,
                 universe,
-                max_depth,
+                flat_depth,
                 max_candidates,
                 strategy_depth,
             ) {
@@ -4314,7 +4341,7 @@ fn rd_try_single_function(
                 expected,
                 env,
                 universe,
-                max_depth,
+                flat_depth,
                 max_candidates,
                 strategy_depth,
             ) {
@@ -4335,7 +4362,7 @@ fn rd_try_single_function(
                 expected,
                 env,
                 universe,
-                max_depth,
+                flat_depth,
                 max_candidates.saturating_sub(result.candidates_explored),
                 rd_depth,
                 strategy_depth,
@@ -4364,7 +4391,7 @@ fn rd_try_generic_binary_inversion(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     rd_depth: usize,
     strategy_depth: usize,
@@ -4472,7 +4499,7 @@ fn rd_try_generic_binary_inversion(
                 &per_k,
                 env,
                 universe,
-                max_depth,
+                flat_depth,
                 max_candidates / 2,
                 rd_depth,
                 strategy_depth,
@@ -4528,7 +4555,7 @@ fn rd_try_library_decomposition(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     rd_depth: usize,
     strategy_depth: usize,
@@ -4611,7 +4638,7 @@ fn rd_try_library_decomposition(
             expected,
             env,
             universe,
-            max_depth,
+            flat_depth,
             budget,
             rd_depth,
             strategy_depth,
@@ -4704,7 +4731,7 @@ fn rd_recursive(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     rd_depth: usize,
     strategy_depth: usize,
@@ -4737,7 +4764,7 @@ fn rd_recursive(
             expected,
             env,
             universe,
-            max_depth,
+            flat_depth,
             budget,
             &features,
             rd_depth,
@@ -4761,7 +4788,7 @@ fn rd_recursive(
             expected,
             env,
             universe,
-            max_depth,
+            flat_depth,
             remaining,
             rd_depth,
             strategy_depth,
@@ -4789,7 +4816,7 @@ pub fn recursive_decompose(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     strategy_depth: usize,
 ) -> Option<(Vec<Node>, usize, usize)> {
@@ -4799,7 +4826,7 @@ pub fn recursive_decompose(
         expected,
         env,
         universe,
-        max_depth,
+        flat_depth,
         max_candidates,
         RD_DEFAULT_DEPTH,
         strategy_depth,
@@ -4873,7 +4900,7 @@ fn try_selph_decomposers(
     env: &Env,
     inputs: &[Value],
     expected: &[Value],
-    max_depth: usize,
+    flat_depth: usize,
     max_budget: usize,
     test_inputs: &[Value],
     test_expected: &[Value],
@@ -4903,7 +4930,7 @@ fn try_selph_decomposers(
         .collect();
     let mut spec_ns = NsMap::new();
     spec_ns.insert(intern("spec"), Value::list(spec_pairs));
-    spec_ns.insert(intern("max-depth"), Value::Int(max_depth as i64));
+    spec_ns.insert(intern("max-depth"), Value::Int(flat_depth as i64));
     spec_ns.insert(intern("max-candidates"), Value::Int(max_budget as i64));
     // §9.47.6: include held-out test pairs so the SELPH chain can
     // self-validate candidates internally.
@@ -4981,7 +5008,7 @@ fn try_type_keyed_decomposers(
     universe: &TypeUniverse,
     inputs: &[Value],
     expected: &[Value],
-    max_depth: usize,
+    flat_depth: usize,
     max_budget: usize,
 ) -> Option<(Vec<Node>, usize, usize, Sym)> {
     // No __types__ loaded → nothing to dispatch.
@@ -5024,7 +5051,7 @@ fn try_type_keyed_decomposers(
         .collect();
     let mut spec_ns = NsMap::new();
     spec_ns.insert(intern("spec"), Value::list(spec_pairs));
-    spec_ns.insert(intern("max-depth"), Value::Int(max_depth as i64));
+    spec_ns.insert(intern("max-depth"), Value::Int(flat_depth as i64));
     spec_ns.insert(intern("max-candidates"), Value::Int(max_budget as i64));
     let spec_val = Value::ns(spec_ns);
 
@@ -5085,14 +5112,14 @@ fn sub_synthesize(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     strategy_depth: usize,
 ) -> SynthResult {
     if strategy_depth > 0 {
         let sr = synthesize_with_strategies_depth(
             components, inputs, expected, env, universe,
-            max_depth, max_candidates, strategy_depth - 1, 0,
+            flat_depth, max_candidates, strategy_depth - 1, 0,
         );
         SynthResult {
             found: sr.found,
@@ -5110,7 +5137,7 @@ fn sub_synthesize(
             experience: Vec::new(),
         }
     } else {
-        synthesize(components, inputs, expected, env, universe, max_depth, max_candidates)
+        synthesize(components, inputs, expected, env, universe, flat_depth, max_candidates)
     }
 }
 
@@ -5120,11 +5147,12 @@ pub fn synthesize_with_strategies(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     flat_budget: usize,
+    strategy_depth: usize,
 ) -> StrategyResult {
     synthesize_with_strategies_depth(
-        components, inputs, expected, env, universe, max_depth, flat_budget, 1, 0,
+        components, inputs, expected, env, universe, flat_depth, flat_budget, strategy_depth, 0,
     )
 }
 
@@ -5140,12 +5168,13 @@ pub fn synthesize_with_strategies_beam(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     flat_budget: usize,
+    strategy_depth: usize,
     beam_width: usize,
 ) -> StrategyResult {
     synthesize_with_strategies_depth(
-        components, inputs, expected, env, universe, max_depth, flat_budget, 1, beam_width,
+        components, inputs, expected, env, universe, flat_depth, flat_budget, strategy_depth, beam_width,
     )
 }
 
@@ -5160,7 +5189,7 @@ fn synthesize_with_strategies_depth(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     flat_budget: usize,
     strategy_depth: usize,
     beam_width: usize,
@@ -5179,7 +5208,7 @@ fn synthesize_with_strategies_depth(
     // §9.37 Stage A: global SELPH decomposers from `__decomposers__`
     // run BEFORE the hardcoded chain. Curriculum is in charge.
     if let Some((nodes, root, sd_explored, name_sym)) =
-        try_selph_decomposers(env, inputs, expected, max_depth, flat_budget, &[], &[])
+        try_selph_decomposers(env, inputs, expected, flat_depth, flat_budget, &[], &[])
     {
         return StrategyResult {
             found: true,
@@ -5204,7 +5233,7 @@ fn synthesize_with_strategies_depth(
     // by hanging the function under `("Int" (ns ("decomposers" ...)))`.
     if let Some((nodes, root, td_explored, name_sym)) =
         try_type_keyed_decomposers(
-            env, universe, inputs, expected, max_depth, flat_budget,
+            env, universe, inputs, expected, flat_depth, flat_budget,
         )
     {
         return StrategyResult {
@@ -5231,7 +5260,7 @@ fn synthesize_with_strategies_depth(
 
     // Strategy 1: Flat enumerative (with optional beam collection).
     let flat = synthesize_inner(
-        components, inputs, expected, env, universe, max_depth, flat_budget,
+        components, inputs, expected, env, universe, flat_depth, flat_budget,
         None, &[], &[], beam_width,
     );
     let mut total_explored = flat.candidates_explored;
@@ -5252,7 +5281,7 @@ fn synthesize_with_strategies_depth(
         expected,
         env,
         universe,
-        max_depth,
+        flat_depth,
         flat_budget,
         strategy_depth,
     ) {
@@ -5305,7 +5334,7 @@ fn synthesize_with_strategies_depth(
         expected,
         env,
         universe,
-        max_depth,
+        flat_depth,
         flat_budget,
         strategy_depth,
     ) {
@@ -5335,7 +5364,7 @@ fn synthesize_with_strategies_depth(
         expected,
         env,
         universe,
-        max_depth,
+        flat_depth,
         flat_budget,
         strategy_depth,
     ) {
@@ -5365,7 +5394,7 @@ fn synthesize_with_strategies_depth(
         expected,
         env,
         universe,
-        max_depth,
+        flat_depth,
         flat_budget,
         strategy_depth,
     ) {
@@ -6122,12 +6151,12 @@ pub fn synthesize(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
 ) -> SynthResult {
     synthesize_inner(
         components, inputs, expected, env, universe,
-        max_depth, max_candidates, None,
+        flat_depth, max_candidates, None,
         &[], &[], 0,
     )
 }
@@ -6148,12 +6177,12 @@ pub fn synthesize_args(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
 ) -> SynthResult {
     synthesize_args_with_test(
         components, inputs, arg_types, expected, env, universe,
-        max_depth, max_candidates, &[], &[],
+        flat_depth, max_candidates, &[], &[],
     )
 }
 
@@ -6168,14 +6197,14 @@ pub fn synthesize_args_with_test(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     test_inputs: &[Value],
     test_expected: &[Value],
 ) -> SynthResult {
     synthesize_args_with_extra_seeds(
         components, inputs, arg_types, expected, env, universe,
-        max_depth, max_candidates, test_inputs, test_expected, &[],
+        flat_depth, max_candidates, test_inputs, test_expected, &[],
     )
 }
 
@@ -6191,7 +6220,7 @@ pub fn synthesize_args_with_extra_seeds(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     test_inputs: &[Value],
     test_expected: &[Value],
@@ -6205,7 +6234,7 @@ pub fn synthesize_args_with_extra_seeds(
     seed_atoms.extend_from_slice(extra_seeds);
     synthesize_inner(
         components, inputs, expected, env, universe,
-        max_depth, max_candidates, Some(seed_atoms),
+        flat_depth, max_candidates, Some(seed_atoms),
         test_inputs, test_expected, 0,
     )
 }
@@ -6237,7 +6266,7 @@ fn synthesize_inner(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     extra_seeds: Option<Vec<SynthComponent>>,
     test_inputs: &[Value],
@@ -6372,7 +6401,7 @@ fn synthesize_inner(
     // counts even when the chain itself would be cheap.
     if extra_seeds_was_some {
         if let Some((nodes, root, sd_explored, name_sym)) =
-            try_selph_decomposers(env, inputs, expected, max_depth, max_candidates,
+            try_selph_decomposers(env, inputs, expected, flat_depth, max_candidates,
                                   test_inputs, test_expected)
         {
             // §9.47.5: the chain now self-validates against test data
@@ -6452,11 +6481,11 @@ fn synthesize_inner(
         }
     }
 
-    // ── Depth 1..max_depth: bottom-up composition ──────────────────────
+    // ── Depth 1..flat_depth: bottom-up composition ──────────────────────
     let mut prev_start: usize = 0;
     let mut prev_end: usize = pool.len();
 
-    'depth_loop: for _depth in 1..=max_depth {
+    'depth_loop: for _depth in 1..=flat_depth {
         if budget_exhausted {
             break 'depth_loop;
         }
@@ -6768,7 +6797,7 @@ pub fn synthesize_beam(
     expected: &[Value],
     env: &Env,
     universe: &TypeUniverse,
-    max_depth: usize,
+    flat_depth: usize,
     max_candidates: usize,
     beam_width: usize,
 ) -> BeamResult {
@@ -6856,11 +6885,11 @@ pub fn synthesize_beam(
         }
     }
 
-    // Depth 1..max_depth: bottom-up composition with beam cap.
+    // Depth 1..flat_depth: bottom-up composition with beam cap.
     let mut prev_start: usize = 0;
     let mut prev_end: usize = pool.len();
 
-    for _depth in 1..=max_depth {
+    for _depth in 1..=flat_depth {
         let prev_range_start = prev_start;
         let prev_range_end = prev_end;
         let all_end = prev_end;
@@ -7600,7 +7629,7 @@ mod tests {
         components: &[SynthComponent],
         inputs: Vec<Value>,
         expected: Vec<Value>,
-        max_depth: usize,
+        flat_depth: usize,
         max_candidates: usize,
     ) -> SynthResult {
         init_special_forms();
@@ -7612,7 +7641,7 @@ mod tests {
             &expected,
             &env,
             &universe,
-            max_depth,
+            flat_depth,
             max_candidates,
         )
     }
@@ -8171,6 +8200,7 @@ mod tests {
             &universe,
             1,
             500,
+            1,
         );
         assert!(r.found);
         assert_eq!(r.strategy, Some(Strategy::Flat));
@@ -8198,6 +8228,7 @@ mod tests {
             2,
             // Tiny budget — Flat will give up fast.
             200,
+            1,
         );
         assert!(r.found);
         // §9.56: with recursive dispatch, D&C may fire before Memo
@@ -8233,6 +8264,7 @@ mod tests {
             &universe,
             1,
             200,
+            1,
         );
         assert!(!r.found);
         assert_eq!(r.strategy, None);
@@ -8524,6 +8556,7 @@ mod tests {
             &universe,
             3,
             500,
+            1,
         );
         assert!(r.found);
         assert_eq!(r.strategy, Some(Strategy::BoolDecomp));
@@ -8742,7 +8775,7 @@ mod tests {
         ];
 
         let r = synthesize_with_strategies(
-            &comps, &inputs, &expected, &env, &universe, 2, 2000,
+            &comps, &inputs, &expected, &env, &universe, 2, 2000, 1,
         );
         assert!(r.found);
         assert_eq!(r.strategy, Some(Strategy::HigherOrder));
@@ -8880,7 +8913,7 @@ mod tests {
         ];
 
         let r = synthesize_with_strategies(
-            &comps, &inputs, &expected, &env, &universe, 2, 10000,
+            &comps, &inputs, &expected, &env, &universe, 2, 10000, 1,
         );
         assert!(r.found);
         // §9.56: with recursive dispatch, RD may solve classification
@@ -9232,7 +9265,7 @@ mod tests {
             Value::Int(30),
         ];
         let r = synthesize_with_strategies(
-            &comps, &inputs, &expected, &env, &universe, 1, 5000,
+            &comps, &inputs, &expected, &env, &universe, 1, 5000, 1,
         );
         assert!(r.found);
         assert_eq!(r.strategy, Some(Strategy::RecursiveDecomposition));
@@ -9274,6 +9307,7 @@ mod tests {
             &universe,
             3,
             5000,
+            1,
         );
         assert!(r.found);
         assert_eq!(r.strategy, Some(Strategy::Flat));

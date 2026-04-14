@@ -2604,8 +2604,16 @@ fn bi_synthesize(args: &[Value], env: &Env) -> Result<Value, String> {
         expected.push(p[1].clone());
     }
 
-    let max_depth = ns
+    let flat_depth = ns
         .get(&intern("max-depth"))
+        .and_then(|v| match v {
+            Value::Int(n) => Some(*n as usize),
+            Value::Num(n) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(1);
+    let strategy_depth = ns
+        .get(&intern("strategy-depth"))
         .and_then(|v| match v {
             Value::Int(n) => Some(*n as usize),
             Value::Num(n) => Some(*n as usize),
@@ -2663,8 +2671,9 @@ fn bi_synthesize(args: &[Value], env: &Env) -> Result<Value, String> {
         &expected,
         env,
         &universe,
-        max_depth,
+        flat_depth,
         max_candidates,
+        strategy_depth,
     );
 
     let source = if result.found {
@@ -2935,8 +2944,17 @@ fn bi_synthesize_beam(args: &[Value], env: &Env) -> Result<Value, String> {
         })
         .unwrap_or(500);
 
-    let max_depth = ns
+    let flat_depth = ns
         .get(&intern("max-depth"))
+        .and_then(|v| match v {
+            Value::Int(n) => Some(*n as usize),
+            Value::Num(n) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(1);
+
+    let strategy_depth = ns
+        .get(&intern("strategy-depth"))
         .and_then(|v| match v {
             Value::Int(n) => Some(*n as usize),
             Value::Num(n) => Some(*n as usize),
@@ -2968,7 +2986,7 @@ fn bi_synthesize_beam(args: &[Value], env: &Env) -> Result<Value, String> {
 
     let result = crate::synth_v2::synthesize_with_strategies_beam(
         &components, &inputs, &expected, env, &universe,
-        max_depth, max_candidates, beam_width,
+        flat_depth, max_candidates, strategy_depth, beam_width,
     );
 
     // Build return namespace.

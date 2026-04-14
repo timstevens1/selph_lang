@@ -168,7 +168,8 @@ fn print_usage() {
     println!("  selph parse -e \"(add 1 2)\"    Parse and print AST");
     println!("  selph grow <tasks.selph>      Run curriculum: solve, promote, save");
     println!("    --budget N                  Max candidates per task (default 200000)");
-    println!("    --depth N                   Max search depth (default 2)");
+    println!("    --depth N                   Strategy/decomposer chaining depth (default 2)");
+    println!("    --flat-depth N              Flat enumeration depth per leaf (default 1)");
     println!("    --post-mortem <pm.selph>    Post-mortem analysis script");
     println!("  selph arc <path> [--output f] Convert ARC JSON to curriculum format");
     println!("  selph repl                    Interactive REPL");
@@ -359,6 +360,7 @@ fn synthesize_one_task(
     test_expected_legacy: &[Value],
     env: &types_v2::Env,
     default_budget: usize,
+    strategy_depth: usize,
 ) -> WorkerResult {
     let force_num = inputs_legacy.iter().chain(expected_legacy.iter())
         .any(legacy_value_has_non_integral);
@@ -429,7 +431,7 @@ fn synthesize_one_task(
     } else {
         synth_v2::synthesize_with_strategies(
             &components, &inputs, &expected,
-            env, &universe, task_depth, default_budget,
+            env, &universe, task_depth, default_budget, strategy_depth,
         )
     };
 
@@ -466,6 +468,7 @@ fn run_parallel_batch(
     env: &types_v2::Env,
     default_budget: usize,
     n_workers: usize,
+    strategy_depth: usize,
 ) -> Vec<WorkerResult> {
     use std::io::{BufRead, BufReader, Write as IoWrite};
 
@@ -509,7 +512,7 @@ fn run_parallel_batch(
                     let wr = synthesize_one_task(
                         name, task_depth, inputs, expected,
                         arity_hint, test_in, test_exp,
-                        env, default_budget,
+                        env, default_budget, strategy_depth,
                     );
                     let line = wr.to_line();
                     let _ = writeln!(file, "{}", line);
@@ -563,13 +566,14 @@ fn run_parallel_batch(
 
 fn cmd_grow_v2(args: &[String]) {
     if args.is_empty() {
-        eprintln!("Usage: selph grow-v2 <tasks.selph> [--budget N] [--depth N] [--parallel N] [--checkpoint PATH] [--no-checkpoint]");
+        eprintln!("Usage: selph grow-v2 <tasks.selph> [--budget N] [--depth N] [--flat-depth N] [--parallel N] [--checkpoint PATH] [--no-checkpoint]");
         return;
     }
 
     let mut task_file = String::new();
     let mut default_budget: usize = 200000;
-    let mut default_depth: usize = 2;
+    let mut default_flat_depth: usize = 1;
+    let mut default_strategy_depth: usize = 2;
     let mut post_mortem_file: Option<String> = None;
     let mut checkpoint_path: Option<String> = None;
     let mut no_checkpoint = false;
@@ -582,7 +586,11 @@ fn cmd_grow_v2(args: &[String]) {
                 i += 2;
             }
             "--depth" => {
-                default_depth = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(default_depth);
+                default_strategy_depth = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(default_strategy_depth);
+                i += 2;
+            }
+            "--flat-depth" => {
+                default_flat_depth = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(default_flat_depth);
                 i += 2;
             }
             "--post-mortem" => {
@@ -614,7 +622,7 @@ fn cmd_grow_v2(args: &[String]) {
         Err(e) => { eprintln!("Error reading {}: {}", task_file, e); return; }
     };
 
-    let tasks = parse_curriculum_tasks(&task_source, default_depth);
+    let tasks = parse_curriculum_tasks(&task_source, default_flat_depth);
 
     // Resolve checkpoint path.
     let ckpt_path = if no_checkpoint {
@@ -625,7 +633,8 @@ fn cmd_grow_v2(args: &[String]) {
 
     eprintln!();
     eprintln!("SELPH grow-v2: {} tasks", tasks.len());
-    eprintln!("  Budget: {}, Default depth: {}", default_budget, default_depth);
+    eprintln!("  Budget: {}, Flat depth: {}, Strategy depth: {}",
+        default_budget, default_flat_depth, default_strategy_depth);
     if parallel_workers > 0 {
         eprintln!("  Parallel: {} workers", parallel_workers);
     }
@@ -727,6 +736,7 @@ fn cmd_grow_v2(args: &[String]) {
 
             let worker_results = run_parallel_batch(
                 &unsolved, &tasks, &env, default_budget, parallel_workers,
+                default_strategy_depth,
             );
 
             // Index results by task name for fast lookup.
@@ -1017,6 +1027,7 @@ fn cmd_grow_v2(args: &[String]) {
                 &universe,
                 *task_depth,
                 default_budget,
+                default_strategy_depth,
             )
         };
         let elapsed = start.elapsed();
@@ -1848,7 +1859,7 @@ fn cmd_beam_overnight(args: &[String]) {
 
         let wr = synthesize_one_task(
             name, depth, inputs, expected, arity_hint,
-            test_inputs, test_expected, &env, baseline_budget,
+            test_inputs, test_expected, &env, baseline_budget, 2,
         );
         total_candidates += wr.candidates;
 
@@ -1965,7 +1976,7 @@ fn cmd_beam_overnight(args: &[String]) {
 
                 let sr = synth_v2::synthesize_with_strategies_beam(
                     &components, &v2_inputs, &v2_expected, &env, &universe,
-                    beam_depth, budget, beam_width,
+                    beam_depth, budget, 2, beam_width,
                 );
                 task_candidates += sr.candidates_explored;
 
@@ -2062,13 +2073,13 @@ fn cmd_arc(args: &[String]) {
 
     let path = &args[0];
     let mut output_file: Option<String> = None;
-    let mut depth = 2usize;
+    let mut depth = 1usize;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--output" | "-o" => { i += 1; output_file = Some(args[i].clone()); }
-            "--depth" => { i += 1; depth = args[i].parse().unwrap_or(2); }
+            "--depth" => { i += 1; depth = args[i].parse().unwrap_or(1); }
             _ => { eprintln!("Unknown flag: {}", args[i]); return; }
         }
         i += 1;

@@ -191,8 +191,11 @@
             nil))))))
 
 ; Budget: max pair evaluations for Form 3. With 11 L1 ops + L2,
-; pool can reach ~133 entries. Cap at 2000 pairs to keep cost bounded.
-(define m8g-form3-budget 2000)
+; pool can reach ~133 entries. Cap at 200 pairs — most ARC tasks
+; that use binary grid ops (xor/and/or) are recognizable in the
+; first ~100 probes. The old budget of 2000 dominated failed-task
+; time (~2-3s per task on 30×30 grids) for zero additional solves.
+(define m8g-form3-budget 200)
 
 (define m8g-try-form-3
   (lambda (pool target)

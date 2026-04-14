@@ -58,6 +58,7 @@ cat \
     "$META/m_chain.selph" \
     "$META/m_fitness_grid.selph" \
     "$META/m_refine.selph" \
+    "$META/m_ho.selph" \
     "$CURRICULUM" \
     > "$COMBINED"
 

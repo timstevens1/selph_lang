@@ -2,7 +2,7 @@
 
 ## From Enumerative Solver to Self-Building Architecture
 
-**Version 0.16 — April 13, 2026**
+**Version 0.17 — April 14, 2026**
 
 Cleaned up from v0.12 to reflect the project's current state. Detailed implementation logs from §9.1–§9.43 have been condensed into summaries; the full history is preserved in git. Sections 3–5 and 7–8 from the original plan have been collapsed — the project vision shifted significantly per §9.38 (symbolic-first, neural-contingent).
 
@@ -93,7 +93,7 @@ The M-chain is a set of recognition stages that run before enumeration. Each sta
 | Strings / POS | 28 | **28/28** | Type-dependent pools + Forms 1–6 recognizers |
 | Grids (ARC scaffolding) | 13 | **13/13** | Forms 1–8, cross-type bridges, object indexing |
 | Original 3-domain chain | 55 | **55/55** | Sequence → CF → NL, library cascade |
-| ARC-AGI-1 (training) | 400 | **31/400** | Grid Forms 1-9 + Phase 1 synthesis (29) + Phase 4 template transfer (+2) |
+| ARC-AGI-1 (training) | 400 | **35/400** | Grid Forms 1-14 + Phase 1 synthesis (33 M-chain + 2 Flat) |
 | ARC-AGI-1 (evaluation) | 400 | **3/400** | M-chain forms tuned to training distribution; eval set is harder |
 
 ### 2.7 CLI Commands
@@ -987,6 +987,52 @@ The generative loop works mechanically — Phase 4 discovers and applies solutio
 The diagnostic side is fully closed (fitness scoring → near-miss analysis → boost retry → composition wrapping → template transfer). The generative side is mechanically closed but capability-limited. To make it productive:
 1. New forms that solve different *classes* of tasks would dramatically increase Phase 4's template pool
 2. The 83 near-miss tasks (>=90% fitness) are the target — they represent tasks where the system is *close* but lacks one specific capability
+
+### 9.62 Strategy depth separation + generic HO decomposer (April 14, 2026)
+
+Architectural refactor separating flat enumeration depth from decomposer chaining depth, plus a generic map-over-objects decomposer and grid synthesis component registration.
+
+#### 9.62.1 Strategy depth vs flat depth
+
+Previously `--depth N` controlled both flat enumeration depth (the bottom-up composition loop in `synthesize_inner`) and was hardcoded to `strategy_depth=1` for decomposer chaining. At depth 2, flat search exhausted at ~1,286 candidates — 33/35 solved tasks used M-chain, not flat composition.
+
+**Change:** `--depth N` now controls **strategy depth** (decomposer chaining levels, default 2). New `--flat-depth N` controls flat enumeration depth per leaf (default 1). When a decomposer/strategy reduces a problem, the sub-problem routes through the full chain with `strategy_depth - 1`, using `flat_depth` at each leaf.
+
+Result: 35/400 ARC unchanged. The 2 Flat-only tasks solve at depth 1. Infrastructure ready for deeper decomposer chaining when forms require it.
+
+#### 9.62.2 Form 3 budget reduction
+
+`m8g_constant_grid.selph` Form 3 (binary grid ops) budget reduced from 2000 to 200 pair evaluations. Most ARC tasks using xor/and/or are recognizable in the first ~100 probes. The old budget dominated failed-task time (~2-3s per task on 30×30 grids).
+
+Result: 715s → 498s (30% faster), +1 task (7b7f7511 via grid-untile, previously blocked by overfitting Form 3 match). 36/400 in sequential mode.
+
+#### 9.62.3 Grid synthesis components
+
+Previously, unary grid→grid transforms (rotate, flip, transpose, trim, compact, fill-enclosed) were excluded from the synthesis component catalog — the M-chain handled them via pool probing. This meant sub-synthesis (from HO or other decomposers) couldn't find per-object transforms.
+
+**Change:** 9 unary grid transforms + `grid-replace-color`, `grid-background`, `grid-colors` now registered as primitive synthesis components at priority 10-12. Candidate count per task increased from 1286 to 1312 (negligible).
+
+#### 9.62.4 Generic HO map decomposer (m_ho.selph)
+
+New pure-SELPH decomposer with extensible (extractor, aligner, recombiner) catalog. Phase 1: `grid-objects-map`.
+
+**Architecture:**
+1. Guard: verify matching object counts in input/output (≥2, ≤20)
+2. Extract: `grid-object` per index, position via `grid-object-pos`
+3. Align: position-based greedy L1-distance matching (not size-order dependent)
+4. Build sub-spec: `(list input-obj) → output-obj` pairs across training examples
+5. Sub-synthesize: call `synthesize-args` with budget 5000 (routes through full strategy chain)
+6. Compose AST: `reduce` over objects with `grid-place` on blank canvas
+7. Validate: against training + held-out test pairs
+
+**Key finding:** No new ARC solves. Root cause: ARC per-object tasks predominantly use *contextual* transforms (varying by object properties, not uniform F). The decomposer is architecturally correct and will fire on genuine uniform-transform tasks. The near-miss analysis (80 tasks ≥ 90% fitness) shows the dominant gaps are ray/projection (6 tasks), boundary fill (2), and conditional recolor (3) — none are per-object map patterns.
+
+**Lessons:**
+- Grid→grid builtins must be registered as synth components for sub-synthesis to work
+- Object alignment must use position matching, not size-order (transforms can change relative sizes)
+- The M-chain's pool-based recognition covers simple transforms efficiently; the HO decomposer adds value only when F requires composition or isn't in the M-chain's catalog
+
+Files: `m_ho.selph` (new), `synth_v2.rs`, `eval_v2.rs`, `main.rs`, `m8g_constant_grid.selph`, `run_probe.sh`, `run_fitness_probe.sh`
 
 ---
 

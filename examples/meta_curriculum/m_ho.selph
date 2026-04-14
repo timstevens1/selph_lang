@@ -1,0 +1,323 @@
+; ─────────────────────────────────────────────────────────────────────────
+; m_ho: generic higher-order map decomposer
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Decomposer that detects map-over-collection patterns and sub-synthesizes
+; the per-element transform F via the full strategy chain.
+;
+; Phase 1: grid-objects-map
+;   For each training pair, extract objects via grid-object, align
+;   input↔output objects by position, build a sub-spec of
+;   (input-obj → output-obj) pairs, call synthesize-args to discover F,
+;   then compose: solution(x) = recompose(map(F, objects(x))).
+;
+; The architecture supports adding extractors (list-map, grid-rows-map,
+; string-split-map) by extending the catalog.
+;
+; Registered as "m-ho" in __decomposers__ (after m-chain and m-refine).
+
+; ── Recursion guard ────────────────────────────────────────────────────
+;
+; Sub-synthesis calls synthesize-args which triggers decomposers again.
+; This flag prevents m-ho from calling itself during sub-synthesis.
+
+(define ho-in-decompose false)
+
+; ── Configuration ──────────────────────────────────────────────────────
+
+(define ho-sub-budget 5000)
+(define ho-sub-depth 1)
+(define ho-min-objects 2)
+(define ho-max-objects 20)
+
+; ── Guard: grid-objects-map ────────────────────────────────────────────
+;
+; Returns true if all inputs/outputs are grids and every pair has the
+; same number of objects (>= ho-min-objects, <= ho-max-objects).
+
+(define ho-grid-objects-guard
+  (lambda (inputs outputs)
+    (if (= (length inputs) 0) false
+      (reduce
+        (lambda (ok i)
+          (if (not ok) false
+            (let ((inp (head (nth inputs i)))
+                  (out (nth outputs i)))
+              (if (not (and (grid? inp) (grid? out))) false
+                (let ((n-in  (try (grid-object-count inp) 0))
+                      (n-out (try (grid-object-count out) 0)))
+                  (and (= n-in n-out)
+                       (>= n-in ho-min-objects)
+                       (<= n-in ho-max-objects)))))))
+        (range (length inputs))
+        true))))
+
+; ── Position-based object alignment ────────────────────────────────────
+;
+; Unlike m10-align-objects (which iterates by size-sorted index), this
+; aligner collects positions for ALL objects first, then does greedy
+; L1-distance matching. Handles transforms that change object sizes
+; (which reorder the size-sorted indices between input and output).
+;
+; Returns list of (in-idx out-idx) pairs, or nil on failure.
+
+(define ho-align-by-position
+  (lambda (in-grid out-grid n)
+    (let ((in-positions
+            (map (lambda (i) (try (grid-object-pos in-grid i) nil))
+                 (range n)))
+          (out-positions
+            (map (lambda (j) (try (grid-object-pos out-grid j) nil))
+                 (range n))))
+      ; Check all positions resolved
+      (if (or (member? nil in-positions) (member? nil out-positions)) nil
+        ; Greedy match: for each input object, find closest unused output
+        (let ((result
+                (reduce
+                  (lambda (acc i)
+                    (if (nil? acc) nil
+                      (let ((in-pos (nth in-positions i))
+                            (used  (nth acc 1)))
+                        (let ((best
+                                (nth
+                                  (reduce
+                                    (lambda (st j)
+                                      (if (member? j used) st
+                                        (let ((out-pos (nth out-positions j)))
+                                          (let ((dist (+ (abs (- (nth in-pos 0) (nth out-pos 0)))
+                                                         (abs (- (nth in-pos 1) (nth out-pos 1))))))
+                                            (if (< dist (nth st 1))
+                                              (list j dist)
+                                              st)))))
+                                    (range n)
+                                    (list -1 9999))
+                                  0)))
+                          (if (= best -1) nil
+                            (list
+                              (append (nth acc 0) (list (list i best)))
+                              (append used (list best))))))))
+                  (range n)
+                  (list (list) (list)))))
+          (if (nil? result) nil
+            (nth result 0)))))))
+
+; ── Extract + align: grid-objects-map ──────────────────────────────────
+;
+; For each training pair:
+;   1. Count objects, align by position
+;   2. For each aligned (in-idx, out-idx), extract the object grids
+;   3. Collect as sub-spec pairs: ((list in-obj) out-obj)
+;
+; Returns list of sub-spec pairs, or nil on failure.
+
+(define ho-grid-objects-sub-spec
+  (lambda (inputs outputs)
+    (let ((result
+            (reduce
+              (lambda (acc i)
+                (if (nil? acc) nil
+                  (let ((in-grid  (head (nth inputs i)))
+                        (out-grid (nth outputs i)))
+                    (let ((n (grid-object-count in-grid)))
+                      (let ((alignment (try (ho-align-by-position in-grid out-grid n) nil)))
+                        (if (nil? alignment) nil
+                          (reduce
+                            (lambda (a pair)
+                              (if (nil? a) nil
+                                (let ((in-obj  (try (grid-object in-grid  (nth pair 0)) nil))
+                                      (out-obj (try (grid-object out-grid (nth pair 1)) nil)))
+                                  (if (or (nil? in-obj) (nil? out-obj)) nil
+                                    (append a (list (list (list in-obj) out-obj)))))))
+                            alignment acc)))))))
+              (range (length inputs))
+              (list))))
+      (if (nil? result) nil
+        (if (< (length result) 3) nil
+          result)))))
+
+; ── Sub-spec for held-out test pairs ───────────────────────────────────
+
+(define ho-grid-objects-test-spec
+  (lambda (test-inputs test-outputs)
+    (if (= (length test-inputs) 0) (list)
+      (let ((result
+              (reduce
+                (lambda (acc i)
+                  (if (nil? acc) (list)
+                    (let ((in-grid  (head (nth test-inputs i)))
+                          (out-grid (nth test-outputs i)))
+                      (let ((n (try (grid-object-count in-grid) 0))
+                            (n2 (try (grid-object-count out-grid) 0)))
+                        (if (not (= n n2)) (list)
+                          (let ((alignment (try (ho-align-by-position in-grid out-grid n) nil)))
+                            (if (nil? alignment) (list)
+                              (reduce
+                                (lambda (a pair)
+                                  (if (nil? a) (list)
+                                    (let ((in-obj  (try (grid-object in-grid  (nth pair 0)) nil))
+                                          (out-obj (try (grid-object out-grid (nth pair 1)) nil)))
+                                      (if (or (nil? in-obj) (nil? out-obj)) (list)
+                                        (append a (list (list (list in-obj) out-obj)))))))
+                                alignment acc))))))))
+                (range (length test-inputs))
+                (list))))
+        (if (nil? result) (list) result)))))
+
+; ── Sub-synthesis ──────────────────────────────────────────────────────
+
+(define ho-try-sub-synth
+  (lambda (sub-spec test-sub-spec)
+    (try
+      (synthesize-args
+        (ns ("spec" sub-spec)
+            ("max-depth" ho-sub-depth)
+            ("max-candidates" ho-sub-budget)
+            ("test" test-sub-spec)))
+      (ns ("found" false)))))
+
+; ── AST composition: grid-objects-map ──────────────────────────────────
+;
+; Builds the composed program:
+;
+;   (lambda (x)
+;     (let ((g (nth x 0))
+;           (ho-f <sub-function-node>))
+;       (reduce
+;         (lambda (canvas i)
+;           (let ((pos (grid-object-pos g i)))
+;             (grid-place canvas
+;               (ho-f (list (grid-object g i)))
+;               (nth pos 0) (nth pos 1))))
+;         (range (grid-object-count g))
+;         (grid-blank (grid-height g) (grid-width g)
+;                     (grid-background g)))))
+
+(define ho-build-grid-objects-ast
+  (lambda (sub-source)
+    (let ((sub-node (parse-source sub-source)))
+      ; Build the full composition AST.
+      ; We bind ho-f to the sub-function, g to (nth x 0),
+      ; then reduce over objects.
+      (make-lambda (list "x")
+        (make-let
+          (list
+            (list "g" (make-app "nth" (make-symbol "x") (make-int 0)))
+            (list "ho-f" sub-node))
+          (make-app "reduce"
+            ; reducer lambda: (canvas, i) -> grid-place canvas (ho-f (list (grid-object g i))) pos
+            (make-lambda (list "canvas" "i")
+              (make-let
+                (list
+                  (list "pos" (make-app "grid-object-pos"
+                                (make-symbol "g") (make-symbol "i"))))
+                (make-app "grid-place"
+                  (make-symbol "canvas")
+                  (make-app "ho-f"
+                    (make-app "list"
+                      (make-app "grid-object"
+                        (make-symbol "g") (make-symbol "i"))))
+                  (make-app "nth" (make-symbol "pos") (make-int 0))
+                  (make-app "nth" (make-symbol "pos") (make-int 1)))))
+            ; range
+            (make-app "range"
+              (make-app "grid-object-count" (make-symbol "g")))
+            ; initial canvas
+            (make-app "grid-blank"
+              (make-app "grid-height" (make-symbol "g"))
+              (make-app "grid-width"  (make-symbol "g"))
+              (make-app "grid-background" (make-symbol "g")))))))))
+
+; ── Runtime validation ─────────────────────────────────────────────────
+;
+; Verify the composed function against held-out test pairs.
+
+(define ho-validate-test
+  (lambda (composed-node test-inputs test-outputs)
+    (if (= (length test-inputs) 0) true
+      (let ((func (try (eval-node composed-node) nil)))
+        (if (nil? func) false
+          (reduce
+            (lambda (ok i)
+              (if (not ok) false
+                (let ((got (try (func (nth test-inputs i)) nil)))
+                  (and (not (nil? got))
+                       (= got (nth test-outputs i))))))
+            (range (length test-inputs))
+            true))))))
+
+; ── Runtime validation against training pairs ──────────────────────────
+
+(define ho-validate-training
+  (lambda (composed-node inputs outputs)
+    (let ((func (try (eval-node composed-node) nil)))
+      (if (nil? func) false
+        (reduce
+          (lambda (ok i)
+            (if (not ok) false
+              (let ((inp (nth inputs i))
+                    (expected (nth outputs i)))
+                (let ((got (try (func inp) nil)))
+                  (and (not (nil? got))
+                       (= got expected))))))
+          (range (length inputs))
+          true)))))
+
+; ── Grid-objects-map extractor ─────────────────────────────────────────
+
+(define ho-try-grid-objects-map
+  (lambda (inputs outputs test-inputs test-outputs)
+    (if (not (ho-grid-objects-guard inputs outputs))
+      (ns ("found" false))
+      (let ((sub-spec (ho-grid-objects-sub-spec inputs outputs)))
+        (if (nil? sub-spec)
+          (ns ("found" false))
+          (let ((test-sub-spec (ho-grid-objects-test-spec test-inputs test-outputs)))
+            (let ((synth-result (ho-try-sub-synth sub-spec test-sub-spec)))
+              (if (not (ns-get synth-result "found"))
+                (ns ("found" false))
+                (let ((sub-source (ns-get synth-result "source")))
+                  (if (= (length sub-source) 0)
+                    (ns ("found" false))
+                    (let ((composed (try (ho-build-grid-objects-ast sub-source) nil)))
+                      (if (nil? composed)
+                        (ns ("found" false))
+                        ; Validate against training pairs
+                        (if (not (ho-validate-training composed inputs outputs))
+                          (ns ("found" false))
+                          ; Validate against test pairs
+                          (if (not (ho-validate-test composed test-inputs test-outputs))
+                            (ns ("found" false))
+                            (ns ("found" true)
+                                ("nodes" composed)
+                                ("candidates" (ns-get synth-result "candidates")))))))))))))))))
+
+
+; ── Main decomposer entry point ────────────────────────────────────────
+
+(define ho-run-decomposer
+  (lambda (synth-spec)
+    (let ((spec (m-chain-spec-from-synth synth-spec)))
+      (let ((inputs  (ns-get spec "inputs"))
+            (outputs (ns-get spec "outputs"))
+            (test-inputs  (try (ns-get spec "test-inputs")  (list)))
+            (test-outputs (try (ns-get spec "test-outputs") (list))))
+        ; Only try grid extractors for grid output tasks.
+        (let ((kind (m-chain-output-kind spec)))
+          (if (= kind "grid")
+            (ho-try-grid-objects-map inputs outputs test-inputs test-outputs)
+            (ns ("found" false))))))))
+
+(define ho-decomposer
+  (lambda (synth-spec)
+    (if (try ho-in-decompose false)
+      (ns ("found" false))
+      (do (eval-source "(define ho-in-decompose true)")
+          (let ((result (try (ho-run-decomposer synth-spec)
+                             (ns ("found" false)))))
+            (do (eval-source "(define ho-in-decompose false)")
+                result))))))
+
+; ── Registration ───────────────────────────────────────────────────────
+
+(define __decomposers__
+  (ns-put __decomposers__ "m-ho" ho-decomposer))
