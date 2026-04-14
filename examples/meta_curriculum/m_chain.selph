@@ -76,13 +76,36 @@
 ; and M10s consumes that pool — a wrap-then-concat shape gets
 ; recognized by M10s without a separate unary stage.
 
+; Validate a detected source-node against held-out test pairs.
+; Returns true if no test data or if the function passes all test pairs.
+(define m-chain-validate-test
+  (lambda (source-node spec)
+    (let ((test-inputs  (try (ns-get spec "test-inputs") (list)))
+          (test-outputs (try (ns-get spec "test-outputs") (list))))
+      (if (= (length test-inputs) 0)
+        true
+        (let ((func (try (eval-node source-node) nil)))
+          (if (nil? func)
+            false
+            (reduce
+              (lambda (acc i)
+                (and acc
+                  (let ((got (try (func (nth test-inputs i)) nil)))
+                    (and (not (nil? got))
+                         (= got (nth test-outputs i))))))
+              (range (length test-inputs))
+              true)))))))
+
 ; Try one detector function and either return its synth-formatted
 ; result, or fall through to the next stage by calling `next-thunk`.
+; §post: validates against held-out test pairs to prevent overfitting.
 (define m-chain-try-or-next
   (lambda (detector spec next-thunk)
     (let ((r (detector spec)))
       (if (ns-get r "found")
-        (m-chain-mn-result-to-synth r)
+        (if (m-chain-validate-test (ns-get r "source-node") spec)
+          (m-chain-mn-result-to-synth r)
+          (next-thunk))
         (next-thunk)))))
 
 ; ── Type detection ───────────────────────────────────────────────────

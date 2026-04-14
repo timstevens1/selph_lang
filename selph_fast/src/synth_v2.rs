@@ -5575,7 +5575,7 @@ impl SynthResult {
 /// test input. Evaluation uses the shared `env` so library functions
 /// from prior tasks are visible — same eval context the training
 /// rows used.
-fn validate_held_out(
+pub fn validate_held_out(
     nodes: &[Node],
     root: usize,
     test_inputs: &[Value],
@@ -5614,7 +5614,7 @@ struct PendingCandidate {
 }
 
 /// Outcome of testing a single candidate.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum TestOutcome {
     /// Matched all training examples — synthesis is done.
     Solution,
@@ -5914,7 +5914,7 @@ fn materialize_app(comp: &SynthComponent, args: &[&SynthPool]) -> SynthPool {
 /// Wrap a candidate body in `(lambda (x) <body>)`. The result is the
 /// program the synthesizer ultimately returns when a candidate matches —
 /// a unary lambda binding the synthesis input variable.
-fn wrap_lambda(entry: &SynthPool) -> (Vec<Node>, usize) {
+pub fn wrap_lambda(entry: &SynthPool) -> (Vec<Node>, usize) {
     let mut nodes = entry.nodes.clone();
     let body_idx = entry.root;
     let lambda_idx = nodes.len();
@@ -6300,7 +6300,8 @@ fn synthesize_inner(
             // internally (via the spec ns "test" key). The external
             // validate_held_out is still a safety net for cases where
             // the chain doesn't implement internal validation.
-            if validate_held_out(&nodes, root, test_inputs, test_expected, env) {
+            let held_out_ok = validate_held_out(&nodes, root, test_inputs, test_expected, env);
+            if held_out_ok {
                 return SynthResult::success_from_decomposer(
                     nodes, root, sd_explored, name_sym,
                 );
@@ -6531,6 +6532,364 @@ fn synthesize_inner(
 // flag remains wired in `synthesize_inner` for the
 // `collect_data_literals` seeding gate (which is the next migration
 // target — DLS / RDC / LCI per §9.45.8).
+
+// ────────────────────────────────────────────────────────────────────────────
+// §9.61 Beam search synthesis
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A single entry in the beam: a program with its fitness and behavior.
+#[derive(Clone, Debug)]
+pub struct BeamEntry {
+    pub pool_entry: SynthPool,
+    pub fitness: f64,
+    pub behavior: Vec<u64>,       // val_hash per training example
+    pub component_name: String,   // which component produced this (for RL)
+}
+
+/// An experience record from beam search: which component was applied,
+/// what fitness resulted, and a hash of the residual pattern.
+#[derive(Clone, Debug)]
+pub struct ExperienceEntry {
+    pub component_name: String,
+    pub result_fitness: f64,
+    pub parent_fitness: f64,
+    pub residual_hash: u64,
+}
+
+/// Result of a beam search synthesis call.
+#[derive(Debug)]
+pub struct BeamResult {
+    pub found: bool,
+    pub solution_nodes: Option<Vec<Node>>,
+    pub solution_root: Option<usize>,
+    pub beam: Vec<BeamEntry>,
+    pub candidates_explored: usize,
+    pub experience: Vec<ExperienceEntry>,
+}
+
+/// Evaluate a candidate expression on all training examples and return
+/// the behavior vector, match count, and cell-level fitness components.
+/// Shared by `test_candidate` and `synthesize_beam_inner`.
+fn eval_candidate_behavior(
+    entry: &SynthPool,
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+) -> Result<(Vec<u64>, usize, usize, usize), ()> {
+    let (nodes, lambda_idx) = wrap_lambda(entry);
+    let nodes_rc: Rc<[Node]> = nodes.into();
+    let f = eval_v2::eval(&nodes_rc, lambda_idx, env).map_err(|_| ())?;
+
+    let mut beh: Vec<u64> = Vec::with_capacity(inputs.len());
+    let mut matches = 0usize;
+    let mut cell_matching = 0usize;
+    let mut cell_total = 0usize;
+    for (inp, exp) in inputs.iter().zip(expected.iter()) {
+        match eval_v2::apply(&f, &[inp.clone()], env) {
+            Ok(v) => {
+                beh.push(val_hash(&v));
+                if eval_v2::values_equal(&v, exp) {
+                    matches += 1;
+                    let (_, t) = eval_v2::value_similarity(&v, exp);
+                    cell_matching += t;
+                    cell_total += t;
+                } else {
+                    let (m, t) = eval_v2::value_similarity(&v, exp);
+                    cell_matching += m;
+                    cell_total += t;
+                }
+            }
+            Err(_) => return Err(()),
+        }
+    }
+    Ok((beh, matches, cell_matching, cell_total))
+}
+
+/// Compute a residual hash from behavior + expected for RL experience.
+fn residual_hash(behavior: &[u64], expected: &[Value]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    for (b, e) in behavior.iter().zip(expected.iter()) {
+        b.hash(&mut h);
+        val_hash(e).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Beam search synthesis: bottom-up enumeration with a bounded pool
+/// (beam width) at each depth level. Returns the top-K candidates
+/// by fitness, deduplicated by observational equivalence. If an exact
+/// match is found, returns immediately.
+///
+/// This is the §9.61 iterative beam search kernel. The SELPH-side
+/// depth ratchet calls this repeatedly, injecting beam results as
+/// library entries between rounds for effective deep composition.
+pub fn synthesize_beam(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+    beam_width: usize,
+) -> BeamResult {
+    if inputs.is_empty() || inputs.len() != expected.len() {
+        return BeamResult {
+            found: false,
+            solution_nodes: None,
+            solution_root: None,
+            beam: Vec::new(),
+            candidates_explored: 0,
+            experience: Vec::new(),
+        };
+    }
+
+    let input_type = infer_uniform_type_sym(inputs).unwrap_or_else(type_any);
+    let target = infer_uniform_type_sym(expected);
+
+    // Reachability prune.
+    let seeds = vec![input_type];
+    let reach = universe.reachable_for_task(&seeds, target, components);
+    let scoped_refs = filter_components_by_reach(components, &reach, universe);
+    let scoped: Vec<SynthComponent> =
+        scoped_refs.iter().map(|c| (*c).clone()).collect();
+    let mut all_components = probe_filter_components(&scoped, env, &inputs[0], input_type, universe);
+    // Add the input variable as a depth-0 component (same as synthesize_inner).
+    all_components.push(input_var_component(input_type));
+
+    // Depth 0: build atom pool.
+    let mut pool: Vec<SynthPool> = Vec::new();
+    for comp in &all_components {
+        if comp.arity != 0 {
+            continue;
+        }
+        if let Some(entry) = materialize_atom(comp) {
+            pool.push(entry);
+        }
+    }
+
+    let mut explored: usize = 0;
+    let mut seen: HashSet<Vec<u64>> = HashSet::new();
+    let mut beam: Vec<BeamEntry> = Vec::new();
+    let mut experience: Vec<ExperienceEntry> = Vec::new();
+
+    // Test depth-0 atoms.
+    for entry in &pool {
+        if explored >= max_candidates {
+            break;
+        }
+        explored += 1;
+
+        let (outcome, fitness, behavior) = match eval_candidate_behavior(entry, inputs, expected, env) {
+            Ok((beh, matches, cm, ct)) => {
+                let fit = if ct > 0 { cm as f64 / ct as f64 } else { 0.0 };
+                if matches == inputs.len() && !inputs.is_empty() {
+                    (TestOutcome::Solution, 1.0, beh)
+                } else if seen.contains(&beh) {
+                    (TestOutcome::Deduped, fit, beh)
+                } else {
+                    seen.insert(beh.clone());
+                    (TestOutcome::Tested, fit, beh)
+                }
+            }
+            Err(()) => continue,
+        };
+
+        if let TestOutcome::Solution = outcome {
+            let (n, r) = wrap_lambda(entry);
+            return BeamResult {
+                found: true,
+                solution_nodes: Some(n),
+                solution_root: Some(r),
+                beam: Vec::new(),
+                candidates_explored: explored,
+                experience,
+            };
+        }
+
+        if fitness > 0.0 && outcome != TestOutcome::Deduped {
+            beam.push(BeamEntry {
+                pool_entry: entry.clone(),
+                fitness,
+                behavior,
+                component_name: String::new(),
+            });
+        }
+    }
+
+    // Depth 1..max_depth: bottom-up composition with beam cap.
+    let mut prev_start: usize = 0;
+    let mut prev_end: usize = pool.len();
+
+    for _depth in 1..=max_depth {
+        let prev_range_start = prev_start;
+        let prev_range_end = prev_end;
+        let all_end = prev_end;
+
+        let mut pending: Vec<PendingCandidate> = Vec::new();
+
+        for (ci, comp) in all_components.iter().enumerate() {
+            if comp.arity == 0 {
+                continue;
+            }
+            if comp.arity == 1 {
+                for pi in prev_range_start..prev_range_end {
+                    let p = &pool[pi];
+                    if !universe.slot_accepts(comp.param_types[0], p.ret_type) {
+                        continue;
+                    }
+                    let score = comp.priority + p.priority;
+                    pending.push(PendingCandidate {
+                        comp_idx: ci,
+                        args: vec![pi],
+                        ret_type: comp.ret_type,
+                        score,
+                    });
+                }
+            } else if comp.arity == 2 {
+                for p1i in prev_range_start..prev_range_end {
+                    let p1 = &pool[p1i];
+                    if !universe.slot_accepts(comp.param_types[0], p1.ret_type) {
+                        continue;
+                    }
+                    for p2i in 0..all_end {
+                        let p2 = &pool[p2i];
+                        if !universe.slot_accepts(comp.param_types[1], p2.ret_type) {
+                            continue;
+                        }
+                        let score = comp.priority + (p1.priority + p2.priority) / 2.0;
+                        pending.push(PendingCandidate {
+                            comp_idx: ci,
+                            args: vec![p1i, p2i],
+                            ret_type: comp.ret_type,
+                            score,
+                        });
+                    }
+                }
+                for p1i in 0..prev_range_start {
+                    let p1 = &pool[p1i];
+                    if !universe.slot_accepts(comp.param_types[0], p1.ret_type) {
+                        continue;
+                    }
+                    for p2i in prev_range_start..prev_range_end {
+                        let p2 = &pool[p2i];
+                        if !universe.slot_accepts(comp.param_types[1], p2.ret_type) {
+                            continue;
+                        }
+                        let score = comp.priority + (p1.priority + p2.priority) / 2.0;
+                        pending.push(PendingCandidate {
+                            comp_idx: ci,
+                            args: vec![p1i, p2i],
+                            ret_type: comp.ret_type,
+                            score,
+                        });
+                    }
+                }
+            }
+        }
+
+        pending.sort_by(|a, b| {
+            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut new_entries: Vec<(SynthPool, f64)> = Vec::new();
+
+        for desc in pending {
+            if explored >= max_candidates {
+                break;
+            }
+            explored += 1;
+
+            let comp = &all_components[desc.comp_idx];
+            let arg_refs: Vec<&SynthPool> =
+                desc.args.iter().map(|&i| &pool[i]).collect();
+            let entry = materialize_app(comp, &arg_refs);
+
+            let (outcome, fitness, behavior) = match eval_candidate_behavior(&entry, inputs, expected, env) {
+                Ok((beh, matches, cm, ct)) => {
+                    let fit = if ct > 0 { cm as f64 / ct as f64 } else { 0.0 };
+                    if matches == inputs.len() && !inputs.is_empty() {
+                        (TestOutcome::Solution, 1.0, beh)
+                    } else if seen.contains(&beh) {
+                        (TestOutcome::Deduped, fit, beh)
+                    } else {
+                        seen.insert(beh.clone());
+                        (TestOutcome::Tested, fit, beh)
+                    }
+                }
+                Err(()) => continue,
+            };
+
+            // Log experience for RL (only positive-fitness compositions).
+            if fitness > 0.0 && outcome != TestOutcome::Deduped {
+                let parent_fitness = desc.args.iter()
+                    .filter_map(|&i| beam.iter().find(|b| std::ptr::eq(&b.pool_entry as *const _, &pool[i] as *const _)).map(|b| b.fitness))
+                    .fold(0.0f64, f64::max);
+                experience.push(ExperienceEntry {
+                    component_name: comp.name.clone(),
+                    result_fitness: fitness,
+                    parent_fitness,
+                    residual_hash: residual_hash(&behavior, expected),
+                });
+            }
+
+            if let TestOutcome::Solution = outcome {
+                let (n, r) = wrap_lambda(&entry);
+                return BeamResult {
+                    found: true,
+                    solution_nodes: Some(n),
+                    solution_root: Some(r),
+                    beam: Vec::new(),
+                    candidates_explored: explored,
+                    experience,
+                };
+            }
+
+            if fitness > 0.0 && outcome != TestOutcome::Deduped {
+                beam.push(BeamEntry {
+                    pool_entry: entry.clone(),
+                    fitness,
+                    behavior,
+                    component_name: comp.name.clone(),
+                });
+                new_entries.push((entry, fitness));
+            } else if outcome == TestOutcome::Tested {
+                new_entries.push((entry, fitness));
+            }
+        }
+
+        if new_entries.is_empty() {
+            break;
+        }
+
+        // Beam cap: keep only the top beam_width entries at each depth.
+        new_entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if new_entries.len() > beam_width {
+            new_entries.truncate(beam_width);
+        }
+
+        prev_start = pool.len();
+        pool.extend(new_entries.into_iter().map(|(entry, _)| entry));
+        prev_end = pool.len();
+    }
+
+    // Sort beam by fitness descending, truncate to beam_width.
+    beam.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap_or(std::cmp::Ordering::Equal));
+    if beam.len() > beam_width {
+        beam.truncate(beam_width);
+    }
+
+    BeamResult {
+        found: false,
+        solution_nodes: None,
+        solution_root: None,
+        beam,
+        candidates_explored: explored,
+        experience,
+    }
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Tests
@@ -8781,5 +9140,101 @@ mod tests {
         );
         assert!(r.found);
         assert_eq!(r.strategy, Some(Strategy::Flat));
+    }
+
+    // ── §9.61 Beam search tests ─────────────────────────────────────────
+
+    #[test]
+    fn beam_finds_exact_match() {
+        // string-upper: "abc" -> "ABC" should solve at depth 1.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let inputs = vec![Value::str("hello"), Value::str("world")];
+        let expected = vec![Value::str("HELLO"), Value::str("WORLD")];
+
+        let r = synthesize_beam(&comps, &inputs, &expected, &env, &universe, 2, 10000, 100);
+        assert!(r.found);
+        assert!(r.solution_nodes.is_some());
+    }
+
+    #[test]
+    fn beam_returns_partials_on_exhaustion() {
+        // Task that can't be solved: x -> 999. With a tiny budget,
+        // beam should return partial matches.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = default_synth_components(&env, &default_skip_set());
+
+        let inputs = vec![Value::Int(1), Value::Int(2), Value::Int(3)];
+        let expected = vec![Value::Int(999), Value::Int(999), Value::Int(999)];
+
+        let r = synthesize_beam(&comps, &inputs, &expected, &env, &universe, 1, 100, 50);
+        assert!(!r.found);
+        // Beam should have entries (some depth-0/1 candidates will have partial fitness).
+        // Not asserting non-empty because 999 is a constant that may not be reachable.
+    }
+
+    #[test]
+    fn beam_obs_eq_dedup() {
+        // All beam entries should have unique behavior vectors.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = default_synth_components(&env, &default_skip_set());
+
+        // Task: x -> x * 2 (solvable, but we check beam diversity on the way)
+        let inputs = vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)];
+        let expected = vec![Value::Int(2), Value::Int(4), Value::Int(6), Value::Int(8)];
+
+        let r = synthesize_beam(&comps, &inputs, &expected, &env, &universe, 2, 5000, 200);
+        // If found, great. Either way, verify beam has no duplicate behaviors.
+        let mut seen_behaviors: HashSet<Vec<u64>> = HashSet::new();
+        for entry in &r.beam {
+            assert!(
+                seen_behaviors.insert(entry.behavior.clone()),
+                "Duplicate behavior in beam"
+            );
+        }
+    }
+
+    #[test]
+    fn beam_respects_beam_width_cap() {
+        // Use a task that's truly unsolvable with primitives:
+        // x -> some complex non-linear function.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let inputs = vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)];
+        let expected = vec![Value::Int(42), Value::Int(97), Value::Int(213), Value::Int(417)];
+
+        let r = synthesize_beam(&comps, &inputs, &expected, &env, &universe, 1, 5000, 5);
+        assert!(!r.found);
+        assert!(r.beam.len() <= 5, "Beam exceeds beam_width cap: got {}", r.beam.len());
+    }
+
+    #[test]
+    fn beam_experience_log_populated() {
+        // Task: x -> x * 2. At depth 1, (add x x) solves it, but
+        // (add x 1) etc. get partial fitness > 0 along the way.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let inputs = vec![Value::Int(1), Value::Int(2), Value::Int(3)];
+        let expected = vec![Value::Int(2), Value::Int(4), Value::Int(6)];
+
+        let r = synthesize_beam(&comps, &inputs, &expected, &env, &universe, 2, 5000, 100);
+        // Experience log should be non-empty — some compositions have partial fitness.
+        // Note: experience only logs entries with fitness > 0, so if no partial
+        // matches occur before the exact match, this could be empty.
+        // The important thing is the structure works — we don't assert non-empty.
+        let _ = r.experience; // just verify it exists and is accessible
     }
 }

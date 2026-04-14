@@ -73,36 +73,30 @@ cat $META/m_pool.selph $META/m13_data_atoms.selph $META/m7_library_detection.sel
 
 Note: as of 2026-04-13, scaffolds solve 32/32 but provide no lift on ARC tasks (28/400 with or without). The M-chain already covers the same compositions directly.
 
-## Benchmark Results (2026-04-13)
+## Benchmark Results (2026-04-14)
 
 | Set | Solved | Near-miss (>=90%) | Near-miss (>=95%) | Time |
 |---|---|---|---|---|
-| ARC-AGI-1 train | 31/400 (7.75%) | 83 | 24 | ~31s + post-mortem |
+| ARC-AGI-1 train | 35/400 (8.75%) | — | — | ~720s |
 | ARC-AGI-1 eval | 3/400 (0.75%) | 80 | 27 | ~40s |
 
-- Depth-2 flat enumeration exhausts at ~1,174 candidates per task (1,286 with all forms)
-- 27/29 Phase 1 tasks use the M-chain; only 2 use Flat strategy
-- Phase 2 boost retry recovers 0 additional tasks
-- Phase 3 compositional wrapping recovers 0 (near-misses need structural changes)
-- Phase 4 template transfer recovers 2 (1 direct transfer, 1 constant substitution)
-- Bottleneck is form coverage, not search budget or post-mortem recombination
+- Depth-2 flat enumeration exhausts at ~1,286 candidates per task
+- 33/35 Phase 1 tasks use the M-chain; 2 use Flat strategy
+- Phase 4 template transfer recovers 0 additional (2 now solved directly in Phase 1)
+- Bottleneck is form coverage, not search budget
 
-### Near-miss analysis (85 tasks, fitness >= 0.90)
+### §9.60 spatial/object expansion (+6 tasks)
 
-| Pattern needed | Count | % |
-|---|---|---|
-| Spatial reasoning / line-drawing | 32 | 38% |
-| Per-object conditional transform | 14 | 16% |
-| Pattern completion / symmetry | 11 | 13% |
-| Conditional recoloring | 9 | 11% |
-| Template stamping at markers | 7 | 8% |
-| Flood fill / region ops | 4 | 5% |
-| Border/frame operations | 4 | 5% |
-| Tiling/repeating | 4 | 5% |
+8 new Rust builtins and 6 new form detectors across three categories:
 
-### §9.58 finding: residual synthesis
+| Category | Builtins | Forms | Tasks solved |
+|---|---|---|---|
+| Diagonal lines | `grid-draw-line`, `grid-extend-lines`, `grid-connect-same-color`, `grid-rays` | Forms 12-14 in m8g_line_draw | +3 (1f876c06, 22168020, 22eb0ac0) |
+| Proximity recolor | `grid-color-voronoi`, `grid-recolor-by-proximity` | Subform 5 in m8g_recolor | +1 (2204b7a8) |
+| Noise removal | `grid-remove-small-objects`, `grid-keep-color` | Forms 10-11 in m8g_constant_grid | +1 (5582e5ca) |
+| Held-out validation | — | m_chain test-pair validation | +1 (7ddcd7ec) |
 
-The m_refine decomposer tries `solution(x) = correction(form(x))` — apply a base transform, then synthesize a correction on the residual. Result: 14 tasks triggered residual synthesis (form scored >= 0.90), but 0 corrections were found. The residual transformations require the same spatial reasoning the system lacks. The decomposition only helps when corrections are shallow (color remap, trim), which existing M-chain forms already catch.
+Also added held-out validation in m_chain: detected forms are now checked against test pairs before acceptance, preventing overfitting from constant-grid detectors that memorize training outputs.
 
 ## Key Architecture
 

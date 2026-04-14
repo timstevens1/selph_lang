@@ -449,6 +449,93 @@
             ("source-node" (mld-build-form-10-ast)))
         nil))))
 
+; ── Form 12: Diagonal connection ────────────────────────────────────
+;
+; Detects tasks where the output connects same-color cells on shared
+; diagonals (as well as rows/columns). Uses grid-connect-same-color.
+
+(define mld-try-form-12
+  (lambda (inputs outputs)
+    (let ((all-ok
+            (reduce
+              (lambda (acc i)
+                (if (not acc) false
+                  (let ((inp (head (nth inputs i)))
+                        (out (nth outputs i)))
+                    (let ((candidate (try (grid-connect-same-color inp) nil)))
+                      (if (nil? candidate) false
+                        (= candidate out))))))
+              (range (length inputs))
+              true)))
+      (if all-ok
+        (ns ("kind" "form-12-diagonal-connection")
+            ("source-node" (mld-build-form-12-ast)))
+        nil))))
+
+(define mld-build-form-12-ast
+  (lambda ()
+    (make-lambda (list "x")
+      (make-app "grid-connect-same-color"
+        (make-app "nth" (make-symbol "x") (make-int 0))))))
+
+; ── Form 13: Line extension to boundary ────────────────────────────
+;
+; Detects tasks where the output extends existing line endpoints to
+; the grid boundary. Uses grid-extend-lines.
+
+(define mld-try-form-13
+  (lambda (inputs outputs)
+    (let ((all-ok
+            (reduce
+              (lambda (acc i)
+                (if (not acc) false
+                  (let ((inp (head (nth inputs i)))
+                        (out (nth outputs i)))
+                    (let ((candidate (try (grid-extend-lines inp) nil)))
+                      (if (nil? candidate) false
+                        (= candidate out))))))
+              (range (length inputs))
+              true)))
+      (if all-ok
+        (ns ("kind" "form-13-line-extension")
+            ("source-node" (mld-build-form-13-ast)))
+        nil))))
+
+(define mld-build-form-13-ast
+  (lambda ()
+    (make-lambda (list "x")
+      (make-app "grid-extend-lines"
+        (make-app "nth" (make-symbol "x") (make-int 0))))))
+
+; ── Form 14: Ray casting ───────────────────────────────────────────
+;
+; Detects tasks where isolated non-background cells project rays in
+; all 8 directions. Uses grid-rays.
+
+(define mld-try-form-14
+  (lambda (inputs outputs)
+    (let ((all-ok
+            (reduce
+              (lambda (acc i)
+                (if (not acc) false
+                  (let ((inp (head (nth inputs i)))
+                        (out (nth outputs i)))
+                    (let ((candidate (try (grid-rays inp) nil)))
+                      (if (nil? candidate) false
+                        (= candidate out))))))
+              (range (length inputs))
+              true)))
+      (if all-ok
+        (ns ("kind" "form-14-ray-casting")
+            ("source-node" (mld-build-form-14-ast)))
+        nil))))
+
+(define mld-build-form-14-ast
+  (lambda ()
+    (make-lambda (list "x")
+      (make-app "grid-rays"
+        (make-app "nth" (make-symbol "x") (make-int 0))))))
+
 ; ── Chain helper ─────────────────────────────────────────────────────
 
 (define mld-try-chain
@@ -472,7 +559,10 @@
           (mld-try-chain
             (list
               (lambda () (mld-try-form-10 inputs outputs))
-              (lambda () (mld-try-form-11 inputs outputs)))))))))
+              (lambda () (mld-try-form-11 inputs outputs))
+              (lambda () (mld-try-form-12 inputs outputs))
+              (lambda () (mld-try-form-13 inputs outputs))
+              (lambda () (mld-try-form-14 inputs outputs)))))))))
 
 ; ── Smoke tests ──────────────────────────────────────────────────────
 
@@ -571,8 +661,78 @@
     (let ((result (mld-connect-markers mld-test-hline-in)))
       (if (= result mld-test-hline-out) "OK" "FAIL"))))
 
+; Test 5: diagonal connection (Form 12)
+; Input: two red (2) cells on a diagonal at (0,0) and (2,2) in a 3x3
+; Output: diagonal filled
+(define mld-test-diag-in
+  (list (list 2 0 0)
+        (list 0 0 0)
+        (list 0 0 2)))
+
+(define mld-test-diag-out
+  (list (list 2 0 0)
+        (list 0 2 0)
+        (list 0 0 2)))
+
+(define mld-test-diag-spec
+  (mld-make-spec
+    (list (list mld-test-diag-in))
+    (list mld-test-diag-out)
+    1))
+
+; Test 6: line extension (Form 13)
+; Input: 5x5, a 2-cell horizontal line at (2,1)-(2,2), bg=0
+; Endpoints at (2,1) has neighbor at (2,2) -> extend left
+; Endpoint at (2,2) has neighbor at (2,1) -> extend right
+; Output: row 2 filled from 0 to 4
+(define mld-test-extend-in
+  (list (list 0 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 3 3 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 0)))
+
+(define mld-test-extend-out
+  (list (list 0 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 3 3 3 3 3)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 0)))
+
+(define mld-test-extend-spec
+  (mld-make-spec
+    (list (list mld-test-extend-in))
+    (list mld-test-extend-out)
+    1))
+
+; Test 7: ray casting (Form 14)
+; Input: 5x5, single red (1) cell at (2,2)
+; Output: rays in all 8 directions from center
+(define mld-test-rays-in
+  (list (list 0 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 1 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 0)))
+
+(define mld-test-rays-out
+  (list (list 1 0 1 0 1)
+        (list 0 1 1 1 0)
+        (list 1 1 1 1 1)
+        (list 0 1 1 1 0)
+        (list 1 0 1 0 1)))
+
+(define mld-test-rays-spec
+  (mld-make-spec
+    (list (list mld-test-rays-in))
+    (list mld-test-rays-out)
+    1))
+
 (print "--- m8g_line_draw smoke tests ---")
 (mld-run-test "h-line between markers" mld-test-hline-spec)
 (mld-run-test "v-line between markers" mld-test-vline-spec)
 (mld-run-test "no-line pattern" mld-test-noline-spec)
 (print (concat "  program-check: " (mld-test-program)))
+(mld-run-test "diagonal connection" mld-test-diag-spec)
+(mld-run-test "line extension" mld-test-extend-spec)
+(mld-run-test "ray casting" mld-test-rays-spec)

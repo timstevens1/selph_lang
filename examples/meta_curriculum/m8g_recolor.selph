@@ -356,6 +356,68 @@
           (make-app "m8r-fill-between-cols" x0 fc-node)
           (make-app "m8r-fill-between-both" x0 fc-node))))))
 
+; ── Subform 5: proximity-based recoloring ──────────────────────────
+;
+; Detect tasks where cells of a specific color are recolored to the
+; color of the nearest non-background source cell (Manhattan BFS).
+;
+; Two variants:
+;   5a: grid-color-voronoi — ALL background cells become nearest non-bg
+;   5b: grid-recolor-by-proximity — cells of a specific target color
+;       become the nearest non-target, non-bg color
+
+(define m8r-try-subform-5
+  (lambda (inputs target)
+    (let ((r5a (m8r-try-subform-5a inputs target)))
+      (if (not (nil? r5a)) r5a
+        (m8r-try-subform-5b inputs target)))))
+
+; 5a: output = grid-color-voronoi(input)
+(define m8r-try-subform-5a
+  (lambda (inputs target)
+    (let ((col (map (lambda (inp)
+                      (try (grid-color-voronoi (m8r-input-grid inp)) nil))
+                    inputs)))
+      (if (reduce (lambda (acc i)
+                    (and acc
+                         (not (nil? (nth col i)))
+                         (= (nth col i) (nth target i))))
+                  (range (length target)) true)
+        (ns ("kind" "recolor-5a-voronoi")
+            ("source-node"
+              (m8r-wrap-lambda
+                (make-app "grid-color-voronoi" (m8r-x0)))))
+        nil))))
+
+; 5b: for each non-bg color in the first input, try grid-recolor-by-proximity
+(define m8r-try-subform-5b
+  (lambda (inputs target)
+    (let ((first-in (m8r-input-grid (head inputs))))
+      (let ((bg (grid-background first-in))
+            (colors (grid-colors first-in)))
+        (let ((candidates (filter (lambda (c) (not (= c bg))) colors)))
+          (m8r-subform-5b-loop inputs target candidates))))))
+
+(define m8r-subform-5b-loop
+  (lambda (inputs target candidates)
+    (if (= (length candidates) 0) nil
+      (let ((tc (head candidates)))
+        (let ((col (map (lambda (inp)
+                          (try (grid-recolor-by-proximity (m8r-input-grid inp) tc) nil))
+                        inputs)))
+          (if (reduce (lambda (acc i)
+                        (and acc
+                             (not (nil? (nth col i)))
+                             (= (nth col i) (nth target i))))
+                      (range (length target)) true)
+            (ns ("kind" (concat "recolor-5b-proximity-" (to-string tc)))
+                ("source-node"
+                  (m8r-wrap-lambda
+                    (make-app "grid-recolor-by-proximity"
+                      (m8r-x0)
+                      (make-int tc)))))
+            (m8r-subform-5b-loop inputs target (tail candidates))))))))
+
 ; ── Chain helper ───────────────────────────────────────────────────
 
 (define m8r-try-chain
@@ -381,7 +443,8 @@
                       (lambda () (m8r-try-subform-1 inputs target))
                       (lambda () (m8r-try-subform-3 inputs target))
                       (lambda () (m8r-try-subform-2 inputs target))
-                      (lambda () (m8r-try-subform-4 inputs target))))))
+                      (lambda () (m8r-try-subform-4 inputs target))
+                      (lambda () (m8r-try-subform-5 inputs target))))))
             (if (nil? result)
               (ns ("found" false) ("reason" "no recolor shape matched"))
               (ns-put result "found" true))))))))
@@ -435,7 +498,39 @@
                 (list 2 2 2 2 2 2)))
     1))
 
+; Test 4: proximity-based recoloring — dots (3) near colored borders
+; Input pair 1: left=1, right=2, dots are 3; each dot → nearest border color
+; Input pair 2: top=4, bottom=7, dots are 3; each dot → nearest border color
+(define m8r-test-proximity-spec
+  (m8r-make-spec
+    (list (list (list (list 1 0 0 0 0 0 0 0 0 2)
+                      (list 1 0 0 0 0 0 3 0 0 2)
+                      (list 1 0 0 0 0 0 0 0 0 2)
+                      (list 1 0 0 0 0 0 0 0 0 2)
+                      (list 1 0 0 0 3 0 0 0 0 2)
+                      (list 1 0 0 0 0 0 0 0 0 2)))
+          (list (list (list 4 4 4 4 4 4 4 4 4 4)
+                      (list 0 0 0 0 0 0 0 0 0 0)
+                      (list 0 3 0 0 0 0 0 3 0 0)
+                      (list 0 0 0 0 0 0 0 0 0 0)
+                      (list 0 0 0 0 0 0 0 0 0 0)
+                      (list 7 7 7 7 7 7 7 7 7 7))))
+    (list (list (list 1 0 0 0 0 0 0 0 0 2)
+                (list 1 0 0 0 0 0 2 0 0 2)
+                (list 1 0 0 0 0 0 0 0 0 2)
+                (list 1 0 0 0 0 0 0 0 0 2)
+                (list 1 0 0 0 1 0 0 0 0 2)
+                (list 1 0 0 0 0 0 0 0 0 2))
+          (list (list 4 4 4 4 4 4 4 4 4 4)
+                (list 0 0 0 0 0 0 0 0 0 0)
+                (list 0 4 0 0 0 0 0 4 0 0)
+                (list 0 0 0 0 0 0 0 0 0 0)
+                (list 0 0 0 0 0 0 0 0 0 0)
+                (list 7 7 7 7 7 7 7 7 7 7)))
+    1))
+
 (print "--- m8g_recolor smoke tests ---")
 (m8r-run-test "color-removal" m8r-test-remove-spec)
 (m8r-run-test "diff-recolor-2-to-5" m8r-test-diff-spec)
 (m8r-run-test "fill-between-rows" m8r-test-fill-between-spec)
+(m8r-run-test "proximity-recolor" m8r-test-proximity-spec)

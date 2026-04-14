@@ -575,6 +575,81 @@
               (if (= sel "grid-object-5") 5
                 nil))))))))
 
+; ── Form 10: noise removal — grid-remove-small-objects ─────────────────
+;
+; Detection:
+;   1. Compare input and output objects.
+;   2. If output has fewer objects than input, and the removed objects
+;      are all below a size threshold, and remaining objects are unchanged,
+;      emit (grid-remove-small-objects x threshold).
+;
+; Probes thresholds 2..max-removed-size+1 to find the right cutoff.
+
+(define m8g-try-form-10
+  (lambda (inputs target)
+    (m8g-try-form-10-loop inputs target 2 10)))
+
+(define m8g-try-form-10-loop
+  (lambda (inputs target min-size max-try)
+    (if (> min-size max-try) nil
+      (let ((col (map (lambda (inp)
+                        (try (grid-remove-small-objects (head inp) min-size) nil))
+                      inputs)))
+        (if (reduce (lambda (acc i)
+                      (and acc
+                           (not (nil? (nth col i)))
+                           (= (nth col i) (nth target i))))
+                    (range (length target)) true)
+          (ns ("kind" (concat "form-10-noise-removal-" (to-string min-size)))
+              ("source-node"
+                (m8g-wrap-lambda
+                  (make-app "grid-remove-small-objects"
+                    (make-app "nth" (make-symbol "x") (make-int 0))
+                    (make-int min-size)))))
+          (m8g-try-form-10-loop inputs target (+ min-size 1) max-try))))))
+
+; ── Form 11: color isolation — grid-keep-color ─────────────────────────
+;
+; Detection:
+;   If output contains only cells of a single non-background color from
+;   the input plus background (0), then emit (grid-keep-color x color).
+;   Probes all non-zero colors found in the first input grid.
+
+(define m8g-extract-nonzero-colors
+  (lambda (g)
+    (reduce
+      (lambda (acc row)
+        (reduce
+          (lambda (a c)
+            (if (or (= c 0) (contains a c)) a (append a (list c))))
+          row acc))
+      g (list))))
+
+(define m8g-try-form-11
+  (lambda (inputs target)
+    (let ((colors (m8g-extract-nonzero-colors (head (head inputs)))))
+      (m8g-try-form-11-loop inputs target colors))))
+
+(define m8g-try-form-11-loop
+  (lambda (inputs target colors)
+    (if (= (length colors) 0) nil
+      (let ((color (head colors)))
+        (let ((col (map (lambda (inp)
+                          (try (grid-keep-color (head inp) color) nil))
+                        inputs)))
+          (if (reduce (lambda (acc i)
+                        (and acc
+                             (not (nil? (nth col i)))
+                             (= (nth col i) (nth target i))))
+                      (range (length target)) true)
+            (ns ("kind" (concat "form-11-keep-color-" (to-string color)))
+                ("source-node"
+                  (m8g-wrap-lambda
+                    (make-app "grid-keep-color"
+                      (make-app "nth" (make-symbol "x") (make-int 0))
+                      (make-int color)))))
+            (m8g-try-form-11-loop inputs target (tail colors))))))))
+
 ; ── Chain helper: try a list of form-thunks in order ─────────────────
 ;
 ; Each thunk returns nil (no match) or a result namespace.
@@ -606,6 +681,8 @@
               (lambda () (m8g-try-form-7 inputs target))
               (lambda () (m8g-try-form-8 inputs target))
               (lambda () (m8g-try-form-9 inputs outputs target))
+              (lambda () (m8g-try-form-10 inputs target))
+              (lambda () (m8g-try-form-11 inputs target))
               (lambda () (m8g-try-form-3 pool target))
               (lambda () (m8g-try-form-4 inputs outputs target))
               (lambda () (m8g-try-form-5 s target)))))))))
@@ -663,8 +740,30 @@
           (list (list 3 3) (list 3 0)))
     1))
 
+; Form 10: noise removal — remove small objects (< 3 cells)
+; Input has a large 2x2 block (color 1) + a small 1-cell dot (color 2).
+; Output has only the large block; the dot is gone.
+(define m8g-noise-spec
+  (m8g-make-spec
+    (list (list (list (list 1 1 0 0) (list 1 1 0 0) (list 0 0 0 2) (list 0 0 0 0)))
+          (list (list (list 0 0 3 0) (list 0 0 3 3) (list 0 0 3 0) (list 5 0 0 0))))
+    (list (list (list 1 1 0 0) (list 1 1 0 0) (list 0 0 0 0) (list 0 0 0 0))
+          (list (list 0 0 3 0) (list 0 0 3 3) (list 0 0 3 0) (list 0 0 0 0)))
+    1))
+
+; Form 11: color isolation — keep only color 2
+(define m8g-keepcolor-spec
+  (m8g-make-spec
+    (list (list (list (list 1 2 0) (list 0 2 1) (list 3 0 2)))
+          (list (list (list 0 0 2) (list 2 0 0) (list 0 2 0))))
+    (list (list (list 0 2 0) (list 0 2 0) (list 0 0 2))
+          (list (list 0 0 2) (list 2 0 0) (list 0 2 0)))
+    1))
+
 (print "--- m8g_constant_grid smoke tests ---")
 (m8g-run-test "constant 2x2" m8g-const-spec)
 (m8g-run-test "rotate-cw" m8g-rotate-spec)
 (m8g-run-test "recomp flip-h" m8g-recomp-spec)
 (m8g-run-test "obj-select" m8g-objsel-spec)
+(m8g-run-test "noise-removal" m8g-noise-spec)
+(m8g-run-test "keep-color" m8g-keepcolor-spec)

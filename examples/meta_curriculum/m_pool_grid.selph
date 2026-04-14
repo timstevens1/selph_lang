@@ -73,6 +73,12 @@
     (list "grid-compact"       (lambda (v) (grid-compact v)))
     ; §9.53: inverse of grid-tile — extract repeated sub-grid
     (list "grid-untile"        (lambda (v) (grid-untile v)))
+    ; proximity-based Voronoi fill
+    (list "grid-color-voronoi" (lambda (v) (grid-color-voronoi v)))
+    ; diagonal line extension and ray-casting
+    (list "grid-extend-lines"       (lambda (v) (grid-extend-lines v)))
+    (list "grid-connect-same-color" (lambda (v) (grid-connect-same-color v)))
+    (list "grid-rays"               (lambda (v) (grid-rays v)))
 ))
 
 ; ���─ Level 0: indexed grid atoms ──────────────────────────────────────

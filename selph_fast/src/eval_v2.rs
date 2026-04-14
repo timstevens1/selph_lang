@@ -732,6 +732,8 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("synthesize"), bi_synthesize);
     t.register(intern("synthesize-args"), bi_synthesize_args);
     t.register(intern("synthesize-optimize"), bi_stub_synthesize_optimize);
+    t.register(intern("synthesize-beam"), bi_synthesize_beam);
+    t.register(intern("library-inject"), bi_library_inject);
     t.register(intern("test-spec"), bi_test_spec);
     t.register(intern("memorize"), bi_memorize);
     t.register(intern("eval-source"), bi_eval_source);
@@ -810,6 +812,8 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("grid-untile"), bi_grid_untile);
     t.register(intern("grid-fill-enclosed"), bi_grid_fill_enclosed);
     t.register(intern("grid-compact"), bi_grid_compact);
+    t.register(intern("grid-remove-small-objects"), bi_grid_remove_small_objects);
+    t.register(intern("grid-keep-color"), bi_grid_keep_color);
     t.register(intern("grid-object"), bi_grid_object);
     t.register(intern("grid-object-pos"), bi_grid_object_pos);
     t.register(intern("grid-place"), bi_grid_place);
@@ -823,6 +827,13 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("grid-probe-extract"), bi_grid_probe_extract);
     t.register(intern("grid-probe-scale"), bi_grid_probe_scale);
     t.register(intern("grid-diagnose-spec"), bi_grid_diagnose_spec);
+    t.register(intern("grid-color-voronoi"), bi_grid_color_voronoi);
+    t.register(intern("grid-recolor-by-proximity"), bi_grid_recolor_by_proximity);
+    // §9.59: diagonal line / ray-casting builtins
+    t.register(intern("grid-draw-line"), bi_grid_draw_line);
+    t.register(intern("grid-extend-lines"), bi_grid_extend_lines);
+    t.register(intern("grid-connect-same-color"), bi_grid_connect_same_color);
+    t.register(intern("grid-rays"), bi_grid_rays);
 
     t
 }
@@ -865,7 +876,9 @@ fn build_default_scope() -> Scope {
         // Errors / control
         "error",
         // Bucket 6 stubs
-        "synthesize", "synthesize-args", "synthesize-optimize", "test-spec", "memorize", "eval-source",
+        "synthesize", "synthesize-args", "synthesize-optimize", "synthesize-beam",
+        "library-inject",
+        "test-spec", "memorize", "eval-source",
         // §9.36 AST homoiconicity — construction
         "make-int", "make-num", "make-str", "make-bool", "make-symbol",
         "make-app", "make-if", "make-lambda", "make-let",
@@ -892,11 +905,15 @@ fn build_default_scope() -> Scope {
         "grid-fill-rect", "grid-size",
         "grid-objects", "grid-objects-8", "grid-object-count",
         "grid-scale", "grid-tile", "grid-untile", "grid-fill-enclosed", "grid-compact",
+        "grid-remove-small-objects", "grid-keep-color",
         "grid-object", "grid-object-pos", "grid-place", "grid-translate",
         "grid-find-color", "grid-mask", "grid-blank",
         "grid-recompose",
         "grid-probe-recomp", "grid-probe-extract", "grid-probe-scale",
         "grid-diagnose-spec",
+        "grid-color-voronoi", "grid-recolor-by-proximity",
+        // §9.59: diagonal line / ray-casting
+        "grid-draw-line", "grid-extend-lines", "grid-connect-same-color", "grid-rays",
     ];
     for name in names {
         let sym = intern(name);
@@ -2862,6 +2879,155 @@ fn bi_stub_synthesize_optimize(_args: &[Value], _env: &Env) -> Result<Value, Str
     )
 }
 
+// ── §9.61 Beam search builtins ───────────────────────────────────────────
+
+/// `(synthesize-beam <namespace>)` — beam search synthesis. Returns the
+/// top-K candidates by fitness, deduplicated by observational equivalence.
+/// If an exact match is found, returns immediately.
+///
+/// Input namespace:
+///   ("spec" list-of-[input output])
+///   ("beam-width" int)        — default 500
+///   ("max-depth" int)         — default 2
+///   ("max-candidates" int)    — default 200000
+///   ("heuristic" fn)          — optional priority rescorer
+///
+/// Output namespace:
+///   ("found" bool)
+///   ("source" str)            — solution source if found
+///   ("beam" list-of-ns)       — each: ("source" str) ("fitness" float)
+///   ("candidates" int)
+///   ("experience" list-of-ns) — each: ("component" str) ("fitness-delta" float) ("residual-hash" int)
+fn bi_synthesize_beam(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("synthesize-beam: expected 1 argument (namespace)".into());
+    }
+    let ns = match &args[0] {
+        Value::Ns(m) => m.clone(),
+        _ => return Err("synthesize-beam: argument must be a namespace".into()),
+    };
+
+    // Extract spec.
+    let spec_val = ns
+        .get(&intern("spec"))
+        .ok_or("synthesize-beam: namespace must have \"spec\" field")?;
+    let pairs = match spec_val {
+        Value::List(l) => l.clone(),
+        _ => return Err("synthesize-beam: \"spec\" must be a list of example pairs".into()),
+    };
+    let mut inputs = Vec::with_capacity(pairs.len());
+    let mut expected = Vec::with_capacity(pairs.len());
+    for pair in pairs.iter() {
+        let p = match pair {
+            Value::List(p) if p.len() == 2 => p,
+            _ => return Err("synthesize-beam: each spec entry must be [input, output]".into()),
+        };
+        inputs.push(p[0].clone());
+        expected.push(p[1].clone());
+    }
+
+    let beam_width = ns
+        .get(&intern("beam-width"))
+        .and_then(|v| match v {
+            Value::Int(n) => Some(*n as usize),
+            Value::Num(n) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(500);
+
+    let max_depth = ns
+        .get(&intern("max-depth"))
+        .and_then(|v| match v {
+            Value::Int(n) => Some(*n as usize),
+            Value::Num(n) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(2);
+
+    let max_candidates = ns
+        .get(&intern("max-candidates"))
+        .and_then(|v| match v {
+            Value::Int(n) => Some(*n as usize),
+            Value::Num(n) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(200000);
+
+    // Build component catalog.
+    let skip = crate::synth_v2::default_skip_set();
+    let mut components = crate::synth_v2::default_synth_components(env, &skip);
+    let universe = crate::synth_v2::TypeUniverse::from_env(env);
+
+    // Heuristic support (§9.34).
+    if let Some(h) = ns.get(&intern("heuristic")) {
+        components = crate::meta_v2::apply_heuristic_value_for_task(
+            h, &components, &inputs, &expected, env,
+        )
+        .map_err(|e| format!("synthesize-beam: {}", e))?;
+    }
+
+    let result = crate::synth_v2::synthesize_beam(
+        &components, &inputs, &expected, env, &universe,
+        max_depth, max_candidates, beam_width,
+    );
+
+    // Build return namespace.
+    let mut out = NsMap::new();
+    out.insert(intern("found"), Value::Bool(result.found));
+    out.insert(intern("candidates"), Value::Int(result.candidates_explored as i64));
+
+    if result.found {
+        let nodes = result.solution_nodes.as_ref().unwrap();
+        let root = result.solution_root.unwrap();
+        out.insert(intern("source"), Value::str(node_to_source(nodes, root)));
+    } else {
+        out.insert(intern("source"), Value::str(String::new()));
+    }
+
+    // Beam entries.
+    let beam_list: Vec<Value> = result.beam.iter().map(|entry| {
+        let (n, r) = crate::synth_v2::wrap_lambda(&entry.pool_entry);
+        let src = node_to_source(&n, r);
+        let mut ens = NsMap::new();
+        ens.insert(intern("source"), Value::str(src));
+        ens.insert(intern("fitness"), Value::Num(entry.fitness));
+        ens.insert(intern("component"), Value::str(entry.component_name.clone()));
+        Value::ns(ens)
+    }).collect();
+    out.insert(intern("beam"), Value::list(beam_list));
+
+    // Experience log for RL.
+    let exp_list: Vec<Value> = result.experience.iter().map(|e| {
+        let mut ens = NsMap::new();
+        ens.insert(intern("component"), Value::str(e.component_name.clone()));
+        ens.insert(intern("fitness-delta"), Value::Num(e.result_fitness - e.parent_fitness));
+        ens.insert(intern("residual-hash"), Value::Int(e.residual_hash as i64));
+        Value::ns(ens)
+    }).collect();
+    out.insert(intern("experience"), Value::list(exp_list));
+
+    Ok(Value::ns(out))
+}
+
+/// `(library-inject <name> <lambda>)` — inject a function into the env
+/// so it's discoverable as a synthesis component on the next synthesis call.
+/// Used by the depth ratchet to promote beam results to library entries.
+fn bi_library_inject(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("library-inject: expected 2 arguments (name, function)".into());
+    }
+    let name = match &args[0] {
+        Value::Str(s) => s.as_ref().to_string(),
+        _ => return Err("library-inject: first argument must be a string".into()),
+    };
+    match &args[1] {
+        Value::Function(_) | Value::Builtin(_) => {}
+        _ => return Err("library-inject: second argument must be a function".into()),
+    }
+    env.define(intern(&name), args[1].clone());
+    Ok(Value::Bool(true))
+}
+
 // ── Grid helpers ────────────────────────────────────────────────────────────
 
 /// Extract a grid (List of List of Int) as Vec<Vec<i64>>.
@@ -3955,6 +4121,117 @@ fn bi_grid_diagnose_spec(args: &[Value], _env: &Env) -> Result<Value, String> {
     Ok(Value::ns(m))
 }
 
+/// `(grid-color-voronoi grid)` — BFS Voronoi fill.
+/// Every background cell is assigned the color of the nearest non-background
+/// cell (Manhattan distance). Non-background cells keep their original color.
+fn bi_grid_color_voronoi(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-color-voronoi: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let h = g.len();
+    if h == 0 { return Ok(grid_to_value(g)); }
+    let w = g[0].len();
+
+    // Background = most common color (or 0).
+    let mut counts = std::collections::HashMap::new();
+    for r in &g { for &c in r { *counts.entry(c).or_insert(0usize) += 1; } }
+    let bg = counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or(0);
+
+    let mut out = g.clone();
+    let mut visited = vec![vec![false; w]; h];
+    let mut queue = std::collections::VecDeque::new();
+
+    // Seed with all non-background cells.
+    for r in 0..h {
+        for c in 0..w {
+            if g[r][c] != bg {
+                visited[r][c] = true;
+                queue.push_back((r, c));
+            }
+        }
+    }
+
+    // BFS outward — first to reach a cell wins.
+    while let Some((r, c)) = queue.pop_front() {
+        let color = out[r][c];
+        for &(dr, dc) in &[(0isize, 1isize), (0, -1), (1, 0), (-1, 0)] {
+            let nr = r as isize + dr;
+            let nc = c as isize + dc;
+            if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
+                let (nr, nc) = (nr as usize, nc as usize);
+                if !visited[nr][nc] {
+                    visited[nr][nc] = true;
+                    out[nr][nc] = color;
+                    queue.push_back((nr, nc));
+                }
+            }
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+/// `(grid-recolor-by-proximity grid target-color)` — recolor target cells.
+/// Every cell of `target-color` is replaced by the color of the nearest
+/// non-target, non-background cell (Manhattan BFS). Other cells are unchanged.
+fn bi_grid_recolor_by_proximity(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-recolor-by-proximity: expected 2 args, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let target = int_arg(&args[1], "grid-recolor-by-proximity")?;
+    let h = g.len();
+    if h == 0 { return Ok(grid_to_value(g)); }
+    let w = g[0].len();
+
+    // Background = most common color (or 0).
+    let mut counts = std::collections::HashMap::new();
+    for r in &g { for &c in r { *counts.entry(c).or_insert(0usize) += 1; } }
+    let bg = counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or(0);
+
+    // BFS from all source cells (non-target, non-background).
+    let mut nearest_color = vec![vec![0i64; w]; h];
+    let mut visited = vec![vec![false; w]; h];
+    let mut queue = std::collections::VecDeque::new();
+
+    for r in 0..h {
+        for c in 0..w {
+            if g[r][c] != target && g[r][c] != bg {
+                visited[r][c] = true;
+                nearest_color[r][c] = g[r][c];
+                queue.push_back((r, c));
+            }
+        }
+    }
+
+    while let Some((r, c)) = queue.pop_front() {
+        let color = nearest_color[r][c];
+        for &(dr, dc) in &[(0isize, 1isize), (0, -1), (1, 0), (-1, 0)] {
+            let nr = r as isize + dr;
+            let nc = c as isize + dc;
+            if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
+                let (nr, nc) = (nr as usize, nc as usize);
+                if !visited[nr][nc] {
+                    visited[nr][nc] = true;
+                    nearest_color[nr][nc] = color;
+                    queue.push_back((nr, nc));
+                }
+            }
+        }
+    }
+
+    // Build output: replace only target-color cells.
+    let mut out = g.clone();
+    for r in 0..h {
+        for c in 0..w {
+            if g[r][c] == target {
+                out[r][c] = nearest_color[r][c];
+            }
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
 // ── Original connected components (kept for existing callers) ───────────────
 
 fn grid_connected_components(g: &[Vec<i64>], eight_connected: bool) -> Vec<Vec<Vec<i64>>> {
@@ -4452,6 +4729,87 @@ fn bi_grid_fill_enclosed(args: &[Value], _env: &Env) -> Result<Value, String> {
     Ok(grid_to_value(out))
 }
 
+/// `(grid-remove-small-objects grid min-size)` — remove connected components
+/// with fewer than min-size cells, replacing them with background (0).
+fn bi_grid_remove_small_objects(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-remove-small-objects: expected 2 args (grid, min-size), got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let min_size = match &args[1] {
+        Value::Int(n) => *n as usize,
+        Value::Num(n) => *n as usize,
+        _ => return Err("grid-remove-small-objects: min-size must be a number".into()),
+    };
+    let h = g.len();
+    if h == 0 { return Ok(grid_to_value(g)); }
+    let w = g[0].len();
+
+    // Detect background (most common value)
+    let mut counts = std::collections::HashMap::new();
+    for row in &g { for &c in row { *counts.entry(c).or_insert(0usize) += 1; } }
+    let bg = counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or(0);
+
+    // Label connected components (4-connected)
+    let mut labels = vec![vec![0u32; w]; h];
+    let mut next_label = 1u32;
+    let dirs: &[(i32, i32)] = &[(-1, 0), (1, 0), (0, -1), (0, 1)];
+    for r in 0..h {
+        for c in 0..w {
+            if g[r][c] != bg && labels[r][c] == 0 {
+                let label = next_label; next_label += 1;
+                labels[r][c] = label;
+                let mut queue = vec![(r, c)];
+                while let Some((cr, cc)) = queue.pop() {
+                    for &(dr, dc) in dirs {
+                        let nr = cr as i32 + dr; let nc = cc as i32 + dc;
+                        if nr >= 0 && nr < h as i32 && nc >= 0 && nc < w as i32 {
+                            let (nr, nc) = (nr as usize, nc as usize);
+                            if labels[nr][nc] == 0 && g[nr][nc] != bg {
+                                labels[nr][nc] = label; queue.push((nr, nc));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Count cells per label
+    let mut label_counts = vec![0usize; next_label as usize];
+    for r in 0..h { for c in 0..w {
+        if labels[r][c] > 0 { label_counts[labels[r][c] as usize] += 1; }
+    }}
+
+    // Build output: replace small objects with background
+    let mut out = g.clone();
+    for r in 0..h { for c in 0..w {
+        let lbl = labels[r][c];
+        if lbl > 0 && label_counts[lbl as usize] < min_size {
+            out[r][c] = bg;
+        }
+    }}
+    Ok(grid_to_value(out))
+}
+
+/// `(grid-keep-color grid color)` — keep only cells of the specified color,
+/// set everything else to 0 (background).
+fn bi_grid_keep_color(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-keep-color: expected 2 args (grid, color), got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let color = match &args[1] {
+        Value::Int(n) => *n,
+        Value::Num(n) => *n as i64,
+        _ => return Err("grid-keep-color: color must be a number".into()),
+    };
+    let out: Vec<Vec<i64>> = g.iter().map(|row| {
+        row.iter().map(|&c| if c == color { c } else { 0 }).collect()
+    }).collect();
+    Ok(grid_to_value(out))
+}
+
 /// `(grid-compact grid)` — remove all-zero rows and all-zero columns.
 fn bi_grid_compact(args: &[Value], _env: &Env) -> Result<Value, String> {
     if args.len() != 1 {
@@ -4470,6 +4828,252 @@ fn bi_grid_compact(args: &[Value], _env: &Env) -> Result<Value, String> {
         .collect();
     if out.is_empty() {
         return Ok(grid_to_value(vec![vec![0i64]]));
+    }
+    Ok(grid_to_value(out))
+}
+
+// ── Diagonal line / ray-casting builtins (§9.59) ────────────────────────────
+
+/// `(grid-draw-line grid r1 c1 r2 c2 color)` — Bresenham line draw.
+fn bi_grid_draw_line(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 6 {
+        return Err(format!("grid-draw-line: expected 6 args, got {}", args.len()));
+    }
+    let mut g = as_grid(&args[0])?;
+    let r1 = int_arg(&args[1], "grid-draw-line")?;
+    let c1 = int_arg(&args[2], "grid-draw-line")?;
+    let r2 = int_arg(&args[3], "grid-draw-line")?;
+    let c2 = int_arg(&args[4], "grid-draw-line")?;
+    let color = int_arg(&args[5], "grid-draw-line")?;
+    let h = g.len() as i64;
+    let w = g.first().map_or(0, |r| r.len()) as i64;
+    if h == 0 || w == 0 { return Ok(grid_to_value(g)); }
+
+    // Bresenham's line algorithm
+    let mut x0 = c1;
+    let mut y0 = r1;
+    let x1 = c2;
+    let y1 = r2;
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx: i64 = if x0 < x1 { 1 } else { -1 };
+    let sy: i64 = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+
+    loop {
+        if y0 >= 0 && y0 < h && x0 >= 0 && x0 < w {
+            g[y0 as usize][x0 as usize] = color;
+        }
+        if x0 == x1 && y0 == y1 { break; }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+    Ok(grid_to_value(g))
+}
+
+/// `(grid-extend-lines grid)` — extend line endpoints to grid boundary.
+///
+/// Finds non-background cells with exactly one non-background neighbor,
+/// determines the direction of the line from context, and extends in
+/// that direction until hitting the boundary or another non-background cell.
+fn bi_grid_extend_lines(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-extend-lines: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let h = g.len();
+    if h == 0 { return Ok(grid_to_value(g)); }
+    let w = g[0].len();
+    if w == 0 { return Ok(grid_to_value(g)); }
+    let bg = grid_background(&g);
+
+    // 8-directional neighbors
+    let dirs: [(isize, isize); 8] = [
+        (-1, -1), (-1, 0), (-1, 1),
+        ( 0, -1),          ( 0, 1),
+        ( 1, -1), ( 1, 0), ( 1, 1),
+    ];
+
+    // Find endpoints: non-bg cells with exactly one non-bg 8-neighbor
+    let mut extensions: Vec<(usize, usize, isize, isize, i64)> = Vec::new();
+
+    for r in 0..h {
+        for c in 0..w {
+            if g[r][c] == bg { continue; }
+            let color = g[r][c];
+
+            // Count non-bg 8-neighbors and track the single neighbor direction
+            let mut nb_count = 0;
+            let mut nb_dr: isize = 0;
+            let mut nb_dc: isize = 0;
+            for &(dr, dc) in &dirs {
+                let nr = r as isize + dr;
+                let nc = c as isize + dc;
+                if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
+                    if g[nr as usize][nc as usize] != bg {
+                        nb_count += 1;
+                        nb_dr = dr;
+                        nb_dc = dc;
+                    }
+                }
+            }
+            if nb_count == 1 {
+                // Extend AWAY from the neighbor: direction is (-nb_dr, -nb_dc)
+                let ext_dr = -nb_dr;
+                let ext_dc = -nb_dc;
+                extensions.push((r, c, ext_dr, ext_dc, color));
+            }
+        }
+    }
+
+    let mut out = g.clone();
+    for (r, c, dr, dc, color) in extensions {
+        let mut cr = r as isize + dr;
+        let mut cc = c as isize + dc;
+        while cr >= 0 && cr < h as isize && cc >= 0 && cc < w as isize {
+            if out[cr as usize][cc as usize] != bg {
+                break; // hit another non-bg cell, stop
+            }
+            out[cr as usize][cc as usize] = color;
+            cr += dr;
+            cc += dc;
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+/// `(grid-connect-same-color grid)` — connect same-color cells on shared
+/// row, column, or diagonal with a line of that color.
+fn bi_grid_connect_same_color(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-connect-same-color: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let h = g.len();
+    if h == 0 { return Ok(grid_to_value(g)); }
+    let w = g[0].len();
+    if w == 0 { return Ok(grid_to_value(g)); }
+    let bg = grid_background(&g);
+
+    // Collect non-bg cells grouped by color
+    let mut by_color: std::collections::HashMap<i64, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+    for r in 0..h {
+        for c in 0..w {
+            if g[r][c] != bg {
+                by_color.entry(g[r][c]).or_default().push((r, c));
+            }
+        }
+    }
+
+    let mut out = g.clone();
+    for (_color, positions) in &by_color {
+        let color = *_color;
+        let n = positions.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let (r1, c1) = positions[i];
+                let (r2, c2) = positions[j];
+                let dr = (r2 as isize - r1 as isize).abs();
+                let dc = (c2 as isize - c1 as isize).abs();
+                // Same row, same column, or same diagonal
+                if dr == 0 || dc == 0 || dr == dc {
+                    // Bresenham between them
+                    let mut x0 = c1 as i64;
+                    let mut y0 = r1 as i64;
+                    let x1 = c2 as i64;
+                    let y1 = r2 as i64;
+                    let ddx = (x1 - x0).abs();
+                    let ddy = -(y1 - y0).abs();
+                    let sx: i64 = if x0 < x1 { 1 } else { -1 };
+                    let sy: i64 = if y0 < y1 { 1 } else { -1 };
+                    let mut err = ddx + ddy;
+                    loop {
+                        if y0 >= 0 && y0 < h as i64 && x0 >= 0 && x0 < w as i64 {
+                            out[y0 as usize][x0 as usize] = color;
+                        }
+                        if x0 == x1 && y0 == y1 { break; }
+                        let e2 = 2 * err;
+                        if e2 >= ddy {
+                            err += ddy;
+                            x0 += sx;
+                        }
+                        if e2 <= ddx {
+                            err += ddx;
+                            y0 += sy;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+/// `(grid-rays grid)` — cast rays in 8 directions from isolated non-bg cells.
+fn bi_grid_rays(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-rays: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let h = g.len();
+    if h == 0 { return Ok(grid_to_value(g)); }
+    let w = g[0].len();
+    if w == 0 { return Ok(grid_to_value(g)); }
+    let bg = grid_background(&g);
+
+    let dirs: [(isize, isize); 8] = [
+        (-1, -1), (-1, 0), (-1, 1),
+        ( 0, -1),          ( 0, 1),
+        ( 1, -1), ( 1, 0), ( 1, 1),
+    ];
+
+    // Find isolated non-bg cells (no same-color 8-neighbors)
+    let mut sources: Vec<(usize, usize, i64)> = Vec::new();
+    for r in 0..h {
+        for c in 0..w {
+            if g[r][c] == bg { continue; }
+            let color = g[r][c];
+            let mut has_same_neighbor = false;
+            for &(dr, dc) in &dirs {
+                let nr = r as isize + dr;
+                let nc = c as isize + dc;
+                if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
+                    if g[nr as usize][nc as usize] == color {
+                        has_same_neighbor = true;
+                        break;
+                    }
+                }
+            }
+            if !has_same_neighbor {
+                sources.push((r, c, color));
+            }
+        }
+    }
+
+    let mut out = g.clone();
+    for (r, c, color) in &sources {
+        for &(dr, dc) in &dirs {
+            let mut cr = *r as isize + dr;
+            let mut cc = *c as isize + dc;
+            while cr >= 0 && cr < h as isize && cc >= 0 && cc < w as isize {
+                let ur = cr as usize;
+                let uc = cc as usize;
+                if g[ur][uc] != bg {
+                    break; // hit another non-bg cell
+                }
+                out[ur][uc] = *color;
+                cr += dr;
+                cc += dc;
+            }
+        }
     }
     Ok(grid_to_value(out))
 }
