@@ -1,0 +1,119 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Grid fitness scoring (§9.55)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Cell-level similarity for grid values. Used by the near-miss handler
+; to evaluate how close a candidate program is to the correct output.
+;
+; Returns a namespace with:
+;   "score"     - 0.0 to 1.0 cell-level accuracy
+;   "dims-ok"   - true if predicted and expected have same dimensions
+;   "bg-ok"     - true if background colors match
+;   "colors-ok" - true if color palettes are identical
+
+; ── Cell-level accuracy ────────────────────────────────────────────────
+;
+; Count matching cells between two grids. When dimensions differ,
+; only the overlapping region is compared and non-overlapping cells
+; count as mismatches.
+
+(define grid-cell-accuracy
+  (lambda (pred expected)
+    (let ((ph (grid-height pred))
+          (pw (grid-width pred))
+          (eh (grid-height expected))
+          (ew (grid-width expected)))
+      (let ((shared-h (min ph eh))
+            (shared-w (min pw ew))
+            (max-h (max ph eh))
+            (max-w (max pw ew)))
+        (let ((total (* max-h max-w)))
+          (if (= total 0)
+            1.0
+            (let ((matching
+                    (reduce +
+                      (map (lambda (r)
+                        (reduce +
+                          (map (lambda (c)
+                            (if (= (grid-get pred r c)
+                                   (grid-get expected r c))
+                              1 0))
+                            (range shared-w))
+                          0))
+                        (range shared-h))
+                      0)))
+              (/ matching total))))))))
+
+; ── Dimension match ───────────────────────────────────────────────────
+
+(define grid-dims-match?
+  (lambda (pred expected)
+    (and (= (grid-height pred) (grid-height expected))
+         (= (grid-width pred) (grid-width expected)))))
+
+; ── Background match ──────────────────────────────────────────────────
+
+(define grid-bg-match?
+  (lambda (pred expected)
+    (= (grid-background pred) (grid-background expected))))
+
+; ── Color palette match ───────────────────────────────────────────────
+
+(define grid-colors-match?
+  (lambda (pred expected)
+    (let ((pc (grid-colors pred))
+          (ec (grid-colors expected)))
+      (and (= (length pc) (length ec))
+           (reduce (lambda (acc c)
+                     (and acc (reduce (lambda (a v) (or a (= v c))) ec false)))
+                   pc true)))))
+
+; ── Combined fitness score ────────────────────────────────────────────
+;
+; Returns a namespace with diagnostic fields for the near-miss handler.
+
+(define grid-fitness
+  (lambda (pred expected)
+    (ns ("score"     (grid-cell-accuracy pred expected))
+        ("dims-ok"   (grid-dims-match? pred expected))
+        ("bg-ok"     (grid-bg-match? pred expected))
+        ("colors-ok" (grid-colors-match? pred expected)))))
+
+; ── Spec-level fitness ────────────────────────────────────────────────
+;
+; Evaluate a candidate function against a full spec (list of
+; (input, output) pairs). Returns average cell accuracy across
+; all examples, plus per-example breakdowns.
+
+(define spec-fitness
+  (lambda (fn spec)
+    (let ((results
+            (map (lambda (pair)
+              (let ((inp (head pair))
+                    (expected (head (tail pair))))
+                (let ((pred (try (fn inp) nil)))
+                  (if (nil? pred)
+                    (ns ("score" 0.0) ("dims-ok" false) ("bg-ok" false) ("colors-ok" false))
+                    (if (and (grid? pred) (grid? expected))
+                      (grid-fitness pred expected)
+                      (if (= pred expected)
+                        (ns ("score" 1.0) ("dims-ok" true) ("bg-ok" true) ("colors-ok" true))
+                        (ns ("score" 0.0) ("dims-ok" false) ("bg-ok" false) ("colors-ok" false))))))))
+              spec)))
+      (let ((avg-score (/ (reduce + (map (lambda (r) (ns-get r "score")) results) 0.0)
+                          (max (length results) 1))))
+        (ns ("avg-score" avg-score)
+            ("per-example" results)
+            ("all-dims-ok" (reduce (lambda (a r) (and a (ns-get r "dims-ok"))) results true))
+            ("all-bg-ok" (reduce (lambda (a r) (and a (ns-get r "bg-ok"))) results true)))))))
+
+; ── Fitness classification ────────────────────────────────────────────
+;
+; Classify a fitness score into actionable categories.
+
+(define fitness-category
+  (lambda (fitness)
+    (if (>= fitness 0.9) "near-miss"
+      (if (>= fitness 0.5) "partial"
+        (if (> fitness 0.0) "far"
+          "zero")))))

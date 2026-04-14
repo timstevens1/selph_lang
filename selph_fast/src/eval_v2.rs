@@ -1062,6 +1062,45 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Cell-level similarity between two values. Returns (matching, total)
+/// where total is the number of leaf cells compared. For grids (nested
+/// lists), this counts matching cells. For scalars, total=1.
+/// When shapes differ, only the overlapping region is counted and the
+/// non-overlapping cells count as mismatches.
+pub fn value_similarity(a: &Value, b: &Value) -> (usize, usize) {
+    match (a, b) {
+        (Value::List(x), Value::List(y)) => {
+            let mut matching = 0usize;
+            let mut total = 0usize;
+            let shared = x.len().min(y.len());
+            for i in 0..shared {
+                let (m, t) = value_similarity(&x[i], &y[i]);
+                matching += m;
+                total += t;
+            }
+            // Non-overlapping elements: count their leaf cells as mismatches.
+            for i in shared..x.len() {
+                total += leaf_count(&x[i]);
+            }
+            for i in shared..y.len() {
+                total += leaf_count(&y[i]);
+            }
+            (matching, total)
+        }
+        _ => {
+            if values_equal(a, b) { (1, 1) } else { (0, 1) }
+        }
+    }
+}
+
+/// Count leaf cells in a value (for similarity denominator).
+fn leaf_count(v: &Value) -> usize {
+    match v {
+        Value::List(items) => items.iter().map(leaf_count).sum::<usize>().max(1),
+        _ => 1,
+    }
+}
+
 fn bi_lt(args: &[Value], _env: &Env) -> Result<Value, String> {
     let (a, b) = as_nums(&args[0], &args[1])?;
     Ok(Value::Bool(a < b))
@@ -2530,6 +2569,11 @@ fn bi_synthesize(args: &[Value], env: &Env) -> Result<Value, String> {
         out.insert(intern("output-type"), Value::str(otype.clone()));
     }
     out.insert(intern("m-chain-ran"), Value::Bool(result.m_chain_ran));
+    // §9.55: fitness data for near-miss analysis.
+    out.insert(intern("fitness"), Value::Num(result.best_fitness));
+    if let Some(ref best_src) = result.best_source {
+        out.insert(intern("best-source"), Value::str(best_src.clone()));
+    }
     Ok(Value::ns(out))
 }
 
@@ -2645,8 +2689,16 @@ fn bi_synthesize_args(args: &[Value], env: &Env) -> Result<Value, String> {
     }
 
     let skip = crate::synth_v2::default_skip_set();
-    let components = crate::synth_v2::default_synth_components(env, &skip);
+    let mut components = crate::synth_v2::default_synth_components(env, &skip);
     let universe = crate::synth_v2::TypeUniverse::from_env(env);
+
+    // §9.55: heuristic support for multi-arg path (same as bi_synthesize).
+    if let Some(h) = ns.get(&intern("heuristic")) {
+        components = crate::meta_v2::apply_heuristic_value_for_task(
+            h, &components, &inputs, &expected, env,
+        )
+        .map_err(|e| format!("synthesize-args: {}", e))?;
+    }
 
     let result = crate::synth_v2::synthesize_args_with_extra_seeds(
         &components,
@@ -2685,6 +2737,12 @@ fn bi_synthesize_args(args: &[Value], env: &Env) -> Result<Value, String> {
     out.insert(intern("source"), Value::str(source));
     out.insert(intern("strategy"), Value::str(strategy_name));
     out.insert(intern("arity"), Value::Int(arity as i64));
+    // §9.55: fitness data for near-miss analysis.
+    out.insert(intern("fitness"), Value::Num(result.best_fitness));
+    if let Some(ref best_nodes) = result.best_nodes {
+        let best_root = result.best_root.unwrap_or(0);
+        out.insert(intern("best-source"), Value::str(node_to_source(best_nodes, best_root)));
+    }
     Ok(Value::ns(out))
 }
 

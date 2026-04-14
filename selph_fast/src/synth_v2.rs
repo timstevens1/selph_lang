@@ -1392,10 +1392,22 @@ pub struct StrategyResult {
     /// §9.49 post-mortem diagnostics: whether the SELPH decomposer
     /// chain (`__decomposers__`) was consulted during this task.
     pub m_chain_ran: bool,
+    /// §9.55: best-so-far fitness from the underlying SynthResult.
+    pub best_fitness: f64,
+    /// §9.55: AST source of the best partial-match candidate.
+    pub best_source: Option<String>,
 }
 
 impl StrategyResult {
     fn from_synth(r: SynthResult, strategy: Strategy) -> Self {
+        let best_source = if !r.found {
+            r.best_nodes.as_ref().map(|nodes| {
+                let root = r.best_root.unwrap_or(0);
+                eval_v2::node_to_source(nodes, root)
+            })
+        } else {
+            None
+        };
         Self {
             found: r.found,
             nodes: r.nodes,
@@ -1404,6 +1416,8 @@ impl StrategyResult {
             strategy: if r.found { Some(strategy) } else { None },
             output_type: None,
             m_chain_ran: false,
+            best_fitness: r.best_fitness,
+            best_source,
         }
     }
 
@@ -1416,6 +1430,8 @@ impl StrategyResult {
             strategy: None,
             output_type: None,
             m_chain_ran: false,
+            best_fitness: 0.0,
+            best_source: None,
         }
     }
 }
@@ -3834,6 +3850,9 @@ fn rd_sub_synthesize(
                 root: Some(rd.root),
                 candidates_explored: rd.candidates_explored,
                 decomposer_name: None,
+                best_fitness: 1.0,
+                best_nodes: None,
+                best_root: None,
             };
         }
         let remaining = max_candidates.saturating_sub(rd.candidates_explored);
@@ -5017,6 +5036,8 @@ pub fn synthesize_with_strategies(
             strategy: Some(Strategy::Custom(name_sym)),
             output_type: Some(output_type_str),
             m_chain_ran: true,
+            best_fitness: 1.0,
+            best_source: None,
         };
     }
 
@@ -5039,6 +5060,8 @@ pub fn synthesize_with_strategies(
             strategy: Some(Strategy::Custom(name_sym)),
             output_type: Some(output_type_str),
             m_chain_ran: has_decomposers,
+            best_fitness: 1.0,
+            best_source: None,
         };
     }
 
@@ -5081,6 +5104,8 @@ pub fn synthesize_with_strategies(
             strategy: Some(Strategy::RecursiveDecomposition),
             output_type: None,
             m_chain_ran: false,
+            best_fitness: 1.0,
+            best_source: None,
         });
     }
 
@@ -5101,6 +5126,8 @@ pub fn synthesize_with_strategies(
             strategy: Some(Strategy::BoolDecomp),
             output_type: None,
             m_chain_ran: false,
+            best_fitness: 1.0,
+            best_source: None,
         });
     }
 
@@ -5125,6 +5152,8 @@ pub fn synthesize_with_strategies(
             strategy: Some(Strategy::HigherOrder),
             output_type: None,
             m_chain_ran: false,
+            best_fitness: 1.0,
+            best_source: None,
         });
     }
 
@@ -5150,6 +5179,8 @@ pub fn synthesize_with_strategies(
             strategy: Some(Strategy::DivideConquer),
             output_type: None,
             m_chain_ran: false,
+            best_fitness: 1.0,
+            best_source: None,
         });
     }
 
@@ -5175,6 +5206,8 @@ pub fn synthesize_with_strategies(
             strategy: Some(Strategy::Induction),
             output_type: None,
             m_chain_ran: false,
+            best_fitness: 1.0,
+            best_source: None,
         });
     }
 
@@ -5188,6 +5221,8 @@ pub fn synthesize_with_strategies(
             strategy: Some(Strategy::Memo),
             output_type: None,
             m_chain_ran: false,
+            best_fitness: 1.0,
+            best_source: None,
         });
     }
 
@@ -5335,6 +5370,15 @@ pub struct SynthResult {
     /// "By strategy" summary distinguishes chain solves from Flat
     /// solves on the multi-arg path (the §9.46 mislabel fix).
     pub decomposer_name: Option<Sym>,
+    /// §9.55: best-so-far fitness (0.0–1.0). For exact-match solutions
+    /// this is 1.0. For failures, it's the highest fitness seen during
+    /// enumeration. Fitness = fraction of training examples matched,
+    /// weighted by cell-level similarity for list/grid outputs.
+    pub best_fitness: f64,
+    /// AST of the best partial-match candidate (when found=false).
+    /// Wrapped as a lambda — can be passed to SELPH for near-miss analysis.
+    pub best_nodes: Option<Vec<Node>>,
+    pub best_root: Option<usize>,
 }
 
 impl SynthResult {
@@ -5345,6 +5389,24 @@ impl SynthResult {
             root: None,
             candidates_explored: explored,
             decomposer_name: None,
+            best_fitness: 0.0,
+            best_nodes: None,
+            best_root: None,
+        }
+    }
+
+    fn not_found_with_best(
+        explored: usize, fitness: f64, nodes: Vec<Node>, root: usize,
+    ) -> Self {
+        Self {
+            found: false,
+            nodes: None,
+            root: None,
+            candidates_explored: explored,
+            decomposer_name: None,
+            best_fitness: fitness,
+            best_nodes: Some(nodes),
+            best_root: Some(root),
         }
     }
 
@@ -5355,6 +5417,9 @@ impl SynthResult {
             root: Some(root),
             candidates_explored: explored,
             decomposer_name: None,
+            best_fitness: 1.0,
+            best_nodes: None,
+            best_root: None,
         }
     }
 
@@ -5370,6 +5435,9 @@ impl SynthResult {
             root: Some(root),
             candidates_explored: explored,
             decomposer_name: Some(name_sym),
+            best_fitness: 1.0,
+            best_nodes: None,
+            best_root: None,
         }
     }
 }
@@ -5746,6 +5814,10 @@ fn wrap_lambda(entry: &SynthPool) -> (Vec<Node>, usize) {
 /// element carries the hole-substituted entry on success — callers
 /// should wrap that one (not the original) when constructing the
 /// final lambda.
+/// Returns (outcome, hole_sub, fitness).
+/// Fitness is a 0.0–1.0 score: fraction of training examples matched,
+/// weighted by cell-level similarity for partial matches on list/grid
+/// outputs. Exact match on all examples → fitness 1.0.
 fn test_candidate(
     entry: &SynthPool,
     inputs: &[Value],
@@ -5754,12 +5826,12 @@ fn test_candidate(
     seen: &mut HashSet<Vec<u64>>,
     target: Option<Sym>,
     universe: &TypeUniverse,
-) -> (TestOutcome, Option<SynthPool>) {
+) -> (TestOutcome, Option<SynthPool>, f64) {
     // Type gate. The candidate's return type must be able to flow into
     // a slot of type `target`.
     if let Some(t) = target {
         if !universe.slot_accepts(t, entry.ret_type) {
-            return (TestOutcome::Skipped, None);
+            return (TestOutcome::Skipped, None, 0.0);
         }
     }
 
@@ -5772,35 +5844,51 @@ fn test_candidate(
     let nodes_rc: Rc<[Node]> = nodes.into();
     let f = match eval_v2::eval(&nodes_rc, lambda_idx, env) {
         Ok(v) => v,
-        Err(_) => return (TestOutcome::Errored, None),
+        Err(_) => return (TestOutcome::Errored, None, 0.0),
     };
 
     let mut beh: Vec<u64> = Vec::with_capacity(inputs.len());
     let mut matches = 0usize;
+    let mut cell_matching = 0usize;
+    let mut cell_total = 0usize;
     for (inp, exp) in inputs.iter().zip(expected.iter()) {
         match eval_v2::apply(&f, &[inp.clone()], env) {
             Ok(v) => {
                 beh.push(val_hash(&v));
                 if eval_v2::values_equal(&v, exp) {
                     matches += 1;
+                    // Count cells for the similarity score too.
+                    let (_, t) = eval_v2::value_similarity(&v, exp);
+                    cell_matching += t; // all match
+                    cell_total += t;
+                } else {
+                    let (m, t) = eval_v2::value_similarity(&v, exp);
+                    cell_matching += m;
+                    cell_total += t;
                 }
             }
-            Err(_) => return (TestOutcome::Errored, None),
+            Err(_) => return (TestOutcome::Errored, None, 0.0),
         }
     }
 
     // Observational equivalence dedup.
     if !beh.is_empty() {
         if seen.contains(&beh) {
-            return (TestOutcome::Deduped, None);
+            return (TestOutcome::Deduped, None, 0.0);
         }
         seen.insert(beh);
     }
 
-    if matches == inputs.len() && !inputs.is_empty() {
-        (TestOutcome::Solution, None)
+    let fitness = if cell_total > 0 {
+        cell_matching as f64 / cell_total as f64
     } else {
-        (TestOutcome::Tested, None)
+        0.0
+    };
+
+    if matches == inputs.len() && !inputs.is_empty() {
+        (TestOutcome::Solution, None, 1.0)
+    } else {
+        (TestOutcome::Tested, None, fitness)
     }
 }
 
@@ -6113,6 +6201,10 @@ fn synthesize_inner(
     let mut explored: usize = 0;
     let mut seen: HashSet<Vec<u64>> = HashSet::new();
 
+    // §9.55: best-so-far tracking for fitness-guided synthesis.
+    let mut best_fitness: f64 = 0.0;
+    let mut best_entry: Option<SynthPool> = None;
+
     // §9.42 affine-fit pass needs an end-of-search hook even when
     // the main enumeration runs out of budget. We track exhausted-or-
     // converged state via this flag and break out instead of early-
@@ -6126,8 +6218,12 @@ fn synthesize_inner(
             break 'depth0;
         }
         explored += 1;
-        let (outcome, hole_sub) =
+        let (outcome, hole_sub, fitness) =
             test_candidate(entry, inputs, expected, env, &mut seen, target, universe);
+        if fitness > best_fitness {
+            best_fitness = fitness;
+            best_entry = Some(entry.clone());
+        }
         if let TestOutcome::Solution = outcome {
             let final_entry = hole_sub.as_ref().unwrap_or(entry);
             let (n, r) = wrap_lambda(final_entry);
@@ -6239,8 +6335,12 @@ fn synthesize_inner(
                 desc.args.iter().map(|&i| &pool[i]).collect();
             let entry = materialize_app(comp, &arg_refs);
 
-            let (outcome, hole_sub) =
+            let (outcome, hole_sub, fitness) =
                 test_candidate(&entry, inputs, expected, env, &mut seen, target, universe);
+            if fitness > best_fitness {
+                best_fitness = fitness;
+                best_entry = Some(entry.clone());
+            }
             match outcome {
                 TestOutcome::Solution => {
                     let final_entry = hole_sub.as_ref().unwrap_or(&entry);
@@ -6292,6 +6392,13 @@ fn synthesize_inner(
     // through the budget first).
     let _ = budget_exhausted;
 
+    // §9.55: return the best partial-match candidate if one exists.
+    if let Some(entry) = best_entry {
+        if best_fitness > 0.0 {
+            let (n, r) = wrap_lambda(&entry);
+            return SynthResult::not_found_with_best(explored, best_fitness, n, r);
+        }
+    }
     SynthResult::not_found(explored)
 }
 

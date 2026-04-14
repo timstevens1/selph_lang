@@ -1,0 +1,19 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Fitness-aware post-mortem (§9.55)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Combined loader for the fitness analysis pipeline. Loaded via
+; --post-mortem flag after the curriculum run completes.
+;
+; Defines run-post-mortem to use the fitness data from §9.55.
+
+; Load fitness, near-miss, and boost modules.
+(load-file "examples/meta_curriculum/m_fitness_grid.selph")
+(load-file "examples/meta_curriculum/m_near_miss.selph")
+(load-file "examples/meta_curriculum/m_boost_heuristic.selph")
+
+; The post-mortem entry point. grow-v2 calls this with
+; __curriculum_results__ bound.
+(define run-post-mortem
+  (lambda (results)
+    (run-fitness-post-mortem results)))

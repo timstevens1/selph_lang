@@ -1,0 +1,159 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Near-miss handler (§9.55)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; When synthesis returns a high-fitness but imperfect candidate, this
+; module analyzes the gap: which examples fail, what's wrong with
+; the outputs, and what M-chain forms might close the gap.
+;
+; Integrates with post-mortem: each failed task's result namespace
+; now carries "fitness" (0.0–1.0) and "best-source" (SELPH source
+; of the best partial match). This module provides:
+;
+;   1. near-miss-analyze: diagnose a single failed task
+;   2. near-miss-retry:   attempt correction by composing on top
+;   3. near-miss-report:  summarize near-misses across a curriculum
+
+; ── Single-task analysis ──────────────────────────────────────────────
+;
+; Given a failed task result (with "fitness", "best-source", "spec"),
+; evaluate the best candidate against each example and classify
+; the failure pattern.
+
+(define near-miss-analyze
+  (lambda (result)
+    (let ((fitness (try (ns-get result "fitness") 0.0))
+          (best-src (try (ns-get result "best-source") ""))
+          (spec (ns-get result "spec"))
+          (name (ns-get result "name")))
+      (if (or (= fitness 0.0) (= best-src ""))
+        (ns ("name" name) ("category" "zero") ("fitness" fitness))
+        ; Evaluate the best candidate against each example.
+        (let ((fn (try (eval-source best-src) nil)))
+          (if (nil? fn)
+            (ns ("name" name) ("category" "parse-error") ("fitness" fitness)
+                ("best-source" best-src))
+            ; Per-example analysis
+            (let ((analyses
+                    (map (lambda (pair)
+                      (let ((inp (head pair))
+                            (expected (head (tail pair))))
+                        (let ((pred (try (fn inp) nil)))
+                          (if (nil? pred)
+                            (ns ("match" false) ("error" true))
+                            (if (= pred expected)
+                              (ns ("match" true) ("error" false))
+                              (if (and (grid? pred) (grid? expected))
+                                (grid-fitness pred expected)
+                                (ns ("match" false) ("error" false)
+                                    ("score" 0.0))))))))
+                      spec)))
+              (let ((n-match (reduce + (map (lambda (a)
+                      (if (try (ns-get a "match") false) 1 0)) analyses) 0))
+                    (n-total (length analyses))
+                    (n-error (reduce + (map (lambda (a)
+                      (if (try (ns-get a "error") false) 1 0)) analyses) 0)))
+                (ns ("name" name)
+                    ("category" (fitness-category fitness))
+                    ("fitness" fitness)
+                    ("examples-matched" n-match)
+                    ("examples-total" n-total)
+                    ("examples-errored" n-error)
+                    ("best-source" best-src)
+                    ("per-example" analyses))))))))))
+
+; ── Retry via composition ─────────────────────────────────────────────
+;
+; For near-miss candidates (fitness >= 0.8), attempt to close the gap
+; by composing a correction on top. Try:
+;   1. Color remapping (if dims match but colors differ)
+;   2. Post-transform (rotate/flip after the near-miss)
+;
+; Returns (ns ("found" true) ("source-node" node)) or (ns ("found" false)).
+
+(define near-miss-retry
+  (lambda (result)
+    (let ((fitness (try (ns-get result "fitness") 0.0))
+          (best-src (try (ns-get result "best-source") ""))
+          (spec (ns-get result "spec"))
+          (test-spec (try (ns-get result "test") (list))))
+      (if (or (< fitness 0.5) (= best-src ""))
+        (ns ("found" false))
+        (let ((fn (try (eval-source best-src) nil)))
+          (if (nil? fn)
+            (ns ("found" false))
+            ; Try wrapping the near-miss in each unary transform.
+            (let ((corrections
+                    (list
+                      (list "rotate-cw"  (lambda (g) (grid-rotate-cw g)))
+                      (list "rotate-ccw" (lambda (g) (grid-rotate-ccw g)))
+                      (list "rotate-180" (lambda (g) (grid-rotate-180 g)))
+                      (list "flip-h"     (lambda (g) (grid-flip-h g)))
+                      (list "flip-v"     (lambda (g) (grid-flip-v g)))
+                      (list "transpose"  (lambda (g) (grid-transpose g)))
+                      (list "trim"       (lambda (g) (grid-trim g))))))
+              (reduce
+                (lambda (acc corr)
+                  (if (ns-get acc "found")
+                    acc
+                    (let ((corr-name (head corr))
+                          (corr-fn (head (tail corr))))
+                      ; Test: does corr(fn(input)) == expected for all examples?
+                      (let ((all-match
+                              (reduce
+                                (lambda (ok pair)
+                                  (if (not ok) false
+                                    (let ((inp (head pair))
+                                          (expected (head (tail pair))))
+                                      (let ((pred (try (corr-fn (fn inp)) nil)))
+                                        (if (nil? pred) false
+                                          (= pred expected))))))
+                                spec true)))
+                        (if (not all-match)
+                          (ns ("found" false))
+                          ; Also validate against held-out test data.
+                          (let ((test-ok
+                                  (reduce
+                                    (lambda (ok pair)
+                                      (if (not ok) false
+                                        (let ((inp (head pair))
+                                              (expected (head (tail pair))))
+                                          (let ((pred (try (corr-fn (fn inp)) nil)))
+                                            (if (nil? pred) false
+                                              (= pred expected))))))
+                                    test-spec true)))
+                            (if test-ok
+                              (ns ("found" true)
+                                  ("correction" corr-name)
+                                  ("source" (concat "(" corr-name " (" best-src " x))")))
+                              (ns ("found" false)))))))))
+                corrections
+                (ns ("found" false))))))))))
+
+; ── Curriculum-level report ───────────────────────────────────────────
+;
+; Summarize near-miss data across all failed tasks. Groups by
+; fitness category and reports the most promising near-misses.
+
+(define near-miss-report
+  (lambda (results)
+    (let ((failures (filter (lambda (r) (not (ns-get r "found"))) results)))
+      (let ((with-fitness
+              (map (lambda (r)
+                (let ((f (try (ns-get r "fitness") 0.0)))
+                  (ns ("name" (ns-get r "name"))
+                      ("fitness" f)
+                      ("category" (fitness-category f))
+                      ("has-source" (not (= "" (try (ns-get r "best-source") "")))))))
+                failures)))
+        (let ((near-misses (filter (lambda (r) (= (ns-get r "category") "near-miss")) with-fitness))
+              (partials (filter (lambda (r) (= (ns-get r "category") "partial")) with-fitness))
+              (fars (filter (lambda (r) (= (ns-get r "category") "far")) with-fitness))
+              (zeros (filter (lambda (r) (= (ns-get r "category") "zero")) with-fitness)))
+          (ns ("total-failures" (length failures))
+              ("near-misses" (length near-misses))
+              ("partials" (length partials))
+              ("fars" (length fars))
+              ("zeros" (length zeros))
+              ("near-miss-tasks" (map (lambda (r) (ns-get r "name")) near-misses))
+              ("partial-tasks" (map (lambda (r) (ns-get r "name")) partials))))))))

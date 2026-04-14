@@ -285,8 +285,9 @@ fn cmd_grow_v2(args: &[String]) {
     // §9.49 post-mortem: accumulate per-task result namespaces.
     let mut curriculum_results: Vec<types_v2::Value> = Vec::new();
 
-    for (name, task_depth, inputs_legacy, expected_legacy, arity_hint,
-         test_inputs_legacy, test_expected_legacy) in &tasks {
+    let task_count = tasks.len();
+    for (task_idx, (name, task_depth, inputs_legacy, expected_legacy, arity_hint,
+         test_inputs_legacy, test_expected_legacy)) in tasks.iter().enumerate() {
         // Convert legacy Values → v2 Values once per task. The legacy
         // parser produces Num(f64) for everything numeric; v2 prefers
         // Int(i64) when integral so the type universe stays Int-biased
@@ -380,6 +381,14 @@ fn cmd_grow_v2(args: &[String]) {
                 env.lookup(intern("__decomposers__")),
                 Some(types_v2::Value::Ns(ref m)) if !m.is_empty()
             );
+            let best_source = if !synth_result.found {
+                synth_result.best_nodes.as_ref().map(|nodes| {
+                    let root = synth_result.best_root.unwrap_or(0);
+                    eval_v2::node_to_source(nodes, root)
+                })
+            } else {
+                None
+            };
             synth_v2::StrategyResult {
                 found: synth_result.found,
                 nodes: synth_result.nodes,
@@ -388,6 +397,8 @@ fn cmd_grow_v2(args: &[String]) {
                 strategy,
                 output_type: Some(output_type),
                 m_chain_ran: has_decomposers,
+                best_fitness: synth_result.best_fitness,
+                best_source,
             }
         } else {
             synth_v2::synthesize_with_strategies(
@@ -414,7 +425,8 @@ fn cmd_grow_v2(args: &[String]) {
 
             let source = eval_v2::node_to_source(&nodes_vec, root);
             eprintln!(
-                "  {:>4}  {:30}  {:>6} cand  {:>6.3}s  {}",
+                "  [{:>3}/{}] {:>4}  {:30}  {:>6} cand  {:>6.3}s  {}",
+                task_idx + 1, task_count,
                 strategy_name, name, result.candidates_explored,
                 elapsed.as_secs_f64(), source,
             );
@@ -439,10 +451,20 @@ fn cmd_grow_v2(args: &[String]) {
 
             solved += 1;
         } else {
-            eprintln!(
-                "  FAIL  {:30}  {:>6} cand  {:>6.3}s",
-                name, result.candidates_explored, elapsed.as_secs_f64(),
-            );
+            if result.best_fitness > 0.0 {
+                eprintln!(
+                    "  [{:>3}/{}] FAIL  {:30}  {:>6} cand  {:>6.3}s  fitness={:.3}",
+                    task_idx + 1, task_count,
+                    name, result.candidates_explored, elapsed.as_secs_f64(),
+                    result.best_fitness,
+                );
+            } else {
+                eprintln!(
+                    "  [{:>3}/{}] FAIL  {:30}  {:>6} cand  {:>6.3}s",
+                    task_idx + 1, task_count,
+                    name, result.candidates_explored, elapsed.as_secs_f64(),
+                );
+            }
         }
 
         // §9.49 post-mortem: build per-task result namespace.
@@ -478,21 +500,54 @@ fn cmd_grow_v2(args: &[String]) {
                     .collect();
                 rns.insert(intern("test"), types_v2::Value::list(test_pairs));
             }
+            // §9.55: fitness data for near-miss analysis.
+            rns.insert(intern("fitness"), types_v2::Value::Num(result.best_fitness));
+            if let Some(ref best_src) = result.best_source {
+                rns.insert(intern("best-source"), types_v2::Value::str(best_src.clone()));
+            }
             curriculum_results.push(types_v2::Value::ns(rns));
         }
     }
 
     let total_elapsed = total_start.elapsed();
     eprintln!();
-    eprintln!("─────────────────────────────────────────────────────");
-    eprintln!("Solved {}/{} tasks in {:.2}s ({} candidates total)",
+    eprintln!("═════════════════════════════════════════════════════");
+    eprintln!("  Phase 1 complete: {}/{} solved in {:.2}s ({} candidates)",
         solved, tasks.len(), total_elapsed.as_secs_f64(), total_candidates);
     if !by_strategy.is_empty() {
         let parts: Vec<String> = by_strategy.iter()
             .map(|(s, n)| format!("{}={}", s, n))
             .collect();
-        eprintln!("By strategy: {}", parts.join(", "));
+        eprintln!("  Strategy: {}", parts.join(", "));
     }
+    // §9.55: fitness distribution summary.
+    {
+        let mut near_miss = 0usize;
+        let mut partial = 0usize;
+        let mut far = 0usize;
+        let mut zero = 0usize;
+        for r in &curriculum_results {
+            if let types_v2::Value::Ns(ns) = r {
+                if let Some(types_v2::Value::Bool(true)) = ns.get(&intern("found")) {
+                    continue;
+                }
+                let fitness = match ns.get(&intern("fitness")) {
+                    Some(types_v2::Value::Num(f)) => *f,
+                    _ => 0.0,
+                };
+                if fitness >= 0.9 { near_miss += 1; }
+                else if fitness >= 0.5 { partial += 1; }
+                else if fitness > 0.0 { far += 1; }
+                else { zero += 1; }
+            }
+        }
+        let failed = near_miss + partial + far + zero;
+        if failed > 0 {
+            eprintln!("  Failures: {} (near-miss:{} partial:{} far:{} zero:{})",
+                failed, near_miss, partial, far, zero);
+        }
+    }
+    eprintln!("═════════════════════════════════════════════════════");
 
     // §9.54: deferred post-mortem loading. If --post-mortem <file> was given,
     // load it NOW (after curriculum, before post-mortem call) so the ~190

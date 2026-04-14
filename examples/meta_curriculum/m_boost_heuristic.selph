@@ -1,0 +1,223 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Boost heuristic (§9.55)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Analyzes near-miss candidates from a curriculum run and produces
+; priority boosts for the next synthesis pass. The idea: if a candidate
+; like (grid-rotate-cw (grid-trim x)) achieved 80% cell accuracy,
+; then grid-rotate-cw and grid-trim should be explored earlier in the
+; next attempt.
+;
+; Two modes:
+;   1. Post-hoc: after a run, produce a heuristic function for next run
+;   2. Online: during a single run, boost between depths (future work;
+;      requires Rust-side hook — currently the SELPH chain runs before
+;      flat enumeration, not interleaved with it)
+;
+; This is the SELPH side of §9.55 online fitness ordering. It produces
+; a heuristic lambda compatible with the ("heuristic" fn) spec field
+; that bi_synthesize accepts (§9.34).
+
+; ── Extract component names from source code ──────────────────────────
+;
+; Parse a SELPH source string (e.g. "(grid-rotate-cw (grid-trim x))")
+; and extract the function names used. Simple tokenization — split on
+; parens/spaces and keep names that look like identifiers.
+
+(define boost-extract-ops
+  (lambda (src)
+    (if (= src "")
+      (list)
+      ; Tokenize by replacing parens with spaces, then splitting.
+      ; Filter to keep only names (no numbers, not "x", not "lambda").
+      (let ((tokens (string-split
+                      (string-replace (string-replace src "(" " ") ")" " ")
+                      " ")))
+        (filter
+          (lambda (tok)
+            (and (> (string-length tok) 0)
+                 (not (= tok "x"))
+                 (not (= tok "lambda"))
+                 (not (= tok "let"))
+                 (not (= tok "list"))
+                 (not (= tok "nth"))
+                 ; Skip pure numeric tokens.
+                 (not (int? (try (to-number tok) nil)))))
+          tokens)))))
+
+; ── Build boost map from curriculum results ───────────────────────────
+;
+; For each failed task with fitness > 0, extract the operations used
+; in the best candidate and weight them by fitness. Returns a namespace
+; mapping op-name → cumulative boost score.
+
+(define boost-build-map
+  (lambda (results)
+    (reduce
+      (lambda (acc result)
+        (if (ns-get result "found")
+          acc
+          (let ((fitness (try (ns-get result "fitness") 0.0))
+                (best-src (try (ns-get result "best-source") "")))
+            (if (or (<= fitness 0.0) (= best-src ""))
+              acc
+              (let ((ops (boost-extract-ops best-src)))
+                (reduce
+                  (lambda (m op)
+                    (let ((prev (try (ns-get m op) 0.0)))
+                      (ns-put m op (+ prev fitness))))
+                  ops
+                  acc))))))
+      results
+      (ns))))
+
+; ── Generate heuristic from boost map ─────────────────────────────────
+;
+; Produce a heuristic lambda that adds priority boosts to components
+; whose names appear in the boost map. Compatible with the
+; ("heuristic" fn) interface in bi_synthesize.
+;
+; The returned function takes a ctx namespace with "name" and "priority"
+; and returns a boosted priority.
+
+(define boost-make-heuristic
+  (lambda (boost-map boost-weight)
+    (lambda (ctx)
+      (let ((name (ns-get ctx "name"))
+            (base-priority (ns-get ctx "priority")))
+        (let ((boost (try (ns-get boost-map name) 0.0)))
+          (+ base-priority (* boost boost-weight)))))))
+
+; ── Top-level: run-boost-analysis ─────────────────────────────────────
+;
+; Called from post-mortem. Takes curriculum results, builds the boost
+; map, and returns a heuristic function ready to pass into the next
+; synthesis call.
+;
+; Usage in post-mortem:
+;   (let ((h (run-boost-analysis __curriculum_results__)))
+;     (synthesize (ns ("spec" ...) ("heuristic" h))))
+
+(define run-boost-analysis
+  (lambda (results)
+    (let ((boost-map (boost-build-map results)))
+      (ns ("boost-map" boost-map)
+          ("heuristic" (boost-make-heuristic boost-map 10.0))
+          ("summary"
+            (let ((keys (ns-keys boost-map)))
+              (ns ("n-ops-boosted" (length keys))
+                  ("ops" keys)
+                  ("total-boost"
+                    (reduce + (map (lambda (k) (ns-get boost-map k)) keys) 0.0)))))))))
+
+; ── Fitness-aware post-mortem integration ─────────────────────────────
+;
+; Enhanced run-post-mortem that uses fitness data. Drop-in replacement
+; for the existing post-mortem. Prints fitness summary and near-miss
+; retry results.
+
+; ── Boosted retry of a single failed task ──────────────────────────────
+;
+; Re-run synthesis on a failed task with the boost heuristic applied.
+; Uses synthesize-args with the ("heuristic" fn) field. Returns the
+; synthesis result namespace (with "found", "source", etc.).
+
+(define boost-retry-task
+  (lambda (result heuristic-fn)
+    (let ((spec (ns-get result "spec"))
+          (depth (try (ns-get result "depth") 2))
+          (budget (try (ns-get result "max-candidates") 200000))
+          (test-pairs (try (ns-get result "test") (list))))
+      ; Retry with same depth but boosted priorities. Extra-seeds add
+      ; small integer constants (0-3) for cross-type compositions.
+      ; Budget capped at 50K to keep retry pass fast.
+      (let ((retry-spec
+              (ns ("spec" spec)
+                  ("max-depth" depth)
+                  ("max-candidates" (min budget 50000))
+                  ("heuristic" heuristic-fn)
+                  ("extra-seeds" (list 0 1 2 3))
+                  ("test" test-pairs))))
+        (try (synthesize-args retry-spec) (ns ("found" false)))))))
+
+; ── Full retry loop ───────────────────────────────────────────────────
+;
+; For each failed task with fitness > threshold, retry with the boost
+; heuristic. Returns a list of (name, retry-result) pairs.
+
+(define boost-retry-failures
+  (lambda (results heuristic-fn threshold)
+    (let ((failures (filter (lambda (r) (not (ns-get r "found"))) results)))
+      (let ((candidates
+              (filter (lambda (r)
+                (>= (try (ns-get r "fitness") 0.0) threshold))
+                failures)))
+        (map (lambda (r)
+          (let ((name (ns-get r "name"))
+                (fitness (try (ns-get r "fitness") 0.0)))
+            (do
+              (print (concat "  Retrying " name " (fitness=" (to-string fitness) ")..."))
+              (let ((retry (boost-retry-task r heuristic-fn)))
+                (list name retry)))))
+          candidates)))))
+
+; ── Print helpers ──────────────────────────────────────────────────────
+
+(define pm-print-fitness-summary
+  (lambda (report)
+    (do
+      (print "")
+      (print "═══ Fitness Analysis ═══")
+      (print (concat "  Near-misses (>=90%): " (to-string (ns-get report "near-misses"))))
+      (print (concat "  Partial (50-90%):    " (to-string (ns-get report "partials"))))
+      (print (concat "  Far (<50%):          " (to-string (ns-get report "fars"))))
+      (print (concat "  Zero (0%):           " (to-string (ns-get report "zeros"))))
+      (let ((nm-tasks (ns-get report "near-miss-tasks")))
+        (if (> (length nm-tasks) 0)
+          (do (print "  Near-miss tasks:")
+              (map (lambda (name) (print (concat "    " name))) nm-tasks))
+          nil)))))
+
+(define pm-print-boost-summary
+  (lambda (boost)
+    (let ((bsummary (ns-get boost "summary")))
+      (do
+        (print "")
+        (print (concat "  Boosted ops: " (to-string (ns-get bsummary "n-ops-boosted"))))
+        (if (> (ns-get bsummary "n-ops-boosted") 0)
+          (map (lambda (op)
+            (print (concat "    " op " +" (to-string (ns-get (ns-get boost "boost-map") op)))))
+            (ns-get bsummary "ops"))
+          nil)))))
+
+(define pm-print-retry-results
+  (lambda (retries)
+    (let ((recovered (filter (lambda (pair) (ns-get (nth pair 1) "found")) retries))
+          (still-failed (filter (lambda (pair) (not (ns-get (nth pair 1) "found"))) retries)))
+      (do
+        (map (lambda (pair)
+          (print (concat "  ✓ " (nth pair 0)
+                         " → " (ns-get (nth pair 1) "source"))))
+          recovered)
+        (if (> (length still-failed) 0)
+          (print (concat "  ✗ " (to-string (length still-failed)) " tasks still failed"))
+          nil)
+        (print "")
+        (print (concat "  Phase 2 result: +" (to-string (length recovered))
+                       " recovered / " (to-string (length retries)) " retried"))
+        (length recovered)))))
+
+(define run-fitness-post-mortem
+  (lambda (results)
+    (let ((report (near-miss-report results))
+          (boost (run-boost-analysis results)))
+      (do
+        (print "")
+        (print "── Phase 2: Fitness Analysis ────────────────────────")
+        (pm-print-fitness-summary report)
+        (pm-print-boost-summary boost)
+        (print "")
+        (print "── Phase 2: Boosted Retry (fitness >= 0.85) ────────")
+        (let ((retries (boost-retry-failures results (ns-get boost "heuristic") 0.85)))
+          (pm-print-retry-results retries))))))
+
