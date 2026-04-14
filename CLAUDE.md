@@ -99,9 +99,59 @@ Note: as of 2026-04-13, scaffolds solve 32/32 but provide no lift on ARC tasks (
 
 Also added held-out validation in m_chain: detected forms are now checked against test pairs before acceptance, preventing overfitting from constant-grid detectors that memorize training outputs.
 
+## AST Tools (structural editing for LLMs)
+
+CLI tools for manipulating SELPH code by node index instead of editing raw s-expressions. Avoids paren-matching issues when an LLM generates or modifies SELPH code.
+
+### Workflow
+
+1. **Query** the file to see definitions and their structure:
+```bash
+selph ast-query file.selph --list-defs
+# 0  define  square  [7]
+# 1  define  double  [15]
+
+selph ast-query file.selph --tree square
+# [7] App
+#   [0] define
+#   [1] square
+#   [6] Lambda (x)
+#     [5] App
+#       [2] multiply
+#       [3] x
+#       [4] x
+```
+
+2. **Edit** by node index (output to stdout; add `--in-place` to write back):
+```bash
+# Replace a node with a new expression
+selph ast-edit file.selph --replace 5 '(power x 2)'
+
+# Wrap a node in a let binding
+selph ast-edit file.selph --wrap-let 5 result
+
+# Add a new definition
+selph ast-edit file.selph --insert-def triple --params 'x' --body '(multiply x 3)'
+
+# Delete a definition
+selph ast-edit file.selph --delete-def double
+```
+
+3. **Format** with consistent indentation:
+```bash
+selph fmt file.selph [--in-place]
+```
+
+### Key properties
+- The LLM only writes small, shallow replacement expressions — never full deeply-nested files
+- Node indices come from `--tree` output and map directly to the parser's arena
+- Every edit round-trips through the parser, so output is always syntactically valid
+- Comments are not preserved (parser discards them)
+
 ## Key Architecture
 
-- `selph_fast/src/main.rs` — CLI dispatcher (`arc`, `grow-v2`, etc.)
+- `selph_fast/src/main.rs` — CLI dispatcher (`arc`, `grow-v2`, `ast-query`, `ast-edit`, `fmt`, etc.)
+- `selph_fast/src/ast_tools.rs` — AST query/edit/format tools (structural editing by node index)
 - `selph_fast/src/synth_v2.rs` — synthesis engine (Flat, Memo, RD, BD, HO, D&C strategies)
 - `selph_fast/src/eval_v2.rs` — interpreter (types_v2 values)
 - `selph_fast/src/arc.rs` — ARC JSON parser and curriculum generator

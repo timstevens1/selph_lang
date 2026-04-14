@@ -16,6 +16,7 @@ mod types_v2;
 mod eval_v2;
 mod synth_v2;
 mod meta_v2;
+mod ast_tools;
 
 use std::env;
 use std::fs;
@@ -146,6 +147,9 @@ fn real_main() {
         "grow" | "grow-v2" => cmd_grow_v2(&args[2..]),
         "arc" => cmd_arc(&args[2..]),
         "beam-overnight" => cmd_beam_overnight(&args[2..]),
+        "ast-query" => cmd_ast_query(&args[2..]),
+        "ast-edit" => cmd_ast_edit(&args[2..]),
+        "fmt" => cmd_fmt(&args[2..]),
         "help" | "--help" | "-h" => print_usage(),
         other => {
             // If it's a .selph file, evaluate it
@@ -173,6 +177,13 @@ fn print_usage() {
     println!("    --post-mortem <pm.selph>    Post-mortem analysis script");
     println!("  selph arc <path> [--output f] Convert ARC JSON to curriculum format");
     println!("  selph repl                    Interactive REPL");
+    println!("  selph ast-query <file> --list-defs         List top-level definitions");
+    println!("  selph ast-query <file> --tree <idx>        Show definition as indexed tree");
+    println!("  selph ast-edit <file> --replace <idx> '<expr>'   Replace node at index");
+    println!("  selph ast-edit <file> --wrap-let <idx> <name>    Wrap node in let binding");
+    println!("  selph ast-edit <file> --insert-def <name> --params '<p1 p2>' --body '<expr>'");
+    println!("  selph ast-edit <file> --delete-def <name>        Delete a definition");
+    println!("  selph fmt <file> [--in-place]              Format SELPH source");
     println!("  selph help                    Show this message");
 }
 
@@ -248,6 +259,186 @@ fn cmd_parse(args: &[String]) {
             }
         }
         Err(e) => eprintln!("Parse error: {}", e),
+    }
+}
+
+fn cmd_ast_query(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: selph ast-query <file> --list-defs | --tree <idx>");
+        return;
+    }
+
+    let source = match fs::read_to_string(&args[0]) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Error reading {}: {}", args[0], e); return; }
+    };
+    let (nodes, roots) = match parse_file(&source) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("Parse error: {}", e); return; }
+    };
+
+    if args.len() < 2 {
+        eprintln!("Expected --list-defs or --tree <idx>");
+        return;
+    }
+
+    match args[1].as_str() {
+        "--list-defs" => {
+            let defs = ast_tools::list_defs(&nodes, &roots);
+            for d in &defs {
+                println!("{}\t{}\t{}\t[{}]", d.order, d.kind, d.name, d.root_idx);
+            }
+            if defs.is_empty() {
+                println!("(no definitions found; {} top-level forms)", roots.len());
+            }
+        }
+        "--tree" => {
+            if args.len() < 3 {
+                eprintln!("Usage: selph ast-query <file> --tree <def-index>");
+                return;
+            }
+            let idx: usize = match args[2].parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    // Try to find by name
+                    let defs = ast_tools::list_defs(&nodes, &roots);
+                    match defs.iter().find(|d| d.name == args[2]) {
+                        Some(d) => d.root_idx,
+                        None => { eprintln!("'{}' is not a valid index or definition name", args[2]); return; }
+                    }
+                }
+            };
+            if idx >= nodes.len() {
+                eprintln!("Index {} out of range (arena has {} nodes)", idx, nodes.len());
+                return;
+            }
+            print!("{}", ast_tools::tree_display(&nodes, idx));
+        }
+        other => eprintln!("Unknown flag '{}'; expected --list-defs or --tree", other),
+    }
+}
+
+fn cmd_ast_edit(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: selph ast-edit <file> --replace|--wrap-let|--insert-def|--delete-def ...");
+        return;
+    }
+
+    let source = match fs::read_to_string(&args[0]) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Error reading {}: {}", args[0], e); return; }
+    };
+    let (mut nodes, mut roots) = match parse_file(&source) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("Parse error: {}", e); return; }
+    };
+
+    if args.len() < 2 {
+        eprintln!("Expected an edit operation");
+        return;
+    }
+
+    // Check for --in-place flag anywhere in args
+    let in_place = args.iter().any(|a| a == "--in-place" || a == "-i");
+
+    let result = match args[1].as_str() {
+        "--replace" => {
+            if args.len() < 4 {
+                eprintln!("Usage: selph ast-edit <file> --replace <node-idx> '<expr>'");
+                return;
+            }
+            let idx: usize = match args[2].parse() {
+                Ok(n) => n,
+                Err(_) => { eprintln!("Invalid index: {}", args[2]); return; }
+            };
+            ast_tools::replace_node(&mut nodes, &mut roots, idx, &args[3])
+        }
+        "--wrap-let" => {
+            if args.len() < 4 {
+                eprintln!("Usage: selph ast-edit <file> --wrap-let <node-idx> <name>");
+                return;
+            }
+            let idx: usize = match args[2].parse() {
+                Ok(n) => n,
+                Err(_) => { eprintln!("Invalid index: {}", args[2]); return; }
+            };
+            ast_tools::wrap_let(&mut nodes, &mut roots, idx, &args[3])
+        }
+        "--insert-def" => {
+            if args.len() < 3 {
+                eprintln!("Usage: selph ast-edit <file> --insert-def <name> --params '<p1 p2>' --body '<expr>'");
+                return;
+            }
+            let name = &args[2];
+            let mut params_str = "";
+            let mut body_str = "";
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--params" if i + 1 < args.len() => { params_str = &args[i + 1]; i += 2; }
+                    "--body" if i + 1 < args.len() => { body_str = &args[i + 1]; i += 2; }
+                    _ => { i += 1; }
+                }
+            }
+            if body_str.is_empty() {
+                eprintln!("Missing --body argument");
+                return;
+            }
+            let params: Vec<&str> = if params_str.is_empty() {
+                vec![]
+            } else {
+                params_str.split_whitespace().collect()
+            };
+            ast_tools::insert_def(&mut nodes, &mut roots, name, &params, body_str)
+        }
+        "--delete-def" => {
+            if args.len() < 3 {
+                eprintln!("Usage: selph ast-edit <file> --delete-def <name>");
+                return;
+            }
+            ast_tools::delete_def(&nodes, &mut roots, &args[2])
+        }
+        other => { eprintln!("Unknown edit operation '{}'", other); return; }
+    };
+
+    match result {
+        Ok(()) => {
+            let output = ast_tools::emit_source(&nodes, &roots);
+            if in_place {
+                if let Err(e) = fs::write(&args[0], &output) {
+                    eprintln!("Error writing {}: {}", args[0], e);
+                }
+            } else {
+                print!("{}", output);
+            }
+        }
+        Err(e) => eprintln!("Error: {}", e),
+    }
+}
+
+fn cmd_fmt(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: selph fmt <file> [--in-place]");
+        return;
+    }
+
+    let source = match fs::read_to_string(&args[0]) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Error reading {}: {}", args[0], e); return; }
+    };
+    let (nodes, roots) = match parse_file(&source) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("Parse error: {}", e); return; }
+    };
+
+    let output = ast_tools::fmt_source(&nodes, &roots);
+    let in_place = args.iter().any(|a| a == "--in-place" || a == "-i");
+    if in_place {
+        if let Err(e) = fs::write(&args[0], &output) {
+            eprintln!("Error writing {}: {}", args[0], e);
+        }
+    } else {
+        print!("{}", output);
     }
 }
 
