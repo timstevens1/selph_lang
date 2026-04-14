@@ -1,0 +1,561 @@
+; -------------------------------------------------------------------------
+; Meta-curriculum M8g: template stamp at marker positions
+; -------------------------------------------------------------------------
+;
+; Detects tasks where:
+;   1. The input contains one multi-cell "template" object and N single-cell
+;      "marker" dots.
+;   2. The output is the input with markers erased and the template stamped
+;      (grid-place) centered on each marker position.
+;
+; Form 10a: stamp template at each marker (same color)
+;   - Extract objects, classify as template (area > 1) or marker (area = 1)
+;   - Exactly 1 template, >= 1 marker
+;   - Output = input with markers erased, template placed centered on each
+;
+; Form 10b: stamp template with color substitution
+;   - Same as 10a, but the template's non-background color is replaced
+;     with the marker's color before stamping.
+
+; ── Helpers ──────────────────────────────────────────────────────────
+
+; Count non-zero cells in a grid (object area).
+(define mts-cell-count
+  (lambda (g)
+    (reduce
+      (lambda (acc row)
+        (reduce
+          (lambda (a cell) (if (= cell 0) a (+ a 1)))
+          row acc))
+      g 0)))
+
+; Get the single non-zero color in a 1x1 or single-cell object.
+(define mts-marker-color
+  (lambda (g)
+    (reduce
+      (lambda (acc row)
+        (reduce
+          (lambda (a cell) (if (= cell 0) a cell))
+          row acc))
+      g 0)))
+
+; Compute grid dimensions.
+(define mts-grid-height (lambda (g) (length g)))
+(define mts-grid-width  (lambda (g) (if (= (length g) 0) 0 (length (head g)))))
+
+; Replace a specific color in a grid with another color.
+(define mts-replace-color
+  (lambda (g from to)
+    (map (lambda (row)
+           (map (lambda (cell) (if (= cell from) to cell)) row))
+         g)))
+
+; Erase markers from the grid: for each marker info ns, set its
+; position cell to 0 (background).
+(define mts-erase-markers
+  (lambda (g markers)
+    (reduce
+      (lambda (acc m)
+        (let ((r (nth (ns-get m "pos") 0))
+              (c (nth (ns-get m "pos") 1)))
+          (grid-set acc r c 0)))
+      markers
+      g)))
+
+; ── Object extraction & classification ─────────────────────────────
+;
+; Uses grid-objects / grid-object-pos to get connected components.
+; Classifies each by cell count: area=1 is a marker, area>1 is a template.
+
+(define mts-classify-objects
+  (lambda (g)
+    (let ((n (grid-object-count g)))
+      (if (= n 0)
+        (ns ("templates" (list)) ("markers" (list)))
+        (let ((indices (range n)))
+          (let ((objs (map (lambda (i)
+                             (let ((obj (grid-object g i))
+                                   (pos (grid-object-pos g i)))
+                               (ns ("obj" obj)
+                                   ("pos" pos)
+                                   ("area" (mts-cell-count obj))
+                                   ("color" (mts-marker-color obj))
+                                   ("idx" i))))
+                           indices)))
+            (ns ("templates" (filter (lambda (o) (> (ns-get o "area") 1)) objs))
+                ("markers"   (filter (lambda (o) (= (ns-get o "area") 1)) objs)))))))))
+
+; ── Stamping logic ─────────────────────────────────────────────────
+;
+; Given a grid (with markers already erased), a template, and a list
+; of marker info namespaces, stamp the template centered on each
+; marker position.
+; "Centered" means template top-left is offset so template center
+; aligns with marker position.
+
+(define mts-stamp-all
+  (lambda (base template markers)
+    (let ((th (mts-grid-height template))
+          (tw (mts-grid-width template)))
+      (let ((dr (floor (/ th 2)))
+            (dc (floor (/ tw 2))))
+        (reduce
+          (lambda (acc m)
+            (let ((mr (nth (ns-get m "pos") 0))
+                  (mc (nth (ns-get m "pos") 1)))
+              (grid-place acc template (- mr dr) (- mc dc))))
+          markers
+          base)))))
+
+; Stamp with color substitution: replace template color with marker color.
+(define mts-stamp-all-colored
+  (lambda (base template template-color markers)
+    (let ((th (mts-grid-height template))
+          (tw (mts-grid-width template)))
+      (let ((dr (floor (/ th 2)))
+            (dc (floor (/ tw 2))))
+        (reduce
+          (lambda (acc m)
+            (let ((mr (nth (ns-get m "pos") 0))
+                  (mc (nth (ns-get m "pos") 1))
+                  (mc-color (ns-get m "color")))
+              (let ((colored-template
+                      (if (= mc-color template-color)
+                        template
+                        (mts-replace-color template template-color mc-color))))
+                (grid-place acc colored-template (- mr dr) (- mc dc)))))
+          markers
+          base)))))
+
+; ── Verification ───────────────────────────────────────────────────
+;
+; Check that erasing markers then stamping the template at marker
+; positions on input produces the expected output, across all
+; training pairs.
+
+(define mts-verify-stamp
+  (lambda (inputs outputs use-color-sub)
+    (reduce
+      (lambda (acc i)
+        (if (not acc) false
+          (let ((inp (head (nth inputs i)))
+                (out (nth outputs i)))
+            (let ((classified (mts-classify-objects inp)))
+              (let ((templates (ns-get classified "templates"))
+                    (markers (ns-get classified "markers")))
+                (if (or (not (= (length templates) 1))
+                        (= (length markers) 0))
+                  false
+                  (let ((template (ns-get (head templates) "obj"))
+                        (template-color (ns-get (head templates) "color"))
+                        (erased (mts-erase-markers inp markers)))
+                    (let ((result
+                            (if use-color-sub
+                              (mts-stamp-all-colored erased template template-color markers)
+                              (mts-stamp-all erased template markers))))
+                      (= result out)))))))))
+      (range (length inputs))
+      true)))
+
+; ── AST emission ───────────────────────────────────────────────────
+;
+; Build the lambda AST node that performs template stamping at runtime.
+; The emitted code:
+;   1. Extracts template and marker positions from input
+;   2. Erases marker cells
+;   3. Stamps template centered on each marker position
+;
+; We hard-code the template object index and marker object indices
+; discovered during detection. At runtime, grid-object ordering is
+; deterministic (sorted by size desc), so the indices are stable.
+
+(define mts-wrap-lambda
+  (lambda (body) (make-lambda (list "x") body)))
+
+; Helper: build AST for an integer list literal (list i1 i2 ...)
+(define mts-int-list-node
+  (lambda (ints)
+    (apply make-app
+      (cons (make-symbol "list")
+        (map make-int ints)))))
+
+; Emit form-10a: stamp same-color template at markers.
+; The emitted lambda:
+;   (lambda (x)
+;     (reduce (lambda (acc idx)
+;               (grid-place acc
+;                 (grid-object (nth x 0) TIDX)
+;                 (- (nth (grid-object-pos (nth x 0) idx) 0) HALF-H)
+;                 (- (nth (grid-object-pos (nth x 0) idx) 1) HALF-W)))
+;       (list M1 M2 ...)
+;       ; initial: erase markers from input
+;       (reduce (lambda (g2 idx2)
+;                 (grid-set g2
+;                   (nth (grid-object-pos (nth x 0) idx2) 0)
+;                   (nth (grid-object-pos (nth x 0) idx2) 1) 0))
+;         (list M1 M2 ...) (nth x 0))))
+
+(define mts-emit-form-10a
+  (lambda (template-idx marker-indices th tw)
+    (let ((half-h (floor (/ th 2)))
+          (half-w (floor (/ tw 2)))
+          (inp-node (make-app "nth" (make-symbol "x") (make-int 0)))
+          (midx-node (mts-int-list-node marker-indices)))
+      (mts-wrap-lambda
+        (make-app "reduce"
+          ; stamping reducer
+          (make-lambda (list "acc" "idx")
+            (make-app "grid-place"
+              (make-symbol "acc")
+              (make-app "grid-object" inp-node (make-int template-idx))
+              (make-app "-"
+                (make-app "nth"
+                  (make-app "grid-object-pos" inp-node (make-symbol "idx"))
+                  (make-int 0))
+                (make-int half-h))
+              (make-app "-"
+                (make-app "nth"
+                  (make-app "grid-object-pos" inp-node (make-symbol "idx"))
+                  (make-int 1))
+                (make-int half-w))))
+          ; marker indices
+          midx-node
+          ; initial: erase markers from input
+          (make-app "reduce"
+            (make-lambda (list "g2" "idx2")
+              (make-app "grid-set"
+                (make-symbol "g2")
+                (make-app "nth"
+                  (make-app "grid-object-pos" inp-node (make-symbol "idx2"))
+                  (make-int 0))
+                (make-app "nth"
+                  (make-app "grid-object-pos" inp-node (make-symbol "idx2"))
+                  (make-int 1))
+                (make-int 0)))
+            midx-node
+            inp-node))))))
+
+; Emit form-10b: stamp with color substitution.
+(define mts-emit-form-10b
+  (lambda (template-idx marker-indices th tw template-color)
+    (let ((half-h (floor (/ th 2)))
+          (half-w (floor (/ tw 2)))
+          (inp-node (make-app "nth" (make-symbol "x") (make-int 0)))
+          (midx-node (mts-int-list-node marker-indices)))
+      (mts-wrap-lambda
+        (make-app "reduce"
+          (make-lambda (list "acc" "idx")
+            (make-app "grid-place"
+              (make-symbol "acc")
+              (make-app "grid-replace-color"
+                (make-app "grid-object" inp-node (make-int template-idx))
+                (make-int template-color)
+                ; marker color: the single non-zero value at marker position
+                (make-app "grid-get" inp-node
+                  (make-app "nth"
+                    (make-app "grid-object-pos" inp-node (make-symbol "idx"))
+                    (make-int 0))
+                  (make-app "nth"
+                    (make-app "grid-object-pos" inp-node (make-symbol "idx"))
+                    (make-int 1))))
+              (make-app "-"
+                (make-app "nth"
+                  (make-app "grid-object-pos" inp-node (make-symbol "idx"))
+                  (make-int 0))
+                (make-int half-h))
+              (make-app "-"
+                (make-app "nth"
+                  (make-app "grid-object-pos" inp-node (make-symbol "idx"))
+                  (make-int 1))
+                (make-int half-w))))
+          midx-node
+          ; initial: erase markers
+          (make-app "reduce"
+            (make-lambda (list "g2" "idx2")
+              (make-app "grid-set"
+                (make-symbol "g2")
+                (make-app "nth"
+                  (make-app "grid-object-pos" inp-node (make-symbol "idx2"))
+                  (make-int 0))
+                (make-app "nth"
+                  (make-app "grid-object-pos" inp-node (make-symbol "idx2"))
+                  (make-int 1))
+                (make-int 0)))
+            midx-node
+            inp-node))))))
+
+; ── Detection: find template index and marker indices ──────────────
+;
+; grid-object sorts by area descending, so template (largest) is
+; typically index 0 and markers are indices 1..N-1.
+
+(define mts-find-template-and-markers
+  (lambda (g)
+    (let ((n (grid-object-count g)))
+      (if (< n 2) nil
+        (let ((indices (range n)))
+          (let ((areas (map (lambda (i) (mts-cell-count (grid-object g i))) indices)))
+            ; Template = first object with area > 1 (should be idx 0 since sorted by size)
+            (let ((template-idx
+                    (reduce
+                      (lambda (found i)
+                        (if (not (nil? found)) found
+                          (if (> (nth areas i) 1) i nil)))
+                      indices nil)))
+              (if (nil? template-idx) nil
+                (let ((marker-indices
+                        (filter
+                          (lambda (i) (and (not (= i template-idx))
+                                          (= (nth areas i) 1)))
+                          indices)))
+                  (if (= (length marker-indices) 0) nil
+                    (ns ("template-idx" template-idx)
+                        ("marker-indices" marker-indices))))))))))))
+
+; ── Top-level detection ────────────────────────────────────────────
+
+(define mts-try-form-10a
+  (lambda (inputs outputs)
+    (let ((first-inp (head (head inputs))))
+      (let ((info (mts-find-template-and-markers first-inp)))
+        (if (nil? info) nil
+          (let ((tidx (ns-get info "template-idx"))
+                (midxs (ns-get info "marker-indices")))
+            (let ((template (grid-object first-inp tidx)))
+              (let ((th (mts-grid-height template))
+                    (tw (mts-grid-width template)))
+                (if (mts-verify-stamp inputs outputs false)
+                  (ns ("kind" "form-10a-template-stamp")
+                      ("source-node" (mts-emit-form-10a tidx midxs th tw)))
+                  nil)))))))))
+
+(define mts-try-form-10b
+  (lambda (inputs outputs)
+    (let ((first-inp (head (head inputs))))
+      (let ((info (mts-find-template-and-markers first-inp)))
+        (if (nil? info) nil
+          (let ((tidx (ns-get info "template-idx"))
+                (midxs (ns-get info "marker-indices")))
+            (let ((template (grid-object first-inp tidx)))
+              (let ((th (mts-grid-height template))
+                    (tw (mts-grid-width template))
+                    (tc (mts-marker-color template)))
+                ; Check if markers have different colors from template
+                (let ((marker-colors
+                        (map (lambda (i) (mts-marker-color (grid-object first-inp i)))
+                             midxs)))
+                  (let ((has-diff-colors
+                          (reduce (lambda (acc c) (or acc (not (= c tc))))
+                                  marker-colors false)))
+                    (if (not has-diff-colors) nil
+                      (if (mts-verify-stamp inputs outputs true)
+                        (ns ("kind" "form-10b-template-stamp-color")
+                            ("source-node" (mts-emit-form-10b tidx midxs th tw tc)))
+                        nil))))))))))))
+
+; ── Entry point: detect-template-stamp ─────────────────────────────
+;
+; Called from m_chain with spec (ns ("inputs" ...) ("outputs" ...) ("arity" ...)).
+; Returns (ns ("found" true) ("kind" ...) ("source-node" ...)) or
+;         (ns ("found" false) ("reason" ...)).
+
+(define detect-template-stamp
+  (lambda (s)
+    (let ((outs (ns-get s "outputs")))
+      ; Only handle grid outputs
+      (if (not (reduce (lambda (acc v) (and acc (grid? v))) outs true))
+        (ns ("found" false) ("reason" "non-grid target"))
+        (let ((inputs (ns-get s "inputs"))
+              (outputs outs))
+          ; Try form-10a first (simpler), then 10b (color sub)
+          (let ((r10a (try (mts-try-form-10a inputs outputs) nil)))
+            (if (not (nil? r10a))
+              (ns-put r10a "found" true)
+              (let ((r10b (try (mts-try-form-10b inputs outputs) nil)))
+                (if (not (nil? r10b))
+                  (ns-put r10b "found" true)
+                  (ns ("found" false)
+                      ("reason" "no template-stamp pattern found")))))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(define mts-make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+; --- Test 1: Form 10a - stamp template at one marker position ---
+;
+; 6x6 grid. Template is an L-shape (color 3) at top-left:
+;   3 3
+;   3 0
+; One marker (single color-3 cell) at (4,1).
+; Output: markers erased, L-shape stamped centered on marker.
+;
+; L-shape is 2x2, half-h=1, half-w=1.
+; Marker at (4,1): place at (4-1, 1-1) = (3, 0)
+; grid-place at (3,0): row 3: cols 0,1 = 3,3; row 4: col 0 = 3 (col 1 stays 0)
+;
+; Input:                         Output:
+;   3 3 0 0 0 0                   3 3 0 0 0 0
+;   3 0 0 0 0 0                   3 0 0 0 0 0
+;   0 0 0 0 0 0     =>           0 0 0 0 0 0
+;   0 0 0 0 0 0                   3 3 0 0 0 0
+;   0 3 0 0 0 0                   3 0 0 0 0 0
+;   0 0 0 0 0 0                   0 0 0 0 0 0
+
+(define mts-test1-in
+  (list (list 3 3 0 0 0 0)
+        (list 3 0 0 0 0 0)
+        (list 0 0 0 0 0 0)
+        (list 0 0 0 0 0 0)
+        (list 0 3 0 0 0 0)
+        (list 0 0 0 0 0 0)))
+
+(define mts-test1-out
+  (list (list 3 3 0 0 0 0)
+        (list 3 0 0 0 0 0)
+        (list 0 0 0 0 0 0)
+        (list 3 3 0 0 0 0)
+        (list 3 0 0 0 0 0)
+        (list 0 0 0 0 0 0)))
+
+; Second training pair: marker at (4, 4).
+; Place at (4-1, 4-1) = (3, 3)
+; grid-place: row 3: cols 3,4 = 3,3; row 4: col 3 = 3
+;
+; Input:                         Output:
+;   3 3 0 0 0 0                   3 3 0 0 0 0
+;   3 0 0 0 0 0                   3 0 0 0 0 0
+;   0 0 0 0 0 0     =>           0 0 0 0 0 0
+;   0 0 0 0 0 0                   0 0 0 3 3 0
+;   0 0 0 0 3 0                   0 0 0 3 0 0
+;   0 0 0 0 0 0                   0 0 0 0 0 0
+
+(define mts-test1b-in
+  (list (list 3 3 0 0 0 0)
+        (list 3 0 0 0 0 0)
+        (list 0 0 0 0 0 0)
+        (list 0 0 0 0 0 0)
+        (list 0 0 0 0 3 0)
+        (list 0 0 0 0 0 0)))
+
+(define mts-test1b-out
+  (list (list 3 3 0 0 0 0)
+        (list 3 0 0 0 0 0)
+        (list 0 0 0 0 0 0)
+        (list 0 0 0 3 3 0)
+        (list 0 0 0 3 0 0)
+        (list 0 0 0 0 0 0)))
+
+(define mts-test1-spec
+  (mts-make-spec
+    (list (list mts-test1-in) (list mts-test1b-in))
+    (list mts-test1-out mts-test1b-out)
+    1))
+
+; --- Test 2: Form 10b — color substitution ---
+;
+; 7x7 grid. Template is a plus-shape (color 1) at center:
+;   0 1 0
+;   1 1 1
+;   0 1 0
+; Markers of different colors from the template.
+;
+; Template 3x3, half-h=1, half-w=1.
+; Marker color 2 at (1,5): place at (0, 4)
+; Marker color 4 at (5,1): place at (4, 0)
+;
+; Input:
+;   0 0 0 0 0 0 0
+;   0 0 0 0 0 2 0
+;   0 0 0 1 0 0 0
+;   0 0 1 1 1 0 0
+;   0 0 0 1 0 0 0
+;   0 4 0 0 0 0 0
+;   0 0 0 0 0 0 0
+;
+; Output (markers erased, template stamped in marker color):
+;   0 0 0 0 0 2 0
+;   0 0 0 0 2 2 2
+;   0 0 0 1 0 2 0
+;   0 0 1 1 1 0 0
+;   0 4 0 1 0 0 0
+;   4 4 4 0 0 0 0
+;   0 4 0 0 0 0 0
+
+(define mts-test2-in
+  (list (list 0 0 0 0 0 0 0)
+        (list 0 0 0 0 0 2 0)
+        (list 0 0 0 1 0 0 0)
+        (list 0 0 1 1 1 0 0)
+        (list 0 0 0 1 0 0 0)
+        (list 0 4 0 0 0 0 0)
+        (list 0 0 0 0 0 0 0)))
+
+(define mts-test2-out
+  (list (list 0 0 0 0 0 2 0)
+        (list 0 0 0 0 2 2 2)
+        (list 0 0 0 1 0 2 0)
+        (list 0 0 1 1 1 0 0)
+        (list 0 4 0 1 0 0 0)
+        (list 4 4 4 0 0 0 0)
+        (list 0 4 0 0 0 0 0)))
+
+; Second pair: template plus (color 1), marker color 7 at (1,1).
+; Place at (0, 0).
+(define mts-test2b-in
+  (list (list 0 0 0 0 0 0 0)
+        (list 0 7 0 0 0 0 0)
+        (list 0 0 0 1 0 0 0)
+        (list 0 0 1 1 1 0 0)
+        (list 0 0 0 1 0 0 0)
+        (list 0 0 0 0 0 0 0)
+        (list 0 0 0 0 0 0 0)))
+
+(define mts-test2b-out
+  (list (list 0 7 0 0 0 0 0)
+        (list 7 7 7 0 0 0 0)
+        (list 0 7 0 1 0 0 0)
+        (list 0 0 1 1 1 0 0)
+        (list 0 0 0 1 0 0 0)
+        (list 0 0 0 0 0 0 0)
+        (list 0 0 0 0 0 0 0)))
+
+(define mts-test2-spec
+  (mts-make-spec
+    (list (list mts-test2-in) (list mts-test2b-in))
+    (list mts-test2-out mts-test2b-out)
+    1))
+
+; --- Test 3: No match — all objects are multi-cell (no markers) ---
+
+(define mts-test3-in
+  (list (list 1 1 0 0)
+        (list 0 0 2 2)
+        (list 0 0 2 2)
+        (list 0 0 0 0)))
+
+(define mts-test3-spec
+  (mts-make-spec
+    (list (list mts-test3-in))
+    (list (list (list 9 9 9 9) (list 9 9 9 9) (list 9 9 9 9) (list 9 9 9 9)))
+    1))
+
+; ── Run smoke tests ────────────────────────────────────────────────
+
+(define mts-run-test
+  (lambda (label spec expected)
+    (let ((result (detect-template-stamp spec)))
+      (let ((found (ns-get result "found")))
+        (if (= found expected)
+          (if found
+            (print (concat "  OK " label " kind=" (ns-get result "kind")))
+            (print (concat "  OK " label " (correctly rejected)")))
+          (if found
+            (print (concat "  FAIL " label " (false positive) kind=" (ns-get result "kind")))
+            (print (concat "  FAIL " label " reason=" (try (ns-get result "reason") "?")))))))))
+
+(print "--- m8g_template_stamp smoke tests ---")
+(mts-run-test "form-10a stamp L at markers" mts-test1-spec true)
+(mts-run-test "form-10b stamp plus colored" mts-test2-spec true)
+(mts-run-test "no-match all multi-cell" mts-test3-spec false)

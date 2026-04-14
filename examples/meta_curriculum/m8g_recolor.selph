@@ -1,0 +1,441 @@
+; -------------------------------------------------------------------------
+; Meta-curriculum M8g-recolor: conditional per-cell recoloring (§9.57+)
+; -------------------------------------------------------------------------
+;
+; Extends the grid chain with recoloring subforms that detect when the
+; output is the input with cells recolored based on structural rules.
+;
+;   Subform 1: color removal — output = grid-replace-color(input, C, bg)
+;   Subform 2: fill-enclosed + replace — composition of fill + color ops
+;   Subform 3: diff-based single-source/single-target recoloring
+;   Subform 4: fill-between-markers on shared row/column
+;
+; Detection order: cheapest first (single replace-color scan, then
+; fill-enclosed variants, then diff analysis, then fill-between).
+
+; ── Helpers ──────────────────────────────────────────────────────────
+
+(define m8r-spec-outputs (lambda (s) (ns-get s "outputs")))
+(define m8r-spec-inputs  (lambda (s) (ns-get s "inputs")))
+
+(define m8r-grid-target
+  (lambda (s)
+    (let ((outs (m8r-spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (grid? v))) outs true)
+        outs
+        nil))))
+
+; Extract the grid from a single-arity input row: (list grid) → grid
+(define m8r-input-grid
+  (lambda (inp) (head inp)))
+
+; Reference to (nth x 0) AST — the input grid in a lambda body
+(define m8r-x0
+  (lambda () (make-app "nth" (make-symbol "x") (make-int 0))))
+
+(define m8r-wrap-lambda
+  (lambda (body) (make-lambda (list "x") body)))
+
+; Check grid dimensions match
+(define m8r-same-dims?
+  (lambda (a b)
+    (and (= (length a) (length b))
+         (if (= (length a) 0) true
+           (= (length (head a)) (length (head b)))))))
+
+; ── Subform 1: color removal ────────────────────────────────────────
+;
+; output = grid-replace-color(input, C, background) for some color C.
+; Try each non-background color in the first input. Verify all pairs.
+
+(define m8r-try-subform-1
+  (lambda (inputs target)
+    (let ((first-in (m8r-input-grid (head inputs))))
+      (let ((bg (grid-background first-in))
+            (colors (grid-colors first-in)))
+        ; Filter to non-background colors
+        (let ((candidates (filter (lambda (c) (not (= c bg))) colors)))
+          (m8r-subform-1-loop inputs target bg candidates))))))
+
+(define m8r-subform-1-loop
+  (lambda (inputs target bg candidates)
+    (if (= (length candidates) 0) nil
+      (let ((c (head candidates)))
+        (let ((col (map (lambda (inp)
+                          (try (grid-replace-color (m8r-input-grid inp) c bg) nil))
+                        inputs)))
+          (if (reduce (lambda (acc i)
+                        (and acc
+                             (not (nil? (nth col i)))
+                             (= (nth col i) (nth target i))))
+                      (range (length target)) true)
+            (ns ("kind" (concat "recolor-1-remove-" (to-string c)))
+                ("source-node"
+                  (m8r-wrap-lambda
+                    (make-app "grid-replace-color"
+                      (m8r-x0)
+                      (make-int c)
+                      (make-int bg)))))
+            (m8r-subform-1-loop inputs target bg (tail candidates))))))))
+
+; ── Subform 2: fill-enclosed + replace-color composition ────────────
+;
+; Probes:
+;   2a: grid-fill-enclosed(grid-replace-color(input, C, bg))
+;   2b: grid-replace-color(grid-fill-enclosed(input), C1, C2)
+;
+; Covers tasks where you first remove a blocking color then fill, or
+; fill first then recolor the fill result.
+
+(define m8r-try-subform-2
+  (lambda (inputs target)
+    (let ((first-in (m8r-input-grid (head inputs))))
+      (let ((bg (grid-background first-in))
+            (colors (grid-colors first-in)))
+        (let ((non-bg (filter (lambda (c) (not (= c bg))) colors)))
+          ; Try 2a: fill-enclosed after removing each non-bg color
+          (let ((r2a (m8r-subform-2a-loop inputs target bg non-bg)))
+            (if (not (nil? r2a)) r2a
+              ; Try 2b: replace-color after fill-enclosed
+              (m8r-subform-2b-loop inputs target non-bg))))))))
+
+(define m8r-subform-2a-loop
+  (lambda (inputs target bg candidates)
+    (if (= (length candidates) 0) nil
+      (let ((c (head candidates)))
+        (let ((col (map (lambda (inp)
+                          (try (grid-fill-enclosed
+                                 (grid-replace-color (m8r-input-grid inp) c bg))
+                               nil))
+                        inputs)))
+          (if (reduce (lambda (acc i)
+                        (and acc
+                             (not (nil? (nth col i)))
+                             (= (nth col i) (nth target i))))
+                      (range (length target)) true)
+            (ns ("kind" (concat "recolor-2a-fill-after-remove-" (to-string c)))
+                ("source-node"
+                  (m8r-wrap-lambda
+                    (make-app "grid-fill-enclosed"
+                      (make-app "grid-replace-color"
+                        (m8r-x0)
+                        (make-int c)
+                        (make-int bg))))))
+            (m8r-subform-2a-loop inputs target bg (tail candidates))))))))
+
+; 2b: for each color pair (from, to), try replace-color after fill-enclosed
+(define m8r-subform-2b-loop
+  (lambda (inputs target colors)
+    (if (= (length colors) 0) nil
+      (let ((from-c (head colors)))
+        (let ((result (m8r-subform-2b-inner inputs target from-c colors)))
+          (if (not (nil? result)) result
+            (m8r-subform-2b-loop inputs target (tail colors))))))))
+
+(define m8r-subform-2b-inner
+  (lambda (inputs target from-c to-colors)
+    (if (= (length to-colors) 0) nil
+      (let ((to-c (head to-colors)))
+        (if (= from-c to-c)
+          (m8r-subform-2b-inner inputs target from-c (tail to-colors))
+          (let ((col (map (lambda (inp)
+                            (try (grid-replace-color
+                                   (grid-fill-enclosed (m8r-input-grid inp))
+                                   from-c to-c)
+                                 nil))
+                          inputs)))
+            (if (reduce (lambda (acc i)
+                          (and acc
+                               (not (nil? (nth col i)))
+                               (= (nth col i) (nth target i))))
+                        (range (length target)) true)
+              (ns ("kind" (concat "recolor-2b-replace-after-fill-" (to-string from-c) "-" (to-string to-c)))
+                  ("source-node"
+                    (m8r-wrap-lambda
+                      (make-app "grid-replace-color"
+                        (make-app "grid-fill-enclosed" (m8r-x0))
+                        (make-int from-c)
+                        (make-int to-c)))))
+              (m8r-subform-2b-inner inputs target from-c (tail to-colors)))))))))
+
+; ── Subform 3: diff-based single-source or single-target recolor ────
+;
+; Analyze the diff between input and output:
+;   3a: All changed cells had the same input color AND received the same
+;       output color → grid-replace-color(input, src, dst)
+;       (This overlaps with Subform 1 when dst == bg, but catches
+;       non-background target colors too.)
+;   3b: All changed cells received the same output color (but came from
+;       different input colors) AND all unchanged cells keep their
+;       original color → multi-source recolor. Check if the pattern
+;       matches grid-fill-enclosed behavior.
+
+(define m8r-compute-diff
+  (lambda (in-grid out-grid)
+    (if (not (m8r-same-dims? in-grid out-grid))
+      nil
+      (let ((h (length in-grid))
+            (w (length (head in-grid))))
+        (reduce
+          (lambda (acc r)
+            (if (nil? acc) nil
+              (reduce
+                (lambda (acc2 c)
+                  (if (nil? acc2) nil
+                    (let ((iv (nth (nth in-grid r) c))
+                          (ov (nth (nth out-grid r) c)))
+                      (if (= iv ov) acc2
+                        (append acc2 (list (list r c iv ov)))))))
+                (range w) acc)))
+          (range h)
+          (list))))))
+
+; Check if all diff entries have the same source and target color
+(define m8r-diff-single-replace?
+  (lambda (diff)
+    (if (= (length diff) 0) nil
+      (let ((first-src (nth (head diff) 2))
+            (first-dst (nth (head diff) 3)))
+        (let ((ok (reduce
+                    (lambda (acc entry)
+                      (and acc
+                           (= (nth entry 2) first-src)
+                           (= (nth entry 3) first-dst)))
+                    diff true)))
+          (if ok (list first-src first-dst) nil))))))
+
+(define m8r-try-subform-3
+  (lambda (inputs target)
+    (let ((first-in (m8r-input-grid (head inputs)))
+          (first-out (head target)))
+      (let ((diff (m8r-compute-diff first-in first-out)))
+        (if (nil? diff) nil
+          (if (= (length diff) 0) nil
+            (let ((pair (m8r-diff-single-replace? diff)))
+              (if (nil? pair) nil
+                (let ((src-c (head pair))
+                      (dst-c (head (tail pair))))
+                  ; Verify: grid-replace-color(input, src, dst) == output for ALL pairs
+                  (let ((col (map (lambda (inp)
+                                    (try (grid-replace-color (m8r-input-grid inp) src-c dst-c) nil))
+                                  inputs)))
+                    (if (reduce (lambda (acc i)
+                                  (and acc
+                                       (not (nil? (nth col i)))
+                                       (= (nth col i) (nth target i))))
+                                (range (length target)) true)
+                      (ns ("kind" (concat "recolor-3-replace-" (to-string src-c) "-to-" (to-string dst-c)))
+                          ("source-node"
+                            (m8r-wrap-lambda
+                              (make-app "grid-replace-color"
+                                (m8r-x0)
+                                (make-int src-c)
+                                (make-int dst-c)))))
+                      nil)))))))))))
+
+; ── Subform 4: fill-between-markers ─────────────────────────────────
+;
+; Detect tasks where pairs of same-color cells on the same row (or
+; column) have the cells between them filled in the output.
+;
+; Strategy:
+;   1. Compute the diff for the first training pair.
+;   2. Check if all newly-colored cells lie on segments between pairs
+;      of marker cells of that same color (or a consistent fill color).
+;   3. Verify the fill-between rule on all training pairs.
+;
+; Implementation:
+;   For each row, find non-background cells that appear in the input.
+;   If two cells of color C are on the same row, cells between them
+;   should be color C (or a consistent fill color) in the output.
+;   Same logic for columns.
+
+; Fill between same-color pairs on rows
+(define m8r-fill-between-rows
+  (lambda (grid fill-color)
+    (map (lambda (row)
+           (m8r-fill-row-segments row fill-color))
+         grid)))
+
+; For a single row, find pairs of same non-bg-color cells and fill between
+(define m8r-fill-row-segments
+  (lambda (row fill-color)
+    (let ((w (length row))
+          (bg 0))  ; we'll use fill-color as the marker color
+      ; For each color, find leftmost and rightmost, fill between
+      (reduce
+        (lambda (current-row c)
+          (if (= c 0) current-row  ; skip background
+            (let ((positions (m8r-find-positions-in-row current-row c)))
+              (if (< (length positions) 2) current-row
+                ; Fill between first and last occurrence
+                (let ((lo (head positions))
+                      (hi (nth positions (- (length positions) 1))))
+                  (m8r-fill-range current-row lo hi
+                    (if (= fill-color -1) c fill-color)))))))
+        (range 10)  ; colors 0-9
+        row))))
+
+(define m8r-find-positions-in-row
+  (lambda (row color)
+    (filter (lambda (i) (= (nth row i) color))
+            (range (length row)))))
+
+(define m8r-fill-range
+  (lambda (row lo hi fill-color)
+    (map (lambda (i)
+           (if (and (> i lo) (< i hi))
+             fill-color
+             (nth row i)))
+         (range (length row)))))
+
+; Fill between same-color pairs on columns (transpose, fill rows, transpose back)
+(define m8r-transpose-grid
+  (lambda (grid)
+    (if (= (length grid) 0) grid
+      (let ((h (length grid))
+            (w (length (head grid))))
+        (map (lambda (c)
+               (map (lambda (r) (nth (nth grid r) c))
+                    (range h)))
+             (range w))))))
+
+(define m8r-fill-between-cols
+  (lambda (grid fill-color)
+    (m8r-transpose-grid
+      (m8r-fill-between-rows
+        (m8r-transpose-grid grid)
+        fill-color))))
+
+; Combined: fill rows then fill cols (or vice versa)
+(define m8r-fill-between-both
+  (lambda (grid fill-color)
+    (m8r-fill-between-cols
+      (m8r-fill-between-rows grid fill-color)
+      fill-color)))
+
+(define m8r-try-subform-4
+  (lambda (inputs target)
+    ; Try row-only fill, col-only fill, and both
+    (let ((r-rows (m8r-try-subform-4-variant inputs target "rows"
+                    (lambda (g fc) (m8r-fill-between-rows g fc)))))
+      (if (not (nil? r-rows)) r-rows
+        (let ((r-cols (m8r-try-subform-4-variant inputs target "cols"
+                        (lambda (g fc) (m8r-fill-between-cols g fc)))))
+          (if (not (nil? r-cols)) r-cols
+            (m8r-try-subform-4-variant inputs target "both"
+              (lambda (g fc) (m8r-fill-between-both g fc)))))))))
+
+(define m8r-try-subform-4-variant
+  (lambda (inputs target variant-name fill-fn)
+    ; Try with fill-color = -1 (same as marker color)
+    (let ((col (map (lambda (inp)
+                      (try (fill-fn (m8r-input-grid inp) -1) nil))
+                    inputs)))
+      (if (reduce (lambda (acc i)
+                    (and acc
+                         (not (nil? (nth col i)))
+                         (= (nth col i) (nth target i))))
+                  (range (length target)) true)
+        (ns ("kind" (concat "recolor-4-fill-between-" variant-name))
+            ("source-node"
+              (m8r-wrap-lambda
+                (m8r-build-fill-between-ast variant-name -1))))
+        nil))))
+
+; Build the AST for fill-between. Since fill-between is implemented in
+; SELPH helper functions, we emit a direct call to the helper.
+; We define a runtime helper and call it from the emitted lambda.
+(define m8r-build-fill-between-ast
+  (lambda (variant fill-color)
+    (let ((fc-node (make-int fill-color))
+          (x0 (m8r-x0)))
+      (if (= variant "rows")
+        (make-app "m8r-fill-between-rows" x0 fc-node)
+        (if (= variant "cols")
+          (make-app "m8r-fill-between-cols" x0 fc-node)
+          (make-app "m8r-fill-between-both" x0 fc-node))))))
+
+; ── Chain helper ───────────────────────────────────────────────────
+
+(define m8r-try-chain
+  (lambda (forms)
+    (if (= (length forms) 0)
+      nil
+      (let ((result (try ((head forms)) nil)))
+        (if (not (nil? result))
+          result
+          (m8r-try-chain (tail forms)))))))
+
+; ── Top-level: detect-recolor ──────────────────────────────────────
+
+(define detect-recolor
+  (lambda (s)
+    (let ((target (m8r-grid-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-grid target"))
+        (let ((inputs (m8r-spec-inputs s)))
+          (let ((result
+                  (m8r-try-chain
+                    (list
+                      (lambda () (m8r-try-subform-1 inputs target))
+                      (lambda () (m8r-try-subform-3 inputs target))
+                      (lambda () (m8r-try-subform-2 inputs target))
+                      (lambda () (m8r-try-subform-4 inputs target))))))
+            (if (nil? result)
+              (ns ("found" false) ("reason" "no recolor shape matched"))
+              (ns-put result "found" true))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(define m8r-make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+(define m8r-run-test
+  (lambda (label spec)
+    (let ((result (detect-recolor spec)))
+      (if (ns-get result "found")
+        (print (concat "  OK " label " kind=" (ns-get result "kind")))
+        (print (concat "  FAIL " label " " (ns-get result "reason")))))))
+
+; Test 1: color removal — remove color 3 from a 3x3 grid (bg=0)
+; Input:  ((0 3 0) (3 1 3) (0 3 0))
+; Output: ((0 0 0) (0 1 0) (0 0 0))
+(define m8r-test-remove-spec
+  (m8r-make-spec
+    (list (list (list (list 0 3 0) (list 3 1 3) (list 0 3 0)))
+          (list (list (list 0 3 0 0) (list 3 2 3 0) (list 0 0 0 0))))
+    (list (list (list 0 0 0) (list 0 1 0) (list 0 0 0))
+          (list (list 0 0 0 0) (list 0 2 0 0) (list 0 0 0 0)))
+    1))
+
+; Test 2: diff-based recolor — color 2 becomes color 5 (non-bg target)
+; Input:  ((1 2) (2 1))   Output: ((1 5) (5 1))
+; Input:  ((0 2) (2 0))   Output: ((0 5) (5 0))
+(define m8r-test-diff-spec
+  (m8r-make-spec
+    (list (list (list (list 1 2) (list 2 1)))
+          (list (list (list 0 2) (list 2 0))))
+    (list (list (list 1 5) (list 5 1))
+          (list (list 0 5) (list 5 0)))
+    1))
+
+; Test 3: fill-between markers on rows
+; Input row: (0 3 0 0 3 0) → fill between the two 3s → (0 3 3 3 3 0)
+(define m8r-test-fill-between-spec
+  (m8r-make-spec
+    (list (list (list (list 0 3 0 0 3 0)
+                      (list 0 0 0 0 0 0)))
+          (list (list (list 0 0 0 0 0 0)
+                      (list 2 0 0 0 0 2))))
+    (list (list (list 0 3 3 3 3 0)
+                (list 0 0 0 0 0 0))
+          (list (list 0 0 0 0 0 0)
+                (list 2 2 2 2 2 2)))
+    1))
+
+(print "--- m8g_recolor smoke tests ---")
+(m8r-run-test "color-removal" m8r-test-remove-spec)
+(m8r-run-test "diff-recolor-2-to-5" m8r-test-diff-spec)
+(m8r-run-test "fill-between-rows" m8r-test-fill-between-spec)

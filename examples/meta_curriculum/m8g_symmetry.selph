@@ -1,0 +1,268 @@
+; -------------------------------------------------------------------------
+; Meta-curriculum M8g-sym: symmetry detection and repair
+; -------------------------------------------------------------------------
+;
+; Detects tasks where the output is the input with symmetry completed:
+;
+;   Form 10: output == grid-overlay(input, grid-flip-h(input), 0, 0)
+;            Horizontal symmetry repair (about vertical center axis)
+;
+;   Form 11: output == grid-overlay(input, grid-flip-v(input), 0, 0)
+;            Vertical symmetry repair (about horizontal center axis)
+;
+;   Form 12: output == grid-overlay(input, grid-rotate-180(input), 0, 0)
+;            Point symmetry (180-degree rotational) repair
+;
+;   Form 13: output == grid-overlay(hov, grid-flip-v(hov), 0, 0)
+;            where hov = grid-overlay(input, grid-flip-h(input), 0, 0)
+;            4-fold symmetry repair (reflect to all 4 quadrants)
+;
+; Key insight: grid-overlay merges non-zero cells onto a base grid.
+; Overlaying a grid with its mirror fills in the "missing" symmetric
+; cells, preserving existing content. ARC background is 0 (transparent
+; in grid-overlay).
+;
+; Only considers same-size tasks (input/output dimensions must match).
+
+; ── Helpers ──────────────────────────────────────────────────────────
+
+(define m8g-sym-spec-outputs (lambda (s) (ns-get s "outputs")))
+
+; Check all outputs are grids
+(define m8g-sym-grid-target
+  (lambda (s)
+    (let ((outs (m8g-sym-spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (grid? v))) outs true)
+        outs
+        nil))))
+
+; Check two grid columns are pairwise equal
+(define m8g-sym-cols-equal?
+  (lambda (xs ys)
+    (if (= (length xs) (length ys))
+      (reduce
+        (lambda (acc i)
+          (and acc (= (nth xs i) (nth ys i))))
+        (range (length xs))
+        true)
+      false)))
+
+; Check that input and output have same dimensions for a given pair
+(define m8g-sym-same-size?
+  (lambda (inp out)
+    (and (= (length inp) (length out))
+         (if (= (length inp) 0) true
+           (= (length (head inp)) (length (head out)))))))
+
+; Check all training pairs have same-size input/output
+(define m8g-sym-all-same-size?
+  (lambda (inputs outputs)
+    (reduce
+      (lambda (acc i)
+        (and acc (m8g-sym-same-size? (head (nth inputs i)) (nth outputs i))))
+      (range (length inputs))
+      true)))
+
+; ── AST building helpers ─────────────────────────────────────────────
+
+(define m8g-sym-wrap-lambda
+  (lambda (body) (make-lambda (list "x") body)))
+
+(define m8g-sym-input-ref
+  (lambda () (make-app "nth" (make-symbol "x") (make-int 0))))
+
+; ── Form 10: horizontal symmetry repair ──────────────────────────────
+;
+; output = grid-overlay(input, grid-flip-h(input), 0, 0)
+
+(define m8g-sym-try-form-10
+  (lambda (inputs target)
+    (let ((col (map (lambda (inp)
+                      (try (grid-overlay (head inp) (grid-flip-h (head inp)) 0 0) nil))
+                    inputs)))
+      (if (reduce (lambda (acc i)
+                    (and acc
+                         (not (nil? (nth col i)))
+                         (= (nth col i) (nth target i))))
+                  (range (length target)) true)
+        (ns ("kind" "form-10-symmetry-h")
+            ("source-node"
+              (m8g-sym-wrap-lambda
+                (make-app "grid-overlay"
+                  (m8g-sym-input-ref)
+                  (make-app "grid-flip-h" (m8g-sym-input-ref))
+                  (make-int 0) (make-int 0)))))
+        nil))))
+
+; ── Form 11: vertical symmetry repair ────────────────────────────────
+;
+; output = grid-overlay(input, grid-flip-v(input), 0, 0)
+
+(define m8g-sym-try-form-11
+  (lambda (inputs target)
+    (let ((col (map (lambda (inp)
+                      (try (grid-overlay (head inp) (grid-flip-v (head inp)) 0 0) nil))
+                    inputs)))
+      (if (reduce (lambda (acc i)
+                    (and acc
+                         (not (nil? (nth col i)))
+                         (= (nth col i) (nth target i))))
+                  (range (length target)) true)
+        (ns ("kind" "form-11-symmetry-v")
+            ("source-node"
+              (m8g-sym-wrap-lambda
+                (make-app "grid-overlay"
+                  (m8g-sym-input-ref)
+                  (make-app "grid-flip-v" (m8g-sym-input-ref))
+                  (make-int 0) (make-int 0)))))
+        nil))))
+
+; ── Form 12: point symmetry (180-degree rotation) repair ─────────────
+;
+; output = grid-overlay(input, grid-rotate-180(input), 0, 0)
+
+(define m8g-sym-try-form-12
+  (lambda (inputs target)
+    (let ((col (map (lambda (inp)
+                      (try (grid-overlay (head inp) (grid-rotate-180 (head inp)) 0 0) nil))
+                    inputs)))
+      (if (reduce (lambda (acc i)
+                    (and acc
+                         (not (nil? (nth col i)))
+                         (= (nth col i) (nth target i))))
+                  (range (length target)) true)
+        (ns ("kind" "form-12-symmetry-180")
+            ("source-node"
+              (m8g-sym-wrap-lambda
+                (make-app "grid-overlay"
+                  (m8g-sym-input-ref)
+                  (make-app "grid-rotate-180" (m8g-sym-input-ref))
+                  (make-int 0) (make-int 0)))))
+        nil))))
+
+; ── Form 13: 4-fold symmetry repair ─────────────────────────────────
+;
+; hov = grid-overlay(input, grid-flip-h(input), 0, 0)
+; output = grid-overlay(hov, grid-flip-v(hov), 0, 0)
+
+(define m8g-sym-try-form-13
+  (lambda (inputs target)
+    (let ((col (map (lambda (inp)
+                      (try
+                        (let ((g (head inp)))
+                          (let ((hov (grid-overlay g (grid-flip-h g) 0 0)))
+                            (grid-overlay hov (grid-flip-v hov) 0 0)))
+                        nil))
+                    inputs)))
+      (if (reduce (lambda (acc i)
+                    (and acc
+                         (not (nil? (nth col i)))
+                         (= (nth col i) (nth target i))))
+                  (range (length target)) true)
+        (let ((inp-ast (m8g-sym-input-ref)))
+          (let ((hov-ast (make-app "grid-overlay"
+                           inp-ast
+                           (make-app "grid-flip-h" inp-ast)
+                           (make-int 0) (make-int 0))))
+            (ns ("kind" "form-13-symmetry-4fold")
+                ("source-node"
+                  (m8g-sym-wrap-lambda
+                    (make-app "grid-overlay"
+                      hov-ast
+                      (make-app "grid-flip-v" hov-ast)
+                      (make-int 0) (make-int 0)))))))
+        nil))))
+
+; ── Chain helper ─────────────────────────────────────────────────────
+
+(define m8g-sym-try-chain
+  (lambda (forms)
+    (if (= (length forms) 0)
+      (ns ("found" false) ("reason" "no symmetry shape matched"))
+      (let ((result (try ((head forms)) nil)))
+        (if (not (nil? result))
+          (ns-put result "found" true)
+          (m8g-sym-try-chain (tail forms)))))))
+
+; ── Top-level: detect-symmetry-grid ──────────────────────────────────
+
+(define detect-symmetry-grid
+  (lambda (s)
+    (let ((target (m8g-sym-grid-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-grid target"))
+        (let ((inputs (ns-get s "inputs"))
+              (outputs (ns-get s "outputs")))
+          (if (not (m8g-sym-all-same-size? inputs outputs))
+            (ns ("found" false) ("reason" "size mismatch"))
+            (m8g-sym-try-chain
+              (list
+                (lambda () (m8g-sym-try-form-10 inputs target))
+                (lambda () (m8g-sym-try-form-11 inputs target))
+                (lambda () (m8g-sym-try-form-12 inputs target))
+                (lambda () (m8g-sym-try-form-13 inputs target))))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(define m8g-sym-make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+(define m8g-sym-run-test
+  (lambda (label spec)
+    (let ((result (detect-symmetry-grid spec)))
+      (if (ns-get result "found")
+        (print (concat "  OK " label " kind=" (ns-get result "kind")))
+        (print (concat "  FAIL " label " " (ns-get result "reason")))))))
+
+; Test 1: horizontal symmetry repair
+; Input 4x4: top-left quadrant has content, right side is empty (0).
+; Output: content mirrored horizontally.
+;   Input:                  Output (overlay with flip-h):
+;   1 2 0 0                 1 2 2 1
+;   3 4 0 0                 3 4 4 3
+;   0 0 0 0                 0 0 0 0
+;   0 0 0 0                 0 0 0 0
+(define m8g-sym-test-h-spec
+  (m8g-sym-make-spec
+    (list (list (list (list 1 2 0 0) (list 3 4 0 0) (list 0 0 0 0) (list 0 0 0 0)))
+          (list (list (list 0 0 5 6) (list 0 0 7 8) (list 0 0 0 0) (list 0 0 0 0))))
+    (list (list (list 1 2 2 1) (list 3 4 4 3) (list 0 0 0 0) (list 0 0 0 0))
+          (list (list 6 5 5 6) (list 8 7 7 8) (list 0 0 0 0) (list 0 0 0 0)))
+    1))
+
+; Test 2: vertical symmetry repair
+; Input 4x4: top rows have content, bottom is empty.
+; Output: content mirrored vertically.
+;   Input:                  Output (overlay with flip-v):
+;   1 2 3                   1 2 3
+;   0 0 0                   0 0 0
+;   0 0 0                   1 2 3
+(define m8g-sym-test-v-spec
+  (m8g-sym-make-spec
+    (list (list (list (list 1 2 3) (list 0 0 0) (list 0 0 0)))
+          (list (list (list 4 5 6) (list 0 0 0) (list 0 0 0))))
+    (list (list (list 1 2 3) (list 0 0 0) (list 1 2 3))
+          (list (list 4 5 6) (list 0 0 0) (list 4 5 6)))
+    1))
+
+; Test 3: 4-fold symmetry repair
+; Input 4x4: top-left quadrant has content, rest is empty.
+; Output: content reflected to all 4 quadrants via flip-h then flip-v.
+;   Input:               hov (overlay+flip-h):   Output (overlay hov+flip-v(hov)):
+;   1 2 0 0              1 2 2 1                  1 2 2 1
+;   3 0 0 0              3 0 0 3                  3 0 0 3
+;   0 0 0 0              0 0 0 0                  3 0 0 3
+;   0 0 0 0              0 0 0 0                  1 2 2 1
+(define m8g-sym-test-4fold-spec
+  (m8g-sym-make-spec
+    (list (list (list (list 1 2 0 0) (list 3 0 0 0) (list 0 0 0 0) (list 0 0 0 0)))
+          (list (list (list 0 0 4 5) (list 0 0 0 6) (list 0 0 0 0) (list 0 0 0 0))))
+    (list (list (list 1 2 2 1) (list 3 0 0 3) (list 3 0 0 3) (list 1 2 2 1))
+          (list (list 5 4 4 5) (list 6 0 0 6) (list 6 0 0 6) (list 5 4 4 5)))
+    1))
+
+(print "--- m8g_symmetry smoke tests ---")
+(m8g-sym-run-test "h-symmetry" m8g-sym-test-h-spec)
+(m8g-sym-run-test "v-symmetry" m8g-sym-test-v-spec)
+(m8g-sym-run-test "4-fold-symmetry" m8g-sym-test-4fold-spec)

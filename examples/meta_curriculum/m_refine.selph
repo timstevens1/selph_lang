@@ -1,0 +1,388 @@
+; ─────────────────────────────────────────────────────────────────────────
+; m_refine: self-refining form loop (§9.58)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Decomposer that automatically closes the form-refinement loop:
+;   1. Try each base transform on the task's inputs
+;   2. Measure cell-level fitness vs expected outputs
+;   3. If a form gets close (>= threshold), synthesize a correction
+;   4. Compose: solution(x) = correction(form(x))
+;
+; Registered as "m-refine" in __decomposers__ (sorts after "m-chain",
+; runs before Flat enumeration).
+;
+; §9.58 finding: residual corrections for ARC grid tasks are typically
+; as complex as the original task (spatial reasoning, not simple color
+; remaps). The decomposition f(x)=correction(form(x)) works best when
+; the correction is simpler than the original — which rarely holds for
+; ARC near-misses. Keep thresholds high (0.90+) and budget low to
+; avoid wasting time on impossible residuals.
+
+; ── Recursion guard ────────────────────────────────────────────────────
+;
+; When m-refine calls synthesize-args for the residual, that call will
+; invoke decomposers again. This flag prevents infinite recursion.
+
+(define mr-in-refine false)
+
+; ── Configuration ──────────────────────────────────────────────────────
+
+(define mr-fitness-threshold-same-dims 0.90)
+(define mr-fitness-threshold-diff-dims 0.95)
+(define mr-max-forms-to-try 1)
+(define mr-residual-budget 1200)
+(define mr-residual-depth 2)
+
+; ── Form catalog ───────────────────────────────────────────────────────
+;
+; Each entry: (name, compute-fn, ast-builder)
+;   compute-fn: grid -> grid (applied to raw input grid)
+;   ast-builder: inp-ast -> Node (builds the AST for (form inp-ast))
+
+(define mr-input-ref
+  (lambda () (make-app "nth" (make-symbol "x") (make-int 0))))
+
+(define mr-form-catalog
+  (list
+    (list "identity"
+      (lambda (g) g)
+      (lambda (inp) inp))
+    (list "flip-h"
+      (lambda (g) (grid-flip-h g))
+      (lambda (inp) (make-app "grid-flip-h" inp)))
+    (list "flip-v"
+      (lambda (g) (grid-flip-v g))
+      (lambda (inp) (make-app "grid-flip-v" inp)))
+    (list "rotate-cw"
+      (lambda (g) (grid-rotate-cw g))
+      (lambda (inp) (make-app "grid-rotate-cw" inp)))
+    (list "rotate-ccw"
+      (lambda (g) (grid-rotate-ccw g))
+      (lambda (inp) (make-app "grid-rotate-ccw" inp)))
+    (list "rotate-180"
+      (lambda (g) (grid-rotate-180 g))
+      (lambda (inp) (make-app "grid-rotate-180" inp)))
+    (list "transpose"
+      (lambda (g) (grid-transpose g))
+      (lambda (inp) (make-app "grid-transpose" inp)))
+    (list "trim"
+      (lambda (g) (grid-trim g))
+      (lambda (inp) (make-app "grid-trim" inp)))
+    (list "fill-enclosed"
+      (lambda (g) (grid-fill-enclosed g))
+      (lambda (inp) (make-app "grid-fill-enclosed" inp)))
+    (list "compact"
+      (lambda (g) (grid-compact g))
+      (lambda (inp) (make-app "grid-compact" inp)))
+    (list "untile"
+      (lambda (g) (grid-untile g))
+      (lambda (inp) (make-app "grid-untile" inp)))
+    (list "gravity-down"
+      (lambda (g) (grid-gravity g 0))
+      (lambda (inp) (make-app "grid-gravity" inp (make-int 0))))
+    (list "gravity-right"
+      (lambda (g) (grid-gravity g 1))
+      (lambda (inp) (make-app "grid-gravity" inp (make-int 1))))
+    (list "gravity-up"
+      (lambda (g) (grid-gravity g 2))
+      (lambda (inp) (make-app "grid-gravity" inp (make-int 2))))
+    (list "gravity-left"
+      (lambda (g) (grid-gravity g 3))
+      (lambda (inp) (make-app "grid-gravity" inp (make-int 3))))
+    (list "overlay-flip-h"
+      (lambda (g) (grid-overlay g (grid-flip-h g) 0 0))
+      (lambda (inp)
+        (make-app "grid-overlay" inp
+          (make-app "grid-flip-h" inp)
+          (make-int 0) (make-int 0))))
+    (list "overlay-flip-v"
+      (lambda (g) (grid-overlay g (grid-flip-v g) 0 0))
+      (lambda (inp)
+        (make-app "grid-overlay" inp
+          (make-app "grid-flip-v" inp)
+          (make-int 0) (make-int 0))))
+    (list "overlay-rot-180"
+      (lambda (g) (grid-overlay g (grid-rotate-180 g) 0 0))
+      (lambda (inp)
+        (make-app "grid-overlay" inp
+          (make-app "grid-rotate-180" inp)
+          (make-int 0) (make-int 0))))))
+
+; Accessors
+(define mr-form-name      (lambda (f) (nth f 0)))
+(define mr-form-compute   (lambda (f) (nth f 1)))
+(define mr-form-ast-build (lambda (f) (nth f 2)))
+
+; ── Form evaluation engine ─────────────────────────────────────────────
+
+(define mr-apply-form
+  (lambda (form-fn inp-grid)
+    (try (form-fn inp-grid) nil)))
+
+; Score one form against all training pairs. Returns avg cell accuracy.
+(define mr-score-form
+  (lambda (form inputs outputs)
+    (let ((form-fn (mr-form-compute form))
+          (n (length inputs)))
+      (let ((total
+              (reduce
+                (lambda (acc i)
+                  (let ((inp-grid (head (nth inputs i)))
+                        (expected (nth outputs i)))
+                    (let ((predicted (mr-apply-form form-fn inp-grid)))
+                      (if (or (nil? predicted) (not (grid? predicted)))
+                        acc
+                        (+ acc (grid-cell-accuracy predicted expected))))))
+                (range n)
+                0.0)))
+        (/ total (max n 1))))))
+
+; Check if all input/output dims match
+(define mr-dims-preserved?
+  (lambda (inputs outputs)
+    (reduce
+      (lambda (acc i)
+        (and acc
+          (let ((inp (head (nth inputs i)))
+                (out (nth outputs i)))
+            (and (= (grid-height inp) (grid-height out))
+                 (= (grid-width inp) (grid-width out))))))
+      (range (length inputs))
+      true)))
+
+; Forms known to preserve dimensions
+(define mr-same-dim-forms
+  (list "identity" "flip-h" "flip-v" "rotate-180"
+        "fill-enclosed" "gravity-down" "gravity-right"
+        "gravity-up" "gravity-left"
+        "overlay-flip-h" "overlay-flip-v" "overlay-rot-180"))
+
+(define mr-prefilter-forms
+  (lambda (forms dims-same)
+    (if dims-same
+      (filter (lambda (f) (member? (mr-form-name f) mr-same-dim-forms))
+              forms)
+      forms)))
+
+; Rank forms by fitness descending
+(define mr-rank-forms
+  (lambda (forms inputs outputs)
+    (let ((scored (map (lambda (f)
+                    (list f (mr-score-form f inputs outputs)))
+                  forms)))
+      (mr-sort-desc scored))))
+
+(define mr-sort-desc
+  (lambda (pairs)
+    (reduce
+      (lambda (sorted pair)
+        (mr-insert-desc sorted pair))
+      pairs (list))))
+
+(define mr-insert-desc
+  (lambda (sorted pair)
+    (if (= (length sorted) 0)
+      (list pair)
+      (if (>= (nth pair 1) (nth (head sorted) 1))
+        (cons pair sorted)
+        (cons (head sorted) (mr-insert-desc (tail sorted) pair))))))
+
+; Take first N elements
+(define mr-take
+  (lambda (lst n)
+    (if (or (= n 0) (= (length lst) 0))
+      (list)
+      (cons (head lst) (mr-take (tail lst) (- n 1))))))
+
+; ── Residual spec builder ──────────────────────────────────────────────
+
+(define mr-build-residual-spec
+  (lambda (form inputs outputs)
+    (let ((form-fn (mr-form-compute form)))
+      (filter (lambda (p) (not (nil? p)))
+        (map (lambda (i)
+          (let ((inp-grid (head (nth inputs i)))
+                (expected (nth outputs i)))
+            (let ((form-out (mr-apply-form form-fn inp-grid)))
+              (if (nil? form-out) nil
+                (list (list form-out) expected)))))
+          (range (length inputs)))))))
+
+(define mr-build-residual-test
+  (lambda (form test-inputs test-outputs)
+    (if (= (length test-inputs) 0)
+      (list)
+      (let ((form-fn (mr-form-compute form)))
+        (filter (lambda (p) (not (nil? p)))
+          (map (lambda (i)
+            (let ((inp-grid (head (nth test-inputs i)))
+                  (expected (nth test-outputs i)))
+              (let ((form-out (mr-apply-form form-fn inp-grid)))
+                (if (nil? form-out) nil
+                  (list (list form-out) expected)))))
+            (range (length test-inputs))))))))
+
+; ── AST composition ────────────────────────────────────────────────────
+;
+; Build: (lambda (x)
+;          (let ((mr-base (FORM (nth x 0))))
+;            (let ((x (list mr-base)))    ; shadow x for correction
+;              CORRECTION-BODY)))
+;
+; The correction's (nth x 0) naturally resolves to mr-base via the
+; shadowed x binding.
+
+(define mr-compose-ast
+  (lambda (form correction-source)
+    (let ((form-ast-builder (mr-form-ast-build form))
+          (inp-ref (mr-input-ref)))
+      (let ((form-body (form-ast-builder inp-ref)))
+        (let ((corr-node (parse-source correction-source)))
+          (let ((children (node-children corr-node)))
+            (let ((corr-body (if (= (length children) 1)
+                               (nth children 0)
+                               (nth children (- (length children) 1)))))
+              (make-lambda (list "x")
+                (make-let
+                  (list (list "mr-base" form-body))
+                  (make-let
+                    (list (list "x"
+                      (make-app "list" (make-symbol "mr-base"))))
+                    corr-body))))))))))
+
+; ── Validation ─────────────────────────────────────────────────────────
+
+(define mr-validate-composed
+  (lambda (form-fn corr-fn test-inputs test-outputs)
+    (if (= (length test-inputs) 0)
+      true
+      (reduce
+        (lambda (ok i)
+          (if (not ok) false
+            (let ((inp (head (nth test-inputs i)))
+                  (expected (nth test-outputs i)))
+              (let ((form-out (try (form-fn inp) nil)))
+                (if (nil? form-out) false
+                  (let ((final (try (corr-fn (list form-out)) nil)))
+                    (if (nil? final) false
+                      (= final expected))))))))
+        (range (length test-inputs))
+        true))))
+
+; ── Main decomposer ───────────────────────────────────────────────────
+
+(define mr-refine-decomposer
+  (lambda (synth-spec)
+    ; Recursion guard
+    (if (try mr-in-refine false)
+      (ns ("found" false))
+      ; Only handle grid-output tasks
+      (let ((spec (m-chain-spec-from-synth synth-spec)))
+        (let ((kind (m-chain-output-kind spec)))
+          (if (not (= kind "grid"))
+            (ns ("found" false))
+            (do (eval-source "(define mr-in-refine true)")
+                (let ((result (try (mr-refine-grid spec synth-spec)
+                                (ns ("found" false)))))
+                  (do (eval-source "(define mr-in-refine false)")
+                      result)))))))))
+
+(define mr-refine-grid
+  (lambda (spec synth-spec)
+    (let ((inputs       (ns-get spec "inputs"))
+          (outputs      (ns-get spec "outputs"))
+          (test-inputs  (try (ns-get spec "test-inputs") (list)))
+          (test-outputs (try (ns-get spec "test-outputs") (list))))
+      ; Step 1: Pre-filter
+      (let ((dims-same (mr-dims-preserved? inputs outputs)))
+        (let ((filtered (mr-prefilter-forms mr-form-catalog dims-same))
+              (threshold (if dims-same
+                           mr-fitness-threshold-same-dims
+                           mr-fitness-threshold-diff-dims)))
+          ; Step 2: Score and rank
+          (let ((ranked (mr-rank-forms filtered inputs outputs)))
+            ; Step 3: Try top forms
+            (let ((top (mr-take ranked mr-max-forms-to-try)))
+              (mr-try-residuals top threshold inputs outputs
+                test-inputs test-outputs))))))))
+
+(define mr-try-residuals
+  (lambda (ranked threshold inputs outputs test-inputs test-outputs)
+    (if (= (length ranked) 0)
+      (ns ("found" false))
+      (let ((entry (head ranked)))
+        (let ((form (nth entry 0))
+              (score (nth entry 1)))
+          (if (< score threshold)
+            (ns ("found" false))
+            (let ((result (mr-try-one-residual form inputs outputs
+                            test-inputs test-outputs)))
+              (if (ns-get result "found")
+                result
+                (mr-try-residuals (tail ranked) threshold
+                  inputs outputs test-inputs test-outputs)))))))))
+
+(define mr-try-one-residual
+  (lambda (form inputs outputs test-inputs test-outputs)
+    ; Build residual spec
+    (let ((residual-pairs (mr-build-residual-spec form inputs outputs)))
+      (if (< (length residual-pairs) (length inputs))
+        (ns ("found" false))
+        ; Build residual test pairs
+        (let ((residual-test (mr-build-residual-test form test-inputs test-outputs)))
+          ; Call synthesize-args on the residual
+          (let ((synth-result
+                  (try
+                    (synthesize-args
+                      (ns ("spec" residual-pairs)
+                          ("max-depth" mr-residual-depth)
+                          ("max-candidates" mr-residual-budget)
+                          ("test" residual-test)))
+                    (ns ("found" false)))))
+            (if (not (try (ns-get synth-result "found") false))
+              (ns ("found" false))
+              ; Residual synthesis succeeded! Validate composition.
+              (let ((corr-source (ns-get synth-result "source")))
+                (let ((corr-fn (try (eval-source corr-source) nil)))
+                  (if (nil? corr-fn)
+                    (ns ("found" false))
+                    ; Validate against test pairs
+                    (let ((form-fn (mr-form-compute form)))
+                      (let ((test-ok (mr-validate-composed form-fn corr-fn
+                                       test-inputs test-outputs)))
+                        (if (not test-ok)
+                          (ns ("found" false))
+                          ; Build composed AST and return
+                          (let ((composed-ast
+                                  (try (mr-compose-ast form corr-source) nil)))
+                            (if (nil? composed-ast)
+                              (ns ("found" false))
+                              (ns ("found" true)
+                                  ("nodes" composed-ast)
+                                  ("candidates" mr-residual-budget)))))))))))))))))
+
+; ── Registration ───────────────────────────────────────────────────────
+
+(define __decomposers__
+  (ns-put __decomposers__ "m-refine" mr-refine-decomposer))
+
+; ── Smoke tests ────────────────────────────────────────────────────────
+
+(define mr-test-spec-1
+  (ns ("inputs" (list
+         (list (list (list 1 1 0) (list 1 0 0) (list 0 0 0)))
+         (list (list (list 2 0 0) (list 2 2 0) (list 0 0 0)))))
+      ("outputs" (list
+         (list (list 1 1 1) (list 1 0 1) (list 0 0 0))
+         (list (list 2 0 2) (list 2 2 2) (list 0 0 0))))
+      ("arity" 1)))
+
+(let ((score (mr-score-form
+               (nth mr-form-catalog 15)  ; overlay-flip-h
+               (ns-get mr-test-spec-1 "inputs")
+               (ns-get mr-test-spec-1 "outputs"))))
+  (do (print (concat "--- m_refine smoke test ---"))
+  (do (print (concat "  overlay-flip-h fitness: " (to-string score)
+                     (if (> score 0.7) " OK" " FAIL")))
+      (print (concat "  recursion guard: "
+        (if (not (try mr-in-refine false)) "OK (false)" "FAIL (true)"))))))

@@ -42,7 +42,14 @@ cat \
     "$META/m11s_string_repeat.selph" \
     "$META/m_pool_grid.selph" \
     "$META/m8g_constant_grid.selph" \
+    "$META/m8g_symmetry.selph" \
+    "$META/m8g_recolor.selph" \
+    "$META/m8g_line_draw.selph" \
+    "$META/m8g_per_object.selph" \
+    "$META/m8g_template_stamp.selph" \
     "$META/m_chain.selph" \
+    "$META/m_fitness_grid.selph" \
+    "$META/m_refine.selph" \
     "$CURRICULUM" \
     > "$COMBINED"
 
@@ -63,8 +70,14 @@ cat \
     "$META/m11s_string_repeat.selph" \
     "$META/m_pool_grid.selph" \
     "$META/m8g_constant_grid.selph" \
+    "$META/m8g_symmetry.selph" \
+    "$META/m8g_recolor.selph" \
+    "$META/m8g_line_draw.selph" \
+    "$META/m8g_per_object.selph" \
+    "$META/m8g_template_stamp.selph" \
     "$META/m_chain.selph" \
     "$META/m_fitness_grid.selph" \
+    "$META/m_refine.selph" \
     "$META/m_near_miss.selph" \
     "$META/m_boost_heuristic.selph" \
     > "$PM_COMBINED"

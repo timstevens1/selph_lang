@@ -1,0 +1,741 @@
+; -------------------------------------------------------------------------
+; Meta-curriculum M8g-per-object: conditional per-object dispatch (Form 10)
+; -------------------------------------------------------------------------
+;
+; Extends Form 9 (uniform per-object transform) with property-based
+; dispatch: different objects receive different transforms based on a
+; distinguishing property (color, size, position).
+;
+; Three sub-forms:
+;
+;   Form 10a: Two-group dispatch — objects partitioned into two classes
+;             by a property, each class gets a different transform.
+;   Form 10b: Object filtering — only objects matching a criterion are
+;             transformed; others pass through unchanged.
+;   Form 10c: Object deletion — objects matching a criterion are removed
+;             (replaced with background).
+;
+; Detection strategy:
+;   1. Extract objects from each input/output pair.
+;   2. If object counts match, align objects by position.
+;   3. For each object, determine which transform (from a catalog) maps
+;      it from input to output. "identity" counts as a transform.
+;   4. If objects receive different transforms, check if the grouping
+;      correlates with a property (object color, object cell-count, or
+;      object bounding-box area).
+;   5. Emit a lambda that classifies each object, dispatches to the
+;      correct transform, and reconstructs.
+;
+; Emitted program shape (using reduce over index range):
+;   (lambda (x)
+;     (let ((g (nth x 0)))
+;       (reduce
+;         (lambda (canvas i)
+;           (let ((obj (grid-object g i))
+;                 (pos (grid-object-pos g i)))
+;             (if (= (PROPERTY obj) VALUE)
+;               (grid-place canvas (TRANSFORM-A obj) (nth pos 0) (nth pos 1))
+;               (grid-place canvas (TRANSFORM-B obj) (nth pos 0) (nth pos 1)))))
+;         (range (grid-object-count g))
+;         (grid-blank (grid-height g) (grid-width g) (grid-background g)))))
+
+; ── Helpers ──────────────────────────────────────────────────────────
+
+; Extract the dominant non-zero color from an object sub-grid.
+; Objects are trimmed bounding boxes with 0 as transparent. The
+; "color" of an object is its most frequent non-zero cell value.
+(define m10-obj-color
+  (lambda (obj)
+    (reduce
+      (lambda (best row)
+        (reduce
+          (lambda (b cell)
+            (if (= cell 0) b
+              (if (nil? b) (list cell 1)
+                (if (= cell (nth b 0))
+                  (list cell (+ (nth b 1) 1))
+                  (if (> 1 (nth b 1)) (list cell 1) b)))))
+          row best))
+      obj nil)))
+
+; Simpler: just return the first non-zero color found.
+(define m10-obj-primary-color
+  (lambda (obj)
+    (reduce
+      (lambda (found row)
+        (if (not (nil? found)) found
+          (reduce
+            (lambda (f cell) (if (not (nil? f)) f (if (= cell 0) nil cell)))
+            row nil)))
+      obj nil)))
+
+; Count non-zero cells in an object sub-grid.
+(define m10-obj-cell-count
+  (lambda (obj)
+    (reduce
+      (lambda (acc row)
+        (+ acc (reduce (lambda (a c) (if (= c 0) a (+ a 1))) row 0)))
+      obj 0)))
+
+; Bounding box area (height * width of the trimmed sub-grid).
+(define m10-obj-area
+  (lambda (obj) (* (length obj) (if (> (length obj) 0) (length (head obj)) 0))))
+
+; ── Transform catalog ────────────────────────────────────────────────
+;
+; Each entry: (name, eval-fn, ast-builder-fn)
+; The eval-fn takes an object sub-grid and returns the transformed grid.
+; The ast-builder-fn takes an AST node for the object and returns an AST
+; node for the transform application.
+;
+; "identity" is included — one group might pass through unchanged while
+; another group gets rotated.
+
+(define m10-transform-catalog
+  (list
+    (list "identity"
+      (lambda (obj) obj)
+      (lambda (src) src))
+    (list "rotate-cw"
+      (lambda (obj) (grid-rotate-cw obj))
+      (lambda (src) (make-app "grid-rotate-cw" src)))
+    (list "rotate-ccw"
+      (lambda (obj) (grid-rotate-ccw obj))
+      (lambda (src) (make-app "grid-rotate-ccw" src)))
+    (list "rotate-180"
+      (lambda (obj) (grid-rotate-180 obj))
+      (lambda (src) (make-app "grid-rotate-180" src)))
+    (list "flip-h"
+      (lambda (obj) (grid-flip-h obj))
+      (lambda (src) (make-app "grid-flip-h" src)))
+    (list "flip-v"
+      (lambda (obj) (grid-flip-v obj))
+      (lambda (src) (make-app "grid-flip-v" src)))))
+
+; ── Property catalog ─────────────────────────────────────────────────
+;
+; Each entry: (name, eval-fn, ast-builder-fn)
+; The eval-fn extracts a scalar from an object sub-grid.
+; The ast-builder-fn wraps an object-AST node in the property extraction.
+
+(define m10-property-catalog
+  (list
+    (list "color"
+      m10-obj-primary-color
+      (lambda (obj-src)
+        ; Inline: reduce to find first non-zero cell. But since we emit
+        ; a concrete property value in the if-test, we only need the
+        ; runtime extraction. Use a helper call if available, else
+        ; inline the check. For now, emit the value extraction as a
+        ; nested reduce — but actually we just need the property for
+        ; the if-condition, so we compare against the concrete value
+        ; using grid-get to peek at row 0, scanning for non-zero.
+        ; Simplification: since the property value is a constant we
+        ; found at detection time, we embed the value directly.
+        ; The AST builder is only used for the obj-src node path.
+        obj-src))
+    (list "cell-count"
+      m10-obj-cell-count
+      (lambda (obj-src) obj-src))
+    (list "area"
+      m10-obj-area
+      (lambda (obj-src) obj-src))))
+
+; ── Object alignment ─────────────────────────────────────────────────
+;
+; Given input objects (from grid-objects, sorted by size descending) and
+; output objects, align them by position proximity. Returns a list of
+; (input-obj-idx . output-obj-idx) pairs, or nil if alignment fails.
+;
+; Strategy: for each input object, find the output object whose
+; position is closest (L1 distance). Greedy assignment.
+
+(define m10-align-objects
+  (lambda (in-grid out-grid n)
+    (let ((used (list)))
+      (reduce
+        (lambda (acc i)
+          (if (nil? acc) nil
+            (let ((in-pos (try (grid-object-pos in-grid i) nil)))
+              (if (nil? in-pos) nil
+                (let ((best (m10-find-closest out-grid n in-pos (nth acc 1))))
+                  (if (nil? best) nil
+                    (list
+                      (append (nth acc 0) (list (list i best)))
+                      (append (nth acc 1) (list best)))))))))
+        (range n)
+        (list (list) used)))))
+
+(define m10-find-closest
+  (lambda (grid n target-pos used)
+    (nth
+      (reduce
+        (lambda (st j)
+          (if (contains (nth st 1) j) st
+            (let ((pos (try (grid-object-pos grid j) nil)))
+              (if (nil? pos) st
+                (let ((dist (+ (abs (- (nth pos 0) (nth target-pos 0)))
+                               (abs (- (nth pos 1) (nth target-pos 1))))))
+                  (if (or (nil? (nth st 0)) (< dist (nth st 2)))
+                    (list j used dist)
+                    st))))))
+        (range n)
+        (list nil used 9999))
+      0)))
+
+; abs helper
+(define abs (lambda (x) (if (< x 0) (- 0 x) x)))
+
+; ── Per-object transform detection ──────────────────────────────────
+;
+; For a single (input-obj, output-obj) pair, determine which transform
+; from the catalog maps input to output. Returns the catalog entry
+; index, or nil if none matches.
+
+(define m10-detect-obj-transform
+  (lambda (in-obj out-obj)
+    (nth
+      (reduce
+        (lambda (st idx)
+          (if (not (nil? (nth st 0))) st
+            (let ((entry (nth m10-transform-catalog idx)))
+              (let ((xf-fn (nth entry 1)))
+                (let ((result (try (xf-fn in-obj) nil)))
+                  (if (nil? result) st
+                    (if (= result out-obj)
+                      (list idx)
+                      st)))))))
+        (range (length m10-transform-catalog))
+        (list nil))
+      0)))
+
+; ── Pair analysis ────────────────────────────────────────────────────
+;
+; Analyze one training pair. Returns a list of
+;   (obj-index transform-index property-values...)
+; or nil if analysis fails (mismatched counts, unaligned objects, etc.)
+
+(define m10-analyze-pair
+  (lambda (in-grid out-grid)
+    (let ((n-in (try (grid-object-count in-grid) 0))
+          (n-out (try (grid-object-count out-grid) 0)))
+      ; For deletion: output can have fewer objects. For dispatch: same count.
+      ; Handle both: if counts match, direct alignment. If output has fewer,
+      ; try deletion detection.
+      (if (= n-in 0) nil
+        (if (= n-in n-out)
+          ; Same count — align and detect per-object transforms
+          (let ((alignment (m10-align-objects in-grid out-grid n-in)))
+            (if (nil? alignment) nil
+              (let ((pairs (nth alignment 0)))
+                (m10-classify-aligned in-grid out-grid pairs))))
+          ; Different counts — try deletion
+          (if (> n-in n-out)
+            (m10-try-deletion in-grid out-grid n-in n-out)
+            nil))))))
+
+; Classify aligned object pairs: for each pair, detect the transform
+; and extract property values.
+(define m10-classify-aligned
+  (lambda (in-grid out-grid pairs)
+    (let ((results
+            (map
+              (lambda (pair)
+                (let ((i (nth pair 0))
+                      (j (nth pair 1)))
+                  (let ((in-obj (try (grid-object in-grid i) nil))
+                        (out-obj (try (grid-object out-grid j) nil)))
+                    (if (or (nil? in-obj) (nil? out-obj))
+                      nil
+                      (let ((xf-idx (m10-detect-obj-transform in-obj out-obj)))
+                        (if (nil? xf-idx) nil
+                          (let ((color (m10-obj-primary-color in-obj))
+                                (cells (m10-obj-cell-count in-obj))
+                                (area  (m10-obj-area in-obj)))
+                            (list i xf-idx color cells area))))))))
+              pairs)))
+      (if (reduce (lambda (ok r) (and ok (not (nil? r)))) results true)
+        results
+        nil))))
+
+; ── Deletion detection ───────────────────────────────────────────────
+;
+; When output has fewer objects, check if the output is the input with
+; some objects removed (replaced by background). The remaining objects
+; should be identity-mapped.
+
+(define m10-try-deletion
+  (lambda (in-grid out-grid n-in n-out)
+    ; Reconstruct: for each subset of n-out objects from input,
+    ; check if placing them on a blank canvas reproduces output.
+    ; For small n-in (<=6), brute-force subsets.
+    ; Mark deleted objects with transform-index = -1.
+    (if (> n-in 6) nil
+      (let ((bg (grid-background in-grid))
+            (h  (length in-grid))
+            (w  (if (> (length in-grid) 0) (length (head in-grid)) 0)))
+        (m10-try-deletion-subsets in-grid out-grid n-in n-out bg h w
+          (m10-subsets-of-size (range n-in) n-out))))))
+
+(define m10-try-deletion-subsets
+  (lambda (in-grid out-grid n-in n-out bg h w subsets)
+    (if (= (length subsets) 0) nil
+      (let ((subset (head subsets)))
+        (let ((canvas
+                (reduce
+                  (lambda (c idx)
+                    (let ((obj (grid-object in-grid idx))
+                          (pos (grid-object-pos in-grid idx)))
+                      (grid-place c obj (nth pos 0) (nth pos 1))))
+                  subset
+                  (grid-blank h w bg))))
+          (if (= canvas out-grid)
+            ; Found the kept subset. Build result: kept objects get identity (0),
+            ; deleted objects get -1.
+            (map
+              (lambda (i)
+                (let ((color (m10-obj-primary-color (grid-object in-grid i)))
+                      (cells (m10-obj-cell-count (grid-object in-grid i)))
+                      (area  (m10-obj-area (grid-object in-grid i))))
+                  (if (contains subset i)
+                    (list i 0 color cells area)          ; identity = kept
+                    (list i -1 color cells area))))      ; -1 = deleted
+              (range n-in))
+            (m10-try-deletion-subsets in-grid out-grid n-in n-out bg h w
+              (tail subsets))))))))
+
+; Generate all subsets of a given size from a list.
+(define m10-subsets-of-size
+  (lambda (items k)
+    (if (= k 0) (list (list))
+      (if (= (length items) 0) (list)
+        (if (> k (length items)) (list)
+          (let ((first (head items))
+                (rest (tail items)))
+            (append
+              ; subsets that include first
+              (map (lambda (sub) (cons first sub))
+                   (m10-subsets-of-size rest (- k 1)))
+              ; subsets that exclude first
+              (m10-subsets-of-size rest k))))))))
+
+; ── Cross-pair consistency check ─────────────────────────────────────
+;
+; Given per-pair analysis results, check if a single property cleanly
+; separates the transform assignments across ALL pairs. Returns
+; (property-name, property-value→transform mapping) or nil.
+
+(define m10-find-consistent-partition
+  (lambda (all-pair-results)
+    ; Try each property: color (idx 2), cell-count (idx 3), area (idx 4)
+    (let ((props (list (list "color" 2) (list "cell-count" 3) (list "area" 4))))
+      (reduce
+        (lambda (found prop-entry)
+          (if (not (nil? found)) found
+            (let ((prop-name (nth prop-entry 0))
+                  (prop-idx  (nth prop-entry 1)))
+              (m10-check-property-consistency all-pair-results prop-idx prop-name))))
+        props
+        nil))))
+
+(define m10-check-property-consistency
+  (lambda (all-pair-results prop-idx prop-name)
+    ; Build a mapping: property-value → transform-index.
+    ; Must be consistent across all pairs: same property value always
+    ; maps to the same transform index.
+    (let ((mapping
+            (reduce
+              (lambda (acc pair-result)
+                (if (nil? acc) nil
+                  (reduce
+                    (lambda (m obj-info)
+                      (if (nil? m) nil
+                        (let ((pval (nth obj-info prop-idx))
+                              (xf-idx (nth obj-info 1)))
+                          (if (nil? pval) nil
+                            (let ((key (to-string pval))
+                                  (existing (try (ns-get m key) nil)))
+                              (if (nil? existing)
+                                (ns-put m key xf-idx)
+                                (if (= existing xf-idx) m nil)))))))
+                    pair-result
+                    acc)))
+              all-pair-results
+              (ns))))
+      (if (nil? mapping) nil
+        ; Must have at least 2 distinct groups
+        (if (< (length (ns-keys mapping)) 2) nil
+          (list prop-name mapping))))))
+
+; ── AST emission ─────────────────────────────────────────────────────
+;
+; Build the lambda AST for per-object conditional dispatch.
+
+(define m10-wrap-lambda
+  (lambda (body) (make-lambda (list "x") body)))
+
+; Build the full dispatch lambda for Form 10a (two-group dispatch).
+;
+; Shape:
+;   (lambda (x)
+;     (let ((g (nth x 0)))
+;       (reduce
+;         (lambda (canvas i)
+;           (let ((obj (grid-object g i))
+;                 (pos (grid-object-pos g i)))
+;             (if (= PROP-EXPR VALUE)
+;               (grid-place canvas (XF-A obj) (nth pos 0) (nth pos 1))
+;               (grid-place canvas (XF-B obj) (nth pos 0) (nth pos 1)))))
+;         (range (grid-object-count g))
+;         (grid-blank (grid-height g) (grid-width g) (grid-background g)))))
+;
+; For >2 groups, nest if-else chains.
+
+(define m10-emit-dispatch
+  (lambda (prop-name mapping)
+    (let ((g-sym (make-symbol "g"))
+          (i-sym (make-symbol "i"))
+          (canvas-sym (make-symbol "canvas"))
+          (obj-sym (make-symbol "obj"))
+          (pos-sym (make-symbol "pos")))
+      ; Build the property extraction AST for the object
+      (let ((prop-ast (m10-emit-property-extract prop-name obj-sym))
+            (keys (ns-keys mapping)))
+        ; Build the if-chain: for each property value, check and apply
+        ; the corresponding transform.
+        (let ((place-chain (m10-emit-if-chain prop-ast mapping keys
+                              obj-sym pos-sym canvas-sym)))
+          ; Full lambda body
+          (m10-wrap-lambda
+            (make-app "let"
+              (make-app "list"
+                (make-app "list" (make-symbol "g")
+                  (make-app "nth" (make-symbol "x") (make-int 0))))
+              (make-app "reduce"
+                (make-lambda (list "canvas" "i")
+                  (make-app "let"
+                    (make-app "list"
+                      (make-app "list" (make-symbol "obj")
+                        (make-app "grid-object" g-sym i-sym))
+                      (make-app "list" (make-symbol "pos")
+                        (make-app "grid-object-pos" g-sym i-sym)))
+                    place-chain))
+                (make-app "range" (make-app "grid-object-count" g-sym))
+                (make-app "grid-blank"
+                  (make-app "grid-height" g-sym)
+                  (make-app "grid-width" g-sym)
+                  (make-app "grid-background" g-sym))))))))))
+
+; Emit the property extraction AST for a given property name.
+(define m10-emit-property-extract
+  (lambda (prop-name obj-src)
+    (if (= prop-name "color")
+      ; Inline first-non-zero scan. For detection we know the exact
+      ; values, so we compare the property of the runtime object.
+      ; Use: reduce over rows, reduce over cells, find first non-zero.
+      ; For simplicity: (grid-get obj 0 col) scanning. But we don't have
+      ; a simple builtin for "primary color of sub-grid". Instead, since
+      ; the property value is a literal int in the if-test, we emit a
+      ; runtime scan. We'll use a dedicated helper defined below.
+      (make-app "m10-obj-primary-color" obj-src)
+      (if (= prop-name "cell-count")
+        (make-app "m10-obj-cell-count" obj-src)
+        ; area
+        (make-app "m10-obj-area" obj-src)))))
+
+; Build nested if-chain for dispatch.
+(define m10-emit-if-chain
+  (lambda (prop-ast mapping keys obj-sym pos-sym canvas-sym)
+    (if (= (length keys) 1)
+      ; Last group — no condition needed, just apply its transform.
+      (let ((xf-idx (ns-get mapping (head keys))))
+        (m10-emit-place canvas-sym obj-sym pos-sym xf-idx))
+      (let ((key (head keys))
+            (rest (tail keys)))
+        (let ((xf-idx (ns-get mapping key))
+              (pval (m10-parse-int-key key)))
+          (make-if
+            (make-app "=" prop-ast (make-int pval))
+            (m10-emit-place canvas-sym obj-sym pos-sym xf-idx)
+            (m10-emit-if-chain prop-ast mapping rest obj-sym pos-sym canvas-sym)))))))
+
+; Emit a grid-place call with a transformed object.
+(define m10-emit-place
+  (lambda (canvas-sym obj-sym pos-sym xf-idx)
+    (let ((xf-entry (nth m10-transform-catalog xf-idx))
+          (xf-ast-fn (nth xf-entry 2)))
+      (make-app "grid-place"
+        canvas-sym
+        (xf-ast-fn obj-sym)
+        (make-app "nth" pos-sym (make-int 0))
+        (make-app "nth" pos-sym (make-int 1))))))
+
+; Parse a string key back to an integer. Handles "0".."9" and negative.
+(define m10-parse-int-key
+  (lambda (key)
+    (reduce
+      (lambda (found v)
+        (if (not (nil? found)) found
+          (if (= (to-string v) key) v nil)))
+      (range 10)
+      nil)))
+
+; Extended parse to handle larger values (0..99 and negatives).
+(define m10-parse-int-key
+  (lambda (key)
+    (let ((neg? (if (> (string-length key) 0)
+                  (= (string-take key 1) "-") false)))
+      (let ((abs-key (if neg? (string-drop key 1) key)))
+        (let ((val (reduce
+                     (lambda (found v)
+                       (if (not (nil? found)) found
+                         (if (= (to-string v) abs-key) v nil)))
+                     (range 100)
+                     nil)))
+          (if (nil? val) 0
+            (if neg? (- 0 val) val)))))))
+
+; ── Form 10c: deletion emission ──────────────────────────────────────
+;
+; When deletion is detected (some objects removed), emit a lambda that
+; keeps only objects matching the "keep" criterion.
+
+(define m10-emit-deletion
+  (lambda (prop-name keep-values)
+    (let ((g-sym (make-symbol "g"))
+          (i-sym (make-symbol "i"))
+          (canvas-sym (make-symbol "canvas"))
+          (obj-sym (make-symbol "obj"))
+          (pos-sym (make-symbol "pos")))
+      (let ((prop-ast (m10-emit-property-extract prop-name obj-sym)))
+        (let ((keep-test (m10-emit-keep-test prop-ast keep-values)))
+          (m10-wrap-lambda
+            (make-app "let"
+              (make-app "list"
+                (make-app "list" (make-symbol "g")
+                  (make-app "nth" (make-symbol "x") (make-int 0))))
+              (make-app "reduce"
+                (make-lambda (list "canvas" "i")
+                  (make-app "let"
+                    (make-app "list"
+                      (make-app "list" (make-symbol "obj")
+                        (make-app "grid-object" g-sym i-sym))
+                      (make-app "list" (make-symbol "pos")
+                        (make-app "grid-object-pos" g-sym i-sym)))
+                    (make-if keep-test
+                      (make-app "grid-place"
+                        canvas-sym obj-sym
+                        (make-app "nth" pos-sym (make-int 0))
+                        (make-app "nth" pos-sym (make-int 1)))
+                      canvas-sym)))
+                (make-app "range" (make-app "grid-object-count" g-sym))
+                (make-app "grid-blank"
+                  (make-app "grid-height" g-sym)
+                  (make-app "grid-width" g-sym)
+                  (make-app "grid-background" g-sym))))))))))
+
+; Emit a disjunction test: property in {v1, v2, ...}
+(define m10-emit-keep-test
+  (lambda (prop-ast keep-values)
+    (if (= (length keep-values) 1)
+      (make-app "=" prop-ast (make-int (head keep-values)))
+      (make-app "or"
+        (make-app "=" prop-ast (make-int (head keep-values)))
+        (m10-emit-keep-test prop-ast (tail keep-values))))))
+
+; ── Top-level detector ───────────────────────────────────────────────
+;
+; Runs the full analysis pipeline:
+; 1. Analyze all training pairs.
+; 2. Find a consistent property partition.
+; 3. Emit the appropriate form.
+
+(define detect-per-object-dispatch
+  (lambda (s)
+    (let ((inputs (ns-get s "inputs"))
+          (outputs (ns-get s "outputs"))
+          (target (try (reduce
+                    (lambda (acc v)
+                      (if (and acc (grid? v)) acc nil))
+                    (ns-get s "outputs") true) nil)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-grid target"))
+        (let ((in-grids (map head inputs))
+              (out-grids outputs))
+          ; Analyze each training pair
+          (let ((all-results
+                  (map (lambda (i)
+                         (try (m10-analyze-pair (nth in-grids i) (nth out-grids i))
+                              nil))
+                       (range (length in-grids)))))
+            ; Check all pairs succeeded
+            (if (reduce (lambda (ok r) (and ok (not (nil? r)))) all-results true)
+              ; Find consistent partition
+              (let ((partition (m10-find-consistent-partition all-results)))
+                (if (nil? partition)
+                  (ns ("found" false) ("reason" "no consistent property partition"))
+                  (let ((prop-name (nth partition 0))
+                        (mapping (nth partition 1)))
+                    ; Check if this is a deletion case (any xf-idx == -1)
+                    (let ((has-deletion
+                            (reduce
+                              (lambda (acc key)
+                                (or acc (= (ns-get mapping key) -1)))
+                              (ns-keys mapping) false)))
+                      (if has-deletion
+                        ; Form 10c: deletion
+                        (let ((keep-keys
+                                (filter
+                                  (lambda (key) (not (= (ns-get mapping key) -1)))
+                                  (ns-keys mapping))))
+                          (let ((keep-values
+                                  (map m10-parse-int-key keep-keys)))
+                            (ns ("kind" (concat "form-10c-delete-by-" prop-name))
+                                ("source-node"
+                                  (m10-emit-deletion prop-name keep-values))
+                                ("found" true))))
+                        ; Check if all transforms are the same (→ Form 9, skip)
+                        (let ((xf-values (map (lambda (k) (ns-get mapping k))
+                                              (ns-keys mapping))))
+                          (if (= (length (m10-dedup xf-values)) 1)
+                            (ns ("found" false) ("reason" "uniform transform — Form 9 handles this"))
+                            ; Form 10a: two-group (or multi-group) dispatch
+                            (ns ("kind" (concat "form-10a-dispatch-by-" prop-name))
+                                ("source-node"
+                                  (m10-emit-dispatch prop-name mapping))
+                                ("found" true)))))))))
+              (ns ("found" false) ("reason" "pair analysis failed")))))))))
+
+(define m10-dedup
+  (lambda (xs)
+    (reduce
+      (lambda (acc x)
+        (if (contains acc x) acc (append acc (list x))))
+      xs (list))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(define m10-make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+; Test 1: Form 10a — two objects, different colors, different transforms.
+; Red (color 1) object gets flip-h, blue (color 2) object stays identity.
+;
+; Input:  4x4 grid with a 1-colored L at top-left and a 2-colored block
+;         at bottom-right.
+; Output: The 1-colored L is flipped-h in place; the 2-colored block is unchanged.
+
+(define m10-test1-in1
+  (list (list 1 1 0 0)
+        (list 1 0 0 0)
+        (list 0 0 2 2)
+        (list 0 0 2 2)))
+
+(define m10-test1-out1
+  (list (list 1 1 0 0)
+        (list 0 1 0 0)
+        (list 0 0 2 2)
+        (list 0 0 2 2)))
+
+(define m10-test1-in2
+  (list (list 0 0 0 0 0)
+        (list 0 1 1 0 0)
+        (list 0 1 0 0 0)
+        (list 0 0 0 2 0)
+        (list 0 0 0 0 0)))
+
+(define m10-test1-out2
+  (list (list 0 0 0 0 0)
+        (list 0 1 1 0 0)
+        (list 0 0 1 0 0)
+        (list 0 0 0 2 0)
+        (list 0 0 0 0 0)))
+
+(define m10-test1-spec
+  (m10-make-spec
+    (list (list m10-test1-in1) (list m10-test1-in2))
+    (list m10-test1-out1 m10-test1-out2)
+    1))
+
+; Test 2: Form 10c — delete objects of color 1, keep color 2.
+;
+; Input:  4x4 grid with a 1-colored object and a 2-colored object.
+; Output: Only the 2-colored object remains on background.
+
+(define m10-test2-in1
+  (list (list 1 0 0 0)
+        (list 1 0 2 2)
+        (list 0 0 2 0)
+        (list 0 0 0 0)))
+
+(define m10-test2-out1
+  (list (list 0 0 0 0)
+        (list 0 0 2 2)
+        (list 0 0 2 0)
+        (list 0 0 0 0)))
+
+(define m10-test2-in2
+  (list (list 0 1 1 0)
+        (list 0 0 0 0)
+        (list 2 2 0 0)
+        (list 2 0 0 0)))
+
+(define m10-test2-out2
+  (list (list 0 0 0 0)
+        (list 0 0 0 0)
+        (list 2 2 0 0)
+        (list 2 0 0 0)))
+
+(define m10-test2-spec
+  (m10-make-spec
+    (list (list m10-test2-in1) (list m10-test2-in2))
+    (list m10-test2-out1 m10-test2-out2)
+    1))
+
+; Test 3: Form 10a — dispatch by size (cell-count).
+; Small objects (1 cell) get identity, large objects (>1 cell) get rotate-180.
+
+(define m10-test3-in1
+  (list (list 3 3 0 0)
+        (list 3 0 0 0)
+        (list 0 0 0 5)
+        (list 0 0 0 0)))
+
+(define m10-test3-out1
+  (list (list 0 3 0 0)
+        (list 3 3 0 0)
+        (list 0 0 0 5)
+        (list 0 0 0 0)))
+
+(define m10-test3-in2
+  (list (list 0 0 7 0)
+        (list 0 0 0 0)
+        (list 4 4 0 0)
+        (list 0 4 0 0)))
+
+(define m10-test3-out2
+  (list (list 0 0 7 0)
+        (list 0 0 0 0)
+        (list 4 0 0 0)
+        (list 4 4 0 0)))
+
+(define m10-test3-spec
+  (m10-make-spec
+    (list (list m10-test3-in1) (list m10-test3-in2))
+    (list m10-test3-out1 m10-test3-out2)
+    1))
+
+(define m10-run-test
+  (lambda (label spec)
+    (let ((result (try (detect-per-object-dispatch spec) nil)))
+      (if (nil? result)
+        (print (concat "  ERR  " label " — exception"))
+        (if (ns-get result "found")
+          (print (concat "  OK   " label " kind=" (ns-get result "kind")))
+          (print (concat "  FAIL " label " " (try (ns-get result "reason") "?"))))))))
+
+(print "--- m8g_per_object smoke tests (Form 10) ---")
+(m10-run-test "10a color dispatch" m10-test1-spec)
+(m10-run-test "10c color deletion" m10-test2-spec)
+(m10-run-test "10a size dispatch"  m10-test3-spec)

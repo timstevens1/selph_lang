@@ -20,9 +20,102 @@ mod meta_v2;
 use std::env;
 use std::fs;
 use std::rc::Rc;
+use std::collections::HashSet;
 use intern::{intern, resolve};
 use types::*;
 use parser::*;
+
+// ── Checkpoint infrastructure ─────────────────────────────────────────
+
+/// A solved task loaded from checkpoint or reported by a worker.
+struct SolvedTask {
+    name: String,
+    strategy: String,
+    candidates: usize,
+    source: String, // SELPH lambda from node_to_source
+}
+
+/// Load checkpoint file. Returns empty vec if file doesn't exist.
+fn load_checkpoint(path: &str) -> Vec<SolvedTask> {
+    let content = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let parts: Vec<&str> = line.splitn(4, '\t').collect();
+        if parts.len() < 4 { continue; }
+        out.push(SolvedTask {
+            name: parts[0].to_string(),
+            strategy: parts[1].to_string(),
+            candidates: parts[2].parse().unwrap_or(0),
+            source: parts[3].to_string(),
+        });
+    }
+    out
+}
+
+/// Save checkpoint atomically (write .tmp, rename).
+fn save_checkpoint(path: &str, solved: &[SolvedTask], preamble_hash: u64) {
+    let tmp = format!("{}.tmp", path);
+    let mut content = format!("#preamble-hash:{:016x}\n", preamble_hash);
+    for st in solved {
+        content.push_str(&st.name);
+        content.push('\t');
+        content.push_str(&st.strategy);
+        content.push('\t');
+        content.push_str(&st.candidates.to_string());
+        content.push('\t');
+        content.push_str(&st.source);
+        content.push('\n');
+    }
+    if fs::write(&tmp, &content).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
+/// Reconstruct a Value::Function from a SELPH source string by parsing and
+/// evaluating it. Same pipeline as eval_curriculum_preamble.
+fn reconstruct_solution(source: &str, env: &types_v2::Env) -> Result<types_v2::Value, String> {
+    let (legacy_nodes, roots) = parse_file(source).map_err(|e| format!("{}", e))?;
+    if roots.is_empty() {
+        return Err("empty source".into());
+    }
+    let v2_nodes_vec = eval_v2::convert_tree(&legacy_nodes);
+    let v2_nodes: Rc<[types_v2::Node]> = v2_nodes_vec.into();
+    eval_v2::eval(&v2_nodes, roots[0], env)
+}
+
+/// Compute a hash of the non-task portion of the curriculum source.
+/// Used to detect when the M-chain or other preamble definitions change.
+fn compute_preamble_hash(source: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    let task_sym = intern("task");
+    let task_args_sym = intern("task-args");
+    let (nodes, roots) = match parse_file(source) {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let mut hasher = DefaultHasher::new();
+    for &root in &roots {
+        let is_task = match &nodes[root] {
+            Node::App(children) if !children.is_empty() => {
+                if let Node::Symbol(s) = &nodes[children[0]] {
+                    *s == task_sym || *s == task_args_sym
+                } else { false }
+            }
+            _ => false,
+        };
+        if !is_task {
+            // Hash the source representation of this preamble form.
+            types::node_to_source(&nodes, root).hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
 
 fn main() {
     // Tree-walking eval can recurse deeply with large SELPH environments
@@ -205,9 +298,269 @@ fn cmd_repl() {
     }
 }
 
+// ── Parallel wavefront infrastructure ──────────────────────────────────
+
+/// Result reported by a worker process for a single task (via pipe).
+/// Tab-delimited: name\tfound\tstrategy\tcandidates\tfitness\toutput_type\tm_chain_ran\tbest_source\tsource
+struct WorkerResult {
+    name: String,
+    found: bool,
+    strategy: String,
+    candidates: usize,
+    fitness: f64,
+    output_type: String,
+    m_chain_ran: bool,
+    best_source: String, // empty if none
+    source: String,      // lambda source if found, empty otherwise
+}
+
+impl WorkerResult {
+    fn to_line(&self) -> String {
+        format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            self.name,
+            if self.found { "1" } else { "0" },
+            self.strategy,
+            self.candidates,
+            self.fitness,
+            self.output_type,
+            if self.m_chain_ran { "1" } else { "0" },
+            self.best_source,
+            self.source,
+        )
+    }
+
+    fn from_line(line: &str) -> Option<Self> {
+        let parts: Vec<&str> = line.splitn(9, '\t').collect();
+        if parts.len() < 9 { return None; }
+        Some(WorkerResult {
+            name: parts[0].to_string(),
+            found: parts[1] == "1",
+            strategy: parts[2].to_string(),
+            candidates: parts[3].parse().unwrap_or(0),
+            fitness: parts[4].parse().unwrap_or(0.0),
+            output_type: parts[5].to_string(),
+            m_chain_ran: parts[6] == "1",
+            best_source: parts[7].to_string(),
+            source: parts[8].to_string(),
+        })
+    }
+}
+
+/// Synthesize a single task and return a WorkerResult.
+/// Used by both sequential and parallel paths.
+fn synthesize_one_task(
+    name: &str,
+    task_depth: usize,
+    inputs_legacy: &[Value],
+    expected_legacy: &[Value],
+    arity_hint: Option<usize>,
+    test_inputs_legacy: &[Value],
+    test_expected_legacy: &[Value],
+    env: &types_v2::Env,
+    default_budget: usize,
+) -> WorkerResult {
+    let force_num = inputs_legacy.iter().chain(expected_legacy.iter())
+        .any(legacy_value_has_non_integral);
+    let convert = |v: &Value| -> types_v2::Value {
+        if force_num { legacy_value_to_v2_force_num(v) }
+        else { legacy_value_to_v2(v) }
+    };
+    let inputs: Vec<types_v2::Value> = inputs_legacy.iter().map(&convert).collect();
+    let expected: Vec<types_v2::Value> = expected_legacy.iter().map(&convert).collect();
+    let test_inputs: Vec<types_v2::Value> = test_inputs_legacy.iter().map(&convert).collect();
+    let test_expected: Vec<types_v2::Value> = test_expected_legacy.iter().map(&convert).collect();
+
+    let skip = synth_v2::default_skip_set();
+    let components = synth_v2::default_synth_components(env, &skip);
+    let universe = synth_v2::TypeUniverse::from_env(env);
+
+    let result = if let Some(arity) = arity_hint {
+        let first = match inputs.first() {
+            Some(types_v2::Value::List(items)) if items.len() == arity => items.clone(),
+            _ => {
+                return WorkerResult {
+                    name: name.to_string(), found: false, strategy: String::new(),
+                    candidates: 0, fitness: 0.0, output_type: String::new(),
+                    m_chain_ran: false, best_source: String::new(), source: String::new(),
+                };
+            }
+        };
+        let arg_types: Vec<crate::intern::Sym> = first.iter()
+            .map(|v| v.type_sym().unwrap_or_else(types_v2::type_any))
+            .collect();
+        let synth_result = synth_v2::synthesize_args_with_test(
+            &components, &inputs, &arg_types, &expected,
+            env, &universe, task_depth, default_budget,
+            &test_inputs, &test_expected,
+        );
+        let strategy = if synth_result.found {
+            Some(match synth_result.decomposer_name {
+                Some(n) => synth_v2::Strategy::Custom(n),
+                None => synth_v2::Strategy::Flat,
+            })
+        } else { None };
+        let output_type = synth_v2::infer_uniform_type_sym(&expected)
+            .map(|s| crate::intern::resolve(s))
+            .unwrap_or_else(|| "Mixed".to_string());
+        let has_decomposers = matches!(
+            env.lookup(intern("__decomposers__")),
+            Some(types_v2::Value::Ns(ref m)) if !m.is_empty()
+        );
+        let best_source = if !synth_result.found {
+            synth_result.best_nodes.as_ref().map(|nodes| {
+                let root = synth_result.best_root.unwrap_or(0);
+                eval_v2::node_to_source(nodes, root)
+            })
+        } else { None };
+        synth_v2::StrategyResult {
+            found: synth_result.found,
+            nodes: synth_result.nodes,
+            root: synth_result.root,
+            candidates_explored: synth_result.candidates_explored,
+            strategy,
+            output_type: Some(output_type),
+            m_chain_ran: has_decomposers,
+            best_fitness: synth_result.best_fitness,
+            best_source,
+        }
+    } else {
+        synth_v2::synthesize_with_strategies(
+            &components, &inputs, &expected,
+            env, &universe, task_depth, default_budget,
+        )
+    };
+
+    let strategy_name = result.strategy
+        .map(|s| s.name())
+        .unwrap_or_default();
+    let output_type = result.output_type.clone().unwrap_or_default();
+    let source = if result.found {
+        let nodes_vec = result.nodes.as_ref().expect("found implies nodes");
+        let root = result.root.expect("found implies root");
+        eval_v2::node_to_source(nodes_vec, root)
+    } else {
+        String::new()
+    };
+
+    WorkerResult {
+        name: name.to_string(),
+        found: result.found,
+        strategy: strategy_name,
+        candidates: result.candidates_explored,
+        fitness: result.best_fitness,
+        output_type,
+        m_chain_ran: result.m_chain_ran,
+        best_source: result.best_source.unwrap_or_default(),
+        source,
+    }
+}
+
+/// Run a parallel wavefront: fork N workers, each synthesizes a subset of tasks.
+/// Returns WorkerResults for all tasks in the batch.
+fn run_parallel_batch(
+    task_indices: &[usize],
+    tasks: &[(String, usize, Vec<Value>, Vec<Value>, Option<usize>, Vec<Value>, Vec<Value>)],
+    env: &types_v2::Env,
+    default_budget: usize,
+    n_workers: usize,
+) -> Vec<WorkerResult> {
+    use std::io::{BufRead, BufReader, Write as IoWrite};
+
+    // Partition tasks round-robin across workers.
+    let actual_workers = n_workers.min(task_indices.len()).max(1);
+    let mut chunks: Vec<Vec<usize>> = (0..actual_workers).map(|_| Vec::new()).collect();
+    for (i, &idx) in task_indices.iter().enumerate() {
+        chunks[i % actual_workers].push(idx);
+    }
+
+    let mut child_pids: Vec<(libc::pid_t, std::os::unix::io::RawFd)> = Vec::new();
+
+    for chunk in &chunks {
+        if chunk.is_empty() { continue; }
+
+        // Create pipe: [read_fd, write_fd]
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            eprintln!("  parallel: pipe() failed, falling back");
+            continue;
+        }
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        match unsafe { libc::fork() } {
+            -1 => {
+                eprintln!("  parallel: fork() failed");
+                unsafe { libc::close(read_fd); libc::close(write_fd); }
+            }
+            0 => {
+                // ── Child process ──
+                unsafe { libc::close(read_fd); }
+
+                // Convert raw fd to a File for buffered writing.
+                let mut file: std::fs::File = unsafe {
+                    std::os::unix::io::FromRawFd::from_raw_fd(write_fd)
+                };
+
+                for &task_idx in chunk {
+                    let (ref name, task_depth, ref inputs, ref expected,
+                         arity_hint, ref test_in, ref test_exp) = tasks[task_idx];
+                    let wr = synthesize_one_task(
+                        name, task_depth, inputs, expected,
+                        arity_hint, test_in, test_exp,
+                        env, default_budget,
+                    );
+                    let line = wr.to_line();
+                    let _ = writeln!(file, "{}", line);
+                }
+                drop(file); // Close write end before _exit.
+                // Exit without running destructors (avoid double-free of Rc state).
+                unsafe { libc::_exit(0); }
+            }
+            pid => {
+                // ── Parent process ──
+                unsafe { libc::close(write_fd); }
+                child_pids.push((pid, read_fd));
+            }
+        }
+    }
+
+    // Read results from all child pipes concurrently (threads in parent).
+    let handles: Vec<_> = child_pids.iter().map(|&(_pid, read_fd)| {
+        std::thread::spawn(move || {
+            let file = unsafe {
+                <std::fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(read_fd)
+            };
+            let reader = BufReader::new(file);
+            let mut results = Vec::new();
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    if let Some(wr) = WorkerResult::from_line(&line) {
+                        results.push(wr);
+                    }
+                }
+            }
+            results
+        })
+    }).collect();
+
+    let mut all_results = Vec::new();
+    for handle in handles {
+        if let Ok(results) = handle.join() {
+            all_results.extend(results);
+        }
+    }
+
+    // Wait for all children.
+    for &(pid, _) in &child_pids {
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0); }
+    }
+
+    all_results
+}
+
 fn cmd_grow_v2(args: &[String]) {
     if args.is_empty() {
-        eprintln!("Usage: selph grow-v2 <tasks.selph> [--budget N] [--depth N]");
+        eprintln!("Usage: selph grow-v2 <tasks.selph> [--budget N] [--depth N] [--parallel N] [--checkpoint PATH] [--no-checkpoint]");
         return;
     }
 
@@ -215,6 +568,9 @@ fn cmd_grow_v2(args: &[String]) {
     let mut default_budget: usize = 200000;
     let mut default_depth: usize = 2;
     let mut post_mortem_file: Option<String> = None;
+    let mut checkpoint_path: Option<String> = None;
+    let mut no_checkpoint = false;
+    let mut parallel_workers: usize = 0;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -228,6 +584,18 @@ fn cmd_grow_v2(args: &[String]) {
             }
             "--post-mortem" => {
                 post_mortem_file = args.get(i + 1).map(|s| s.to_string());
+                i += 2;
+            }
+            "--checkpoint" => {
+                checkpoint_path = args.get(i + 1).map(|s| s.to_string());
+                i += 2;
+            }
+            "--no-checkpoint" => {
+                no_checkpoint = true;
+                i += 1;
+            }
+            "--parallel" => {
+                parallel_workers = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
                 i += 2;
             }
             other => { task_file = other.to_string(); i += 1; }
@@ -245,9 +613,22 @@ fn cmd_grow_v2(args: &[String]) {
 
     let tasks = parse_curriculum_tasks(&task_source, default_depth);
 
+    // Resolve checkpoint path.
+    let ckpt_path = if no_checkpoint {
+        None
+    } else {
+        Some(checkpoint_path.unwrap_or_else(|| format!("{}.checkpoint", task_file)))
+    };
+
     eprintln!();
     eprintln!("SELPH grow-v2: {} tasks", tasks.len());
     eprintln!("  Budget: {}, Default depth: {}", default_budget, default_depth);
+    if parallel_workers > 0 {
+        eprintln!("  Parallel: {} workers", parallel_workers);
+    }
+    if let Some(ref p) = ckpt_path {
+        eprintln!("  Checkpoint: {}", p);
+    }
     eprintln!("  Core: synth_v2 + eval_v2 + types_v2 (no legacy consumer modules)");
     eprintln!();
 
@@ -271,6 +652,35 @@ fn cmd_grow_v2(args: &[String]) {
         eprintln!("(no tasks; preamble-only run)");
         return;
     }
+
+    // ── Checkpoint: load previously solved tasks ──────────────────
+    let preamble_hash = compute_preamble_hash(&task_source);
+    let mut checkpoint_solved: Vec<SolvedTask> = Vec::new();
+    let mut checkpoint_names: HashSet<String> = HashSet::new();
+
+    if let Some(ref ckpt) = ckpt_path {
+        let loaded = load_checkpoint(ckpt);
+        if !loaded.is_empty() {
+            eprintln!("  Checkpoint: {} previously solved tasks", loaded.len());
+            for st in &loaded {
+                match reconstruct_solution(&st.source, &env) {
+                    Ok(func @ types_v2::Value::Function(_)) => {
+                        env.define(intern(&st.name), func);
+                        checkpoint_names.insert(st.name.clone());
+                    }
+                    Ok(_) => {
+                        eprintln!("    checkpoint: {} did not eval to Function, skipping", st.name);
+                    }
+                    Err(e) => {
+                        eprintln!("    checkpoint: {} failed to reconstruct: {}", st.name, e);
+                    }
+                }
+            }
+            checkpoint_solved = loaded;
+            eprintln!("    {} restored into env", checkpoint_names.len());
+        }
+    }
+
     // §9.37 Stage B: type universe is rebuilt per task from
     // `__types__` so curriculum-defined types take effect mid-run.
 
@@ -286,8 +696,154 @@ fn cmd_grow_v2(args: &[String]) {
     let mut curriculum_results: Vec<types_v2::Value> = Vec::new();
 
     let task_count = tasks.len();
+
+    // ── Parallel wavefront path ──────────────────────────────────────
+    if parallel_workers > 0 {
+        // Build initial unsolved set (excluding checkpoint-restored tasks).
+        let mut unsolved: Vec<usize> = (0..tasks.len())
+            .filter(|i| !checkpoint_names.contains(&tasks[*i].0))
+            .collect();
+
+        // Count checkpoint-restored tasks in solved/strategy tallies.
+        for st in &checkpoint_solved {
+            solved += 1;
+            total_candidates += st.candidates;
+            *by_strategy.entry(st.strategy.clone()).or_insert(0) += 1;
+        }
+
+        let mut round = 0usize;
+        loop {
+            if unsolved.is_empty() { break; }
+            round += 1;
+            eprintln!("  ── Wavefront round {} ({} unsolved, {} workers) ──",
+                round, unsolved.len(), parallel_workers);
+
+            let worker_results = run_parallel_batch(
+                &unsolved, &tasks, &env, default_budget, parallel_workers,
+            );
+
+            // Index results by task name for fast lookup.
+            let result_map: std::collections::HashMap<String, &WorkerResult> =
+                worker_results.iter().map(|wr| (wr.name.clone(), wr)).collect();
+
+            let mut new_solved = 0usize;
+            let mut still_unsolved = Vec::new();
+
+            for &idx in &unsolved {
+                let name = &tasks[idx].0;
+                if let Some(wr) = result_map.get(name) {
+                    total_candidates += wr.candidates;
+
+                    if wr.found {
+                        // Reconstruct and bind into env.
+                        match reconstruct_solution(&wr.source, &env) {
+                            Ok(func @ types_v2::Value::Function(_)) => {
+                                env.define(intern(name), func);
+                            }
+                            Ok(_) => {
+                                eprintln!("    parallel: {} did not eval to Function", name);
+                            }
+                            Err(e) => {
+                                eprintln!("    parallel: {} reconstruct failed: {}", name, e);
+                            }
+                        }
+
+                        eprintln!(
+                            "  [{:>3}/{}] {:>4}  {:30}  {:>6} cand  {}",
+                            idx + 1, task_count, wr.strategy, name,
+                            wr.candidates, wr.source,
+                        );
+
+                        *by_strategy.entry(wr.strategy.clone()).or_insert(0) += 1;
+                        solved += 1;
+                        new_solved += 1;
+
+                        checkpoint_solved.push(SolvedTask {
+                            name: name.clone(),
+                            strategy: wr.strategy.clone(),
+                            candidates: wr.candidates,
+                            source: wr.source.clone(),
+                        });
+                    } else {
+                        still_unsolved.push(idx);
+                        if wr.fitness > 0.0 {
+                            eprintln!(
+                                "  [{:>3}/{}] FAIL  {:30}  {:>6} cand  fitness={:.3}",
+                                idx + 1, task_count, name, wr.candidates, wr.fitness,
+                            );
+                        }
+                    }
+
+                    // Build post-mortem result namespace.
+                    let mut rns = types_v2::NsMap::new();
+                    rns.insert(intern("name"), types_v2::Value::str(name.clone()));
+                    rns.insert(intern("found"), types_v2::Value::Bool(wr.found));
+                    rns.insert(intern("candidates"), types_v2::Value::Int(wr.candidates as i64));
+                    if !wr.output_type.is_empty() {
+                        rns.insert(intern("output-type"), types_v2::Value::str(wr.output_type.clone()));
+                    }
+                    rns.insert(intern("m-chain-ran"), types_v2::Value::Bool(wr.m_chain_ran));
+                    rns.insert(intern("strategy"), types_v2::Value::str(wr.strategy.clone()));
+                    rns.insert(intern("fitness"), types_v2::Value::Num(wr.fitness));
+                    if !wr.best_source.is_empty() {
+                        rns.insert(intern("best-source"), types_v2::Value::str(wr.best_source.clone()));
+                    }
+                    rns.insert(intern("max-candidates"), types_v2::Value::Int(default_budget as i64));
+                    curriculum_results.push(types_v2::Value::ns(rns));
+                } else {
+                    // Worker didn't report this task — shouldn't happen.
+                    still_unsolved.push(idx);
+                }
+            }
+
+            eprintln!("    Round {} complete: {} new solutions", round, new_solved);
+            unsolved = still_unsolved;
+
+            if new_solved == 0 { break; } // Fixed point.
+        }
+
+        // Build post-mortem entries for checkpoint-restored tasks.
+        for st in &checkpoint_solved {
+            if checkpoint_names.contains(&st.name) {
+                let mut rns = types_v2::NsMap::new();
+                rns.insert(intern("name"), types_v2::Value::str(st.name.clone()));
+                rns.insert(intern("found"), types_v2::Value::Bool(true));
+                rns.insert(intern("candidates"), types_v2::Value::Int(st.candidates as i64));
+                rns.insert(intern("strategy"), types_v2::Value::str(st.strategy.clone()));
+                rns.insert(intern("m-chain-ran"), types_v2::Value::Bool(true));
+                rns.insert(intern("fitness"), types_v2::Value::Num(1.0));
+                curriculum_results.push(types_v2::Value::ns(rns));
+            }
+        }
+    } else {
+    // ── Sequential path (original behavior) ──────────────────────────
     for (task_idx, (name, task_depth, inputs_legacy, expected_legacy, arity_hint,
          test_inputs_legacy, test_expected_legacy)) in tasks.iter().enumerate() {
+        // Skip tasks already restored from checkpoint.
+        if checkpoint_names.contains(name) {
+            let st = checkpoint_solved.iter().find(|s| s.name == *name);
+            let strategy_name = st.map(|s| s.strategy.as_str()).unwrap_or("Ckpt");
+            let cands = st.map(|s| s.candidates).unwrap_or(0);
+            eprintln!(
+                "  [{:>3}/{}] CKPT  {:30}  {:>6} cand  (cached)  {}",
+                task_idx + 1, task_count, name, cands, strategy_name,
+            );
+            *by_strategy.entry(strategy_name.to_string()).or_insert(0) += 1;
+            total_candidates += cands;
+            solved += 1;
+            // Build a minimal post-mortem entry for checkpointed tasks.
+            {
+                let mut rns = types_v2::NsMap::new();
+                rns.insert(intern("name"), types_v2::Value::str(name.clone()));
+                rns.insert(intern("found"), types_v2::Value::Bool(true));
+                rns.insert(intern("candidates"), types_v2::Value::Int(cands as i64));
+                rns.insert(intern("strategy"), types_v2::Value::str(strategy_name.to_string()));
+                rns.insert(intern("m-chain-ran"), types_v2::Value::Bool(true));
+                rns.insert(intern("fitness"), types_v2::Value::Num(1.0));
+                curriculum_results.push(types_v2::Value::ns(rns));
+            }
+            continue;
+        }
         // Convert legacy Values → v2 Values once per task. The legacy
         // parser produces Num(f64) for everything numeric; v2 prefers
         // Int(i64) when integral so the type universe stays Int-biased
@@ -449,6 +1005,14 @@ fn cmd_grow_v2(args: &[String]) {
                 }
             }
 
+            // Accumulate into checkpoint.
+            checkpoint_solved.push(SolvedTask {
+                name: name.clone(),
+                strategy: strategy_name.clone(),
+                candidates: result.candidates_explored,
+                source: source.clone(),
+            });
+
             solved += 1;
         } else {
             if result.best_fitness > 0.0 {
@@ -508,6 +1072,7 @@ fn cmd_grow_v2(args: &[String]) {
             curriculum_results.push(types_v2::Value::ns(rns));
         }
     }
+    } // end else (sequential path)
 
     let total_elapsed = total_start.elapsed();
     eprintln!();
@@ -548,6 +1113,12 @@ fn cmd_grow_v2(args: &[String]) {
         }
     }
     eprintln!("═════════════════════════════════════════════════════");
+
+    // Save checkpoint after synthesis completes.
+    if let Some(ref ckpt) = ckpt_path {
+        save_checkpoint(ckpt, &checkpoint_solved, preamble_hash);
+        eprintln!("  Checkpoint saved: {} entries → {}", checkpoint_solved.len(), ckpt);
+    }
 
     // §9.54: deferred post-mortem loading. If --post-mortem <file> was given,
     // load it NOW (after curriculum, before post-mortem call) so the ~190

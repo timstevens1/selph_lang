@@ -139,8 +139,18 @@
   (lambda (spec)
     (m-chain-try-or-next detect-constant-grid spec
       (lambda ()
-        (m-chain-try-or-next detect-library-shape spec
-          (lambda () (ns ("found" false))))))))
+        (m-chain-try-or-next detect-symmetry-grid spec
+          (lambda ()
+            (m-chain-try-or-next detect-recolor spec
+              (lambda ()
+                (m-chain-try-or-next detect-line-draw spec
+                  (lambda ()
+                    (m-chain-try-or-next detect-per-object spec
+                      (lambda ()
+                        (m-chain-try-or-next detect-template-stamp spec
+                          (lambda ()
+                            (m-chain-try-or-next detect-library-shape spec
+                              (lambda () (ns ("found" false))))))))))))))))))
 
 ; ── Top-level dispatcher ─────────────────────────────────────────────
 

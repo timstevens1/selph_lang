@@ -1,0 +1,578 @@
+; -------------------------------------------------------------------------
+; Meta-curriculum M8g-LD: directional line/ray drawing
+; -------------------------------------------------------------------------
+;
+; Detects tasks where the output is the input plus drawn horizontal or
+; vertical line segments connecting same-color markers. Covers:
+;
+;   Form 10:  H/V line between markers
+;             Two non-background cells of the same color on the same row
+;             (or column), output fills the gap between them.
+;
+;   Form 11:  H/V projection from marker to rectangle edge
+;             A non-background isolated cell and a filled rectangle;
+;             output draws a line from the cell to the nearest edge of
+;             the rectangle (same row or column).
+;
+; Detection strategy for each training pair:
+;   1. Compute cell-level diff: cells that changed between input and output.
+;   2. Check that all changed cells form one or more axis-aligned segments.
+;   3. For each segment, verify endpoints correspond to existing markers.
+;   4. If consistent across all pairs, emit the corresponding program.
+;
+; The emitted program uses grid-fill-rect with height=1 or width=1 to
+; draw segments, since grid-fill-rect handles both rects and lines.
+
+; ── Helpers ──────────────────────────────────────────────────────────
+
+(define mld-spec-inputs  (lambda (s) (ns-get s "inputs")))
+(define mld-spec-outputs (lambda (s) (ns-get s "outputs")))
+
+(define mld-grid-target
+  (lambda (s)
+    (let ((outs (mld-spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (grid? v))) outs true)
+        outs
+        nil))))
+
+; ── Diff computation ─────────────────────────────────────────────────
+;
+; Returns list of (row col new-color) for cells that differ between
+; input and output grids. Requires same dimensions.
+
+(define mld-grid-diff
+  (lambda (inp out)
+    (let ((h (length inp))
+          (w (length (head inp))))
+      (if (or (not (= (length out) h))
+              (not (= (length (head out)) w)))
+        nil
+        (reduce append
+          (map (lambda (r)
+                 (filter (lambda (e) (not (nil? e)))
+                   (map (lambda (c)
+                          (let ((iv (nth (nth inp r) c))
+                                (ov (nth (nth out r) c)))
+                            (if (= iv ov) nil (list r c ov))))
+                        (range w))))
+               (range h))
+          (list))))))
+
+; ── Segment detection ────────────────────────────────────────────────
+;
+; Given a list of diff cells (r c color), groups them into horizontal
+; or vertical segments. A segment is a maximal set of changed cells
+; sharing the same row (horizontal) or column (vertical) with
+; contiguous coordinates and the same color.
+;
+; Returns list of (ns ("dir" "h"/"v") ("color" int) ("row" int)
+;                     ("col-min" int) ("col-max" int))
+; or for vertical: ("col" int) ("row-min" int) ("row-max" int)
+
+; Check if diff cells form a single horizontal segment
+(define mld-is-h-segment?
+  (lambda (diffs)
+    (if (= (length diffs) 0) false
+      (let ((r0 (nth (head diffs) 0))
+            (c0 (nth (head diffs) 1))
+            (color (nth (head diffs) 2)))
+        (let ((all-same-row
+                (reduce (lambda (acc d) (and acc (= (nth d 0) r0))) diffs true))
+              (all-same-color
+                (reduce (lambda (acc d) (and acc (= (nth d 2) color))) diffs true)))
+          (if (and all-same-row all-same-color)
+            (let ((cols (map (lambda (d) (nth d 1)) diffs)))
+              (let ((cmin (reduce min cols (head cols)))
+                    (cmax (reduce max cols (head cols))))
+                ; Contiguous: count should equal span + 1
+                (if (= (length diffs) (+ 1 (- cmax cmin)))
+                  (ns ("dir" "h") ("color" color) ("row" r0)
+                      ("col-min" cmin) ("col-max" cmax))
+                  false)))
+            false))))))
+
+; Check if diff cells form a single vertical segment
+(define mld-is-v-segment?
+  (lambda (diffs)
+    (if (= (length diffs) 0) false
+      (let ((r0 (nth (head diffs) 0))
+            (c0 (nth (head diffs) 1))
+            (color (nth (head diffs) 2)))
+        (let ((all-same-col
+                (reduce (lambda (acc d) (and acc (= (nth d 1) c0))) diffs true))
+              (all-same-color
+                (reduce (lambda (acc d) (and acc (= (nth d 2) color))) diffs true)))
+          (if (and all-same-col all-same-color)
+            (let ((rows (map (lambda (d) (nth d 0)) diffs)))
+              (let ((rmin (reduce min rows (head rows)))
+                    (rmax (reduce max rows (head rows))))
+                (if (= (length diffs) (+ 1 (- rmax rmin)))
+                  (ns ("dir" "v") ("color" color) ("col" c0)
+                      ("row-min" rmin) ("row-max" rmax))
+                  false)))
+            false))))))
+
+; Group diff cells by color, then check each color group for segments.
+; Returns list of segment-ns, or nil if any group is not a valid segment.
+(define mld-extract-segments
+  (lambda (diffs)
+    (if (nil? diffs) nil
+      (if (= (length diffs) 0) (list)
+        ; Group by color
+        (let ((colors (reduce
+                        (lambda (acc d)
+                          (let ((c (nth d 2)))
+                            (if (contains acc c) acc (append acc (list c)))))
+                        diffs (list))))
+          (let ((groups (map (lambda (color)
+                              (filter (lambda (d) (= (nth d 2) color)) diffs))
+                            colors)))
+            ; For each group, try to split into segments.
+            ; For simplicity, each color group must be a single H or V segment.
+            (let ((segs (map (lambda (grp)
+                              (let ((h-seg (mld-is-h-segment? grp)))
+                                (if (not (= h-seg false)) h-seg
+                                  (let ((v-seg (mld-is-v-segment? grp)))
+                                    (if (not (= v-seg false)) v-seg
+                                      nil)))))
+                            groups)))
+              (if (reduce (lambda (acc s) (and acc (not (nil? s)))) segs true)
+                segs
+                nil))))))))
+
+; ── Marker verification (Form 10) ───────────────────────────────────
+;
+; For a horizontal segment on row r from col-min to col-max with color c:
+;   Check that the input grid has color c at (r, col-min-1) and (r, col-max+1)
+;   OR at (r, col-min) and (r, col-max) — endpoints are the markers themselves.
+;
+; The two markers bracket the segment. The segment fills between them.
+
+(define mld-find-bracket-markers-h
+  (lambda (inp seg)
+    (let ((r (ns-get seg "row"))
+          (cmin (ns-get seg "col-min"))
+          (cmax (ns-get seg "col-max"))
+          (color (ns-get seg "color"))
+          (w (length (head inp))))
+      ; Check markers at cmin-1 and cmax+1
+      (let ((left-ok (and (>= (- cmin 1) 0)
+                          (= (nth (nth inp r) (- cmin 1)) color)))
+            (right-ok (and (< (+ cmax 1) w)
+                           (= (nth (nth inp r) (+ cmax 1)) color))))
+        (if (and left-ok right-ok)
+          (ns ("left" (- cmin 1)) ("right" (+ cmax 1)))
+          ; Also check if markers are AT the segment endpoints (inclusive)
+          (let ((left-at (= (nth (nth inp r) cmin) color))
+                (right-at (= (nth (nth inp r) cmax) color)))
+            (if (and left-at right-at (> (- cmax cmin) 0))
+              (ns ("left" cmin) ("right" cmax))
+              nil)))))))
+
+(define mld-find-bracket-markers-v
+  (lambda (inp seg)
+    (let ((c (ns-get seg "col"))
+          (rmin (ns-get seg "row-min"))
+          (rmax (ns-get seg "row-max"))
+          (color (ns-get seg "color"))
+          (h (length inp)))
+      ; Check markers at rmin-1 and rmax+1
+      (let ((top-ok (and (>= (- rmin 1) 0)
+                         (= (nth (nth inp (- rmin 1)) c) color)))
+            (bot-ok (and (< (+ rmax 1) h)
+                         (= (nth (nth inp (+ rmax 1)) c) color))))
+        (if (and top-ok bot-ok)
+          (ns ("top" (- rmin 1)) ("bottom" (+ rmax 1)))
+          ; Check markers AT endpoints
+          (let ((top-at (= (nth (nth inp rmin) c) color))
+                (bot-at (= (nth (nth inp rmax) c) color)))
+            (if (and top-at bot-at (> (- rmax rmin) 0))
+              (ns ("top" rmin) ("bottom" rmax))
+              nil)))))))
+
+; ── Form 10: H/V line between markers ──────────────────────────────
+;
+; Detects tasks where pairs of same-color non-background markers on the
+; same row/column get connected by a line of that color.
+;
+; Algorithm:
+;   1. For each training pair, compute diff and extract segments.
+;   2. For each segment, verify bracket markers exist in the input.
+;   3. If all pairs have consistent segment structure, we have a match.
+;
+; The emitted program:
+;   - Finds non-background colors in the input.
+;   - For each non-background color, finds all positions of that color.
+;   - Groups positions by row (for H lines) and by column (for V lines).
+;   - Where a group has exactly 2 positions, fills between them.
+;
+; For simplicity and reliability, the emitted program iterates over
+; all non-background colors, finds positions, and draws lines between
+; pairs sharing a row or column. This is general enough to handle the
+; multi-segment case.
+
+; Try bracket check in the segment's declared direction; if the segment
+; is a single cell (ambiguous between H and V), also try the other
+; direction.
+(define mld-seg-is-single-cell?
+  (lambda (seg)
+    (let ((dir (ns-get seg "dir")))
+      (if (= dir "h")
+        (= (ns-get seg "col-min") (ns-get seg "col-max"))
+        (= (ns-get seg "row-min") (ns-get seg "row-max"))))))
+
+(define mld-seg-as-other-dir
+  (lambda (seg)
+    (let ((dir (ns-get seg "dir"))
+          (color (ns-get seg "color")))
+      (if (= dir "h")
+        ; Convert single-cell H to V
+        (ns ("dir" "v") ("color" color)
+            ("col" (ns-get seg "col-min"))
+            ("row-min" (ns-get seg "row")) ("row-max" (ns-get seg "row")))
+        ; Convert single-cell V to H
+        (ns ("dir" "h") ("color" color)
+            ("row" (ns-get seg "row-min"))
+            ("col-min" (ns-get seg "col")) ("col-max" (ns-get seg "col")))))))
+
+(define mld-check-bracket
+  (lambda (inp seg)
+    (let ((dir (ns-get seg "dir")))
+      (if (= dir "h")
+        (mld-find-bracket-markers-h inp seg)
+        (mld-find-bracket-markers-v inp seg)))))
+
+(define mld-verify-form-10-pair
+  (lambda (inp out)
+    (let ((diffs (mld-grid-diff inp out)))
+      (if (nil? diffs) nil
+        (if (= (length diffs) 0) true  ; no diff means identity — trivially ok
+          (let ((segs (mld-extract-segments diffs)))
+            (if (nil? segs) nil
+              ; Verify each segment has bracket markers
+              (reduce
+                (lambda (acc seg)
+                  (if (not acc) false
+                    (let ((primary (mld-check-bracket inp seg)))
+                      (if (not (nil? primary)) true
+                        ; For single-cell segments, try the other direction
+                        (if (mld-seg-is-single-cell? seg)
+                          (not (nil? (mld-check-bracket inp (mld-seg-as-other-dir seg))))
+                          false)))))
+                segs
+                true))))))))
+
+(define mld-try-form-10
+  (lambda (inputs outputs)
+    (let ((all-ok
+            (reduce
+              (lambda (acc i)
+                (if (not acc) false
+                  (let ((inp (head (nth inputs i)))
+                        (out (nth outputs i)))
+                    (let ((result (try (mld-verify-form-10-pair inp out) nil)))
+                      (if (nil? result) false
+                        (if (= result true) true false))))))
+              (range (length inputs))
+              true)))
+      (if all-ok
+        (ns ("kind" "form-10-line-between-markers")
+            ("source-node" (mld-build-form-10-ast)))
+        nil))))
+
+; ── Form 10 AST builder ─────────────────────────────────────────────
+;
+; Emits a lambda that:
+;   1. Gets the input grid (nth x 0)
+;   2. Gets the background color
+;   3. Gets all unique colors
+;   4. For each non-background color, finds positions and draws lines
+;      between pairs on the same row or column
+;
+; Since the emitted program needs loops that SELPH handles via reduce/map,
+; and building deeply nested AST for that is unwieldy, we use a simpler
+; approach: emit a call to a helper function defined at load time.
+
+(define mld-connect-markers
+  (lambda (g)
+    (let ((bg (grid-background g))
+          (colors (grid-colors g)))
+      (let ((non-bg (filter (lambda (c) (not (= c bg))) colors)))
+        (reduce
+          (lambda (acc-g color)
+            (let ((positions (grid-find-color acc-g color)))
+              (mld-connect-color-positions acc-g positions color)))
+          non-bg
+          g)))))
+
+; For a list of positions of the same color, find pairs sharing a row
+; or column and draw lines between them.
+(define mld-connect-color-positions
+  (lambda (g positions color)
+    (let ((n (length positions)))
+      (reduce
+        (lambda (acc-g i)
+          (reduce
+            (lambda (acc-g2 j)
+              (if (<= j i) acc-g2
+                (let ((pi (nth positions i))
+                      (pj (nth positions j)))
+                  (let ((ri (nth pi 0)) (ci (nth pi 1))
+                        (rj (nth pj 0)) (cj (nth pj 1)))
+                    (if (= ri rj)
+                      ; Same row — draw horizontal line
+                      (let ((cmin (if (< ci cj) ci cj))
+                            (cmax (if (< ci cj) cj ci)))
+                        (grid-fill-rect acc-g2 ri cmin ri cmax color))
+                      (if (= ci cj)
+                        ; Same column — draw vertical line
+                        (let ((rmin (if (< ri rj) ri rj))
+                              (rmax (if (< ri rj) rj ri)))
+                          (grid-fill-rect acc-g2 rmin ci rmax ci color))
+                        acc-g2))))))
+            (range n)
+            acc-g))
+        (range n)
+        g))))
+
+; Build AST that calls mld-connect-markers on (nth x 0)
+(define mld-build-form-10-ast
+  (lambda ()
+    (make-lambda (list "x")
+      (make-app "mld-connect-markers"
+        (make-app "nth" (make-symbol "x") (make-int 0))))))
+
+; ── Form 11: projection from marker to rectangle ────────────────────
+;
+; Detects tasks where an isolated marker draws a line towards the
+; nearest edge of a rectangle (filled region) in the same row or column.
+;
+; Detection:
+;   1. Compute diff — changed cells form H/V segments.
+;   2. One endpoint of each segment is a non-background isolated cell.
+;   3. The other endpoint is adjacent to a filled rectangular region.
+;
+; For simplicity, we detect this by checking:
+;   - The input has rectangular objects (connected components that are
+;     filled rectangles) and isolated single-cell markers.
+;   - The diff segments connect markers to rectangle edges.
+
+(define mld-cell-is-isolated?
+  (lambda (g r c bg)
+    (let ((v (nth (nth g r) c))
+          (h (length g))
+          (w (length (head g))))
+      (if (= v bg) false
+        ; Check all 4-neighbors are background or out-of-bounds
+        (let ((up    (if (> r 0)        (nth (nth g (- r 1)) c) bg))
+              (down  (if (< (+ r 1) h)  (nth (nth g (+ r 1)) c) bg))
+              (left  (if (> c 0)        (nth (nth g r) (- c 1)) bg))
+              (right (if (< (+ c 1) w)  (nth (nth g r) (+ c 1)) bg)))
+          (and (= up bg) (and (= down bg) (and (= left bg) (= right bg)))))))))
+
+; Find isolated markers (non-background cells with no same-color neighbors)
+(define mld-find-isolated-markers
+  (lambda (g)
+    (let ((bg (grid-background g))
+          (h (length g))
+          (w (length (head g))))
+      (reduce append
+        (map (lambda (r)
+               (filter (lambda (e) (not (nil? e)))
+                 (map (lambda (c)
+                        (if (mld-cell-is-isolated? g r c bg)
+                          (list r c (nth (nth g r) c))
+                          nil))
+                      (range w))))
+             (range h))
+        (list)))))
+
+; Check if a segment projects from a marker toward a filled region
+(define mld-verify-form-11-pair
+  (lambda (inp out)
+    (let ((diffs (mld-grid-diff inp out)))
+      (if (nil? diffs) nil
+        (if (= (length diffs) 0) true
+          (let ((segs (mld-extract-segments diffs)))
+            (if (nil? segs) nil
+              (let ((markers (mld-find-isolated-markers inp)))
+                (if (= (length markers) 0) nil
+                  ; Each segment must have one endpoint near a marker
+                  (reduce
+                    (lambda (acc seg)
+                      (if (not acc) false
+                        (mld-segment-touches-marker? seg markers)))
+                    segs
+                    true))))))))))
+
+; Check if a segment has an endpoint adjacent to any marker
+(define mld-segment-touches-marker?
+  (lambda (seg markers)
+    (let ((dir (ns-get seg "dir"))
+          (color (ns-get seg "color")))
+      (reduce
+        (lambda (found m)
+          (if found true
+            (let ((mr (nth m 0)) (mc (nth m 1)) (mcolor (nth m 2)))
+              (if (not (= mcolor color)) false
+                (if (= dir "h")
+                  (let ((r (ns-get seg "row"))
+                        (cmin (ns-get seg "col-min"))
+                        (cmax (ns-get seg "col-max")))
+                    (and (= mr r)
+                         (or (= mc (- cmin 1)) (= mc (+ cmax 1)))))
+                  (let ((c (ns-get seg "col"))
+                        (rmin (ns-get seg "row-min"))
+                        (rmax (ns-get seg "row-max")))
+                    (and (= mc c)
+                         (or (= mr (- rmin 1)) (= mr (+ rmax 1))))))))))
+        markers
+        false))))
+
+(define mld-try-form-11
+  (lambda (inputs outputs)
+    (let ((all-ok
+            (reduce
+              (lambda (acc i)
+                (if (not acc) false
+                  (let ((inp (head (nth inputs i)))
+                        (out (nth outputs i)))
+                    (let ((result (try (mld-verify-form-11-pair inp out) nil)))
+                      (if (nil? result) false
+                        (if (= result true) true false))))))
+              (range (length inputs))
+              true)))
+      (if all-ok
+        ; Form 11 also uses the connect-markers program since it draws
+        ; lines between same-color cells on shared rows/columns
+        (ns ("kind" "form-11-marker-to-rect")
+            ("source-node" (mld-build-form-10-ast)))
+        nil))))
+
+; ── Chain helper ─────────────────────────────────────────────────────
+
+(define mld-try-chain
+  (lambda (forms)
+    (if (= (length forms) 0)
+      (ns ("found" false) ("reason" "no line-draw shape matched"))
+      (let ((result (try ((head forms)) nil)))
+        (if (not (nil? result))
+          (ns-put result "found" true)
+          (mld-try-chain (tail forms)))))))
+
+; ── Top-level: detect-line-draw ──────────────────────────────────────
+
+(define detect-line-draw
+  (lambda (s)
+    (let ((target (mld-grid-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-grid target"))
+        (let ((inputs (ns-get s "inputs"))
+              (outputs (ns-get s "outputs")))
+          (mld-try-chain
+            (list
+              (lambda () (mld-try-form-10 inputs outputs))
+              (lambda () (mld-try-form-11 inputs outputs)))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(define mld-make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+(define mld-run-test
+  (lambda (label spec)
+    (let ((result (detect-line-draw spec)))
+      (if (ns-get result "found")
+        (print (concat "  OK " label " kind=" (ns-get result "kind")))
+        (print (concat "  FAIL " label " " (ns-get result "reason")))))))
+
+; Test 1: H-line between two markers on the same row
+; Input:  5x5 grid, bg=0, two red (2) markers at (1,0) and (1,4)
+; Output: same grid with row 1 filled with 2 from col 0 to col 4
+(define mld-test-hline-in
+  (list (list 0 0 0 0 0)
+        (list 2 0 0 0 2)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 0)))
+
+(define mld-test-hline-out
+  (list (list 0 0 0 0 0)
+        (list 2 2 2 2 2)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 0)))
+
+; Second training pair: markers at (3,1) and (3,3)
+(define mld-test-hline-in2
+  (list (list 0 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 3 0 3 0)
+        (list 0 0 0 0 0)))
+
+(define mld-test-hline-out2
+  (list (list 0 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 3 3 3 0)
+        (list 0 0 0 0 0)))
+
+(define mld-test-hline-spec
+  (mld-make-spec
+    (list (list mld-test-hline-in) (list mld-test-hline-in2))
+    (list mld-test-hline-out mld-test-hline-out2)
+    1))
+
+; Test 2: V-line between two markers on the same column
+; Input:  4x4 grid, bg=0, blue (1) markers at (0,2) and (3,2)
+; Output: column 2 filled with 1 from row 0 to row 3
+(define mld-test-vline-in
+  (list (list 0 0 1 0)
+        (list 0 0 0 0)
+        (list 0 0 0 0)
+        (list 0 0 1 0)))
+
+(define mld-test-vline-out
+  (list (list 0 0 1 0)
+        (list 0 0 1 0)
+        (list 0 0 1 0)
+        (list 0 0 1 0)))
+
+(define mld-test-vline-in2
+  (list (list 0 0 0 0)
+        (list 0 4 0 0)
+        (list 0 0 0 0)
+        (list 0 4 0 0)))
+
+(define mld-test-vline-out2
+  (list (list 0 0 0 0)
+        (list 0 4 0 0)
+        (list 0 4 0 0)
+        (list 0 4 0 0)))
+
+(define mld-test-vline-spec
+  (mld-make-spec
+    (list (list mld-test-vline-in) (list mld-test-vline-in2))
+    (list mld-test-vline-out mld-test-vline-out2)
+    1))
+
+; Test 3: no line pattern (should fail gracefully)
+(define mld-test-noline-spec
+  (mld-make-spec
+    (list (list (list (list 1 2) (list 3 4))))
+    (list (list (list 9 9) (list 9 9)))
+    1))
+
+; Test 4: verify emitted program actually works
+(define mld-test-program
+  (lambda ()
+    (let ((result (mld-connect-markers mld-test-hline-in)))
+      (if (= result mld-test-hline-out) "OK" "FAIL"))))
+
+(print "--- m8g_line_draw smoke tests ---")
+(mld-run-test "h-line between markers" mld-test-hline-spec)
+(mld-run-test "v-line between markers" mld-test-vline-spec)
+(mld-run-test "no-line pattern" mld-test-noline-spec)
+(print (concat "  program-check: " (mld-test-program)))
