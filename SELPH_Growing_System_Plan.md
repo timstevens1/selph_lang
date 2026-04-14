@@ -2,7 +2,7 @@
 
 ## From Enumerative Solver to Self-Building Architecture
 
-**Version 0.15 — April 13, 2026**
+**Version 0.16 — April 13, 2026**
 
 Cleaned up from v0.12 to reflect the project's current state. Detailed implementation logs from §9.1–§9.43 have been condensed into summaries; the full history is preserved in git. Sections 3–5 and 7–8 from the original plan have been collapsed — the project vision shifted significantly per §9.38 (symbolic-first, neural-contingent).
 
@@ -93,9 +93,8 @@ The M-chain is a set of recognition stages that run before enumeration. Each sta
 | Strings / POS | 28 | **28/28** | Type-dependent pools + Forms 1–6 recognizers |
 | Grids (ARC scaffolding) | 13 | **13/13** | Forms 1–8, cross-type bridges, object indexing |
 | Original 3-domain chain | 55 | **55/55** | Sequence → CF → NL, library cascade |
-| ARC-AGI-1 (training) | 400 | **28/400** | Grid Forms 1-9 + grid-untile + object-level primitives + color-map |
+| ARC-AGI-1 (training) | 400 | **31/400** | Grid Forms 1-9 + Phase 1 synthesis (29) + Phase 4 template transfer (+2) |
 | ARC-AGI-1 (evaluation) | 400 | **3/400** | M-chain forms tuned to training distribution; eval set is harder |
-| ARC-AGI-1 (eval + post-mortem) | 400 | **~4/400** | Post-mortem scaffold pipeline recovers ~1 additional task |
 
 ### 2.7 CLI Commands
 
@@ -226,9 +225,11 @@ Inspired by evolutionary ARC-AGI-2 approaches (Imbue Darwinian Evolver, SOAR). A
 **SELPH curriculum (3 new M-chain modules):**
 - `m_fitness_grid.selph`: grid-cell-accuracy, grid-fitness, fitness-category
 - `m_near_miss.selph`: per-example failure analysis, unary correction retry
-- `m_boost_heuristic.selph`: extract ops from near-miss source, build priority map, closed retry loop with `run-fitness-post-mortem`
+- `m_boost_heuristic.selph`: extract ops from near-miss source, build priority map, orchestrates 4-phase post-mortem via `run-fitness-post-mortem`
+- `m_phase3_compose.selph`: compositional near-miss wrapping — single transforms (103: 13 geometric + 90 recolor) and depth-2 pairs (~4K combinations across 3 directions)
+- `m_phase4_templates.selph`: template transfer from solved tasks — direct transfer + AST-based constant substitution with character-level position finding
 
-**Key finding:** Boost-based retry recovered 0/136 evaluation tasks because depth 2 exhausts. The bottleneck is M-chain form coverage, not search efficiency. The 80 evaluation near-misses are the actionable target.
+**Key finding:** Boost-based retry (Phase 2) recovered 0 tasks because depth 2 exhausts. Phase 3 composition recovered 0 — near-misses aren't simple-transform away from correct. Phase 4 template transfer recovered 2 (1 direct, 1 constant sub). The bottleneck is M-chain form coverage, not search efficiency or post-mortem recombination.
 
 ---
 
@@ -923,6 +924,69 @@ RD("f(g(x))") → sub_synthesize(g) → D&C: conditional inner function
    - **Conditional-per-cell**: classify cells by neighborhood → apply per-class rule
    - **Pattern-repeat**: detect repeating unit → synthesize unit transform → tile
 4. **Budget management.** Monitor whether recursive dispatch causes meaningful slowdown. If so, reduce per-strategy sub-budgets or add early-exit heuristics.
+
+---
+
+### 9.58 Five grid forms + self-refining residual synthesis (April 13, 2026)
+
+Added five new grid form detectors to the M-chain: symmetry (detect-symmetry-grid), recolor (detect-recolor), line-draw (detect-line-draw), per-object (detect-per-object), and template-stamp (detect-template-stamp). Also added m_refine — a self-refining residual synthesis decomposer that tries `solution(x) = correction(form(x))`: apply a base transform, measure cell-level fitness, then synthesize a correction on the residual.
+
+#### m_refine finding
+
+14 tasks triggered residual synthesis (base form scored >= 0.90), but 0 corrections were found. The residual transformations require the same spatial reasoning the system lacks. The decomposition `f(x) = correction(base_form(x))` only helps when corrections are shallow (color remap, trim), which existing M-chain forms already catch.
+
+#### Results
+
+ARC-AGI-1 train: 29/400 (was 28). Near-miss (>=90%): 83 tasks. The five new forms contribute directly to the solve count; m_refine establishes the infrastructure for compositional recovery but doesn't recover additional tasks.
+
+---
+
+### 9.60 Closed-loop post-mortem: Phase 3 composition + Phase 4 template transfer (April 13, 2026)
+
+Extended the post-mortem from 2 phases to 4, closing the generative side of the meta-learning loop. The system can now automatically discover and apply new solution strategies from its own results — though the current form vocabulary limits what it finds.
+
+#### Phase 3: Compositional near-miss wrapping (m_phase3_compose.selph)
+
+Inverts m_refine's failed strategy: instead of `correction(base_form(x))`, tries `simple_transform(best_candidate(x))` — use the near-miss best candidate AS the base, wrap with simple transforms.
+
+**Transform catalog:** 13 geometric (flip, rotate, transpose, trim, fill-enclosed, compact, gravity×4) + 90 recolors (all color pairs 0-9). Single pass: 103 transforms × 2 directions (before/after). Depth-2 pairs: geometric×geometric + geometric×recolor × 3 directions (after, before, mixed) ≈ 4K combinations per task.
+
+**Result:** 0/61 near-miss tasks recovered. Strong signal — the gap between near-misses and correct solutions is structural (spatial reasoning, per-object conditionals), not a missing flip or recolor.
+
+#### Phase 4: Template transfer (m_phase4_templates.selph)
+
+Extracts solution skeletons from solved tasks, groups by operation sequence, and tries transferring to unsolved tasks.
+
+**Direct transfer:** Try each solved task's exact solution on each unsolved task. Found 1: task `22168020` solved by the identical solution from `22eb0ac0`.
+
+**Constant substitution:** AST-based approach using character-level position finding. For each solved source, finds all single-digit integer tokens (color constants 0-9), generates single-position variants (K×9) and pair-position variants (for K≤3 constants). Found 1: task `5582e5ca` solved by color-substituted solution from `25ff71a9`.
+
+**Template decomposer registration:** Successful templates are registered into `__decomposers__` via `ns-put`, making them available for future synthesis runs. The generative loop is mechanically closed.
+
+#### Rust changes
+
+- Parallel post-mortem now includes `spec`, `test`, `depth` (was missing, broke Phases 2-4 in `--parallel` mode)
+- Solution source stored in post-mortem results for solved tasks (enables Phase 4 template extraction)
+
+#### Results
+
+| Phase | Recovered | Mechanism |
+|-------|-----------|-----------|
+| P1 (synthesis) | 29 | M-chain + Flat enumeration |
+| P2 (boost retry) | 0 | Depth 2 exhausts |
+| P3 (composition) | 0 | Near-misses need structural changes, not transform wrapping |
+| P4 (template transfer) | 2 | 1 direct + 1 constant sub |
+| **Total** | **31/400** | |
+
+#### Key insight
+
+The generative loop works mechanically — Phase 4 discovers and applies solution transfers automatically. But the current 29 solved solutions produce only 21 unique skeletons, and those skeletons don't generalize beyond 2 additional tasks. The 371 unsolved tasks need genuinely new forms (spatial reasoning, per-object conditionals, pattern completion), not recombinations of existing ones.
+
+#### What this tells us about closing the outer loop
+
+The diagnostic side is fully closed (fitness scoring → near-miss analysis → boost retry → composition wrapping → template transfer). The generative side is mechanically closed but capability-limited. To make it productive:
+1. New forms that solve different *classes* of tasks would dramatically increase Phase 4's template pool
+2. The 83 near-miss tasks (>=90% fitness) are the target — they represent tasks where the system is *close* but lacks one specific capability
 
 ---
 

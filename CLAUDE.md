@@ -77,13 +77,15 @@ Note: as of 2026-04-13, scaffolds solve 32/32 but provide no lift on ARC tasks (
 
 | Set | Solved | Near-miss (>=90%) | Near-miss (>=95%) | Time |
 |---|---|---|---|---|
-| ARC-AGI-1 train | 29/400 (7.25%) | 83 | 24 | ~31s |
+| ARC-AGI-1 train | 31/400 (7.75%) | 83 | 24 | ~31s + post-mortem |
 | ARC-AGI-1 eval | 3/400 (0.75%) | 80 | 27 | ~40s |
 
 - Depth-2 flat enumeration exhausts at ~1,174 candidates per task (1,286 with all forms)
-- 27/29 solved tasks use the M-chain; only 2 use Flat strategy
-- Phase 2 fitness retry recovers 0 additional tasks
-- Bottleneck is form coverage, not search budget
+- 27/29 Phase 1 tasks use the M-chain; only 2 use Flat strategy
+- Phase 2 boost retry recovers 0 additional tasks
+- Phase 3 compositional wrapping recovers 0 (near-misses need structural changes)
+- Phase 4 template transfer recovers 2 (1 direct transfer, 1 constant substitution)
+- Bottleneck is form coverage, not search budget or post-mortem recombination
 
 ### Near-miss analysis (85 tasks, fitness >= 0.90)
 
