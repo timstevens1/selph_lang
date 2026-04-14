@@ -28,7 +28,7 @@
 
 #![allow(dead_code)]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -297,7 +297,6 @@ fn eval_let(
     // today's behaviour.
     let frame = env.push_scope(Scope::new());
 
-    use std::cell::RefCell;
     let shared: SharedScope = Rc::new(RefCell::new(Scope::new()));
     let mut closure_names: Vec<Sym> = Vec::new();
 
@@ -474,24 +473,7 @@ fn eval_special(
 
 pub fn apply(f: &Value, args: &[Value], env: &Env) -> Result<Value, String> {
     match f {
-        Value::Function(fd) => {
-            // Build the parameter scope.
-            let mut scope = Scope::with_capacity(fd.params.len());
-            for (i, &p) in fd.params.iter().enumerate() {
-                if i < args.len() {
-                    scope.insert(p, args[i].clone());
-                }
-            }
-            // If this function was patched for letrec, push the shared
-            // letrec scope before the param scope so its names resolve.
-            let call_env = if let Some(shared) = &fd.letrec_scope {
-                let with_letrec = fd.captured_env.push_scope(shared.borrow().clone());
-                with_letrec.push_scope(scope)
-            } else {
-                fd.captured_env.push_scope(scope)
-            };
-            eval(&fd.body.nodes, fd.body.idx, &call_env)
-        }
+        Value::Function(fd) => apply_tco(fd, args),
         Value::Builtin(sym) => {
             let f = BUILTIN_TABLE
                 .with(|t| t.lookup(*sym))
@@ -499,6 +481,115 @@ pub fn apply(f: &Value, args: &[Value], env: &Env) -> Result<Value, String> {
             f(args, env)
         }
         _ => Err(format!("not callable: {:?}", f)),
+    }
+}
+
+/// Tail-call-optimized function application.  Loops instead of recursing
+/// when the body of a function is in tail position (If branches, Let bodies)
+/// and the tail expression is an App that resolves to another Function.
+fn apply_tco(initial_fd: &Rc<FunctionData>, initial_args: &[Value]) -> Result<Value, String> {
+    let mut cur_fd = Rc::clone(initial_fd);
+    let mut owned_args: Vec<Value> = initial_args.to_vec();
+
+    loop {
+        // Build the parameter scope.
+        let mut scope = Scope::with_capacity(cur_fd.params.len());
+        for (i, &p) in cur_fd.params.iter().enumerate() {
+            if i < owned_args.len() {
+                scope.insert(p, owned_args[i].clone());
+            }
+        }
+        let call_env = if let Some(shared) = &cur_fd.letrec_scope {
+            let with_letrec = cur_fd.captured_env.push_scope(shared.borrow().clone());
+            with_letrec.push_scope(scope)
+        } else {
+            cur_fd.captured_env.push_scope(scope)
+        };
+
+        // Walk tail positions iteratively.
+        let nodes = &cur_fd.body.nodes;
+        let mut idx = cur_fd.body.idx;
+        let mut env = call_env;
+
+        let result = loop {
+            match &nodes[idx] {
+                Node::If(cond, then_br, else_br) => {
+                    let c = eval(nodes, *cond, &env)?;
+                    idx = if is_truthy(&c) { *then_br } else { *else_br };
+                    // continue walking tail position
+                }
+                Node::Let(bindings, body) => {
+                    // Evaluate let bindings, then continue with body in tail position.
+                    env = {
+                        let frame = env.push_scope(Scope::new());
+                        let shared: SharedScope = Rc::new(RefCell::new(Scope::new()));
+                        let mut closure_names: Vec<Sym> = Vec::new();
+                        for (name, val_idx) in bindings {
+                            let v = eval(nodes, *val_idx, &frame)?;
+                            if matches!(&v, Value::Function(_))
+                                && matches!(&nodes[*val_idx], Node::Lambda(_, _))
+                            {
+                                closure_names.push(*name);
+                            }
+                            frame.define(*name, v);
+                        }
+                        if !closure_names.is_empty() {
+                            let mut top = frame.top_scope_mut();
+                            for cname in &closure_names {
+                                if let Some(Value::Function(fd)) = top.get(cname).cloned() {
+                                    let patched = FunctionData {
+                                        params: fd.params.clone(),
+                                        body: fd.body.clone(),
+                                        captured_env: fd.captured_env.clone(),
+                                        letrec_scope: Some(shared.clone()),
+                                    };
+                                    top.insert(*cname, Value::Function(Rc::new(patched)));
+                                }
+                            }
+                            let mut s = shared.borrow_mut();
+                            for (k, v) in top.iter() {
+                                s.insert(*k, v.clone());
+                            }
+                        }
+                        frame
+                    };
+                    idx = *body;
+                    // continue walking tail position
+                }
+                Node::App(children) if !children.is_empty() => {
+                    // Evaluate function and args.
+                    let f = eval(nodes, children[0], &env)?;
+                    let mut new_args = Vec::with_capacity(children.len() - 1);
+                    for &c in &children[1..] {
+                        new_args.push(eval(nodes, c, &env)?);
+                    }
+                    match f {
+                        Value::Function(fd) => {
+                            // Tail call — rebind and loop.
+                            cur_fd = fd;
+                            owned_args = new_args;
+                            break None; // signal: continue outer loop
+                        }
+                        Value::Builtin(sym) => {
+                            let bf = BUILTIN_TABLE
+                                .with(|t| t.lookup(sym))
+                                .ok_or_else(|| format!("unknown builtin: {}", resolve(sym)))?;
+                            break Some(bf(&new_args, &env));
+                        }
+                        _ => break Some(Err(format!("not callable: {:?}", f))),
+                    }
+                }
+                // Not a tail-optimizable form — fall through to normal eval.
+                _ => {
+                    break Some(eval(nodes, idx, &env));
+                }
+            }
+        };
+
+        match result {
+            None => continue, // tail call — outer loop rebinds params
+            Some(r) => return r,
+        }
     }
 }
 
@@ -599,6 +690,7 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("append"), bi_append);
     t.register(intern("range"), bi_range);
     t.register(intern("contains"), bi_contains);
+    t.register(intern("member?"), bi_member);
     t.register(intern("zip"), bi_zip);
     t.register(intern("enumerate"), bi_enumerate);
     t.register(intern("identity"), bi_identity);
@@ -760,7 +852,7 @@ fn build_default_scope() -> Scope {
         "print",
         // List
         "list", "head", "tail", "length", "nth", "cons", "slice",
-        "sort", "reverse", "append", "range", "contains", "zip",
+        "sort", "reverse", "append", "range", "contains", "member?", "zip",
         "enumerate", "identity",
         // Higher-order
         "map", "reduce", "filter", "apply",
@@ -1432,6 +1524,17 @@ fn bi_range(args: &[Value], _env: &Env) -> Result<Value, String> {
 fn bi_contains(args: &[Value], _env: &Env) -> Result<Value, String> {
     let l = args[0].as_list()?;
     let needle = &args[1];
+    Ok(Value::Bool(l.iter().any(|v| values_equal(v, needle))))
+}
+
+/// (member? needle list) — same as contains but with (needle, list) arg order,
+/// matching the Lisp/Scheme convention used by pm-member? in post_mortem.selph.
+fn bi_member(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("member?: expected 2 args (needle, list), got {}", args.len()));
+    }
+    let needle = &args[0];
+    let l = args[1].as_list()?;
     Ok(Value::Bool(l.iter().any(|v| values_equal(v, needle))))
 }
 
@@ -3427,8 +3530,17 @@ fn parse_spec_grid_pairs(spec: &Value) -> Result<Vec<(Vec<Vec<i64>>, Vec<Vec<i64
         let items = pair.as_list().map_err(|_| "spec pair must be a list".to_string())?;
         if items.len() < 2 { return Err("spec pair must have input and output".into()); }
         // Unwrap arity-1 wrapper: ((grid)) -> grid
+        // A wrapper is a 1-element list whose element is a grid (list of lists).
+        // A 1-row grid like ((1 2 3)) is also a 1-element list, but its element
+        // is a flat list of ints, not a list of lists.  Distinguish by checking
+        // whether l[0][0] is itself a list (grid row) or a scalar (1-row grid).
         let input = match &items[0] {
-            Value::List(l) if l.len() == 1 && matches!(&l[0], Value::List(_)) => as_grid(&l[0])?,
+            Value::List(l)
+                if l.len() == 1
+                    && matches!(&l[0], Value::List(inner) if !inner.is_empty() && matches!(&inner[0], Value::List(_))) =>
+            {
+                as_grid(&l[0])?
+            }
             v => as_grid(v)?,
         };
         let output = as_grid(&items[1])?;
@@ -6525,7 +6637,7 @@ mod tests {
     #[test]
     fn bucket6_synthesize_falls_through_to_memo() {
         // String→Int with no algorithmic relationship — Flat fails,
-        // Memo wins, the result lambda contains ns-get-or.
+        // Memo or D&C (§9.56 recursive dispatch) wins.
         let src = r#"
             (synthesize (ns
                 ("spec" (list (list "alpha" 13) (list "beta" 99) (list "gamma" 7)))
@@ -6536,9 +6648,11 @@ mod tests {
         match r {
             Value::Ns(map) => {
                 assert!(matches!(map.get(&intern("found")), Some(Value::Bool(true))));
-                assert!(matches!(map.get(&intern("strategy")), Some(Value::Str(s)) if s.as_ref() == "Memo"));
-                let source = map.get(&intern("source")).unwrap().as_str().unwrap().to_string();
-                assert!(source.contains("ns-get-or"), "got source: {}", source);
+                // §9.56: with recursive dispatch, D&C may solve this
+                // before Memo, since sub-synthesis routes through the
+                // full strategy chain.
+                let strat = map.get(&intern("strategy")).unwrap().as_str().unwrap().to_string();
+                assert!(strat == "Memo" || strat == "D&C", "unexpected strategy: {}", strat);
             }
             _ => panic!("expected Ns"),
         }
@@ -6546,13 +6660,11 @@ mod tests {
 
     #[test]
     fn bucket6_synthesize_returns_not_found_when_impossible() {
-        // Single distinct output that isn't reachable from the literal
-        // pool at depth 1 (D&C bails on <2 distinct outputs, Memo bails
-        // on Int input, BD bails on non-bool output, HO bails on no
-        // list/string structure, Flat at depth 1 can't construct 23).
+        // Conflicting spec: same input maps to different outputs.
+        // No strategy can satisfy this, even with recursive dispatch.
         let src = r#"
             (synthesize (ns
-                ("spec" (list (list 1 23) (list 2 23) (list 3 23)))
+                ("spec" (list (list 1 10) (list 1 20) (list 1 30)))
                 ("max-depth" 1)
                 ("max-candidates" 50)))
         "#;
@@ -7100,5 +7212,97 @@ mod tests {
             }
             other => panic!("expected Node, got {:?}", other),
         }
+    }
+
+    // ── member? builtin ──────────────────────────────────────────────────
+
+    #[test]
+    fn member_found() {
+        let r = run_file(r#"(member? 3 (list 1 2 3 4))"#).unwrap();
+        assert!(matches!(r, Value::Bool(true)));
+    }
+
+    #[test]
+    fn member_not_found() {
+        let r = run_file(r#"(member? 5 (list 1 2 3 4))"#).unwrap();
+        assert!(matches!(r, Value::Bool(false)));
+    }
+
+    #[test]
+    fn member_empty_list() {
+        let r = run_file(r#"(member? 1 (list))"#).unwrap();
+        assert!(matches!(r, Value::Bool(false)));
+    }
+
+    #[test]
+    fn member_string_needle() {
+        let r = run_file(r#"(member? "b" (list "a" "b" "c"))"#).unwrap();
+        assert!(matches!(r, Value::Bool(true)));
+    }
+
+    // ── tail-call optimization ───────────────────────────────────────────
+
+    #[test]
+    fn tco_simple_tail_recursion() {
+        // count-down would blow the stack without TCO at depth 256+
+        let r = run_file(r#"
+            (do
+              (define count-down (lambda (n)
+                (if (<= n 0) 0
+                  (count-down (- n 1)))))
+              (count-down 1000))
+        "#).unwrap();
+        assert!(matches!(r, Value::Int(0)), "expected 0, got {:?}", r);
+    }
+
+    #[test]
+    fn tco_accumulator_pattern() {
+        // sum 1..1000 via tail-recursive accumulator
+        let r = run_file(r#"
+            (do
+              (define sum-acc (lambda (n acc)
+                (if (<= n 0) acc
+                  (sum-acc (- n 1) (+ acc n)))))
+              (sum-acc 1000 0))
+        "#).unwrap();
+        assert!(matches!(r, Value::Int(500500)), "expected 500500, got {:?}", r);
+    }
+
+    #[test]
+    fn tco_mutual_recursion_via_let() {
+        // even?/odd? mutual recursion — tests TCO through let bodies
+        let r = run_file(r#"
+            (let ((even? (lambda (n) (if (= n 0) true  (odd?  (- n 1)))))
+                  (odd?  (lambda (n) (if (= n 0) false (even? (- n 1))))))
+              (even? 1000))
+        "#).unwrap();
+        assert!(matches!(r, Value::Bool(true)), "expected true, got {:?}", r);
+    }
+
+    #[test]
+    fn tco_member_like_pattern() {
+        // Direct equivalent of pm-member? — should not blow stack on large lists
+        let r = run_file(r#"
+            (do
+              (define my-member? (lambda (v lst)
+                (if (= (length lst) 0) false
+                  (if (= v (head lst)) true
+                    (my-member? v (tail lst))))))
+              (my-member? 999 (range 1000)))
+        "#).unwrap();
+        assert!(matches!(r, Value::Bool(true)), "expected true, got {:?}", r);
+    }
+
+    #[test]
+    fn tco_non_tail_recursion_still_works() {
+        // Fibonacci is NOT tail-recursive — should still work (just limited by depth)
+        let r = run_file(r#"
+            (do
+              (define fib (lambda (n)
+                (if (<= n 1) n
+                  (+ (fib (- n 1)) (fib (- n 2))))))
+              (fib 10))
+        "#).unwrap();
+        assert!(matches!(r, Value::Int(55)), "expected 55, got {:?}", r);
     }
 }

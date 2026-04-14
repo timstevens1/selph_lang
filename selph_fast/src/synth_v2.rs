@@ -1602,6 +1602,7 @@ pub fn higher_order_decompose(
     universe: &TypeUniverse,
     max_depth: usize,
     max_candidates: usize,
+    strategy_depth: usize,
 ) -> Option<(Vec<Node>, usize, usize)> {
     if inputs.is_empty() || inputs.len() != expected.len() {
         return None;
@@ -1623,6 +1624,7 @@ pub fn higher_order_decompose(
             universe,
             max_depth,
             budget_per_template,
+            strategy_depth,
         );
         total_explored += r.candidates_explored;
         if r.found {
@@ -1638,6 +1640,7 @@ type HoTemplate = fn(
     &[Value],
     &Env,
     &TypeUniverse,
+    usize,
     usize,
     usize,
 ) -> HoResult;
@@ -1730,6 +1733,7 @@ fn ho_try_list_map(
     universe: &TypeUniverse,
     max_depth: usize,
     max_candidates: usize,
+    strategy_depth: usize,
 ) -> HoResult {
     let mut sub_pairs: Vec<(Value, Value)> = Vec::new();
     for (inp, out) in inputs.iter().zip(expected.iter()) {
@@ -1750,7 +1754,7 @@ fn ho_try_list_map(
     };
     let (sub_inputs, sub_expected): (Vec<Value>, Vec<Value>) = sub_spec.into_iter().unzip();
 
-    let sr = synthesize(
+    let sr = sub_synthesize(
         components,
         &sub_inputs,
         &sub_expected,
@@ -1758,6 +1762,7 @@ fn ho_try_list_map(
         universe,
         max_depth,
         max_candidates,
+        strategy_depth,
     );
     let mut result = HoResult::empty();
     result.candidates_explored = sr.candidates_explored;
@@ -1803,6 +1808,7 @@ fn ho_try_list_filter(
     universe: &TypeUniverse,
     max_depth: usize,
     max_candidates: usize,
+    strategy_depth: usize,
 ) -> HoResult {
     let mut sub_pairs: Vec<(Value, Value)> = Vec::new();
     for (inp, out) in inputs.iter().zip(expected.iter()) {
@@ -1834,7 +1840,7 @@ fn ho_try_list_filter(
     };
     let (sub_inputs, sub_expected): (Vec<Value>, Vec<Value>) = sub_spec.into_iter().unzip();
 
-    let sr = synthesize(
+    let sr = sub_synthesize(
         components,
         &sub_inputs,
         &sub_expected,
@@ -1842,6 +1848,7 @@ fn ho_try_list_filter(
         universe,
         max_depth,
         max_candidates,
+        strategy_depth,
     );
     let mut result = HoResult::empty();
     result.candidates_explored = sr.candidates_explored;
@@ -1891,6 +1898,7 @@ fn ho_try_split_map_join(
     universe: &TypeUniverse,
     max_depth: usize,
     max_candidates: usize,
+    strategy_depth: usize,
 ) -> HoResult {
     let mut result = HoResult::empty();
 
@@ -1924,7 +1932,7 @@ fn ho_try_split_map_join(
         };
         let (sub_inputs, sub_expected): (Vec<Value>, Vec<Value>) = sub_spec.into_iter().unzip();
 
-        let sr = synthesize(
+        let sr = sub_synthesize(
             components,
             &sub_inputs,
             &sub_expected,
@@ -1932,6 +1940,7 @@ fn ho_try_split_map_join(
             universe,
             max_depth,
             max_candidates,
+            strategy_depth,
         );
         result.candidates_explored += sr.candidates_explored;
         if !sr.found {
@@ -2022,6 +2031,7 @@ fn ho_try_char_map_join(
     universe: &TypeUniverse,
     max_depth: usize,
     max_candidates: usize,
+    strategy_depth: usize,
 ) -> HoResult {
     let mut sub_pairs: Vec<(Value, Value)> = Vec::new();
     for (inp, out) in inputs.iter().zip(expected.iter()) {
@@ -2044,7 +2054,7 @@ fn ho_try_char_map_join(
     };
     let (sub_inputs, sub_expected): (Vec<Value>, Vec<Value>) = sub_spec.into_iter().unzip();
 
-    let sr = synthesize(
+    let sr = sub_synthesize(
         components,
         &sub_inputs,
         &sub_expected,
@@ -2052,6 +2062,7 @@ fn ho_try_char_map_join(
         universe,
         max_depth,
         max_candidates,
+        strategy_depth,
     );
     let mut result = HoResult::empty();
     result.candidates_explored = sr.candidates_explored;
@@ -2416,6 +2427,7 @@ pub fn divide_and_conquer(
     universe: &TypeUniverse,
     max_depth: usize,
     max_candidates: usize,
+    strategy_depth: usize,
 ) -> Option<(Vec<Node>, usize, usize)> {
     if inputs.is_empty() || inputs.len() != expected.len() {
         return None;
@@ -2467,6 +2479,7 @@ pub fn divide_and_conquer(
         max_depth,
         max_candidates,
         &mut total_explored,
+        strategy_depth,
     )?;
 
     // Wrap the body in a lambda and verify against every example.
@@ -2521,6 +2534,7 @@ fn dc_build_nested_if(
     max_depth: usize,
     max_candidates: usize,
     total_explored: &mut usize,
+    strategy_depth: usize,
 ) -> Option<(Vec<Node>, usize)> {
     if sorted_groups.len() == 1 {
         let (out_val, indices) = &sorted_groups[0];
@@ -2535,6 +2549,7 @@ fn dc_build_nested_if(
             max_depth,
             max_candidates,
             total_explored,
+            strategy_depth,
         );
     }
 
@@ -2556,6 +2571,7 @@ fn dc_build_nested_if(
         max_depth,
         max_candidates,
         total_explored,
+        strategy_depth,
     ) {
         let then_branch = dc_synthesize_branch(
             first_val,
@@ -2568,6 +2584,7 @@ fn dc_build_nested_if(
             max_depth,
             max_candidates,
             total_explored,
+            strategy_depth,
         )?;
         let else_branch = dc_build_nested_if(
             rest_groups,
@@ -2579,6 +2596,7 @@ fn dc_build_nested_if(
             max_depth,
             max_candidates,
             total_explored,
+            strategy_depth,
         )?;
         return Some(dc_merge_if(cond, then_branch, else_branch));
     }
@@ -2594,6 +2612,7 @@ fn dc_build_nested_if(
         max_depth,
         max_candidates,
         total_explored,
+        strategy_depth,
     ) {
         let then_branch = dc_build_nested_if(
             rest_groups,
@@ -2605,6 +2624,7 @@ fn dc_build_nested_if(
             max_depth,
             max_candidates,
             total_explored,
+            strategy_depth,
         )?;
         let else_branch = dc_synthesize_branch(
             first_val,
@@ -2617,6 +2637,7 @@ fn dc_build_nested_if(
             max_depth,
             max_candidates,
             total_explored,
+            strategy_depth,
         )?;
         return Some(dc_merge_if(cond, then_branch, else_branch));
     }
@@ -2670,6 +2691,7 @@ fn dc_find_separator(
     max_depth: usize,
     max_candidates: usize,
     total_explored: &mut usize,
+    strategy_depth: usize,
 ) -> Option<(Vec<Node>, usize)> {
     // Build the labeled sub-spec.
     let mut sub_inputs: Vec<Value> = Vec::with_capacity(true_indices.len() + false_indices.len());
@@ -2683,7 +2705,7 @@ fn dc_find_separator(
         sub_expected.push(Value::Bool(false));
     }
 
-    let r = synthesize(
+    let r = sub_synthesize(
         components,
         &sub_inputs,
         &sub_expected,
@@ -2691,6 +2713,7 @@ fn dc_find_separator(
         universe,
         max_depth,
         max_candidates,
+        strategy_depth,
     );
     *total_explored += r.candidates_explored;
     if !r.found {
@@ -2721,6 +2744,7 @@ fn dc_synthesize_branch(
     max_depth: usize,
     max_candidates: usize,
     total_explored: &mut usize,
+    strategy_depth: usize,
 ) -> Option<(Vec<Node>, usize)> {
     // Constant-branch shortcut: every output in this group is the
     // same value. Emit a literal Node and skip sub-synthesis entirely.
@@ -2743,7 +2767,7 @@ fn dc_synthesize_branch(
     let group_inputs: Vec<Value> = indices.iter().map(|&i| inputs[i].clone()).collect();
     let group_expected: Vec<Value> = indices.iter().map(|&i| expected[i].clone()).collect();
 
-    let r = synthesize(
+    let r = sub_synthesize(
         components,
         &group_inputs,
         &group_expected,
@@ -2751,6 +2775,7 @@ fn dc_synthesize_branch(
         universe,
         max_depth,
         max_candidates,
+        strategy_depth,
     );
     *total_explored += r.candidates_explored;
     if !r.found {
@@ -2836,6 +2861,7 @@ pub fn induce_decomposition(
     universe: &TypeUniverse,
     max_depth: usize,
     max_candidates: usize,
+    strategy_depth: usize,
 ) -> Option<(Vec<Node>, usize, usize)> {
     if inputs.is_empty() || inputs.len() != expected.len() {
         return None;
@@ -2862,7 +2888,7 @@ pub fn induce_decomposition(
 
         // Step 2 first: mid → expected. Cheaper to detect when this
         // can't work — if step 2 fails the intermediate is useless.
-        let step2 = synthesize(
+        let step2 = sub_synthesize(
             components,
             &mid.values,
             expected,
@@ -2870,6 +2896,7 @@ pub fn induce_decomposition(
             universe,
             max_depth,
             budget_per_step,
+            strategy_depth,
         );
         total_explored += step2.candidates_explored;
         if !step2.found {
@@ -2877,7 +2904,7 @@ pub fn induce_decomposition(
         }
 
         // Step 1: inputs → mid.
-        let step1 = synthesize(
+        let step1 = sub_synthesize(
             components,
             inputs,
             &mid.values,
@@ -2885,6 +2912,7 @@ pub fn induce_decomposition(
             universe,
             max_depth,
             budget_per_step,
+            strategy_depth,
         );
         total_explored += step1.candidates_explored;
         if !step1.found {
@@ -3830,6 +3858,7 @@ fn rd_sub_synthesize(
     max_depth: usize,
     max_candidates: usize,
     rd_depth: usize,
+    strategy_depth: usize,
 ) -> SynthResult {
     if rd_depth > 0 && inputs.len() >= 2 {
         let rd_budget = max_candidates / 3;
@@ -3842,6 +3871,7 @@ fn rd_sub_synthesize(
             max_depth,
             rd_budget,
             rd_depth - 1,
+            strategy_depth,
         );
         if rd.found {
             return SynthResult {
@@ -3856,13 +3886,13 @@ fn rd_sub_synthesize(
             };
         }
         let remaining = max_candidates.saturating_sub(rd.candidates_explored);
-        let sr = synthesize(components, inputs, expected, env, universe, max_depth, remaining);
+        let sr = sub_synthesize(components, inputs, expected, env, universe, max_depth, remaining, strategy_depth);
         return SynthResult {
             candidates_explored: sr.candidates_explored + rd.candidates_explored,
             ..sr
         };
     }
-    synthesize(components, inputs, expected, env, universe, max_depth, max_candidates)
+    sub_synthesize(components, inputs, expected, env, universe, max_depth, max_candidates, strategy_depth)
 }
 
 // ── Per-function dispatch ──────────────────────────────────────────────────
@@ -3881,6 +3911,7 @@ fn rd_try_single_function(
     max_candidates: usize,
     features: &RdSpecFeatures,
     rd_depth: usize,
+    strategy_depth: usize,
 ) -> RdResult {
     let mut result = RdResult::empty();
 
@@ -3897,6 +3928,7 @@ fn rd_try_single_function(
                     max_depth,
                     max_candidates,
                     rd_depth,
+                    strategy_depth,
                 );
                 result.candidates_explored += sr.candidates_explored;
                 if sr.found {
@@ -3924,6 +3956,7 @@ fn rd_try_single_function(
                     max_depth,
                     max_candidates / 2,
                     rd_depth,
+                    strategy_depth,
                 );
                 result.candidates_explored += sr.candidates_explored;
                 if sr.found {
@@ -3951,6 +3984,7 @@ fn rd_try_single_function(
                     max_depth,
                     remaining.min(max_candidates / 2),
                     rd_depth,
+                    strategy_depth,
                 );
                 result.candidates_explored += sr.candidates_explored;
                 if sr.found {
@@ -3981,6 +4015,7 @@ fn rd_try_single_function(
                     max_depth,
                     max_candidates,
                     rd_depth,
+                    strategy_depth,
                 );
                 result.candidates_explored += sr.candidates_explored;
                 if sr.found {
@@ -4009,6 +4044,7 @@ fn rd_try_single_function(
                     max_depth,
                     max_candidates,
                     rd_depth,
+                    strategy_depth,
                 );
                 result.candidates_explored += sr.candidates_explored;
                 if sr.found {
@@ -4043,6 +4079,7 @@ fn rd_try_single_function(
                     max_depth,
                     remaining / 2,
                     rd_depth,
+                    strategy_depth,
                 );
                 result.candidates_explored += sr.candidates_explored;
                 if sr.found {
@@ -4099,6 +4136,7 @@ fn rd_try_single_function(
                     max_depth,
                     max_candidates,
                     rd_depth,
+                    strategy_depth,
                 );
                 result.candidates_explored += sr.candidates_explored;
                 if sr.found {
@@ -4248,6 +4286,7 @@ fn rd_try_single_function(
                 universe,
                 max_depth,
                 max_candidates,
+                strategy_depth,
             ) {
                 result.candidates_explored += ho_explored;
                 result.found = true;
@@ -4267,6 +4306,7 @@ fn rd_try_single_function(
                 universe,
                 max_depth,
                 max_candidates,
+                strategy_depth,
             ) {
                 result.candidates_explored += dc_explored;
                 result.found = true;
@@ -4288,6 +4328,7 @@ fn rd_try_single_function(
                 max_depth,
                 max_candidates.saturating_sub(result.candidates_explored),
                 rd_depth,
+                strategy_depth,
             );
             result.candidates_explored += gen_r.candidates_explored;
             if gen_r.found {
@@ -4316,6 +4357,7 @@ fn rd_try_generic_binary_inversion(
     max_depth: usize,
     max_candidates: usize,
     rd_depth: usize,
+    strategy_depth: usize,
 ) -> RdResult {
     let mut result = RdResult::empty();
     let f_sym = intern(fn_name);
@@ -4423,6 +4465,7 @@ fn rd_try_generic_binary_inversion(
                 max_depth,
                 max_candidates / 2,
                 rd_depth,
+                strategy_depth,
             );
             result.candidates_explored += sr.candidates_explored;
             if sr.found {
@@ -4478,6 +4521,7 @@ fn rd_try_library_decomposition(
     max_depth: usize,
     max_candidates: usize,
     rd_depth: usize,
+    strategy_depth: usize,
 ) -> RdResult {
     let mut result = RdResult::empty();
     let phase_budget = max_candidates / 4;
@@ -4560,6 +4604,7 @@ fn rd_try_library_decomposition(
             max_depth,
             budget,
             rd_depth,
+            strategy_depth,
         );
         result.candidates_explored += sr.candidates_explored;
         if sr.found {
@@ -4652,6 +4697,7 @@ fn rd_recursive(
     max_depth: usize,
     max_candidates: usize,
     rd_depth: usize,
+    strategy_depth: usize,
 ) -> RdResult {
     if inputs.is_empty() || expected.is_empty() || inputs.len() != expected.len() {
         return RdResult::empty();
@@ -4685,6 +4731,7 @@ fn rd_recursive(
             budget,
             &features,
             rd_depth,
+            strategy_depth,
         );
         total_explored += r.candidates_explored;
         if r.found {
@@ -4707,6 +4754,7 @@ fn rd_recursive(
             max_depth,
             remaining,
             rd_depth,
+            strategy_depth,
         );
         total_explored += lr.candidates_explored;
         if lr.found {
@@ -4733,6 +4781,7 @@ pub fn recursive_decompose(
     universe: &TypeUniverse,
     max_depth: usize,
     max_candidates: usize,
+    strategy_depth: usize,
 ) -> Option<(Vec<Node>, usize, usize)> {
     let r = rd_recursive(
         components,
@@ -4743,6 +4792,7 @@ pub fn recursive_decompose(
         max_depth,
         max_candidates,
         RD_DEFAULT_DEPTH,
+        strategy_depth,
     );
     if r.found {
         Some((r.nodes, r.root, r.candidates_explored))
@@ -5003,6 +5053,55 @@ fn try_type_keyed_decomposers(
     None
 }
 
+// ── Recursive sub-synthesis dispatch ──────────────────────────────────────
+//
+// §9.56 composability: when `strategy_depth > 0`, sub-problems from
+// HO/D&C/Induction/RD route through the full strategy chain (M-chain,
+// Flat, RD, HO, D&C, Induction, Memo) with decremented depth. At
+// depth 0, sub-synthesis is flat enumeration only (the previous behavior).
+//
+// This enables cross-strategy composition:
+//   HO detects "map F over objects" → sub-synthesize F → M-chain finds
+//   F = grid-rotate-cw(grid-flip-h(x))
+//
+// Depth limit prevents infinite recursion (e.g. HO→HO→HO...).
+
+/// Sub-synthesis helper for decomposition strategies. Routes through
+/// the full strategy dispatcher when `strategy_depth > 0`, otherwise
+/// falls back to flat enumeration.
+fn sub_synthesize(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    max_candidates: usize,
+    strategy_depth: usize,
+) -> SynthResult {
+    if strategy_depth > 0 {
+        let sr = synthesize_with_strategies_depth(
+            components, inputs, expected, env, universe,
+            max_depth, max_candidates, strategy_depth - 1,
+        );
+        SynthResult {
+            found: sr.found,
+            nodes: sr.nodes,
+            root: sr.root,
+            candidates_explored: sr.candidates_explored,
+            decomposer_name: sr.strategy.and_then(|s| match s {
+                Strategy::Custom(sym) => Some(sym),
+                _ => None,
+            }),
+            best_fitness: sr.best_fitness,
+            best_nodes: None,
+            best_root: None,
+        }
+    } else {
+        synthesize(components, inputs, expected, env, universe, max_depth, max_candidates)
+    }
+}
+
 pub fn synthesize_with_strategies(
     components: &[SynthComponent],
     inputs: &[Value],
@@ -5011,6 +5110,25 @@ pub fn synthesize_with_strategies(
     universe: &TypeUniverse,
     max_depth: usize,
     flat_budget: usize,
+) -> StrategyResult {
+    synthesize_with_strategies_depth(
+        components, inputs, expected, env, universe, max_depth, flat_budget, 1,
+    )
+}
+
+/// Inner dispatcher with explicit `strategy_depth` tracking.
+/// When `strategy_depth > 0`, sub-synthesis in HO/D&C/Induction/RD
+/// routes through the full strategy chain (decrementing depth).
+/// At `strategy_depth == 0`, sub-synthesis uses flat enumeration only.
+fn synthesize_with_strategies_depth(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    flat_budget: usize,
+    strategy_depth: usize,
 ) -> StrategyResult {
     // §9.49 post-mortem diagnostics: infer output type tag once.
     let output_type_str = infer_uniform_type_sym(expected)
@@ -5094,6 +5212,7 @@ pub fn synthesize_with_strategies(
         universe,
         max_depth,
         flat_budget,
+        strategy_depth,
     ) {
         total_explored += rd_explored;
         return stamp(StrategyResult {
@@ -5142,6 +5261,7 @@ pub fn synthesize_with_strategies(
         universe,
         max_depth,
         flat_budget,
+        strategy_depth,
     ) {
         total_explored += ho_explored;
         return stamp(StrategyResult {
@@ -5169,6 +5289,7 @@ pub fn synthesize_with_strategies(
         universe,
         max_depth,
         flat_budget,
+        strategy_depth,
     ) {
         total_explored += dc_explored;
         return stamp(StrategyResult {
@@ -5196,6 +5317,7 @@ pub fn synthesize_with_strategies(
         universe,
         max_depth,
         flat_budget,
+        strategy_depth,
     ) {
         total_explored += in_explored;
         return stamp(StrategyResult {
@@ -7582,9 +7704,15 @@ mod tests {
             200,
         );
         assert!(r.found);
-        assert_eq!(r.strategy, Some(Strategy::Memo));
+        // §9.56: with recursive dispatch, D&C may fire before Memo
+        // since sub-synthesis can now route through the full chain.
+        // The important thing is that it's found and correct.
+        assert!(
+            r.strategy == Some(Strategy::Memo)
+            || r.strategy == Some(Strategy::DivideConquer)
+        );
 
-        // Verify the memo solution actually works.
+        // Verify the solution actually works.
         let (nodes, root) = (r.nodes.unwrap(), r.root.unwrap());
         let nodes_rc: Rc<[Node]> = nodes.into();
         let f = eval_v2::eval(&nodes_rc, root, &env).unwrap();
@@ -7594,12 +7722,8 @@ mod tests {
 
     #[test]
     fn dispatcher_returns_not_found_when_no_strategy_applies() {
-        // Single distinct output (so D&C bails — needs ≥2 groups), Int
-        // input (so Memo bails — needs string keys), and target value
-        // 23 which is unreachable at depth 1 using the literal pool
-        // {0,1,2,3,4,5,6,7,10,-1}. No atomic predicate or arity-2
-        // composition produces 23. So Flat, BD, HO, D&C, and Memo all
-        // give up.
+        // Conflicting spec: same input maps to different outputs.
+        // No strategy can satisfy this, even with recursive dispatch.
         init_special_forms();
         let env = eval_v2::make_default_env();
         let universe = TypeUniverse::primitives();
@@ -7607,8 +7731,8 @@ mod tests {
 
         let r = synthesize_with_strategies(
             &comps,
-            &[Value::Int(1), Value::Int(2), Value::Int(3)],
-            &[Value::Int(23), Value::Int(23), Value::Int(23)],
+            &[Value::Int(1), Value::Int(1), Value::Int(1)],
+            &[Value::Int(10), Value::Int(20), Value::Int(30)],
             &env,
             &universe,
             1,
@@ -7943,7 +8067,7 @@ mod tests {
         ];
 
         let r = higher_order_decompose(
-            &comps, &inputs, &expected, &env, &universe, 2, 2000,
+            &comps, &inputs, &expected, &env, &universe, 2, 2000, 1,
         )
         .expect("HO should solve via list-map");
 
@@ -7974,7 +8098,7 @@ mod tests {
         ];
 
         let (nodes, root, _explored) = higher_order_decompose(
-            &comps, &inputs, &expected, &env, &universe, 2, 2000,
+            &comps, &inputs, &expected, &env, &universe, 2, 2000, 1,
         )
         .expect("HO should solve via list-filter");
 
@@ -8006,7 +8130,7 @@ mod tests {
         ];
 
         let (nodes, root, _explored) = higher_order_decompose(
-            &comps, &inputs, &expected, &env, &universe, 2, 2000,
+            &comps, &inputs, &expected, &env, &universe, 2, 2000, 1,
         )
         .expect("HO should solve via split-map-join");
 
@@ -8043,7 +8167,7 @@ mod tests {
         // are single-word, so split-map-join's `any_multi` check fails
         // for every delimiter and HO falls through to char-map-join.
         let (nodes, root, _explored) = higher_order_decompose(
-            &comps, &inputs, &expected, &env, &universe, 2, 2000,
+            &comps, &inputs, &expected, &env, &universe, 2, 2000, 1,
         )
         .expect("HO should solve via char-map-join");
 
@@ -8071,6 +8195,7 @@ mod tests {
             &universe,
             2,
             500,
+            1,
         );
         assert!(r.is_none());
     }
@@ -8161,7 +8286,7 @@ mod tests {
         ];
 
         let (nodes, root, _explored) = divide_and_conquer(
-            &comps, &inputs, &expected, &env, &universe, 2, 5000,
+            &comps, &inputs, &expected, &env, &universe, 2, 5000, 1,
         )
         .expect("D&C should solve two-constant classification");
 
@@ -8198,7 +8323,7 @@ mod tests {
         ];
 
         let (nodes, root, _explored) = divide_and_conquer(
-            &comps, &inputs, &expected, &env, &universe, 2, 10000,
+            &comps, &inputs, &expected, &env, &universe, 2, 10000, 1,
         )
         .expect("D&C should solve three-way classification");
 
@@ -8227,6 +8352,7 @@ mod tests {
             &universe,
             2,
             500,
+            1,
         );
         assert!(r.is_none());
     }
@@ -8261,7 +8387,13 @@ mod tests {
             &comps, &inputs, &expected, &env, &universe, 2, 10000,
         );
         assert!(r.found);
-        assert_eq!(r.strategy, Some(Strategy::DivideConquer));
+        // §9.56: with recursive dispatch, RD may solve classification
+        // tasks that were previously only reachable by D&C, because
+        // RD's sub-synthesis now routes through the full chain.
+        assert!(
+            r.strategy == Some(Strategy::DivideConquer)
+            || r.strategy == Some(Strategy::RecursiveDecomposition)
+        );
     }
 
     // ── Induction strategy tests ────────────────────────────────────────
@@ -8307,7 +8439,7 @@ mod tests {
         ];
 
         let r = induce_decomposition(
-            &comps, &inputs, &expected, &env, &universe, 2, 5000,
+            &comps, &inputs, &expected, &env, &universe, 2, 5000, 1,
         );
         // Even with a curated catalog, induction needs both halves to
         // sub-synthesize. If it can't, the test still asserts that the
@@ -8418,7 +8550,7 @@ mod tests {
         let universe = TypeUniverse::primitives();
         let comps = primitive_components();
         let r = induce_decomposition(
-            &comps, &[], &[], &env, &universe, 2, 100,
+            &comps, &[], &[], &env, &universe, 2, 100, 1,
         );
         assert!(r.is_none());
     }
@@ -8505,7 +8637,7 @@ mod tests {
             Value::Int(30),
         ];
         let r = recursive_decompose(
-            &comps, &inputs, &expected, &env, &universe, 1, 5000,
+            &comps, &inputs, &expected, &env, &universe, 1, 5000, 1,
         );
         let (nodes, root, _explored) = r.expect("RD should solve x*(x+1) at max-depth=1");
         let nodes_rc: Rc<[Node]> = nodes.into();
@@ -8563,7 +8695,7 @@ mod tests {
         ];
 
         let r = recursive_decompose(
-            &comps, &inputs, &expected, &env, &universe, 1, 5000,
+            &comps, &inputs, &expected, &env, &universe, 1, 5000, 1,
         );
         let (nodes, root, _explored) =
             r.expect("RD should solve string-upper∘wrap via library bridge");
@@ -8616,7 +8748,7 @@ mod tests {
         let env = eval_v2::make_default_env();
         let universe = TypeUniverse::primitives();
         let comps = primitive_components();
-        let r = recursive_decompose(&comps, &[], &[], &env, &universe, 2, 100);
+        let r = recursive_decompose(&comps, &[], &[], &env, &universe, 2, 100, 1);
         assert!(r.is_none());
     }
 

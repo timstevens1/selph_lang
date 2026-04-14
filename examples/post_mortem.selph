@@ -18,11 +18,8 @@
   (lambda (results)
     (filter (lambda (r) (not (ns-get r "found"))) results)))
 
-(define pm-member?
-  (lambda (v lst)
-    (if (= (length lst) 0) false
-      (if (= v (head lst)) true
-        (pm-member? v (tail lst))))))
+; pm-member? — delegates to the Rust `member?` builtin (§9.56).
+(define pm-member? member?)
 
 (define pm-unique
   (lambda (lst)

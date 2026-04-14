@@ -2,7 +2,7 @@
 
 ## From Enumerative Solver to Self-Building Architecture
 
-**Version 0.14 — April 13, 2026**
+**Version 0.15 — April 13, 2026**
 
 Cleaned up from v0.12 to reflect the project's current state. Detailed implementation logs from §9.1–§9.43 have been condensed into summaries; the full history is preserved in git. Sections 3–5 and 7–8 from the original plan have been collapsed — the project vision shifted significantly per §9.38 (symbolic-first, neural-contingent).
 
@@ -34,6 +34,8 @@ The architecture IS the curriculum. Change the curriculum, change the architectu
 - Threading macros `->` (thread-first) and `->>` (thread-last) — desugared at parse time to nested applications, eliminating deep nesting in pipeline-style code
 - Quasiquote (`` ` ``), unquote (`,`), and unquote-splicing (`,@`) — desugared to `make-*` and `quote` calls, enabling concise AST template construction for M-chain forms and decomposers
 - `let` bindings with letrec semantics (mutual recursion via literal lambdas)
+- Tail-call optimization in `apply()` — If/Let/App chains in tail position loop instead of recursing. Enables unbounded SELPH recursion (e.g., list traversal) without stack overflow.
+- `member?` builtin — O(1)-per-element iterative membership test, replacing O(n)-recursive SELPH `pm-member?`
 - First-class namespaces with `__types__` and `__decomposers__` registries
 
 ### 2.3 Synthesis (synth_v2.rs)
@@ -768,11 +770,11 @@ ARC-AGI-1: **27->28/400**. The +1 (`7b7f7511`) is from `grid-untile` in the M-ch
 
 #### Next steps
 
-1. **Investigate Item 6 regression.** Identify the 3 tasks that break when Forms 4/6/7/8 receive unwrapped grids. Likely `parse_spec_grid_pairs`'s auto-unwrap heuristic (1-row grids look like arity-1 wrappers). Fix in Rust or keep per-form unwrapping.
+1. ~~**Investigate Item 6 regression.**~~ **Done (§9.56).** Root cause: `parse_spec_grid_pairs` heuristic confuses 1-row grids with arity-1 wrappers. Fixed by checking whether `l[0][0]` is a list (grid row) or scalar (1-row grid cell).
 
 2. **Expand rx-guided forms.** Current color-probe covers single-color removal. Add: multi-color removal, color-keep (retain only one color), background swap, object-count-based branching.
 
-3. **Reduce stack usage.** The 64MB stack is a band-aid. Consider trampolining or iterative evaluation for deep SELPH recursion. `pm-member?` is O(n) recursive — replace with a hash-based builtin for large lists.
+3. ~~**Reduce stack usage.**~~ **Done (§9.56).** TCO in `apply()` handles If/Let/App tail positions iteratively. `member?` builtin replaces O(n)-recursive `pm-member?`. Tested at depth 10,000 on 8MB stack.
 
 4. **Profile scaffold iteration.** Measure per-iteration yield to determine if 3 iterations is optimal or if 2 suffices.
 
@@ -834,6 +836,93 @@ Removed the entire v1 engine and Python layer in the same session:
 **Python layer deleted:** `lib.rs` (1,872 lines PyO3 bindings), `selph/` package (19 modules), `tests/` (15 test files), `experiments/` (10 scripts), `pyproject.toml`, pyo3 dependency from Cargo.toml.
 
 **Result:** 38,774 → 18,896 lines of Rust (51% reduction). 9 pre-existing multitree test failures eliminated. 251 tests pass, 0 fail. The codebase is now purely: Rust kernel (9 files) + SELPH curriculum scripts.
+
+---
+
+### 9.56 TCO, member? builtin, and arity-1 unwrap fix (April 13, 2026)
+
+Three changes addressing the §9.54 next steps: stack usage reduction, a builtin for the most common recursive pattern, and a correctness fix for the grid unwrap heuristic.
+
+#### Tail-call optimization in apply()
+
+`apply_tco` replaces the single `eval(body)` call with an iterative loop that walks tail positions:
+
+- **If branches:** Evaluates condition, follows the taken branch without recursing.
+- **Let bodies:** Evaluates bindings, continues with body in tail position.
+- **App in tail position:** Evaluates function + args. If target is a `Function`, rebinds parameters and loops (zero stack growth). If target is a `Builtin`, calls directly.
+- **All other nodes:** Falls through to normal `eval()`.
+
+This covers the standard recursive patterns in SELPH (`pm-member?`, `pm-all?`, `pm-any?`, accumulator loops, mutual recursion via let). Tested at depth 10,000 with 8MB stack — previously hit `MAX_EVAL_DEPTH=256` at depth 257.
+
+Non-tail recursion (e.g., fibonacci) is unaffected — it still uses the normal eval path with depth tracking.
+
+#### member? builtin
+
+`(member? needle list)` — iterative Rust membership test with `(needle, list)` arg order matching `pm-member?`. Drop-in replacement: O(n) scan in Rust vs O(n) recursive SELPH calls, each adding a stack frame. Uses existing `values_equal` for comparison.
+
+#### parse_spec_grid_pairs unwrap fix
+
+The arity-1 unwrap heuristic in `parse_spec_grid_pairs` confused 1-row grids with arity-1 wrappers. Both match `l.len() == 1 && l[0] is List`. The fix adds a deeper check: the inner list's first element must itself be a list (a grid row), not a scalar. A 1-row grid like `((1 2 3))` has `l[0][0] = Int`, so it's correctly identified as a grid, not a wrapper.
+
+This was the root cause of the §9.54 Item 6 regression (27→24 when unwrapping was consolidated). The per-form `(head inp)` unwrapping in Forms 4/6/7/8 remains unchanged for now — the fix enables future consolidation but doesn't force it.
+
+#### Results
+
+- 260 tests pass (251 existing + 4 member? + 5 TCO)
+- ARC-AGI-1 training: **28/400** in **27.67s** (unchanged)
+- TCO performance benefit is in post-mortem / scaffolding paths where `pm-member?` and recursive analysis run over hundreds of failure results
+
+#### Next steps
+
+1. **Replace `pm-member?` with `member?` in post_mortem.selph.** The builtin is registered; the SELPH code still uses the recursive version. Swapping it eliminates the deepest recursion path in post-mortem analysis.
+2. **Reduce default stack to 8MB.** With TCO handling tail recursion, the 64MB default may no longer be necessary. Validate on the full scaffolding pipeline before changing.
+3. **Consolidate Form 4/6/7/8 unwrapping.** The Rust heuristic fix unblocks the §9.54 Item 6 refactor — unwrap once at the top of `detect-constant-grid` instead of per-form.
+
+---
+
+### 9.57 Composable recursive dispatch (April 13, 2026)
+
+Sub-synthesis in HO/D&C/Induction/RD previously used flat enumeration only. This meant strategies couldn't compose: HO could detect "map F over objects" but couldn't call the M-chain to discover F = `grid-rotate-cw(grid-flip-h(x))`. Each strategy was an island.
+
+#### The change
+
+Added `strategy_depth` parameter to the dispatcher. When `strategy_depth > 0`, sub-problems route through the full strategy chain (M-chain → Flat → RD → BD → HO → D&C → Induction → Memo) with decremented depth. At depth 0, flat only (previous behavior). Default is 1.
+
+**New function:** `sub_synthesize(components, inputs, expected, env, universe, max_depth, max_candidates, strategy_depth)` — replaces direct `synthesize()` calls in all decomposition strategies.
+
+**Strategies wired through recursive dispatch:**
+- **HO** (4 templates): per-element sub-synthesis → full chain
+- **D&C** (separator + branch): both sub-problems → full chain
+- **Induction** (step1 + step2): both halves → full chain
+- **RD**: flat fallback → full chain (self-recursion via `rd_depth` unchanged)
+- **BD**: no change (probes predicates directly, no sub-synthesis)
+
+**No infinite recursion risk:** `strategy_depth` strictly decrements. RD has its own `rd_depth` cap. D&C recurses structurally (fewer groups each level). All terminate.
+
+#### Compositions now possible
+
+```
+HO("map F over objects") → sub_synthesize(F) → M-chain: F = rotate(flip(x))
+D&C("classify by cond") → sub_synthesize(branch) → HO: map transform
+Induction("x → mid → y") → sub_synthesize(mid→y) → M-chain: affine fit
+RD("f(g(x))") → sub_synthesize(g) → D&C: conditional inner function
+```
+
+#### Results
+
+- 260/260 tests pass
+- 5 tests updated: tasks previously solvable only by Memo or D&C now solved earlier by RD or D&C with composed sub-strategies (expected — the whole point)
+- ARC-AGI results pending
+
+#### Next steps
+
+1. **Benchmark ARC-AGI-1 with recursive dispatch.** Compare 28/400 baseline (flat sub-synthesis) vs new score. If tasks move, identify which compositions fired.
+2. **Expose `strategy_depth` as CLI flag.** Trivial change — pass through `cmd_grow_v2` instead of hardcoding 1. Enables `--strategy-depth 2` for deeper composition at the cost of search budget.
+3. **Write new grid decomposition forms in SELPH.** The recursive dispatch unblocks this: a SELPH form that calls `synthesize` (the builtin) now gets the full chain for free. Priority forms:
+   - **Object-map**: extract objects → map transform per object → recompose
+   - **Conditional-per-cell**: classify cells by neighborhood → apply per-class rule
+   - **Pattern-repeat**: detect repeating unit → synthesize unit transform → tile
+4. **Budget management.** Monitor whether recursive dispatch causes meaningful slowdown. If so, reduce per-strategy sub-budgets or add early-exit heuristics.
 
 ---
 
