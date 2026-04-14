@@ -42,7 +42,7 @@ The architecture IS the curriculum. Change the curriculum, change the architectu
 - Deferred materialization (lightweight PendingDesc, on-demand node trees)
 - Arity 1–3 support with adaptive type-count caps
 - Type reachability filtering (40–65% candidate reduction)
-- RL reward propagation (partial match scores adjust pool priorities)
+- §9.55 fitness tracking: cell-level similarity scores per candidate, best-so-far tracking, fitness in SynthResult
 - Early depth extension (targeted composition probes)
 - Domain-based component filtering (grid ops excluded for string tasks, etc.)
 - Auto-constant extraction, probe-and-filter, observational equivalence dedup
@@ -91,9 +91,9 @@ The M-chain is a set of recognition stages that run before enumeration. Each sta
 | Strings / POS | 28 | **28/28** | Type-dependent pools + Forms 1–6 recognizers |
 | Grids (ARC scaffolding) | 13 | **13/13** | Forms 1–8, cross-type bridges, object indexing |
 | Original 3-domain chain | 55 | **55/55** | Sequence → CF → NL, library cascade |
-| ARC-AGI-1 (eval) | 400 | **28/400** | Grid Forms 1-9 + grid-untile + object-level primitives + color-map |
-| ARC-AGI-1 (cold, no scaffold curriculum) | 400 | **4/400** | M-chain + auto-scaffolding loop recovers 1 task |
-| ARC-AGI-1 (with post-mortem pipeline) | 400 | **28/400** | §9.54: 176 scaffolds solved, 0 additional tasks recovered |
+| ARC-AGI-1 (training) | 400 | **28/400** | Grid Forms 1-9 + grid-untile + object-level primitives + color-map |
+| ARC-AGI-1 (evaluation) | 400 | **3/400** | M-chain forms tuned to training distribution; eval set is harder |
+| ARC-AGI-1 (eval + post-mortem) | 400 | **~4/400** | Post-mortem scaffold pipeline recovers ~1 additional task |
 
 ### 2.7 CLI Commands
 
@@ -206,6 +206,27 @@ Key innovations:
 - **Recognition logic is easy; the shared substrate it reads from is the hard part:** When migrating kernel passes to M-stages, the pool-isolation gap caused regressions. Future M-stage curricula should plan for shared data structures at design time.
 - **Priority scoring must normalize by arity:** Sum-based scoring creates systematic bias toward higher-arity compositions. Average-based scoring normalizes this.
 - **Scaffolding must match the composition chain:** Each step in a multi-step composition needs a separate curriculum stage so promoted macros have correct types and high priority.
+- **Depth 2 exhausts — search ordering only matters when budget constrains:** At depth 2, flat enumeration produces ~1,174 candidates and explores them all. Priority reordering, fitness-guided boosting, and online learning are no-ops on an exhausted search. These techniques become valuable at depth 3+ where combinatorial explosion exceeds budget.
+- **Fitness is diagnostic gold, not a search signal (at depth 2):** Cell-level fitness on failed tasks reveals 80 near-misses (>=90% accuracy) on ARC-AGI-1 evaluation. This directly identifies which M-chain forms to build next. The 28/400 was on training; evaluation is 3/400 — the M-chain forms are distribution-specific.
+
+### 4.9 Fitness-Guided Synthesis (§9.55, April 13, 2026)
+
+Inspired by evolutionary ARC-AGI-2 approaches (Imbue Darwinian Evolver, SOAR). Added:
+
+**Rust kernel:**
+- `value_similarity()` for cell-level grid comparison
+- `test_candidate` returns fitness (0.0–1.0) alongside outcome
+- `synthesize_inner` tracks best-so-far candidate during enumeration
+- `SynthResult`/`StrategyResult` carry fitness + best_source for post-mortem
+- `bi_synthesize_args` accepts `("heuristic" fn)` for priority boosting
+- Progress counter `[N/M]` and fitness on FAIL lines
+
+**SELPH curriculum (3 new M-chain modules):**
+- `m_fitness_grid.selph`: grid-cell-accuracy, grid-fitness, fitness-category
+- `m_near_miss.selph`: per-example failure analysis, unary correction retry
+- `m_boost_heuristic.selph`: extract ops from near-miss source, build priority map, closed retry loop with `run-fitness-post-mortem`
+
+**Key finding:** Boost-based retry recovered 0/136 evaluation tasks because depth 2 exhausts. The bottleneck is M-chain form coverage, not search efficiency. The 80 evaluation near-misses are the actionable target.
 
 ---
 
