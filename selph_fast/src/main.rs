@@ -810,7 +810,8 @@ fn cmd_grow_v2(args: &[String]) {
         }
         // Then: tasks that went through the wavefront.
         for idx in 0..tasks.len() {
-            let name = &tasks[idx].0;
+            let (name, task_depth, inputs_legacy, expected_legacy, arity_hint,
+                 test_inputs_legacy, test_expected_legacy) = &tasks[idx];
             if checkpoint_names.contains(name) { continue; }
             if let Some(wr) = last_result.get(name) {
                 let mut rns = types_v2::NsMap::new();
@@ -826,7 +827,38 @@ fn cmd_grow_v2(args: &[String]) {
                 if !wr.best_source.is_empty() {
                     rns.insert(intern("best-source"), types_v2::Value::str(wr.best_source.clone()));
                 }
+                // For solved tasks, store solution source for Phase 4 template transfer.
+                if wr.found && !wr.source.is_empty() {
+                    rns.insert(intern("best-source"), types_v2::Value::str(wr.source.clone()));
+                }
                 rns.insert(intern("max-candidates"), types_v2::Value::Int(default_budget as i64));
+                rns.insert(intern("depth"), types_v2::Value::Int(*task_depth as i64));
+                if let Some(arity) = arity_hint {
+                    rns.insert(intern("arity"), types_v2::Value::Int(*arity as i64));
+                }
+                // Convert legacy values to v2 for spec/test.
+                let force_num = inputs_legacy.iter().chain(expected_legacy.iter())
+                    .any(legacy_value_has_non_integral);
+                let convert = |v: &Value| -> types_v2::Value {
+                    if force_num { legacy_value_to_v2_force_num(v) }
+                    else { legacy_value_to_v2(v) }
+                };
+                let inputs: Vec<types_v2::Value> = inputs_legacy.iter().map(&convert).collect();
+                let expected: Vec<types_v2::Value> = expected_legacy.iter().map(&convert).collect();
+                let spec_pairs: Vec<types_v2::Value> = inputs.iter()
+                    .zip(expected.iter())
+                    .map(|(i, e)| types_v2::Value::list(vec![i.clone(), e.clone()]))
+                    .collect();
+                rns.insert(intern("spec"), types_v2::Value::list(spec_pairs));
+                if !test_inputs_legacy.is_empty() {
+                    let test_inputs: Vec<types_v2::Value> = test_inputs_legacy.iter().map(&convert).collect();
+                    let test_expected: Vec<types_v2::Value> = test_expected_legacy.iter().map(&convert).collect();
+                    let test_pairs: Vec<types_v2::Value> = test_inputs.iter()
+                        .zip(test_expected.iter())
+                        .map(|(i, e)| types_v2::Value::list(vec![i.clone(), e.clone()]))
+                        .collect();
+                    rns.insert(intern("test"), types_v2::Value::list(test_pairs));
+                }
                 curriculum_results.push(types_v2::Value::ns(rns));
             }
         }
@@ -1083,6 +1115,15 @@ fn cmd_grow_v2(args: &[String]) {
             rns.insert(intern("fitness"), types_v2::Value::Num(result.best_fitness));
             if let Some(ref best_src) = result.best_source {
                 rns.insert(intern("best-source"), types_v2::Value::str(best_src.clone()));
+            }
+            // For solved tasks, store the solution source so Phase 4
+            // template transfer can use it.
+            if result.found {
+                if let Some(ref st) = checkpoint_solved.last() {
+                    if st.name == *name {
+                        rns.insert(intern("best-source"), types_v2::Value::str(st.source.clone()));
+                    }
+                }
             }
             curriculum_results.push(types_v2::Value::ns(rns));
         }

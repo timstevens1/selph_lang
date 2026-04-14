@@ -1,0 +1,454 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Phase 3: composition recovery (post-mortem)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; After Phase 1 (main synthesis) and Phase 2 (boost retry), many tasks
+; remain unsolved but have near-miss candidates with >= 80% cell accuracy.
+;
+; m_refine (§9.58) tried correction(form(x)) — synthesize a correction
+; on top of a base form. That failed because the residual corrections
+; are as complex as the original task.
+;
+; Phase 3 inverts this: use the BEST CANDIDATE as the base, and try
+; wrapping it with a single simple transform from a fixed catalog:
+;
+;   Direction A: simple_transform(best_candidate(input))
+;   Direction B: best_candidate(simple_transform(input))
+;
+; This is cheap (no synthesis — just enumerate known transforms) and
+; catches cases where the candidate is correct modulo a flip, rotation,
+; trim, gravity, or other simple grid operation.
+
+; ── Configuration ──────────────────────────────────────────────────────
+
+(define p3-fitness-threshold 0.80)
+
+; ── Transform catalog ──────────────────────────────────────────────────
+;
+; Each entry: (name, compute-fn, ast-name, extra-ast-args)
+;   compute-fn: grid -> grid
+;   ast-name: string name of the builtin for AST construction
+;   extra-ast-args: list of additional AST args (e.g. direction int)
+;
+; We skip identity — Phase 1 already tried that.
+
+(define p3-geometric-transforms
+  (list
+    (list "grid-flip-h"      (lambda (g) (grid-flip-h g))      "grid-flip-h"      (list))
+    (list "grid-flip-v"      (lambda (g) (grid-flip-v g))      "grid-flip-v"      (list))
+    (list "grid-rotate-cw"   (lambda (g) (grid-rotate-cw g))   "grid-rotate-cw"   (list))
+    (list "grid-rotate-ccw"  (lambda (g) (grid-rotate-ccw g))  "grid-rotate-ccw"  (list))
+    (list "grid-rotate-180"  (lambda (g) (grid-rotate-180 g))  "grid-rotate-180"  (list))
+    (list "grid-transpose"   (lambda (g) (grid-transpose g))   "grid-transpose"   (list))
+    (list "grid-trim"        (lambda (g) (grid-trim g))        "grid-trim"        (list))
+    (list "grid-fill-enclosed" (lambda (g) (grid-fill-enclosed g)) "grid-fill-enclosed" (list))
+    (list "grid-compact"     (lambda (g) (grid-compact g))     "grid-compact"     (list))
+    (list "grid-gravity-down"  (lambda (g) (grid-gravity g 0)) "grid-gravity"     (list 0))
+    (list "grid-gravity-right" (lambda (g) (grid-gravity g 1)) "grid-gravity"     (list 1))
+    (list "grid-gravity-up"    (lambda (g) (grid-gravity g 2)) "grid-gravity"     (list 2))
+    (list "grid-gravity-left"  (lambda (g) (grid-gravity g 3)) "grid-gravity"     (list 3))))
+
+; ── Recolor transforms ───────────────────────────────────────────────
+;
+; For each color pair (from, to) where from != to, 0-9:
+;   (grid-replace-color g from to)
+; 90 transforms total.
+
+(define p3-make-recolor-tx
+  (lambda (from to)
+    (list (concat "recolor-" (to-string from) "->" (to-string to))
+          (lambda (g) (grid-replace-color g from to))
+          "grid-replace-color"
+          (list from to))))
+
+(define p3-recolor-transforms
+  (let ((colors (range 10)))
+    (reduce (lambda (acc from)
+      (reduce (lambda (acc2 to)
+        (if (= from to) acc2
+          (cons (p3-make-recolor-tx from to) acc2)))
+        colors acc))
+      colors (list))))
+
+; Combined: geometric first, then recolor for single-pass
+; (reduce cons recolor-list geometric-list) prepends each recolor onto geometric,
+; so geometric ends up at the tail. We want geometric first, so we append recolors.
+(define p3-unary-transforms
+  (reduce (lambda (acc tx) (cons tx acc))
+    p3-geometric-transforms
+    p3-recolor-transforms))
+
+; Accessors
+(define p3-tx-name     (lambda (tx) (nth tx 0)))
+(define p3-tx-fn       (lambda (tx) (nth tx 1)))
+(define p3-tx-ast-name (lambda (tx) (nth tx 2)))
+(define p3-tx-ast-args (lambda (tx) (nth tx 3)))
+
+; ── AST builders ───────────────────────────────────────────────────────
+
+; Build AST node for applying a transform, with optional extra int args.
+(define p3-make-tx-ast
+  (lambda (tx inner-ast)
+    (let ((extra (p3-tx-ast-args tx)))
+      (if (= (length extra) 0)
+        (make-app (p3-tx-ast-name tx) inner-ast)
+        (if (= (length extra) 1)
+          (make-app (p3-tx-ast-name tx) inner-ast (make-int (nth extra 0)))
+          (if (= (length extra) 2)
+            (make-app (p3-tx-ast-name tx) inner-ast
+              (make-int (nth extra 0)) (make-int (nth extra 1)))
+            inner-ast))))))
+
+; Build: (lambda (x) (transform (best-fn x)))
+; Direction A — wrap after
+(define p3-build-wrap-after-ast
+  (lambda (tx best-source)
+    (let ((best-node (parse-source best-source)))
+      (let ((children (node-children best-node)))
+        (let ((best-body (if (= (length children) 1)
+                           (nth children 0)
+                           (nth children (- (length children) 1)))))
+          (make-lambda (list "x")
+            (p3-make-tx-ast tx best-body)))))))
+
+; Build: (lambda (x) (best-fn (transform (nth x 0))))
+; Direction B — wrap before (transform the input before passing to candidate)
+; The candidate expects input as (list grid), so we extract, transform,
+; re-wrap, then feed to the candidate body.
+(define p3-build-wrap-before-ast
+  (lambda (tx best-source)
+    (let ((tx-input (p3-make-tx-ast tx (make-app "nth" (make-symbol "x") (make-int 0)))))
+      (let ((best-node (parse-source best-source)))
+        (let ((children (node-children best-node)))
+          (let ((best-body (if (= (length children) 1)
+                             (nth children 0)
+                             (nth children (- (length children) 1)))))
+            (make-lambda (list "x")
+              (make-let
+                (list (list "x" (make-app "list" tx-input)))
+                best-body))))))))
+
+; ── Validation engine ──────────────────────────────────────────────────
+
+; Check if composed-fn(input) == expected for all pairs in a spec list.
+; Each pair is (input expected).
+(define p3-validate-all
+  (lambda (composed-fn pairs)
+    (if (= (length pairs) 0)
+      true
+      (reduce
+        (lambda (ok pair)
+          (if (not ok) false
+            (let ((inp (head pair))
+                  (expected (head (tail pair))))
+              (let ((pred (try (composed-fn inp) nil)))
+                (if (nil? pred) false
+                  (= pred expected))))))
+        pairs
+        true))))
+
+; ── Try one transform direction on one task ────────────────────────────
+
+; Direction A: transform(best-fn(input))
+(define p3-try-wrap-after
+  (lambda (tx best-fn spec test-pairs)
+    (let ((tx-fn (p3-tx-fn tx)))
+      (let ((composed (lambda (inp) (tx-fn (best-fn inp)))))
+        (if (not (p3-validate-all composed spec))
+          nil
+          (if (not (p3-validate-all composed test-pairs))
+            nil
+            tx))))))
+
+; Direction B: best-fn(list (transform (nth input 0)))
+(define p3-try-wrap-before
+  (lambda (tx best-fn spec test-pairs)
+    (let ((tx-fn (p3-tx-fn tx)))
+      (let ((composed (lambda (inp) (best-fn (list (tx-fn (head inp)))))))
+        (if (not (p3-validate-all composed spec))
+          nil
+          (if (not (p3-validate-all composed test-pairs))
+            nil
+            tx))))))
+
+; ── Try all transforms on one task ─────────────────────────────────────
+
+; Single-transform scan (depth 1)
+(define p3-scan-transforms
+  (lambda (transforms best-fn best-source spec test-pairs direction)
+    (if (= (length transforms) 0)
+      nil
+      (let ((tx (head transforms)))
+        (let ((hit (try
+                     (if (= direction "after")
+                       (p3-try-wrap-after tx best-fn spec test-pairs)
+                       (p3-try-wrap-before tx best-fn spec test-pairs))
+                     nil)))
+          (if (not (nil? hit))
+            ; Found a match! Build result.
+            (let ((ast (try
+                         (if (= direction "after")
+                           (p3-build-wrap-after-ast tx best-source)
+                           (p3-build-wrap-before-ast tx best-source))
+                         nil)))
+              (let ((src (concat "(" (p3-tx-name tx) " " direction " " best-source ")")))
+                (ns ("found" true)
+                    ("source" src)
+                    ("nodes" ast)
+                    ("transform" (p3-tx-name tx))
+                    ("direction" direction))))
+            (p3-scan-transforms (tail transforms) best-fn best-source
+              spec test-pairs direction)))))))
+
+; ── Depth-2 pair composition ─────────────────────────────────────────
+;
+; Direction A2: t2(t1(best_fn(input)))     — two transforms after
+; Direction B2: best_fn(list t2(t1(input))) — two transforms before
+; Direction AB: t2(best_fn(list t1(input))) — one before, one after
+;
+; Only geometric x geometric and geometric x recolor pairs are tried
+; (recolor x recolor and recolor x geometric are skipped).
+
+; Direction A2: t2(t1(best-fn(input)))
+(define p3-try-pair-after
+  (lambda (t1 t2 best-fn spec test-pairs)
+    (let ((t1-fn (p3-tx-fn t1))
+          (t2-fn (p3-tx-fn t2)))
+      (let ((composed (lambda (inp) (t2-fn (t1-fn (best-fn inp))))))
+        (if (not (p3-validate-all composed spec))
+          nil
+          (if (not (p3-validate-all composed test-pairs))
+            nil
+            (list t1 t2)))))))
+
+; Direction B2: best-fn(list t2(t1(head input)))
+(define p3-try-pair-before
+  (lambda (t1 t2 best-fn spec test-pairs)
+    (let ((t1-fn (p3-tx-fn t1))
+          (t2-fn (p3-tx-fn t2)))
+      (let ((composed (lambda (inp) (best-fn (list (t2-fn (t1-fn (head inp))))))))
+        (if (not (p3-validate-all composed spec))
+          nil
+          (if (not (p3-validate-all composed test-pairs))
+            nil
+            (list t1 t2)))))))
+
+; Direction AB: t2(best-fn(list t1(head input)))
+(define p3-try-pair-mixed
+  (lambda (t1 t2 best-fn spec test-pairs)
+    (let ((t1-fn (p3-tx-fn t1))
+          (t2-fn (p3-tx-fn t2)))
+      (let ((composed (lambda (inp) (t2-fn (best-fn (list (t1-fn (head inp))))))))
+        (if (not (p3-validate-all composed spec))
+          nil
+          (if (not (p3-validate-all composed test-pairs))
+            nil
+            (list t1 t2)))))))
+
+; AST builders for depth-2
+
+; Direction A2: (lambda (x) (t2 (t1 (best-body))))
+(define p3-build-pair-after-ast
+  (lambda (t1 t2 best-source)
+    (let ((best-node (parse-source best-source)))
+      (let ((children (node-children best-node)))
+        (let ((best-body (if (= (length children) 1)
+                           (nth children 0)
+                           (nth children (- (length children) 1)))))
+          (make-lambda (list "x")
+            (p3-make-tx-ast t2 (p3-make-tx-ast t1 best-body))))))))
+
+; Direction B2: (lambda (x) (let ((x (list (t2 (t1 (nth x 0)))))) best-body))
+(define p3-build-pair-before-ast
+  (lambda (t1 t2 best-source)
+    (let ((tx-input (p3-make-tx-ast t2
+            (p3-make-tx-ast t1
+              (make-app "nth" (make-symbol "x") (make-int 0))))))
+      (let ((best-node (parse-source best-source)))
+        (let ((children (node-children best-node)))
+          (let ((best-body (if (= (length children) 1)
+                             (nth children 0)
+                             (nth children (- (length children) 1)))))
+            (make-lambda (list "x")
+              (make-let
+                (list (list "x" (make-app "list" tx-input)))
+                best-body))))))))
+
+; Direction AB: (lambda (x) (t2 (let ((x (list (t1 (nth x 0))))) best-body)))
+(define p3-build-pair-mixed-ast
+  (lambda (t1 t2 best-source)
+    (let ((tx-input (p3-make-tx-ast t1
+            (make-app "nth" (make-symbol "x") (make-int 0)))))
+      (let ((best-node (parse-source best-source)))
+        (let ((children (node-children best-node)))
+          (let ((best-body (if (= (length children) 1)
+                             (nth children 0)
+                             (nth children (- (length children) 1)))))
+            (make-lambda (list "x")
+              (p3-make-tx-ast t2
+                (make-let
+                  (list (list "x" (make-app "list" tx-input)))
+                  best-body)))))))))
+
+; Scan pairs: iterate over outer list, for each t1 iterate over inner list.
+; try-fn takes (t1, t2, best-fn, spec, test-pairs) -> (list t1 t2) or nil.
+; build-fn takes (t1, t2, best-source) -> ast.
+; direction-label: string for display.
+(define p3-scan-pairs
+  (lambda (outer-txs inner-txs best-fn best-source spec test-pairs
+           try-fn build-fn direction-label)
+    (p3-scan-pairs-outer outer-txs inner-txs best-fn best-source spec
+      test-pairs try-fn build-fn direction-label)))
+
+(define p3-scan-pairs-outer
+  (lambda (outer-txs inner-txs best-fn best-source spec test-pairs
+           try-fn build-fn direction-label)
+    (if (= (length outer-txs) 0)
+      nil
+      (let ((t1 (head outer-txs)))
+        (let ((inner-result (p3-scan-pairs-inner t1 inner-txs best-fn
+                best-source spec test-pairs try-fn build-fn direction-label)))
+          (if (not (nil? inner-result))
+            inner-result
+            (p3-scan-pairs-outer (tail outer-txs) inner-txs best-fn best-source
+              spec test-pairs try-fn build-fn direction-label)))))))
+
+(define p3-scan-pairs-inner
+  (lambda (t1 inner-txs best-fn best-source spec test-pairs
+           try-fn build-fn direction-label)
+    (if (= (length inner-txs) 0)
+      nil
+      (let ((t2 (head inner-txs)))
+        (let ((hit (try (try-fn t1 t2 best-fn spec test-pairs) nil)))
+          (if (not (nil? hit))
+            ; Build result
+            (let ((ast (try (build-fn t1 t2 best-source) nil)))
+              (let ((tx-label (concat (p3-tx-name t1) "+" (p3-tx-name t2))))
+                (ns ("found" true)
+                    ("source" (concat "(" tx-label " " direction-label " " best-source ")"))
+                    ("nodes" ast)
+                    ("transform" tx-label)
+                    ("direction" direction-label))))
+            (p3-scan-pairs-inner t1 (tail inner-txs) best-fn best-source
+              spec test-pairs try-fn build-fn direction-label)))))))
+
+; ── Orchestrate: single then pair ────────────────────────────────────
+
+(define p3-try-task
+  (lambda (name best-fn best-source spec test-pairs)
+    ; Pass 1: single transforms (all 103)
+    (let ((result-a (p3-scan-transforms p3-unary-transforms
+                      best-fn best-source spec test-pairs "after")))
+      (if (not (nil? result-a))
+        result-a
+        (let ((result-b (p3-scan-transforms p3-unary-transforms
+                          best-fn best-source spec test-pairs "before")))
+          (if (not (nil? result-b))
+            result-b
+            ; Pass 2: depth-2 pairs
+            (p3-try-task-pairs name best-fn best-source spec test-pairs)))))))
+
+; Depth-2 pair search: geometric x geometric, then geometric x recolor
+(define p3-try-task-pairs
+  (lambda (name best-fn best-source spec test-pairs)
+    ; A2: geometric x geometric (13x13 = 169)
+    (let ((r-a2-gg (p3-scan-pairs p3-geometric-transforms p3-geometric-transforms
+            best-fn best-source spec test-pairs
+            p3-try-pair-after p3-build-pair-after-ast "after2")))
+      (if (not (nil? r-a2-gg)) r-a2-gg
+      ; A2: geometric x recolor (13x90 = 1170)
+      (let ((r-a2-gr (p3-scan-pairs p3-geometric-transforms p3-recolor-transforms
+              best-fn best-source spec test-pairs
+              p3-try-pair-after p3-build-pair-after-ast "after2")))
+        (if (not (nil? r-a2-gr)) r-a2-gr
+        ; B2: geometric x geometric
+        (let ((r-b2-gg (p3-scan-pairs p3-geometric-transforms p3-geometric-transforms
+                best-fn best-source spec test-pairs
+                p3-try-pair-before p3-build-pair-before-ast "before2")))
+          (if (not (nil? r-b2-gg)) r-b2-gg
+          ; B2: geometric x recolor
+          (let ((r-b2-gr (p3-scan-pairs p3-geometric-transforms p3-recolor-transforms
+                  best-fn best-source spec test-pairs
+                  p3-try-pair-before p3-build-pair-before-ast "before2")))
+            (if (not (nil? r-b2-gr)) r-b2-gr
+            ; AB: geometric x geometric
+            (let ((r-ab-gg (p3-scan-pairs p3-geometric-transforms p3-geometric-transforms
+                    best-fn best-source spec test-pairs
+                    p3-try-pair-mixed p3-build-pair-mixed-ast "mixed")))
+              (if (not (nil? r-ab-gg)) r-ab-gg
+              ; AB: geometric x recolor
+              (let ((r-ab-gr (p3-scan-pairs p3-geometric-transforms p3-recolor-transforms
+                      best-fn best-source spec test-pairs
+                      p3-try-pair-mixed p3-build-pair-mixed-ast "mixed")))
+                (if (not (nil? r-ab-gr)) r-ab-gr
+                  nil))))))))))))))
+
+; ── Main entry point ───────────────────────────────────────────────────
+
+(define run-phase3-compose
+  (lambda (results)
+    (let ((failures (filter (lambda (r) (not (ns-get r "found"))) results)))
+      (let ((candidates
+              (filter (lambda (r)
+                (let ((fitness (try (ns-get r "fitness") 0.0))
+                      (best-src (try (ns-get r "best-source") "")))
+                  (and (>= fitness p3-fitness-threshold)
+                       (not (= best-src "")))))
+                failures)))
+        (do
+          (print "")
+          (print (concat "── Phase 3: Composition Recovery ──────────────────"))
+          (print (concat "  Candidates: " (to-string (length candidates))
+                         " tasks with fitness >= " (to-string p3-fitness-threshold)))
+          (let ((solutions
+                  (filter (lambda (s) (not (nil? s)))
+                    (map (lambda (r)
+                      (let ((name (ns-get r "name"))
+                            (fitness (try (ns-get r "fitness") 0.0))
+                            (best-src (ns-get r "best-source"))
+                            (spec (ns-get r "spec"))
+                            (test-pairs (try (ns-get r "test") (list))))
+                        (do
+                          (print (concat "  Trying " name
+                                         " (fitness=" (to-string fitness) ")..."))
+                          (let ((best-fn (try (eval-source best-src) nil)))
+                            (if (nil? best-fn)
+                              (do (print (concat "    skip: could not eval best-source"))
+                                  nil)
+                              (let ((result (try (p3-try-task name best-fn best-src
+                                                   spec test-pairs) nil)))
+                                (if (or (nil? result) (not (try (ns-get result "found") false)))
+                                  nil
+                                  (do
+                                    (print (concat "    SOLVED via "
+                                      (ns-get result "direction") " "
+                                      (ns-get result "transform")))
+                                    (list name result)))))))))
+                      candidates))))
+            solutions))))))
+
+; ── Integration: phase3-post-mortem ────────────────────────────────────
+;
+; Called after Phase 2. Takes the full results list, runs composition
+; recovery, prints summary, returns count of recovered tasks.
+
+(define phase3-post-mortem
+  (lambda (results)
+    (let ((solutions (run-phase3-compose results)))
+      (let ((n-recovered (length solutions)))
+        (do
+          (print "")
+          (if (> n-recovered 0)
+            (do
+              (print (concat "  Phase 3 recovered tasks:"))
+              (map (lambda (pair)
+                (let ((name (nth pair 0))
+                      (sol (nth pair 1)))
+                  (print (concat "    + " name " via "
+                    (ns-get sol "direction") " "
+                    (ns-get sol "transform")))))
+                solutions))
+            (print "  Phase 3: no additional tasks recovered"))
+          (print (concat "  Phase 3 result: +" (to-string n-recovered) " recovered"))
+          (print "")
+          n-recovered)))))

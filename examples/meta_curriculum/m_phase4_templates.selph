@@ -1,0 +1,489 @@
+; ─────────────────────────────────────────────────────────────────────────
+; Phase 4: Template transfer from solved tasks (post-mortem)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; After Phase 1 (main synthesis), Phase 2 (boost retry), and Phase 3
+; (compositional wrapping), Phase 4 extracts solution templates from
+; solved tasks and tries to transfer them to unsolved tasks.
+;
+; The key insight: if task A was solved by (grid-trim (grid-flip-h x)),
+; then task B might be solvable by the same skeleton with different
+; constants. For grid tasks, colors are integers 0-9, so a template
+; like (grid-replace-color (grid-trim x) ?from ?to) has only 100
+; possible instantiations — trivially enumerable.
+;
+; Algorithm:
+;   1. Extract operation skeletons from solved task sources
+;   2. Group solutions by skeleton (operation sequence)
+;   3. For each unsolved task, try direct transfer (exact solution)
+;   4. For each unsolved task, try constant-substituted transfer
+;   5. Register successful templates as decomposers for future runs
+;
+; Loaded AFTER m_boost_heuristic.selph. Uses boost-extract-ops.
+
+; ── Configuration ──────────────────────────────────────────────────────
+
+(define p4-max-color 9)
+(define p4-max-templates 50)
+
+; ── Skeleton extraction ────────────────────────────────────────────────
+;
+; Extract the operation skeleton from a source string. Uses
+; boost-extract-ops (from m_boost_heuristic.selph) to get the ordered
+; list of operations, then joins them into a canonical key string.
+
+(define p4-skeleton-key
+  (lambda (src)
+    (let ((ops (boost-extract-ops src)))
+      (if (= (length ops) 0)
+        ""
+        (reduce
+          (lambda (acc op) (concat acc "+" op))
+          (tail ops)
+          (head ops))))))
+
+; ── Collect solved solutions ───────────────────────────────────────────
+;
+; From curriculum results, extract each solved task's name, source, and
+; skeleton. Returns a list of (name, source, skeleton) triples.
+
+(define p4-collect-solved
+  (lambda (results)
+    (filter
+      (lambda (entry) (not (= (nth entry 2) "")))
+      (reduce
+        (lambda (acc r)
+          (if (not (ns-get r "found"))
+            acc
+            (let ((src (try (ns-get r "best-source") "")))
+              (if (= src "")
+                acc
+                (let ((name (ns-get r "name")))
+                  (let ((skel (p4-skeleton-key src)))
+                    (cons (list name src skel) acc)))))))
+        results
+        (list)))))
+
+; ── Collect unsolved tasks ─────────────────────────────────────────────
+
+(define p4-collect-unsolved
+  (lambda (results)
+    (filter (lambda (r) (not (ns-get r "found"))) results)))
+
+; ── Group by skeleton ──────────────────────────────────────────────────
+;
+; Returns a namespace mapping skeleton-key -> list of (name, source).
+; Skeletons with more solutions are more likely to generalize.
+
+(define p4-group-by-skeleton
+  (lambda (solved-entries)
+    (reduce
+      (lambda (groups entry)
+        (let ((skel (nth entry 2)))
+          (let ((name (nth entry 0)))
+            (let ((src (nth entry 1)))
+              (let ((existing (try (ns-get groups skel) (list))))
+                (ns-put groups skel (cons (list name src) existing)))))))
+      solved-entries
+      (ns))))
+
+; ── Direct transfer ────────────────────────────────────────────────────
+;
+; Try applying each solved task's exact solution function to an unsolved
+; task's inputs. If the function produces correct outputs for all
+; training examples AND all test examples, it's a hit.
+
+(define p4-validate-fn-on-task
+  (lambda (fn task-result)
+    (let ((spec (ns-get task-result "spec")))
+      (let ((train-ok
+              (reduce
+                (lambda (ok pair)
+                  (if (not ok) false
+                    (let ((inp (head pair)))
+                      (let ((expected (head (tail pair))))
+                        (let ((pred (try (fn inp) nil)))
+                          (if (nil? pred) false
+                            (= pred expected)))))))
+                spec true)))
+        (if (not train-ok)
+          false
+          ; Also validate against held-out test data if present.
+          (let ((test-pairs (try (ns-get task-result "test") (list))))
+            (reduce
+              (lambda (ok pair)
+                (if (not ok) false
+                  (let ((inp (head pair)))
+                    (let ((expected (head (tail pair))))
+                      (let ((pred (try (fn inp) nil)))
+                        (if (nil? pred) false
+                          (= pred expected)))))))
+              test-pairs true)))))))
+
+(define p4-try-direct-transfer
+  (lambda (solved-entries unsolved-tasks)
+    (reduce
+      (lambda (acc unsolved)
+        (let ((uname (ns-get unsolved "name")))
+          ; Skip if already recovered in this pass.
+          (if (member? uname (map head acc))
+            acc
+            (let ((hit (p4-scan-solved-for-match solved-entries unsolved)))
+              (if (nil? hit)
+                acc
+                (cons hit acc))))))
+      unsolved-tasks
+      (list))))
+
+; Scan each solved entry against one unsolved task. Returns
+; (unsolved-name, source, donor-name) or nil.
+(define p4-scan-solved-for-match
+  (lambda (solved-entries unsolved)
+    (if (= (length solved-entries) 0)
+      nil
+      (let ((entry (head solved-entries)))
+        (let ((donor-name (nth entry 0)))
+          (let ((src (nth entry 1)))
+            (let ((fn (try (eval-source src) nil)))
+              (if (nil? fn)
+                (p4-scan-solved-for-match (tail solved-entries) unsolved)
+                (if (p4-validate-fn-on-task fn unsolved)
+                  (list (ns-get unsolved "name") src donor-name)
+                  (p4-scan-solved-for-match (tail solved-entries) unsolved))))))))))
+
+; ── Constant-substituted transfer ──────────────────────────────────────
+;
+; For grid tasks, try replacing color constants in a solved source.
+; Integer literals 0-9 represent grid colors. We find all single-digit
+; integer token positions in the source using character-level scanning,
+; then generate variants by replacing each position with each color.
+;
+; Strategy: scan source for integer tokens at character level (bounded
+; by delimiters), generate single-position variants (K*9), and for
+; K <= 3 positions also generate pair-combination variants. Each
+; variant is evaluated against the unsolved task's spec.
+;
+; This replaces the old string-replace approach which only matched
+; integers in " N)" patterns and did global replacement, missing many
+; valid substitutions.
+
+; ── AST-based integer position finder ─────────────────────────────────
+;
+; Scan the source string character by character to find integer tokens
+; (single digits 0-9) that appear as complete tokens — i.e. bounded by
+; whitespace, parens, or string boundaries. Returns a list of
+; (char-offset, digit-value) pairs.
+;
+; This replaces the old p4-extract-int-tokens which lost positional
+; information and could not do per-occurrence replacement.
+
+(define p4-is-digit
+  (lambda (ch)
+    (or (= ch "0") (or (= ch "1") (or (= ch "2") (or (= ch "3")
+    (or (= ch "4") (or (= ch "5") (or (= ch "6") (or (= ch "7")
+    (or (= ch "8") (= ch "9"))))))))))))
+
+(define p4-is-delimiter
+  (lambda (ch)
+    (or (= ch " ") (or (= ch "(") (or (= ch ")") (or (= ch "\n")
+    (= ch "\t")))))))
+
+; Check if character at position i in source is a single-digit integer
+; token: the char is a digit, and the chars before and after (if they
+; exist) are delimiters or at string boundary.
+(define p4-is-int-token-at
+  (lambda (src i len)
+    (let ((ch (string-nth src i)))
+      (if (not (p4-is-digit ch))
+        false
+        (let ((before-ok (if (= i 0) true
+                           (p4-is-delimiter (string-nth src (- i 1))))))
+          (if (not before-ok)
+            false
+            (let ((after-ok (if (>= (+ i 1) len) true
+                              (p4-is-delimiter (string-nth src (+ i 1))))))
+              after-ok)))))))
+
+; Walk the source string and collect all integer token positions.
+; Returns list of (offset, value) pairs.
+(define p4-find-int-positions
+  (lambda (src)
+    (let ((len (string-length src)))
+      (let ((loop (lambda (self i acc)
+                    (if (>= i len)
+                      acc
+                      (if (p4-is-int-token-at src i len)
+                        (self self (+ i 1)
+                          (cons (list i (to-number (string-nth src i))) acc))
+                        (self self (+ i 1) acc))))))
+        (loop loop 0 (list))))))
+
+; ── Positional substitution ──────────────────────────────────────────
+;
+; Replace the single character at position `pos` in `src` with `new-ch`.
+; Uses string-slice for the before/after segments.
+
+(define p4-sub-at-pos
+  (lambda (src pos new-val)
+    (concat (string-slice src 0 pos)
+            (to-string new-val)
+            (string-slice src (+ pos 1) (string-length src)))))
+
+; ── Variant generation ───────────────────────────────────────────────
+;
+; For each integer position x each color 0-9 (skipping the original),
+; generate a variant source string. With K positions and 10 colors,
+; single-position variants = K*9. For K <= 3, also generate all
+; 2-position combinations (K*(K-1)/2 * 9*9 = at most 3*729 = 2187,
+; but we cap at a reasonable limit).
+
+(define p4-generate-single-variants
+  (lambda (src positions)
+    (reduce
+      (lambda (acc pos-pair)
+        (let ((pos (nth pos-pair 0)))
+          (let ((orig (nth pos-pair 1)))
+            (reduce
+              (lambda (acc2 c)
+                (if (= c orig)
+                  acc2
+                  (let ((new-src (p4-sub-at-pos src pos c)))
+                    (if (member? new-src acc2) acc2
+                      (cons new-src acc2)))))
+              (range (+ p4-max-color 1))
+              acc))))
+      positions
+      (list))))
+
+; Generate 2-position combination variants for positions list.
+; For each pair of positions, try all color combinations (0-9 x 0-9),
+; skipping when both match originals.
+(define p4-generate-pair-variants
+  (lambda (src positions)
+    (if (< (length positions) 2)
+      (list)
+      (let ((pairs (p4-all-pairs positions)))
+        (reduce
+          (lambda (acc pair)
+            (let ((p1 (nth pair 0)))
+              (let ((p2 (nth pair 1)))
+                (let ((pos1 (nth p1 0)))
+                  (let ((orig1 (nth p1 1)))
+                    (let ((pos2 (nth p2 0)))
+                      (let ((orig2 (nth p2 1)))
+                        (reduce
+                          (lambda (acc2 c1)
+                            (reduce
+                              (lambda (acc3 c2)
+                                (if (and (= c1 orig1) (= c2 orig2))
+                                  acc3
+                                  (let ((tmp (p4-sub-at-pos src pos1 c1)))
+                                    (let ((new-src (p4-sub-at-pos tmp pos2 c2)))
+                                      (if (member? new-src acc3) acc3
+                                        (cons new-src acc3))))))
+                              (range (+ p4-max-color 1))
+                              acc2))
+                          (range (+ p4-max-color 1))
+                          acc))))))))
+          pairs
+          (list))))))
+
+; Generate all unique pairs from a list (order-independent).
+(define p4-all-pairs
+  (lambda (lst)
+    (if (< (length lst) 2)
+      (list)
+      (let ((first (head lst)))
+        (let ((rest (tail lst)))
+          (reduce
+            (lambda (acc item) (cons (list first item) acc))
+            rest
+            (p4-all-pairs rest)))))))
+
+; Main variant generator: single-position + (if K <= 3) pair variants.
+(define p4-generate-variants
+  (lambda (src)
+    (let ((positions (p4-find-int-positions src)))
+      (if (= (length positions) 0)
+        (list)
+        (let ((singles (p4-generate-single-variants src positions)))
+          (if (> (length positions) 3)
+            singles
+            (let ((pairs (p4-generate-pair-variants src positions)))
+              (reduce
+                (lambda (acc v) (if (member? v acc) acc (cons v acc)))
+                pairs
+                singles))))))))
+
+; Try constant-substituted transfer for one unsolved task against all
+; solved sources. Returns (unsolved-name, source, donor-name) or nil.
+(define p4-try-constant-sub
+  (lambda (solved-entries unsolved)
+    (if (= (length solved-entries) 0)
+      nil
+      (let ((entry (head solved-entries)))
+        (let ((donor-name (nth entry 0)))
+          (let ((src (nth entry 1)))
+            (let ((result (p4-try-variants-for-task src donor-name unsolved)))
+              (if (nil? result)
+                (p4-try-constant-sub (tail solved-entries) unsolved)
+                result))))))))
+
+(define p4-try-variants-for-task
+  (lambda (src donor-name unsolved)
+    (let ((variants (p4-generate-variants src)))
+      (p4-scan-variants variants donor-name unsolved))))
+
+(define p4-scan-variants
+  (lambda (variants donor-name unsolved)
+    (if (= (length variants) 0)
+      nil
+      (let ((vsrc (head variants)))
+        (let ((fn (try (eval-source vsrc) nil)))
+          (if (nil? fn)
+            (p4-scan-variants (tail variants) donor-name unsolved)
+            (if (try (p4-validate-fn-on-task fn unsolved) false)
+              (list (ns-get unsolved "name") vsrc donor-name)
+              (p4-scan-variants (tail variants) donor-name unsolved))))))))
+
+; Full constant-substituted transfer pass.
+(define p4-try-constant-transfer
+  (lambda (solved-entries unsolved-tasks already-recovered)
+    (reduce
+      (lambda (acc unsolved)
+        (let ((uname (ns-get unsolved "name")))
+          (if (member? uname (map head already-recovered))
+            acc
+            (if (member? uname (map head acc))
+              acc
+              (let ((hit (p4-try-constant-sub solved-entries unsolved)))
+                (if (nil? hit)
+                  acc
+                  (cons hit acc)))))))
+      unsolved-tasks
+      (list))))
+
+; ── Build template decomposer ──────────────────────────────────────────
+;
+; Given a list of successful transfer results, build a decomposer
+; function that tries each template source. Register it in
+; __decomposers__ so future synthesis runs benefit.
+
+(define p4-build-decomposer
+  (lambda (templates)
+    (lambda (synth-spec)
+      (let ((spec-pairs (ns-get synth-spec "spec")))
+        (let ((test-pairs (try (ns-get synth-spec "test") (list))))
+          (p4-try-templates-on-spec templates spec-pairs test-pairs))))))
+
+(define p4-try-templates-on-spec
+  (lambda (templates spec-pairs test-pairs)
+    (if (= (length templates) 0)
+      (ns ("found" false))
+      (let ((tpl (head templates)))
+        (let ((src (nth tpl 1)))
+          (let ((fn (try (eval-source src) nil)))
+            (if (nil? fn)
+              (p4-try-templates-on-spec (tail templates) spec-pairs test-pairs)
+              ; Validate against training.
+              (let ((train-ok
+                      (reduce
+                        (lambda (ok pair)
+                          (if (not ok) false
+                            (let ((inp (head pair)))
+                              (let ((expected (head (tail pair))))
+                                (let ((pred (try (fn inp) nil)))
+                                  (if (nil? pred) false
+                                    (= pred expected)))))))
+                        spec-pairs true)))
+                (if (not train-ok)
+                  (p4-try-templates-on-spec (tail templates) spec-pairs test-pairs)
+                  ; Validate against test.
+                  (let ((test-ok
+                          (reduce
+                            (lambda (ok pair)
+                              (if (not ok) false
+                                (let ((inp (head pair)))
+                                  (let ((expected (head (tail pair))))
+                                    (let ((pred (try (fn inp) nil)))
+                                      (if (nil? pred) false
+                                        (= pred expected)))))))
+                            test-pairs true)))
+                    (if (not test-ok)
+                      (p4-try-templates-on-spec (tail templates) spec-pairs test-pairs)
+                      ; Success: parse source to AST and return.
+                      (let ((ast (try (parse-source src) nil)))
+                        (if (nil? ast)
+                          (p4-try-templates-on-spec (tail templates) spec-pairs test-pairs)
+                          (ns ("found" true)
+                              ("nodes" ast)
+                              ("candidates" (length templates))))))))))))))))
+
+; ── Print helpers ──────────────────────────────────────────────────────
+
+(define p4-print-skeleton-summary
+  (lambda (skel-groups)
+    (let ((keys (ns-keys skel-groups)))
+      (do
+        (print (concat "  Unique skeletons: " (to-string (length keys))))
+        (map (lambda (k)
+          (let ((entries (ns-get skel-groups k)))
+            (if (> (length entries) 1)
+              (print (concat "    " k " (" (to-string (length entries)) " tasks)"))
+              nil)))
+          keys)))))
+
+(define p4-print-transfer-results
+  (lambda (label hits)
+    (do
+      (print (concat "  " label ": " (to-string (length hits)) " recovered"))
+      (map (lambda (hit)
+        (print (concat "    + " (nth hit 0) " (from " (nth hit 2) ")")))
+        hits))))
+
+; ── Top-level entry points ─────────────────────────────────────────────
+
+(define run-phase4-templates
+  (lambda (results)
+    (do (print "")
+    (do (print "-- Phase 4: Template Transfer --------------------------------")
+      ; Step 1: Collect solved solutions and skeletons.
+      (let ((solved (p4-collect-solved results)))
+        (do (print (concat "  Solved tasks with source: " (to-string (length solved))))
+          (let ((skel-groups (p4-group-by-skeleton solved)))
+            (do (p4-print-skeleton-summary skel-groups)
+              ; Step 2: Collect unsolved tasks.
+              (let ((unsolved (p4-collect-unsolved results)))
+                (do (print (concat "  Unsolved tasks: " (to-string (length unsolved))))
+                  ; Step 3: Direct transfer.
+                  (do (print "")
+                  (do (print "  Trying direct transfer...")
+                    (let ((direct-hits (p4-try-direct-transfer solved unsolved)))
+                      (do (p4-print-transfer-results "Direct transfer" direct-hits)
+                        ; Step 4: Constant-substituted transfer.
+                        (do (print "")
+                        (do (print "  Trying constant-substituted transfer...")
+                          (let ((const-hits (p4-try-constant-transfer
+                                              solved unsolved direct-hits)))
+                            (do (p4-print-transfer-results "Constant sub" const-hits)
+                              ; Step 5: Register combined templates as decomposer.
+                              (let ((all-hits (reduce
+                                      (lambda (acc h) (cons h acc))
+                                      const-hits
+                                      direct-hits)))
+                                (do (if (> (length all-hits) 0)
+                                      (do (print "")
+                                        (do (print "  Registering template decomposer...")
+                                          (define __decomposers__
+                                            (ns-put __decomposers__ "p4-templates"
+                                              (p4-build-decomposer all-hits)))))
+                                      nil)
+                                  (do (print "")
+                                    (do (print (concat "  Phase 4 result: +"
+                                                       (to-string (length all-hits))
+                                                       " recovered"))
+                                      (length all-hits)))))))))))))))))))))))
+
+(define phase4-post-mortem
+  (lambda (results)
+    (run-phase4-templates results)))
