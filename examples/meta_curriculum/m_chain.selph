@@ -172,8 +172,10 @@
                       (lambda ()
                         (m-chain-try-or-next detect-template-stamp spec
                           (lambda ()
-                            (m-chain-try-or-next detect-library-shape spec
-                              (lambda () (ns ("found" false))))))))))))))))))
+                            (m-chain-try-or-next detect-grid-compose spec
+                              (lambda ()
+                                (m-chain-try-or-next detect-library-shape spec
+                                  (lambda () (ns ("found" false))))))))))))))))))))
 
 ; ── Top-level dispatcher ─────────────────────────────────────────────
 

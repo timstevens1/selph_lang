@@ -77,11 +77,11 @@ Note: as of 2026-04-13, scaffolds solve 32/32 but provide no lift on ARC tasks (
 
 | Set | Solved | Near-miss (>=90%) | Near-miss (>=95%) | Time |
 |---|---|---|---|---|
-| ARC-AGI-1 train | 35/400 (8.75%) | 80 | 20 | ~500s |
+| ARC-AGI-1 train | 36/400 (9.0%) | 80 | 20 | ~960s |
 | ARC-AGI-1 eval | 3/400 (0.75%) | 80 | 27 | ~40s |
 
 - Flat-depth-1 enumeration exhausts at ~1,312 candidates per task
-- 33/35 Phase 1 tasks use the M-chain; 2 use Flat strategy
+- 34/36 Phase 1 tasks use the M-chain; 2 use Flat strategy
 - `--depth` now controls strategy/decomposer chaining depth (default 2), `--flat-depth` controls flat enumeration (default 1)
 - Phase 4 template transfer recovers 0 additional (2 now solved directly in Phase 1)
 - Bottleneck is form coverage, not search budget or composition depth

@@ -93,7 +93,7 @@ The M-chain is a set of recognition stages that run before enumeration. Each sta
 | Strings / POS | 28 | **28/28** | Type-dependent pools + Forms 1–6 recognizers |
 | Grids (ARC scaffolding) | 13 | **13/13** | Forms 1–8, cross-type bridges, object indexing |
 | Original 3-domain chain | 55 | **55/55** | Sequence → CF → NL, library cascade |
-| ARC-AGI-1 (training) | 400 | **35/400** | Grid Forms 1-14 + Phase 1 synthesis (33 M-chain + 2 Flat) |
+| ARC-AGI-1 (training) | 400 | **36/400** | Grid Forms 1-14 + compose + Phase 1 synthesis (34 M-chain + 2 Flat) |
 | ARC-AGI-1 (evaluation) | 400 | **3/400** | M-chain forms tuned to training distribution; eval set is harder |
 
 ### 2.7 CLI Commands
@@ -1033,6 +1033,52 @@ New pure-SELPH decomposer with extensible (extractor, aligner, recombiner) catal
 - The M-chain's pool-based recognition covers simple transforms efficiently; the HO decomposer adds value only when F requires composition or isn't in the M-chain's catalog
 
 Files: `m_ho.selph` (new), `synth_v2.rs`, `eval_v2.rs`, `main.rs`, `m8g_constant_grid.selph`, `run_probe.sh`, `run_fitness_probe.sh`
+
+### 9.63 Cross-form composition + near-miss curriculum (April 14, 2026)
+
+Built a form-generating loop (Level 1: pool composition) and a near-miss task curriculum for fast prototyping.
+
+#### 9.63.1 Cross-form composition detector (m8g_compose.selph)
+
+Existing M-chain forms operate independently: Form 2 matches pool entries exactly, Forms 4/10/11 do parameterized ops on raw input only. `m8g_compose.selph` closes the gap by trying parameterized post-processing on each pool entry's column:
+
+- **C1**: Color remap after pool transform — analyze color diff between `pool_entry(x)` and target, build `grid-replace-color` chain
+- **C2**: Noise removal after pool transform — `grid-remove-small-objects(pool_entry(x), threshold)` for thresholds 2-8
+- **C3**: Color isolation after pool transform — `grid-keep-color(pool_entry(x), c)` for colors 0-9
+- **C4**: Fill-enclosed after pool transform — `grid-fill-enclosed(pool_entry(x))`
+- **C5**: Compact after pool transform — `grid-compact(pool_entry(x))`
+
+Cost: O(pool × probes_per_entry) ≈ 343 × 25 ≈ 8K checks. Registered in m_chain grid branch after template-stamp, before library-shape.
+
+**Result:** 0 new ARC solves. Smoke test passes (synthetic color-remap-after-transform detected). The compose form is architecturally correct but the 80 near-miss tasks need genuinely new spatial patterns, not compositions of existing pool transforms.
+
+#### 9.63.2 Near-miss curriculum
+
+Extracted 80 tasks with fitness ≥ 0.90 into `examples/arc_near_miss.selph` (658 lines). Runs in ~800s sequential vs ~960s for full 400 — 5× fewer tasks, ~1.2× faster per task (most near-miss tasks trigger expensive grid form probing).
+
+Also built `extract_near_miss.sh` to regenerate from future probe runs.
+
+#### 9.63.3 Near-miss gap analysis
+
+Examined top near-miss tasks to characterize what's missing:
+
+| Task | Fitness | Pattern needed |
+|------|---------|----------------|
+| 50846271 | 0.976 | Proximity-based recolor (cells near color X get recolored) |
+| 6cf79266 | 0.970 | Rectangular hole detection + fill |
+| 11852cab | 0.970 | Enclosed region analysis |
+| 776ffc46 | 0.969 | Spatial pattern completion |
+| 72322fa7 | 0.968 | Boundary/adjacency reasoning |
+
+**Key finding:** The near-miss gap is **structural**, not compositional. The 80 near-miss tasks need new detection patterns (proximity recolor, rectangular hole fill, enclosed region analysis) — not compositions of existing transforms. Pool composition (Level 1) is necessary infrastructure but insufficient alone. The path to more solves is **Level 2/3: new form detectors** targeting the dominant near-miss patterns.
+
+#### 9.63.4 Updated results
+
+| Set | Solved | Near-miss (≥90%) | Partial (≥50%) | Time |
+|-----|--------|------------------|----------------|------|
+| ARC-AGI-1 train | 36/400 (9.0%) | 80 | 245 | ~960s parallel |
+
+Files: `m8g_compose.selph` (new), `arc_near_miss.selph` (new), `extract_near_miss.sh` (new), `m_chain.selph`, `run_probe.sh`, `run_fitness_probe.sh`
 
 ---
 

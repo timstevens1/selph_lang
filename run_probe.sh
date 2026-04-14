@@ -55,6 +55,7 @@ cat \
     "$META/m8g_line_draw.selph" \
     "$META/m8g_per_object.selph" \
     "$META/m8g_template_stamp.selph" \
+    "$META/m8g_compose.selph" \
     "$META/m_chain.selph" \
     "$META/m_fitness_grid.selph" \
     "$META/m_refine.selph" \

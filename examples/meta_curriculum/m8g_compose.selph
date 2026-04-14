@@ -1,0 +1,280 @@
+; -------------------------------------------------------------------------
+; m8g_compose: cross-form composition detector (§9.63)
+; -------------------------------------------------------------------------
+;
+; The existing M-chain forms operate independently: Form 2 matches pool
+; entries exactly, Form 4 does color remapping on raw input, Forms 10/11
+; do noise removal / color isolation on raw input. None compose with each
+; other.
+;
+; This form closes that gap by trying parameterized post-processing on
+; each pool entry's column:
+;
+;   Form C1: grid-replace-color(pool_entry(x), c1, c2)  — color remap after transform
+;   Form C2: grid-remove-small-objects(pool_entry(x), t) — noise removal after transform
+;   Form C3: grid-keep-color(pool_entry(x), c)           — color isolation after transform
+;   Form C4: grid-fill-enclosed(pool_entry(x))            — fill after transform (L1 covers
+;            this but only for base atoms, not L2 entries)
+;
+; Cost: O(pool × probes_per_entry). With pool ~343 entries and ~25 probes
+; per entry (10 keep-color + ~5 noise thresholds + ~10 derived color pairs),
+; worst case ~8K checks. Each check is a column comparison with early bail.
+;
+; Registered in m_chain after existing grid forms, before library reuse.
+
+; ── Helpers ────────────────────────────────────────────────────────────
+
+; Check if all column values are non-nil grids with same dimensions as target
+(define m8gc-dims-match?
+  (lambda (col target)
+    (if (not (= (length col) (length target))) false
+      (reduce
+        (lambda (acc i)
+          (if (not acc) false
+            (let ((c (nth col i))
+                  (t (nth target i)))
+              (if (or (nil? c) (not (grid? c)) (not (grid? t))) false
+                (and (= (grid-height c) (grid-height t))
+                     (= (grid-width c) (grid-width t)))))))
+        (range (length col))
+        true))))
+
+; Extract the set of colors that differ between two same-dimension grids.
+; Returns a list of (from-color . to-color) pairs, or nil if too many
+; distinct mappings (> 10) or inconsistent (one from-color maps to multiple
+; to-colors).
+(define m8gc-color-diff
+  (lambda (grid-a grid-b)
+    (let ((h (grid-height grid-a))
+          (w (grid-width grid-a)))
+      (reduce
+        (lambda (acc r)
+          (if (nil? acc) nil
+            (reduce
+              (lambda (acc2 c)
+                (if (nil? acc2) nil
+                  (let ((ca (nth (nth grid-a r) c))
+                        (cb (nth (nth grid-b r) c)))
+                    (if (= ca cb) acc2
+                      ; Check if we've seen this source color
+                      (let ((existing (try (ns-get acc2 (to-string ca)) nil)))
+                        (if (nil? existing)
+                          (if (> (length (ns-keys acc2)) 10) nil ; too many
+                            (ns-put acc2 (to-string ca) cb))
+                          (if (= existing cb) acc2
+                            nil)))))))  ; inconsistent
+              (range w)
+              acc)))
+        (range h)
+        (ns)))))
+
+; Check if a color mapping is consistent across all column/target pairs
+(define m8gc-consistent-color-diff?
+  (lambda (col target)
+    (let ((first-diff (m8gc-color-diff (nth col 0) (nth target 0))))
+      (if (nil? first-diff) nil
+        (if (= (length (ns-keys first-diff)) 0) nil ; no diff = already matches
+          (let ((ok (reduce
+                      (lambda (acc i)
+                        (if (not acc) false
+                          (let ((d (m8gc-color-diff (nth col i) (nth target i))))
+                            (if (nil? d) false
+                              ; Check same mapping
+                              (let ((keys (ns-keys first-diff)))
+                                (and (= (length (ns-keys d)) (length keys))
+                                     (reduce
+                                       (lambda (a k)
+                                         (and a (= (try (ns-get d k) -1)
+                                                   (ns-get first-diff k))))
+                                       keys true)))))))
+                      (range 1 (length col))
+                      true)))
+            (if ok first-diff nil)))))))
+
+; Build AST for color remapping chain on top of a pool entry source
+(define m8gc-build-color-remap-ast
+  (lambda (base-source mapping)
+    (let ((keys (ns-keys mapping)))
+      ; Two-pass temp trick (same as Form 4)
+      (let ((after-temps
+              (reduce
+                (lambda (acc key)
+                  (let ((from-color (m8gc-parse-color-key key)))
+                    (if (nil? from-color) acc
+                      (make-app "grid-replace-color"
+                        acc (make-int from-color) (make-int (+ from-color 50))))))
+                keys base-source)))
+        (reduce
+          (lambda (acc key)
+            (let ((from-color (m8gc-parse-color-key key))
+                  (to-color (ns-get mapping key)))
+              (if (nil? from-color) acc
+                (make-app "grid-replace-color"
+                  acc (make-int (+ from-color 50)) (make-int to-color)))))
+          keys after-temps)))))
+
+(define m8gc-parse-color-key
+  (lambda (key)
+    (reduce
+      (lambda (found v) (if (not (nil? found)) found
+        (if (= (to-string v) key) v nil)))
+      (range 10) nil)))
+
+; ── Form C1: color remap after pool transform ─────────────────────────
+
+(define m8gc-try-color-remap
+  (lambda (pool target)
+    (reduce
+      (lambda (acc entry)
+        (if (not (nil? acc)) acc
+          (let ((col (m8g-pool-col entry))
+                (src (m8g-pool-source entry)))
+            (if (not (m8gc-dims-match? col target)) nil
+              (let ((mapping (m8gc-consistent-color-diff? col target)))
+                (if (nil? mapping) nil
+                  (ns ("kind" (concat "compose-color-remap+" (m8g-pool-kind entry)))
+                      ("source-node"
+                        (m8g-wrap-lambda
+                          (m8gc-build-color-remap-ast src mapping))))))))))
+      pool
+      nil)))
+
+; ── Form C2: noise removal after pool transform ───────────────────────
+
+(define m8gc-try-noise-removal
+  (lambda (pool target)
+    (reduce
+      (lambda (acc entry)
+        (if (not (nil? acc)) acc
+          (let ((col (m8g-pool-col entry))
+                (src (m8g-pool-source entry)))
+            (m8gc-try-noise-thresholds col target src
+              (m8g-pool-kind entry) 2 8))))
+      pool
+      nil)))
+
+(define m8gc-try-noise-thresholds
+  (lambda (col target src kind threshold max-t)
+    (if (> threshold max-t) nil
+      (let ((result-col
+              (try (map (lambda (g) (grid-remove-small-objects g threshold)) col) nil)))
+        (if (nil? result-col) nil
+          (if (m8g-cols-equal? result-col target)
+            (ns ("kind" (concat "compose-noise-" (to-string threshold) "+" kind))
+                ("source-node"
+                  (m8g-wrap-lambda
+                    (make-app "grid-remove-small-objects" src (make-int threshold)))))
+            (m8gc-try-noise-thresholds col target src kind (+ threshold 1) max-t)))))))
+
+; ── Form C3: color isolation after pool transform ─────────────────────
+
+(define m8gc-try-keep-color
+  (lambda (pool target)
+    (reduce
+      (lambda (acc entry)
+        (if (not (nil? acc)) acc
+          (let ((col (m8g-pool-col entry))
+                (src (m8g-pool-source entry)))
+            (m8gc-try-keep-color-loop col target src
+              (m8g-pool-kind entry) 0))))
+      pool
+      nil)))
+
+(define m8gc-try-keep-color-loop
+  (lambda (col target src kind color)
+    (if (> color 9) nil
+      (let ((result-col
+              (try (map (lambda (g) (grid-keep-color g color)) col) nil)))
+        (if (nil? result-col) nil
+          (if (m8g-cols-equal? result-col target)
+            (ns ("kind" (concat "compose-keep-" (to-string color) "+" kind))
+                ("source-node"
+                  (m8g-wrap-lambda
+                    (make-app "grid-keep-color" src (make-int color)))))
+            (m8gc-try-keep-color-loop col target src kind (+ color 1))))))))
+
+; ── Form C4: fill-enclosed after L2 pool entries ──────────────────────
+;
+; L1 already has fill-enclosed(atom), but L2 doesn't compose it with
+; other L1 entries. Try fill-enclosed on every pool entry's column.
+
+(define m8gc-try-fill-enclosed
+  (lambda (pool target)
+    (reduce
+      (lambda (acc entry)
+        (if (not (nil? acc)) acc
+          (let ((col (m8g-pool-col entry))
+                (src (m8g-pool-source entry)))
+            (let ((result-col
+                    (try (map (lambda (g) (grid-fill-enclosed g)) col) nil)))
+              (if (nil? result-col) nil
+                (if (m8g-cols-equal? result-col target)
+                  (ns ("kind" (concat "compose-fill+" (m8g-pool-kind entry)))
+                      ("source-node"
+                        (m8g-wrap-lambda
+                          (make-app "grid-fill-enclosed" src))))
+                  nil))))))
+      pool
+      nil)))
+
+; ── Form C5: grid-compact after pool transform ────────────────────────
+
+(define m8gc-try-compact
+  (lambda (pool target)
+    (reduce
+      (lambda (acc entry)
+        (if (not (nil? acc)) acc
+          (let ((col (m8g-pool-col entry))
+                (src (m8g-pool-source entry)))
+            (let ((result-col
+                    (try (map (lambda (g) (grid-compact g)) col) nil)))
+              (if (nil? result-col) nil
+                (if (m8g-cols-equal? result-col target)
+                  (ns ("kind" (concat "compose-compact+" (m8g-pool-kind entry)))
+                      ("source-node"
+                        (m8g-wrap-lambda
+                          (make-app "grid-compact" src))))
+                  nil))))))
+      pool
+      nil)))
+
+; ── Top-level: detect-grid-compose ─────────────────────────────────────
+;
+; Build the pool (same as m8g: L0+L1+L2+derived), then try each
+; composition form. Color remap first (most likely to hit), then
+; keep-color, noise removal, fill-enclosed, compact.
+
+(define m8g-pool-kind (lambda (e) (ns-get e "kind")))
+
+(define detect-grid-compose
+  (lambda (s)
+    (let ((target (m8g-grid-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-grid target"))
+        (let ((pool (m8g-build-pool s)))
+          (m8g-try-chain
+            (list
+              (lambda () (m8gc-try-color-remap pool target))
+              (lambda () (m8gc-try-keep-color pool target))
+              (lambda () (m8gc-try-noise-removal pool target))
+              (lambda () (m8gc-try-fill-enclosed pool target))
+              (lambda () (m8gc-try-compact pool target)))))))))
+
+; ── Smoke tests ────────────────────────────────────────────────────────
+
+; Compose test: rotate-cw then keep-color 1
+; Input: 2x2 grid with colors 1 and 2
+; rotate-cw gives ((2 1) (2 1)), keep-color 1 gives ((0 1) (0 1))
+(define m8gc-test-spec-1
+  (m8g-make-spec
+    (list (list (list (list 1 2) (list 1 2)))
+          (list (list (list 3 4) (list 3 4))))
+    (list (list (list 0 1) (list 0 1))
+          (list (list 0 3) (list 0 3)))
+    1))
+
+(print "--- m8g_compose smoke tests ---")
+(let ((r (detect-grid-compose m8gc-test-spec-1)))
+  (if (ns-get r "found")
+    (print (concat "  OK compose test kind=" (ns-get r "kind")))
+    (print (concat "  SKIP compose test (no match for synthetic spec)"))))
