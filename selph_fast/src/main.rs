@@ -711,6 +711,10 @@ fn cmd_grow_v2(args: &[String]) {
             *by_strategy.entry(st.strategy.clone()).or_insert(0) += 1;
         }
 
+        // Track the last WorkerResult per task for post-mortem.
+        let mut last_result: std::collections::HashMap<String, WorkerResult> =
+            std::collections::HashMap::new();
+
         let mut round = 0usize;
         loop {
             if unsolved.is_empty() { break; }
@@ -723,8 +727,8 @@ fn cmd_grow_v2(args: &[String]) {
             );
 
             // Index results by task name for fast lookup.
-            let result_map: std::collections::HashMap<String, &WorkerResult> =
-                worker_results.iter().map(|wr| (wr.name.clone(), wr)).collect();
+            let result_map: std::collections::HashMap<String, WorkerResult> =
+                worker_results.into_iter().map(|wr| (wr.name.clone(), wr)).collect();
 
             let mut new_solved = 0usize;
             let mut still_unsolved = Vec::new();
@@ -773,27 +777,15 @@ fn cmd_grow_v2(args: &[String]) {
                             );
                         }
                     }
-
-                    // Build post-mortem result namespace.
-                    let mut rns = types_v2::NsMap::new();
-                    rns.insert(intern("name"), types_v2::Value::str(name.clone()));
-                    rns.insert(intern("found"), types_v2::Value::Bool(wr.found));
-                    rns.insert(intern("candidates"), types_v2::Value::Int(wr.candidates as i64));
-                    if !wr.output_type.is_empty() {
-                        rns.insert(intern("output-type"), types_v2::Value::str(wr.output_type.clone()));
-                    }
-                    rns.insert(intern("m-chain-ran"), types_v2::Value::Bool(wr.m_chain_ran));
-                    rns.insert(intern("strategy"), types_v2::Value::str(wr.strategy.clone()));
-                    rns.insert(intern("fitness"), types_v2::Value::Num(wr.fitness));
-                    if !wr.best_source.is_empty() {
-                        rns.insert(intern("best-source"), types_v2::Value::str(wr.best_source.clone()));
-                    }
-                    rns.insert(intern("max-candidates"), types_v2::Value::Int(default_budget as i64));
-                    curriculum_results.push(types_v2::Value::ns(rns));
                 } else {
                     // Worker didn't report this task — shouldn't happen.
                     still_unsolved.push(idx);
                 }
+            }
+
+            // Merge this round's results (overwrite earlier rounds for same task).
+            for (name, wr) in result_map {
+                last_result.insert(name, wr);
             }
 
             eprintln!("    Round {} complete: {} new solutions", round, new_solved);
@@ -802,7 +794,8 @@ fn cmd_grow_v2(args: &[String]) {
             if new_solved == 0 { break; } // Fixed point.
         }
 
-        // Build post-mortem entries for checkpoint-restored tasks.
+        // Build curriculum_results from final results (one entry per task).
+        // First: checkpoint-restored tasks.
         for st in &checkpoint_solved {
             if checkpoint_names.contains(&st.name) {
                 let mut rns = types_v2::NsMap::new();
@@ -812,6 +805,28 @@ fn cmd_grow_v2(args: &[String]) {
                 rns.insert(intern("strategy"), types_v2::Value::str(st.strategy.clone()));
                 rns.insert(intern("m-chain-ran"), types_v2::Value::Bool(true));
                 rns.insert(intern("fitness"), types_v2::Value::Num(1.0));
+                curriculum_results.push(types_v2::Value::ns(rns));
+            }
+        }
+        // Then: tasks that went through the wavefront.
+        for idx in 0..tasks.len() {
+            let name = &tasks[idx].0;
+            if checkpoint_names.contains(name) { continue; }
+            if let Some(wr) = last_result.get(name) {
+                let mut rns = types_v2::NsMap::new();
+                rns.insert(intern("name"), types_v2::Value::str(name.clone()));
+                rns.insert(intern("found"), types_v2::Value::Bool(wr.found));
+                rns.insert(intern("candidates"), types_v2::Value::Int(wr.candidates as i64));
+                if !wr.output_type.is_empty() {
+                    rns.insert(intern("output-type"), types_v2::Value::str(wr.output_type.clone()));
+                }
+                rns.insert(intern("m-chain-ran"), types_v2::Value::Bool(wr.m_chain_ran));
+                rns.insert(intern("strategy"), types_v2::Value::str(wr.strategy.clone()));
+                rns.insert(intern("fitness"), types_v2::Value::Num(wr.fitness));
+                if !wr.best_source.is_empty() {
+                    rns.insert(intern("best-source"), types_v2::Value::str(wr.best_source.clone()));
+                }
+                rns.insert(intern("max-candidates"), types_v2::Value::Int(default_budget as i64));
                 curriculum_results.push(types_v2::Value::ns(rns));
             }
         }

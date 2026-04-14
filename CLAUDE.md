@@ -36,6 +36,23 @@ cd selph_fast && cargo build --release && cd ..
 
 Both scripts automatically prepend the M-chain modules (`examples/meta_curriculum/m_pool.selph` through `m_chain.selph`) in dependency order.
 
+**Parallel mode (fork-based, for depth 3+):**
+```bash
+./run_probe.sh /tmp/arc_agi1_train.selph --budget 200000 --depth 3 --parallel 8
+```
+
+**Checkpoint re-run (skip previously solved tasks):**
+```bash
+# First run creates <file>.checkpoint automatically
+./run_probe.sh /tmp/arc_agi1_train.selph --budget 200000 --depth 2
+# Second run skips solved tasks, only probes unsolved
+./run_probe.sh /tmp/arc_agi1_train.selph --budget 200000 --depth 2
+# Disable checkpoint: --no-checkpoint
+# Custom checkpoint path: --checkpoint /path/to/file
+```
+
+Parallel mode uses wavefront rounds: run all unsolved tasks in parallel, merge new solutions into the library, repeat until no new solutions appear. Process-level parallelism (fork) — no Rc→Arc migration needed.
+
 ### 4. With scaffolding library
 
 The scaffolding curricula (`examples/arc_grid_curriculum.selph`, `arc_object_curriculum.selph`, `arc_scaffolding_curriculum.selph`) teach object-level primitives. To include them, manually build a combined file:

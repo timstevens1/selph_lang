@@ -218,6 +218,19 @@
         (pm-print-boost-summary boost)
         (print "")
         (print "── Phase 2: Boosted Retry (fitness >= 0.85) ────────")
-        (let ((retries (boost-retry-failures results (ns-get boost "heuristic") 0.85)))
-          (pm-print-retry-results retries))))))
+        (let ((p2-recovered
+                (let ((retries (boost-retry-failures results (ns-get boost "heuristic") 0.85)))
+                  (pm-print-retry-results retries))))
+          ; Phase 3: compositional wrapping of near-misses
+          (let ((p3-recovered (phase3-post-mortem results)))
+            ; Phase 4: template transfer from solved tasks
+            (let ((p4-recovered (phase4-post-mortem results)))
+              (do (print "")
+                (print "═══════════════════════════════════════════════════")
+                (print (concat "  Post-mortem total: +"
+                  (to-string (+ p2-recovered (+ p3-recovered p4-recovered)))
+                  " recovered (P2=" (to-string p2-recovered)
+                  " P3=" (to-string p3-recovered)
+                  " P4=" (to-string p4-recovered) ")"))
+                (+ p2-recovered (+ p3-recovered p4-recovered))))))))))
 

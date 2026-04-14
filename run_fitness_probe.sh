@@ -80,6 +80,8 @@ cat \
     "$META/m_refine.selph" \
     "$META/m_near_miss.selph" \
     "$META/m_boost_heuristic.selph" \
+    "$META/m_phase3_compose.selph" \
+    "$META/m_phase4_templates.selph" \
     > "$PM_COMBINED"
 echo '(define run-post-mortem (lambda (results) (run-fitness-post-mortem results)))' >> "$PM_COMBINED"
 
