@@ -1,0 +1,145 @@
+; ─────────────────────────────────────────────────────────────────────────
+; §9.61 Beam search depth ratchet
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Iterative beam search for deep composition. Each round:
+;   1. Run synthesize-beam at depth 1 with the current library
+;   2. If exact match → return solution
+;   3. Inject top beam entries as library functions (library-inject)
+;   4. Build/update RL policy from experience log
+;   5. Pass policy as heuristic to next round
+;
+; The library grows each round, so effective composition depth = num rounds.
+; ObsEq dedup inside synthesize-beam keeps the beam diverse.
+;
+; Usage from SELPH:
+;   (depth-ratchet spec max-rounds beam-width budget)
+;
+; Usage from CLI (via a curriculum wrapper):
+;   (depth-ratchet-task "task_name" spec test-spec max-rounds beam-width budget)
+
+; ── RL policy builder (tabular) ──────────────────────────────────────
+
+; Merge a list of experience entries into a policy table (namespace).
+; Each entry: (ns ("component" str) ("fitness-delta" float) ("residual-hash" int))
+; Table maps component-name → (ns ("total-delta" float) ("count" int))
+(define merge-experience
+  (lambda (old-table experience)
+    (reduce
+      (lambda (tbl entry)
+        (let ((name (ns-get entry "component"))
+              (delta (ns-get entry "fitness-delta")))
+          (if (= name "")
+            tbl  ; skip unnamed entries
+            (let ((prev (ns-get-or tbl name nil)))
+              (if (nil? prev)
+                (ns-put tbl name (ns ("total-delta" delta) ("count" 1)))
+                (ns-put tbl name
+                  (ns ("total-delta" (add (ns-get prev "total-delta") delta))
+                      ("count" (add (ns-get prev "count") 1)))))))))
+      experience
+      old-table)))
+
+; Build a heuristic lambda from a policy table.
+; Components with positive average fitness delta get boosted.
+(define build-heuristic-from-policy
+  (lambda (policy-table)
+    (if (or (nil? policy-table) (= (ns-size policy-table) 0))
+      nil  ; no policy yet → use default priorities
+      (lambda (ctx)
+        (let ((base (ns-get ctx "priority"))
+              (name (ns-get ctx "name"))
+              (entry (ns-get-or policy-table name nil)))
+          (if (nil? entry)
+            base
+            (let ((avg-delta (divide (ns-get entry "total-delta")
+                                     (ns-get entry "count"))))
+              (if (> avg-delta 0)
+                (add base (multiply avg-delta 100.0))
+                base))))))))
+
+; ── Beam entry injection ─────────────────────────────────────────────
+
+; Inject beam entries as library functions for the next round.
+; Each beam entry's source is parsed and injected via library-inject.
+(define inject-beam-entries
+  (lambda (beam-entries round)
+    (reduce
+      (lambda (count entry)
+        (let ((src (ns-get entry "source"))
+              (fitness (ns-get entry "fitness"))
+              (name (concat "__beam_r" (to-string round) "_" (to-string count))))
+          (if (= src "")
+            count
+            (do
+              (library-inject name (eval-source src))
+              (add count 1)))))
+      beam-entries
+      0)))
+
+; ── Core depth ratchet ───────────────────────────────────────────────
+
+; Recursive implementation of the depth ratchet loop.
+; Returns (ns ("found" bool) ("source" str) ("rounds" int) ("candidates" int))
+(define depth-ratchet-loop
+  (lambda (spec budget beam-width round max-rounds policy-table total-candidates)
+    (if (> round max-rounds)
+      ; Exhausted all rounds without solving.
+      (ns ("found" false) ("source" "") ("rounds" max-rounds)
+          ("candidates" total-candidates))
+      (let ((heuristic (build-heuristic-from-policy policy-table))
+            (beam-args (ns ("spec" spec)
+                           ("beam-width" beam-width)
+                           ("max-depth" 1)
+                           ("max-candidates" budget))))
+        ; Attach heuristic if we have one.
+        (let ((beam-args-final
+                (if (nil? heuristic)
+                  beam-args
+                  (ns-put beam-args "heuristic" heuristic))))
+          (let ((result (synthesize-beam beam-args-final)))
+            (if (ns-get result "found")
+              ; Found exact solution!
+              (ns ("found" true)
+                  ("source" (ns-get result "source"))
+                  ("rounds" round)
+                  ("candidates" (add total-candidates
+                                     (ns-get result "candidates"))))
+              ; Not found — inject beam, update policy, recurse.
+              (let ((beam-entries (ns-get result "beam"))
+                    (experience (ns-get result "experience"))
+                    (new-candidates (add total-candidates
+                                        (ns-get result "candidates"))))
+                (do
+                  (inject-beam-entries beam-entries round)
+                  (let ((new-policy (merge-experience policy-table experience)))
+                    (depth-ratchet-loop spec budget beam-width
+                      (add round 1) max-rounds new-policy new-candidates)))))))))))
+
+; Main entry point.
+; spec: list of (input output) pairs
+; max-rounds: maximum number of beam rounds (= effective max depth)
+; beam-width: how many programs to keep per round
+; budget: max candidates per round
+(define depth-ratchet
+  (lambda (spec max-rounds beam-width budget)
+    (depth-ratchet-loop spec budget beam-width 1 max-rounds (ns) 0)))
+
+; ── Task-level wrapper (for curriculum integration) ──────────────────
+
+; Run depth ratchet on a named task with training and test specs.
+; Prints progress and validates against test data.
+(define depth-ratchet-task
+  (lambda (task-name spec test-spec max-rounds beam-width budget)
+    (let ((result (depth-ratchet spec max-rounds beam-width budget)))
+      (do
+        (if (ns-get result "found")
+          (print (concat "✓ " task-name
+                          " solved in " (to-string (ns-get result "rounds"))
+                          " rounds (" (to-string (ns-get result "candidates"))
+                          " candidates): " (ns-get result "source")))
+          (print (concat "✗ " task-name
+                          " unsolved after " (to-string max-rounds)
+                          " rounds (" (to-string (ns-get result "candidates"))
+                          " candidates)")))
+        result))))

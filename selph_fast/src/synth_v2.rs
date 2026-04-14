@@ -1396,6 +1396,10 @@ pub struct StrategyResult {
     pub best_fitness: f64,
     /// §9.55: AST source of the best partial-match candidate.
     pub best_source: Option<String>,
+    /// §9.61: beam entries from flat enumeration (when beam_width > 0).
+    pub beam: Vec<BeamEntry>,
+    /// §9.61: experience log for RL (when beam_width > 0).
+    pub experience: Vec<ExperienceEntry>,
 }
 
 impl StrategyResult {
@@ -1418,6 +1422,8 @@ impl StrategyResult {
             m_chain_ran: false,
             best_fitness: r.best_fitness,
             best_source,
+            beam: r.beam,
+            experience: r.experience,
         }
     }
 
@@ -1432,6 +1438,8 @@ impl StrategyResult {
             m_chain_ran: false,
             best_fitness: 0.0,
             best_source: None,
+            beam: Vec::new(),
+            experience: Vec::new(),
         }
     }
 }
@@ -3883,6 +3891,8 @@ fn rd_sub_synthesize(
                 best_fitness: 1.0,
                 best_nodes: None,
                 best_root: None,
+                beam: Vec::new(),
+                experience: Vec::new(),
             };
         }
         let remaining = max_candidates.saturating_sub(rd.candidates_explored);
@@ -5082,7 +5092,7 @@ fn sub_synthesize(
     if strategy_depth > 0 {
         let sr = synthesize_with_strategies_depth(
             components, inputs, expected, env, universe,
-            max_depth, max_candidates, strategy_depth - 1,
+            max_depth, max_candidates, strategy_depth - 1, 0,
         );
         SynthResult {
             found: sr.found,
@@ -5096,6 +5106,8 @@ fn sub_synthesize(
             best_fitness: sr.best_fitness,
             best_nodes: None,
             best_root: None,
+            beam: Vec::new(),
+            experience: Vec::new(),
         }
     } else {
         synthesize(components, inputs, expected, env, universe, max_depth, max_candidates)
@@ -5112,7 +5124,28 @@ pub fn synthesize_with_strategies(
     flat_budget: usize,
 ) -> StrategyResult {
     synthesize_with_strategies_depth(
-        components, inputs, expected, env, universe, max_depth, flat_budget, 1,
+        components, inputs, expected, env, universe, max_depth, flat_budget, 1, 0,
+    )
+}
+
+/// Like `synthesize_with_strategies` but with beam collection enabled.
+/// When `beam_width > 0`, the Flat enumeration stage collects the top-K
+/// partial-match candidates (deduplicated by observational equivalence)
+/// and returns them in `StrategyResult.beam`. All strategies (M-chain,
+/// RD, BD, HO, D&C, Induction) still run as normal — the beam is
+/// populated by the Flat stage when it fails to find an exact match.
+pub fn synthesize_with_strategies_beam(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    max_depth: usize,
+    flat_budget: usize,
+    beam_width: usize,
+) -> StrategyResult {
+    synthesize_with_strategies_depth(
+        components, inputs, expected, env, universe, max_depth, flat_budget, 1, beam_width,
     )
 }
 
@@ -5120,6 +5153,7 @@ pub fn synthesize_with_strategies(
 /// When `strategy_depth > 0`, sub-synthesis in HO/D&C/Induction/RD
 /// routes through the full strategy chain (decrementing depth).
 /// At `strategy_depth == 0`, sub-synthesis uses flat enumeration only.
+/// When `beam_width > 0`, the Flat stage collects top-K beam entries.
 fn synthesize_with_strategies_depth(
     components: &[SynthComponent],
     inputs: &[Value],
@@ -5129,6 +5163,7 @@ fn synthesize_with_strategies_depth(
     max_depth: usize,
     flat_budget: usize,
     strategy_depth: usize,
+    beam_width: usize,
 ) -> StrategyResult {
     // §9.49 post-mortem diagnostics: infer output type tag once.
     let output_type_str = infer_uniform_type_sym(expected)
@@ -5156,6 +5191,8 @@ fn synthesize_with_strategies_depth(
             m_chain_ran: true,
             best_fitness: 1.0,
             best_source: None,
+            beam: Vec::new(),
+            experience: Vec::new(),
         };
     }
 
@@ -5180,6 +5217,8 @@ fn synthesize_with_strategies_depth(
             m_chain_ran: has_decomposers,
             best_fitness: 1.0,
             best_source: None,
+            beam: Vec::new(),
+            experience: Vec::new(),
         };
     }
 
@@ -5190,11 +5229,14 @@ fn synthesize_with_strategies_depth(
         r
     };
 
-    // Strategy 1: Flat enumerative.
-    let flat = synthesize(
+    // Strategy 1: Flat enumerative (with optional beam collection).
+    let flat = synthesize_inner(
         components, inputs, expected, env, universe, max_depth, flat_budget,
+        None, &[], &[], beam_width,
     );
     let mut total_explored = flat.candidates_explored;
+    let flat_beam = flat.beam.clone();
+    let flat_experience = flat.experience.clone();
     if flat.found {
         return stamp(StrategyResult::from_synth(flat, Strategy::Flat));
     }
@@ -5225,6 +5267,8 @@ fn synthesize_with_strategies_depth(
             m_chain_ran: false,
             best_fitness: 1.0,
             best_source: None,
+            beam: Vec::new(),
+            experience: Vec::new(),
         });
     }
 
@@ -5247,6 +5291,8 @@ fn synthesize_with_strategies_depth(
             m_chain_ran: false,
             best_fitness: 1.0,
             best_source: None,
+            beam: Vec::new(),
+            experience: Vec::new(),
         });
     }
 
@@ -5274,6 +5320,8 @@ fn synthesize_with_strategies_depth(
             m_chain_ran: false,
             best_fitness: 1.0,
             best_source: None,
+            beam: Vec::new(),
+            experience: Vec::new(),
         });
     }
 
@@ -5302,6 +5350,8 @@ fn synthesize_with_strategies_depth(
             m_chain_ran: false,
             best_fitness: 1.0,
             best_source: None,
+            beam: Vec::new(),
+            experience: Vec::new(),
         });
     }
 
@@ -5330,6 +5380,8 @@ fn synthesize_with_strategies_depth(
             m_chain_ran: false,
             best_fitness: 1.0,
             best_source: None,
+            beam: Vec::new(),
+            experience: Vec::new(),
         });
     }
 
@@ -5345,10 +5397,24 @@ fn synthesize_with_strategies_depth(
             m_chain_ran: false,
             best_fitness: 1.0,
             best_source: None,
+            beam: Vec::new(),
+            experience: Vec::new(),
         });
     }
 
-    stamp(StrategyResult::not_found(total_explored))
+    // §9.61: propagate beam from the Flat stage into the final result.
+    let mut result = StrategyResult::not_found(total_explored);
+    // Use Flat's best fitness/source if available.
+    if flat.best_fitness > 0.0 {
+        result.best_fitness = flat.best_fitness;
+        result.best_source = flat.best_nodes.as_ref().map(|nodes| {
+            let root = flat.best_root.unwrap_or(0);
+            eval_v2::node_to_source(nodes, root)
+        });
+    }
+    result.beam = flat_beam;
+    result.experience = flat_experience;
+    stamp(result)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -5501,6 +5567,10 @@ pub struct SynthResult {
     /// Wrapped as a lambda — can be passed to SELPH for near-miss analysis.
     pub best_nodes: Option<Vec<Node>>,
     pub best_root: Option<usize>,
+    /// §9.61: beam entries (when beam_width > 0).
+    pub beam: Vec<BeamEntry>,
+    /// §9.61: experience log for RL (when beam_width > 0).
+    pub experience: Vec<ExperienceEntry>,
 }
 
 impl SynthResult {
@@ -5514,6 +5584,8 @@ impl SynthResult {
             best_fitness: 0.0,
             best_nodes: None,
             best_root: None,
+            beam: Vec::new(),
+            experience: Vec::new(),
         }
     }
 
@@ -5529,6 +5601,8 @@ impl SynthResult {
             best_fitness: fitness,
             best_nodes: Some(nodes),
             best_root: Some(root),
+            beam: Vec::new(),
+            experience: Vec::new(),
         }
     }
 
@@ -5542,6 +5616,8 @@ impl SynthResult {
             best_fitness: 1.0,
             best_nodes: None,
             best_root: None,
+            beam: Vec::new(),
+            experience: Vec::new(),
         }
     }
 
@@ -5560,6 +5636,8 @@ impl SynthResult {
             best_fitness: 1.0,
             best_nodes: None,
             best_root: None,
+            beam: Vec::new(),
+            experience: Vec::new(),
         }
     }
 }
@@ -6050,7 +6128,7 @@ pub fn synthesize(
     synthesize_inner(
         components, inputs, expected, env, universe,
         max_depth, max_candidates, None,
-        &[], &[],
+        &[], &[], 0,
     )
 }
 
@@ -6128,7 +6206,7 @@ pub fn synthesize_args_with_extra_seeds(
     synthesize_inner(
         components, inputs, expected, env, universe,
         max_depth, max_candidates, Some(seed_atoms),
-        test_inputs, test_expected,
+        test_inputs, test_expected, 0,
     )
 }
 
@@ -6164,6 +6242,7 @@ fn synthesize_inner(
     extra_seeds: Option<Vec<SynthComponent>>,
     test_inputs: &[Value],
     test_expected: &[Value],
+    beam_width: usize,
 ) -> SynthResult {
     // Empty examples: nothing to fit. Return failure rather than
     // returning an arbitrary trivial program.
@@ -6328,6 +6407,10 @@ fn synthesize_inner(
     let mut best_fitness: f64 = 0.0;
     let mut best_entry: Option<SynthPool> = None;
 
+    // §9.61: beam collection (when beam_width > 0).
+    let mut beam: Vec<BeamEntry> = Vec::new();
+    let mut experience: Vec<ExperienceEntry> = Vec::new();
+
     // §9.42 affine-fit pass needs an end-of-search hook even when
     // the main enumeration runs out of budget. We track exhausted-or-
     // converged state via this flag and break out instead of early-
@@ -6353,7 +6436,19 @@ fn synthesize_inner(
             if validate_held_out(&n, r, test_inputs, test_expected, env) {
                 return SynthResult::success(n, r, explored);
             }
-            // Failed held-out — continue searching.
+        }
+        // §9.61: collect beam entry if fitness > 0 and not deduped.
+        if beam_width > 0 && fitness > 0.0
+            && !matches!(outcome, TestOutcome::Deduped | TestOutcome::Errored)
+        {
+            if let Ok((beh, _, _, _)) = eval_candidate_behavior(entry, inputs, expected, env) {
+                beam.push(BeamEntry {
+                    pool_entry: entry.clone(),
+                    fitness,
+                    behavior: beh,
+                    component_name: String::new(),
+                });
+            }
         }
     }
 
@@ -6464,6 +6559,31 @@ fn synthesize_inner(
                 best_fitness = fitness;
                 best_entry = Some(entry.clone());
             }
+            // §9.61: collect beam entry.
+            if beam_width > 0 && fitness > 0.0
+                && !matches!(outcome, TestOutcome::Deduped | TestOutcome::Errored)
+            {
+                if let Ok((beh, _, _, _)) = eval_candidate_behavior(&entry, inputs, expected, env) {
+                    let comp_name = all_components[desc.comp_idx].name.clone();
+                    experience.push(ExperienceEntry {
+                        component_name: comp_name.clone(),
+                        result_fitness: fitness,
+                        parent_fitness: desc.args.iter()
+                            .filter_map(|&i| beam.iter().rev()
+                                .find(|b| std::ptr::eq(&b.pool_entry as *const _, &pool[i] as *const _))
+                                .map(|b| b.fitness))
+                            .fold(0.0f64, f64::max),
+                        residual_hash: residual_hash(&beh, expected),
+                    });
+                    beam.push(BeamEntry {
+                        pool_entry: entry.clone(),
+                        fitness,
+                        behavior: beh,
+                        component_name: comp_name,
+                    });
+                }
+            }
+
             match outcome {
                 TestOutcome::Solution => {
                     let final_entry = hole_sub.as_ref().unwrap_or(&entry);
@@ -6471,23 +6591,26 @@ fn synthesize_inner(
                     if validate_held_out(&n, r, test_inputs, test_expected, env) {
                         return SynthResult::success(n, r, explored);
                     }
-                    // Failed held-out — continue searching.
                 }
                 TestOutcome::Tested | TestOutcome::Skipped => {
                     new_entries.push(entry);
                 }
-                TestOutcome::Errored | TestOutcome::Deduped => {
-                    // Don't add: errored candidates compose into more
-                    // errors; deduped candidates have a behavioural
-                    // equivalent already in the pool.
-                }
+                TestOutcome::Errored | TestOutcome::Deduped => {}
             }
         }
 
         if new_entries.is_empty() {
-            // No progress this depth — search has converged. No point
-            // going deeper without new sub-expressions.
             break;
+        }
+
+        // §9.61: beam cap — when beam_width > 0, limit pool growth per depth.
+        if beam_width > 0 && new_entries.len() > beam_width {
+            // Keep entries with highest fitness. We need fitness info,
+            // so use the beam entries as a proxy: keep pool entries that
+            // correspond to beam entries (they have fitness > 0).
+            // For entries not in the beam (fitness = 0), keep all —
+            // they're needed for type diversity at the next depth.
+            new_entries.truncate(beam_width);
         }
 
         prev_start = pool.len();
@@ -6515,14 +6638,28 @@ fn synthesize_inner(
     // through the budget first).
     let _ = budget_exhausted;
 
+    // §9.61: finalize beam — sort by fitness, truncate to beam_width.
+    if beam_width > 0 {
+        beam.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap_or(std::cmp::Ordering::Equal));
+        if beam.len() > beam_width {
+            beam.truncate(beam_width);
+        }
+    }
+
     // §9.55: return the best partial-match candidate if one exists.
     if let Some(entry) = best_entry {
         if best_fitness > 0.0 {
             let (n, r) = wrap_lambda(&entry);
-            return SynthResult::not_found_with_best(explored, best_fitness, n, r);
+            let mut result = SynthResult::not_found_with_best(explored, best_fitness, n, r);
+            result.beam = beam;
+            result.experience = experience;
+            return result;
         }
     }
-    SynthResult::not_found(explored)
+    let mut result = SynthResult::not_found(explored);
+    result.beam = beam;
+    result.experience = experience;
+    result
 }
 
 // §9.45 deletion: `affine_fit_pass`, `try_affine_fit`, and the

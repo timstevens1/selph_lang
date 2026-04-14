@@ -2966,7 +2966,7 @@ fn bi_synthesize_beam(args: &[Value], env: &Env) -> Result<Value, String> {
         .map_err(|e| format!("synthesize-beam: {}", e))?;
     }
 
-    let result = crate::synth_v2::synthesize_beam(
+    let result = crate::synth_v2::synthesize_with_strategies_beam(
         &components, &inputs, &expected, env, &universe,
         max_depth, max_candidates, beam_width,
     );
@@ -2977,11 +2977,25 @@ fn bi_synthesize_beam(args: &[Value], env: &Env) -> Result<Value, String> {
     out.insert(intern("candidates"), Value::Int(result.candidates_explored as i64));
 
     if result.found {
-        let nodes = result.solution_nodes.as_ref().unwrap();
-        let root = result.solution_root.unwrap();
+        let nodes = result.nodes.as_ref().unwrap();
+        let root = result.root.unwrap();
         out.insert(intern("source"), Value::str(node_to_source(nodes, root)));
     } else {
         out.insert(intern("source"), Value::str(String::new()));
+    }
+
+    // Strategy info.
+    let strategy_name = result.strategy
+        .map(|s| s.name())
+        .unwrap_or_default();
+    out.insert(intern("strategy"), Value::str(strategy_name));
+    out.insert(intern("m-chain-ran"), Value::Bool(result.m_chain_ran));
+    if let Some(ref otype) = result.output_type {
+        out.insert(intern("output-type"), Value::str(otype.clone()));
+    }
+    out.insert(intern("fitness"), Value::Num(result.best_fitness));
+    if let Some(ref best_src) = result.best_source {
+        out.insert(intern("best-source"), Value::str(best_src.clone()));
     }
 
     // Beam entries.

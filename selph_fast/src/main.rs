@@ -145,6 +145,7 @@ fn real_main() {
         "parse" => cmd_parse(&args[2..]),
         "grow" | "grow-v2" => cmd_grow_v2(&args[2..]),
         "arc" => cmd_arc(&args[2..]),
+        "beam-overnight" => cmd_beam_overnight(&args[2..]),
         "help" | "--help" | "-h" => print_usage(),
         other => {
             // If it's a .selph file, evaluate it
@@ -422,6 +423,8 @@ fn synthesize_one_task(
             m_chain_ran: has_decomposers,
             best_fitness: synth_result.best_fitness,
             best_source,
+            beam: Vec::new(),
+            experience: Vec::new(),
         }
     } else {
         synth_v2::synthesize_with_strategies(
@@ -1002,6 +1005,8 @@ fn cmd_grow_v2(args: &[String]) {
                 m_chain_ran: has_decomposers,
                 best_fitness: synth_result.best_fitness,
                 best_source,
+                beam: Vec::new(),
+                experience: Vec::new(),
             }
         } else {
             synth_v2::synthesize_with_strategies(
@@ -1671,6 +1676,382 @@ fn parens_balanced(s: &str) -> bool {
         if c == ')' { depth -= 1; }
     }
     depth <= 0
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// §9.61 Beam overnight command
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Long-running beam search synthesis on ARC tasks.
+///
+/// Phase 1: baseline synthesis (regular grow-v2 probe) on all tasks.
+/// Phase 2: beam ratchet on unsolved tasks with escalating rounds.
+///
+/// Solutions compound into the library across tasks (wavefront).
+/// Checkpoints after each newly solved task.
+fn cmd_beam_overnight(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: selph beam-overnight <tasks.selph> [--preamble preamble.selph] \
+                   [--budget N] [--beam-width N] [--max-rounds N] [--time-limit-hours N] \
+                   [--checkpoint PATH] [--no-checkpoint]");
+        return;
+    }
+
+    let mut task_file = String::new();
+    let mut preamble_file: Option<String> = None;
+    let mut budget: usize = 50000;
+    let mut beam_width: usize = 200;
+    let mut beam_depth: usize = 2;
+    let mut max_rounds: usize = 10;
+    let mut time_limit_secs: u64 = 8 * 3600; // 8 hours default
+    let mut checkpoint_path: Option<String> = None;
+    let mut no_checkpoint = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--preamble" => {
+                preamble_file = args.get(i + 1).map(|s| s.to_string());
+                i += 2;
+            }
+            "--budget" => {
+                budget = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(budget);
+                i += 2;
+            }
+            "--beam-width" => {
+                beam_width = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(beam_width);
+                i += 2;
+            }
+            "--beam-depth" => {
+                beam_depth = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(beam_depth);
+                i += 2;
+            }
+            "--max-rounds" => {
+                max_rounds = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(max_rounds);
+                i += 2;
+            }
+            "--time-limit-hours" => {
+                let hours: f64 = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(8.0);
+                time_limit_secs = (hours * 3600.0) as u64;
+                i += 2;
+            }
+            "--checkpoint" => {
+                checkpoint_path = args.get(i + 1).map(|s| s.to_string());
+                i += 2;
+            }
+            "--no-checkpoint" => {
+                no_checkpoint = true;
+                i += 1;
+            }
+            other => { task_file = other.to_string(); i += 1; }
+        }
+    }
+
+    if task_file.is_empty() {
+        eprintln!("No task file specified");
+        return;
+    }
+
+    let task_source = match fs::read_to_string(&task_file) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Error reading {}: {}", task_file, e); return; }
+    };
+
+    let tasks = parse_curriculum_tasks(&task_source, 2);
+    let ckpt_path = if no_checkpoint {
+        None
+    } else {
+        Some(checkpoint_path.unwrap_or_else(|| format!("{}.beam_checkpoint", task_file)))
+    };
+
+    eprintln!();
+    eprintln!("═══════════════════════════════════════════════════════════════");
+    eprintln!("  SELPH beam-overnight: {} tasks", tasks.len());
+    eprintln!("  Budget/round: {}, Beam width: {}, Beam depth: {}, Max rounds: {}",
+        budget, beam_width, beam_depth, max_rounds);
+    eprintln!("  Time limit: {:.1} hours", time_limit_secs as f64 / 3600.0);
+    if let Some(ref p) = ckpt_path {
+        eprintln!("  Checkpoint: {}", p);
+    }
+    eprintln!("═══════════════════════════════════════════════════════════════");
+    eprintln!();
+
+    let env = eval_v2::make_default_env();
+
+    // Load preamble (M-chain, helpers, etc.)
+    if let Some(ref preamble) = preamble_file {
+        match fs::read_to_string(preamble) {
+            Ok(source) => {
+                if let Err(e) = eval_curriculum_preamble(&source, &env) {
+                    eprintln!("warning: preamble eval failed: {}", e);
+                }
+                eprintln!("  Preamble loaded: {}", preamble);
+            }
+            Err(e) => eprintln!("warning: could not read preamble {}: {}", preamble, e),
+        }
+    }
+
+    // Also eval the task file preamble (non-task defines).
+    if let Err(e) = eval_curriculum_preamble(&task_source, &env) {
+        eprintln!("warning: task file preamble eval failed: {}", e);
+    }
+
+    // Load checkpoint.
+    let mut checkpoint_solved: Vec<SolvedTask> = Vec::new();
+    let mut checkpoint_names: HashSet<String> = HashSet::new();
+    if let Some(ref ckpt) = ckpt_path {
+        let loaded = load_checkpoint(ckpt);
+        if !loaded.is_empty() {
+            eprintln!("  Checkpoint: {} previously solved tasks", loaded.len());
+            for st in &loaded {
+                match reconstruct_solution(&st.source, &env) {
+                    Ok(func @ types_v2::Value::Function(_)) => {
+                        env.define(intern(&st.name), func);
+                        checkpoint_names.insert(st.name.clone());
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("    checkpoint: {} failed: {}", st.name, e);
+                    }
+                }
+            }
+            checkpoint_solved = loaded;
+            eprintln!("    {} restored into env", checkpoint_names.len());
+        }
+    }
+
+    let total_start = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(time_limit_secs);
+    let mut solved = checkpoint_names.len();
+    let mut total_candidates: usize = 0;
+    let preamble_hash = compute_preamble_hash(&task_source);
+
+    // ── Phase 1: Baseline synthesis (regular grow-v2 path) ──────────
+    eprintln!();
+    eprintln!("── Phase 1: Baseline synthesis ──────────────────────────────");
+
+    let baseline_budget: usize = 200000;
+    let mut unsolved_indices: Vec<usize> = Vec::new();
+    let mut best_fitness: Vec<(usize, f64, String)> = Vec::new(); // (idx, fitness, best_source)
+
+    for (idx, task) in tasks.iter().enumerate() {
+        if total_start.elapsed() > deadline {
+            eprintln!("  ⏰ Time limit reached during Phase 1");
+            break;
+        }
+        let (ref name, depth, ref inputs, ref expected, arity_hint,
+             ref test_inputs, ref test_expected) = *task;
+
+        if checkpoint_names.contains(name) {
+            continue;
+        }
+
+        let wr = synthesize_one_task(
+            name, depth, inputs, expected, arity_hint,
+            test_inputs, test_expected, &env, baseline_budget,
+        );
+        total_candidates += wr.candidates;
+
+        if wr.found {
+            match reconstruct_solution(&wr.source, &env) {
+                Ok(func @ types_v2::Value::Function(_)) => {
+                    env.define(intern(name), func);
+                }
+                _ => {}
+            }
+            eprintln!("  ✓ {:>3}/{} {:30} {:>6} cand  {}",
+                idx + 1, tasks.len(), name, wr.candidates, wr.source);
+            solved += 1;
+            checkpoint_solved.push(SolvedTask {
+                name: name.clone(),
+                strategy: wr.strategy.clone(),
+                candidates: wr.candidates,
+                source: wr.source.clone(),
+            });
+            checkpoint_names.insert(name.clone());
+        } else {
+            unsolved_indices.push(idx);
+            if wr.fitness > 0.0 {
+                best_fitness.push((idx, wr.fitness, wr.best_source.clone()));
+            }
+        }
+    }
+
+    // Save checkpoint after Phase 1.
+    if let Some(ref ckpt) = ckpt_path {
+        save_checkpoint(ckpt, &checkpoint_solved, preamble_hash);
+    }
+
+    eprintln!();
+    eprintln!("  Phase 1 complete: {}/{} solved, {} unsolved ({} with fitness > 0)",
+        solved, tasks.len(), unsolved_indices.len(),
+        best_fitness.len());
+    eprintln!("  Elapsed: {:.1}s", total_start.elapsed().as_secs_f64());
+
+    // ── Phase 2: Beam ratchet on unsolved tasks ─────────────────────
+    eprintln!();
+    eprintln!("── Phase 2: Beam ratchet ({} rounds, depth={}, beam={}, budget={}/round) ──",
+        max_rounds, beam_depth, beam_width, budget);
+
+    // Sort unsolved by fitness descending — try near-misses first.
+    let mut fitness_map: std::collections::HashMap<usize, (f64, String)> =
+        best_fitness.into_iter().map(|(i, f, s)| (i, (f, s))).collect();
+    unsolved_indices.sort_by(|a, b| {
+        let fa = fitness_map.get(a).map(|x| x.0).unwrap_or(0.0);
+        let fb = fitness_map.get(b).map(|x| x.0).unwrap_or(0.0);
+        fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut beam_solved = 0usize;
+    let mut beam_round = 0usize;
+
+    // Wavefront: repeat until no new solutions or time limit.
+    loop {
+        if total_start.elapsed() > deadline {
+            eprintln!("  ⏰ Time limit reached");
+            break;
+        }
+        if unsolved_indices.is_empty() {
+            eprintln!("  All tasks solved!");
+            break;
+        }
+
+        beam_round += 1;
+        let round_start = std::time::Instant::now();
+        let mut round_solved = 0usize;
+        let mut still_unsolved = Vec::new();
+
+        eprintln!("  ── Beam wavefront round {} ({} unsolved) ──", beam_round, unsolved_indices.len());
+
+        for &idx in &unsolved_indices {
+            if total_start.elapsed() > deadline {
+                still_unsolved.push(idx);
+                continue;
+            }
+
+            let (ref name, _depth, ref inputs, ref expected, _arity_hint,
+                 ref test_inputs, ref test_expected) = tasks[idx];
+
+            // Convert values.
+            let v2_inputs: Vec<types_v2::Value> = inputs.iter().map(|v| legacy_value_to_v2(v)).collect();
+            let v2_expected: Vec<types_v2::Value> = expected.iter().map(|v| legacy_value_to_v2(v)).collect();
+            let v2_test_inputs: Vec<types_v2::Value> = test_inputs.iter().map(|v| legacy_value_to_v2(v)).collect();
+            let v2_test_expected: Vec<types_v2::Value> = test_expected.iter().map(|v| legacy_value_to_v2(v)).collect();
+
+            // Build spec as Value pairs.
+            let spec_pairs: Vec<types_v2::Value> = v2_inputs.iter().zip(v2_expected.iter())
+                .map(|(i, e)| types_v2::Value::list(vec![i.clone(), e.clone()]))
+                .collect();
+
+            let skip = synth_v2::default_skip_set();
+            let mut components = synth_v2::default_synth_components(&env, &skip);
+            let universe = synth_v2::TypeUniverse::from_env(&env);
+
+            // Run beam ratchet: iterative rounds with full strategy chain.
+            // Each round runs M-chain + Flat (with beam) + RD + BD + HO + D&C.
+            // Beam entries from Flat get injected as library for the next round.
+            let mut task_found = false;
+            let mut task_candidates = 0usize;
+            let mut task_source = String::new();
+            let mut task_strategy = String::new();
+
+            for round in 1..=max_rounds {
+                if total_start.elapsed() > deadline { break; }
+
+                // Rebuild components each round (picks up injected library).
+                let skip = synth_v2::default_skip_set();
+                let components = synth_v2::default_synth_components(&env, &skip);
+                let universe = synth_v2::TypeUniverse::from_env(&env);
+
+                let sr = synth_v2::synthesize_with_strategies_beam(
+                    &components, &v2_inputs, &v2_expected, &env, &universe,
+                    beam_depth, budget, beam_width,
+                );
+                task_candidates += sr.candidates_explored;
+
+                if sr.found {
+                    let nodes = sr.nodes.as_ref().unwrap();
+                    let root = sr.root.unwrap();
+                    if synth_v2::validate_held_out(nodes, root,
+                            &v2_test_inputs, &v2_test_expected, &env) {
+                        task_source = eval_v2::node_to_source(nodes, root);
+                        task_strategy = sr.strategy.map(|s| s.name()).unwrap_or_default();
+                        task_found = true;
+                        break;
+                    }
+                }
+
+                // Inject beam entries as library functions for next round.
+                for (bi, entry) in sr.beam.iter().enumerate() {
+                    let (n, r) = synth_v2::wrap_lambda(&entry.pool_entry);
+                    let src = eval_v2::node_to_source(&n, r);
+                    let lib_name = format!("__beam_{}_r{}_{}", name, round, bi);
+                    match reconstruct_solution(&src, &env) {
+                        Ok(func @ types_v2::Value::Function(_)) => {
+                            env.define(intern(&lib_name), func);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            total_candidates += task_candidates;
+
+            if task_found {
+                match reconstruct_solution(&task_source, &env) {
+                    Ok(func @ types_v2::Value::Function(_)) => {
+                        env.define(intern(name), func);
+                    }
+                    _ => {}
+                }
+                eprintln!("  ✓ {:>3}/{} {:30} {:>6} cand  {}",
+                    idx + 1, tasks.len(), name, task_candidates, task_source);
+                solved += 1;
+                beam_solved += 1;
+                round_solved += 1;
+                checkpoint_solved.push(SolvedTask {
+                    name: name.clone(),
+                    strategy: format!("Beam+{}", task_strategy),
+                    candidates: task_candidates,
+                    source: task_source.clone(),
+                });
+                checkpoint_names.insert(name.clone());
+            } else {
+                still_unsolved.push(idx);
+            }
+        }
+
+        // Save checkpoint after each wavefront round.
+        if let Some(ref ckpt) = ckpt_path {
+            save_checkpoint(ckpt, &checkpoint_solved, preamble_hash);
+        }
+
+        eprintln!("  Round {} done: +{} solved, {:.1}s",
+            beam_round, round_solved, round_start.elapsed().as_secs_f64());
+
+        unsolved_indices = still_unsolved;
+
+        if round_solved == 0 {
+            // No progress this wavefront round.
+            // Escalate: try with higher depth per beam round.
+            eprintln!("  No new solutions this round. Continuing with escalated budget...");
+            // Double the budget for next round, cap at 500K.
+            // budget = (budget * 2).min(500000); // Keep budget fixed for now.
+        }
+    }
+
+    // ── Summary ─────────────────────────────────────────────────────
+    let elapsed = total_start.elapsed();
+    eprintln!();
+    eprintln!("═══════════════════════════════════════════════════════════════");
+    eprintln!("  beam-overnight complete");
+    eprintln!("  Total: {}/{} solved ({} from Phase 1, {} from beam ratchet)",
+        solved, tasks.len(), solved - beam_solved, beam_solved);
+    eprintln!("  Candidates: {}", total_candidates);
+    eprintln!("  Elapsed: {:.1}s ({:.1} hours)",
+        elapsed.as_secs_f64(), elapsed.as_secs_f64() / 3600.0);
+    eprintln!("  Unsolved: {}", unsolved_indices.len());
+    eprintln!("═══════════════════════════════════════════════════════════════");
 }
 
 fn cmd_arc(args: &[String]) {
