@@ -50,8 +50,9 @@ The architecture IS the curriculum. Change the curriculum, change the architectu
 - Auto-constant extraction, probe-and-filter, observational equivalence dedup
 - Epsilon-equivalence for float dedup
 
-**Strategy pipeline:** SELPH decomposers (M-chain + rx-guided forms) → RD → Flat → BD → HO → D&C → Memo
+**Strategy pipeline:** SELPH decomposers (M-chain + hole-fc decomposers) → RD → Flat → BD → HO → D&C → Memo
 
+- **SELPH hole-fc decomposers (§hole-fc):** Return AST templates with `__hole_N__` placeholders + sub-specs. Rust fills holes via `sub_synthesize`. Includes: list-map, list-filter, split-map-join, char-map-join, D&C (nested if-trees), RD (library bridge).
 - **Recursive Decomposition (RD):** Top-down prediction — classify outermost function family, invert to derive subspecs, recursively solve. 6 family inversions (arithmetic, string-op, count, compare, HO, if-expr). Macro-aware bridge decomposition.
 - **Boolean Decomposition (BD):** Tries `(and P Q)`, `(or P Q)`, `(not P)` compositions of bool-returning macros.
 - **Higher-Order (HO):** Template decomposition — list-map, split-map-join, char-map-join, list-filter. Fills function holes via recursive sub-synthesis.
@@ -1079,6 +1080,65 @@ Examined top near-miss tasks to characterize what's missing:
 | ARC-AGI-1 train | 36/400 (9.0%) | 80 | 245 | ~960s parallel |
 
 Files: `m8g_compose.selph` (new), `arc_near_miss.selph` (new), `extract_near_miss.sh` (new), `m_chain.selph`, `run_probe.sh`, `run_fitness_probe.sh`
+
+### §hole-fc First-class holes: decomposers return templates with sub-specs (April 14–15, 2026)
+
+Unified the two disconnected systems: M-chain detectors (SELPH, return complete solutions) and Rust strategies (HO, RD, D&C — fuse template choice and hole-filling in Rust). SELPH decomposers can now return **AST templates with named holes** (`__hole_0__`, `__hole_1__`, ...), where each hole carries a sub-spec. The Rust engine fills holes via `sub_synthesize`.
+
+#### Design
+
+Holes are `Node::Symbol` with reserved names — no new `Node` or `Value` variants. The `"holes"` key in the decomposer result maps each name to a sub-spec namespace. When absent, the existing complete-solution path runs. When present, `fill_template_holes` sub-synthesizes each hole, splices results into the template, and verifies.
+
+```
+(ns ("found" true)
+    ("nodes" <template-with-holes>)
+    ("holes" (ns ("__hole_0__" (ns ("spec" ((in0 out0) (in1 out1) ...))))))
+    ("candidates" 1))
+```
+
+#### Rust infrastructure
+
+- `HoleContext<'a>` — carries `components`, `universe`, `strategy_depth` for sub-synthesis
+- `is_hole_symbol(sym)` — detects `__hole_N__` pattern
+- `remap_node_with_holes(node, offset, hole_redirects)` — index remapping with hole splicing
+- `fill_template_holes(...)` — scan, sub-synthesize, splice, verify
+- `make-hole` builtin: `(make-hole 0)` → `Node::Symbol(intern("__hole_0__"))`
+- `try_selph_decomposers` takes `hole_ctx: Option<HoleContext>`, dispatches to fill_template_holes when holes present
+
+#### SELPH decomposers (7 files)
+
+| File | Template | Detection |
+|---|---|---|
+| `m_ho_list_map.selph` | `(map __hole_0__ x)` | list→list, equal length |
+| `m_ho_list_filter.selph` | `(filter __hole_0__ x)` | list→list, output is ordered subset |
+| `m_ho_split_map_join.selph` | `(string-join (map __hole_0__ (string-split x SEP)) SEP)` | string→string, 9 delimiters |
+| `m_ho_char_map_join.selph` | `(string-join (map __hole_0__ (string-chars x)) "")` | string→string, equal char count |
+| `m_dc.selph` | nested `(if __hole_N__ __hole_N+1__ ...)` | 2+ distinct output values |
+| `m_rd.selph` | `(let ((x (m x))) __hole_0__)` | library bridge composition |
+| `m_ho.selph` | `reduce` over grid objects | grid→grid, same object count |
+
+All HO decomposers use dedup + conflict detection + ≥3 unique pairs. D&C uses variable hole count (2N−1 for N groups). RD enumerates library functions, returns first promising match with bridge hole.
+
+#### Key design decision: no `synthesize` calls from SELPH decomposers
+
+Initial D&C and RD ports called `synthesize` internally (old pattern from pre-hole-fc worktrees). This caused **cascading decomposer overhead** — each sub-synthesis triggered ALL decomposers including the M-chain's expensive grid detectors. The 55-task curriculum hung for hours.
+
+Fix: decomposers return templates with holes, Rust `fill_template_holes` does sub-synthesis with `strategy_depth - 1`. No SELPH↔Rust overhead per sub-call.
+
+#### Results
+
+- **55-task curriculum:** 55/55 in 232s (was hanging for hours with `synthesize` calls)
+- `custom:m-ho-split-map-join` fired on 2 tasks (structure_2w, structure_3w)
+- D&C fired on 7 tasks, RD on 5 tasks
+- No regressions vs baseline
+
+#### What this enables (future)
+
+- SELPH-side strategy logic: observe spec features → choose decomposition template
+- Eventually synthesizable observers and policies (the RL formulation)
+- Port Induction strategy to SELPH hole-fc decomposer
+
+Files: `synth_v2.rs`, `eval_v2.rs`, `m_ho_list_map.selph`, `m_ho_list_filter.selph`, `m_ho_split_map_join.selph`, `m_ho_char_map_join.selph`, `m_dc.selph`, `m_rd.selph`, `m_ho.selph`, `run_probe.sh`, `run_fitness_probe.sh`
 
 ---
 
