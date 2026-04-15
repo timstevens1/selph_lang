@@ -60,6 +60,7 @@ cat \
     "$META/m_fitness_grid.selph" \
     "$META/m_refine.selph" \
     "$META/m_ho.selph" \
+    "$META/m_ho_list_map.selph" \
     "$CURRICULUM" \
     > "$COMBINED"
 

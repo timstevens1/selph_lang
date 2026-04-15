@@ -52,6 +52,7 @@ cat \
     "$META/m_fitness_grid.selph" \
     "$META/m_refine.selph" \
     "$META/m_ho.selph" \
+    "$META/m_ho_list_map.selph" \
     "$CURRICULUM" \
     > "$COMBINED"
 
@@ -82,6 +83,7 @@ cat \
     "$META/m_fitness_grid.selph" \
     "$META/m_refine.selph" \
     "$META/m_ho.selph" \
+    "$META/m_ho_list_map.selph" \
     "$META/m_near_miss.selph" \
     "$META/m_boost_heuristic.selph" \
     "$META/m_phase3_compose.selph" \

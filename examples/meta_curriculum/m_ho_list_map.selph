@@ -1,0 +1,102 @@
+; ─────────────────────────────────────────────────────────────────────────
+; m_ho_list_map: list-map decomposer using first-class holes
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Detects list-map patterns: all inputs and outputs are lists of equal
+; length, and a per-element function F exists such that
+;   output[i] = map(F, input[i])  for all training pairs.
+;
+; Returns an AST template with a hole for the per-element function:
+;   (lambda (x) (map __hole_0__ x))
+; and a sub-spec of element-wise (input-element, output-element) pairs.
+;
+; The Rust hole-filling engine (fill_template_holes) sub-synthesizes F
+; and splices the result into the template.
+
+; ── Guard: all pairs are list→list of same non-zero length ───────────
+
+(define lm-guard
+  (lambda (pairs)
+    (if (= (length pairs) 0) false
+      (reduce
+        (lambda (ok pair)
+          (if (not ok) false
+            (let ((inp (head pair))
+                  (out (head (tail pair))))
+              (and (list? inp)
+                   (list? out)
+                   (> (length inp) 0)
+                   (= (length inp) (length out))))))
+        pairs
+        true))))
+
+; ── Derive element-wise sub-spec ─────────────────────────────────────
+;
+; From each training pair (input-list, output-list), extract element-wise
+; pairs (input[j], output[j]). Deduplicates by equality and rejects
+; conflicting mappings (same input → different outputs). Returns nil
+; if fewer than 3 unique pairs or if conflicts are found.
+
+(define lm-derive-sub-spec
+  (lambda (pairs)
+    (let ((all-pairs
+            (reduce
+              (lambda (acc pair)
+                (let ((inp (head pair))
+                      (out (head (tail pair))))
+                  (reduce
+                    (lambda (a i)
+                      (append a (list (list (nth inp i) (nth out i)))))
+                    (range (length inp))
+                    acc)))
+              pairs
+              (list))))
+      ; Deduplicate: keep first occurrence of each input, reject conflicts.
+      (let ((unique
+              (reduce
+                (lambda (acc p)
+                  (if (nil? acc) nil
+                    (let ((in-val (head p))
+                          (out-val (head (tail p))))
+                      (let ((existing
+                              (reduce
+                                (lambda (found u)
+                                  (if found found
+                                    (if (= (head u) in-val)
+                                      (if (= (head (tail u)) out-val) "dup" "conflict")
+                                      false)))
+                                acc
+                                false)))
+                        (if (= existing "conflict") nil
+                          (if (= existing "dup") acc
+                            (append acc (list p))))))))
+                all-pairs
+                (list))))
+        (if (nil? unique) nil
+          (if (< (length unique) 3) nil
+            unique))))))
+
+; ── Main decomposer ─────────────────────────────────────────────────
+
+(define detect-list-map
+  (lambda (synth-spec)
+    (let ((pairs (ns-get synth-spec "spec")))
+      (if (not (lm-guard pairs))
+        (ns ("found" false))
+        (let ((sub-pairs (lm-derive-sub-spec pairs)))
+          (if (nil? sub-pairs)
+            (ns ("found" false))
+            (ns ("found" true)
+                ("nodes" (make-lambda (list "x")
+                           (make-app "map" (make-hole 0) (make-symbol "x"))))
+                ("holes" (ns ("__hole_0__" (ns ("spec" sub-pairs)))))
+                ("candidates" 1))))))))
+
+; ── Registration ─────────────────────────────────────────────────────
+;
+; Register as a separate __decomposers__ entry (after m_chain.selph).
+; Uses ns-put to add to the existing namespace without clobbering the
+; m-chain entry.
+
+(define __decomposers__
+  (ns-put __decomposers__ "m-ho-list-map" detect-list-map))

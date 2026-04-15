@@ -750,6 +750,7 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("make-if"), bi_make_if);
     t.register(intern("make-lambda"), bi_make_lambda);
     t.register(intern("make-let"), bi_make_let);
+    t.register(intern("make-hole"), bi_make_hole);
     t.register(intern("node?"), bi_is_node);
     t.register(intern("node-kind"), bi_node_kind);
     t.register(intern("node-int"), bi_node_int);
@@ -881,7 +882,7 @@ fn build_default_scope() -> Scope {
         "test-spec", "memorize", "eval-source",
         // §9.36 AST homoiconicity — construction
         "make-int", "make-num", "make-str", "make-bool", "make-symbol",
-        "make-app", "make-if", "make-lambda", "make-let",
+        "make-app", "make-if", "make-lambda", "make-let", "make-hole",
         // §9.36 AST homoiconicity — inspection
         "node?", "node-kind", "node-int", "node-num", "node-str",
         "node-bool", "node-symbol", "node-children", "node-params",
@@ -1904,6 +1905,21 @@ fn bi_make_symbol(args: &[Value], _env: &Env) -> Result<Value, String> {
         Value::Str(s) => s.as_ref().to_string(),
         other => return Err(format!("make-symbol: expected string, got {:?}", other)),
     };
+    let sym = intern(&name);
+    Ok(single_node_value(Node::Symbol(sym)))
+}
+
+/// §hole-fc: convenience for constructing hole placeholder symbols.
+/// `(make-hole 0)` → `Node::Symbol(intern("__hole_0__"))`.
+fn bi_make_hole(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("make-hole: expected 1 arg (index), got {}", args.len()));
+    }
+    let idx = match &args[0] {
+        Value::Int(n) => *n,
+        other => return Err(format!("make-hole: expected int index, got {:?}", other)),
+    };
+    let name = format!("__hole_{}__", idx);
     let sym = intern(&name);
     Ok(single_node_value(Node::Symbol(sym)))
 }

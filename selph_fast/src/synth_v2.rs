@@ -4877,12 +4877,27 @@ pub fn recursive_decompose(
 /// `flat_budget` is the candidate budget for the Flat strategy and is
 /// also passed to RD/HO/D&C/Induction sub-syntheses. BD and Memo are
 /// bounded by their own intrinsic costs and ignore it.
+/// §hole-fc: context for filling holes in decomposer templates.
+/// When provided, decomposers may return AST templates with named hole
+/// symbols (`__hole_0__`, `__hole_1__`, ...) alongside a `"holes"` key
+/// mapping each name to a sub-spec. The engine fills each hole via
+/// `sub_synthesize` and splices the results into the template.
+struct HoleContext<'a> {
+    components: &'a [SynthComponent],
+    universe: &'a TypeUniverse,
+    strategy_depth: usize,
+}
+
 /// §9.37 Stage A: walk the env's `__decomposers__` namespace, calling
 /// each entry as a SELPH decomposer until one returns a `found: true`
 /// result. Each decomposer is a SELPH lambda accepting one argument
 /// (the spec namespace, in the same shape `bi_synthesize` accepts) and
 /// returning either `nil` (doesn't apply) or a result namespace
 /// `(ns ("found" true) ("nodes" <Node>) ("candidates" <Int>))`.
+///
+/// §hole-fc: decomposers may also return a `"holes"` key with named
+/// sub-specs. When `hole_ctx` is Some, the engine fills each hole via
+/// sub-synthesis and splices the results into the template.
 ///
 /// Returns `Some((nodes, root, candidates, name_sym))` on the first
 /// successful decomposer, where `name_sym` is the entry's key in the
@@ -4904,6 +4919,9 @@ fn try_selph_decomposers(
     max_budget: usize,
     test_inputs: &[Value],
     test_expected: &[Value],
+    // §hole-fc: extra params for hole-filling sub-synthesis.
+    // When None, hole-returning decomposers are skipped (backward compat).
+    hole_ctx: Option<HoleContext<'_>>,
 ) -> Option<(Vec<Node>, usize, usize, Sym)> {
     let decomp_ns = match env.lookup(intern("__decomposers__")) {
         Some(Value::Ns(map)) => map,
@@ -4969,16 +4987,35 @@ fn try_selph_decomposers(
                     if let Some(Value::Node(node_ref)) =
                         result.get(&intern("nodes"))
                     {
-                        // Materialize the constructed AST into a fresh
-                        // owned Vec<Node>. The NodeRef's arena is Rc-shared
-                        // and may live longer than this dispatcher call;
-                        // owning the Vec keeps the StrategyResult
-                        // self-contained.
                         let nodes: Vec<Node> = node_ref.nodes.iter().cloned().collect();
-                        return Some((nodes, node_ref.idx, total_cands, *name_sym));
+                        let root = node_ref.idx;
+
+                        // §hole-fc: check for holes in the template.
+                        if let Some(Value::Ns(holes_map)) = result.get(&intern("holes")) {
+                            if !holes_map.is_empty() {
+                                if let Some(ref ctx) = hole_ctx {
+                                    if let Some((filled_nodes, filled_root, hole_cands)) =
+                                        fill_template_holes(
+                                            &nodes, root, holes_map,
+                                            ctx.components, inputs, expected,
+                                            env, ctx.universe,
+                                            flat_depth, max_budget,
+                                            ctx.strategy_depth,
+                                        )
+                                    {
+                                        return Some((filled_nodes, filled_root,
+                                                     total_cands + hole_cands, *name_sym));
+                                    }
+                                }
+                                // No hole_ctx or hole-filling failed — skip.
+                                continue;
+                            }
+                        }
+
+                        // Complete solution (no holes).
+                        return Some((nodes, root, total_cands, *name_sym));
                     }
-                    // Found but missing nodes — skip silently. A future
-                    // version could log this as a curriculum bug.
+                    // Found but missing nodes — skip silently.
                 }
             }
             Ok(Value::Nil) => continue,
@@ -4987,6 +5024,160 @@ fn try_selph_decomposers(
         }
     }
     None
+}
+
+// ── §hole-fc: template hole filling ──────────────────────────────────────
+//
+// When a SELPH decomposer returns a template AST with named hole symbols
+// (`__hole_0__`, `__hole_1__`, ...) and a `"holes"` namespace mapping each
+// name to a sub-spec, this function:
+//   1. Identifies hole positions in the template
+//   2. Sub-synthesizes a program for each hole's sub-spec
+//   3. Splices the sub-programs into the template
+//   4. Verifies the composed result against the original spec
+
+/// Returns true if `sym` is a hole placeholder symbol (__hole_N__).
+fn is_hole_symbol(sym: Sym) -> bool {
+    let name = resolve(sym);
+    name.starts_with("__hole_") && name.ends_with("__")
+}
+
+/// Remap node indices by `offset`, but redirect any child index that
+/// pointed to a hole position to the corresponding sub-tree root instead.
+fn remap_node_with_holes(
+    node: &Node,
+    offset: usize,
+    hole_redirects: &HashMap<usize, usize>,
+) -> Node {
+    let remap = |i: usize| -> usize {
+        if let Some(&target) = hole_redirects.get(&i) {
+            target
+        } else {
+            i + offset
+        }
+    };
+    match node {
+        Node::App(c) => Node::App(c.iter().map(|&i| remap(i)).collect()),
+        Node::SpecialApp(form, c) => {
+            Node::SpecialApp(*form, c.iter().map(|&i| remap(i)).collect())
+        }
+        Node::If(a, b, c) => Node::If(remap(*a), remap(*b), remap(*c)),
+        Node::Lambda(p, b) => Node::Lambda(p.clone(), remap(*b)),
+        Node::Let(bs, b) => Node::Let(
+            bs.iter().map(|(n, i)| (*n, remap(*i))).collect(),
+            remap(*b),
+        ),
+        Node::Int(_) | Node::Num(_) | Node::Str(_) | Node::Bool(_) | Node::Symbol(_) => {
+            node.clone()
+        }
+    }
+}
+
+/// Fill holes in a template AST by sub-synthesizing each hole's sub-spec,
+/// then splicing the results into the template. Returns None if any hole
+/// fails to synthesize or the composed program fails verification.
+fn fill_template_holes(
+    template_nodes: &[Node],
+    template_root: usize,
+    holes: &NsMap,
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    flat_depth: usize,
+    max_candidates: usize,
+    strategy_depth: usize,
+) -> Option<(Vec<Node>, usize, usize)> {
+    // 1. Find hole positions in the template.
+    let mut hole_positions: HashMap<Sym, usize> = HashMap::new();
+    for (i, node) in template_nodes.iter().enumerate() {
+        if let Node::Symbol(sym) = node {
+            if is_hole_symbol(*sym) {
+                hole_positions.insert(*sym, i);
+            }
+        }
+    }
+    if hole_positions.is_empty() {
+        return None; // No holes found — shouldn't happen if "holes" was non-empty.
+    }
+
+    // Budget per hole: split evenly.
+    let budget_per_hole = (max_candidates / hole_positions.len().max(1)).max(1);
+    let mut total_cands = 0usize;
+
+    // 2. Sub-synthesize each hole and splice into output.
+    let mut out: Vec<Node> = Vec::new();
+    let mut hole_redirects: HashMap<usize, usize> = HashMap::new(); // template_idx → out_idx
+
+    for (&hole_sym, &template_idx) in &hole_positions {
+        // Look up this hole's sub-spec in the holes namespace.
+        let hole_spec = match holes.get(&hole_sym) {
+            Some(Value::Ns(ns)) => ns,
+            _ => return None, // Hole declared in template but missing from "holes" map.
+        };
+        let spec_pairs = match hole_spec.get(&intern("spec")) {
+            Some(Value::List(pairs)) => pairs,
+            _ => return None,
+        };
+
+        // Parse sub-spec pairs: each is a list [input, output].
+        let mut sub_inputs: Vec<Value> = Vec::new();
+        let mut sub_expected: Vec<Value> = Vec::new();
+        for pair in spec_pairs.iter() {
+            if let Value::List(p) = pair {
+                if p.len() >= 2 {
+                    sub_inputs.push(p[0].clone());
+                    sub_expected.push(p[1].clone());
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+
+        if sub_inputs.is_empty() {
+            return None;
+        }
+
+        // Sub-synthesize.
+        let sr = sub_synthesize(
+            components, &sub_inputs, &sub_expected,
+            env, universe, flat_depth, budget_per_hole, strategy_depth,
+        );
+        total_cands += sr.candidates_explored;
+        if !sr.found {
+            return None;
+        }
+
+        // Splice the sub-result into `out`, recording the root index.
+        let sub_nodes = sr.nodes.unwrap();
+        let sub_root = sr.root.unwrap();
+        let spliced_root = ho_splice_sub(&mut out, &sub_nodes, sub_root);
+        hole_redirects.insert(template_idx, spliced_root);
+    }
+
+    // 3. Copy template nodes into `out`, redirecting hole references.
+    let tpl_offset = out.len();
+    for (i, node) in template_nodes.iter().enumerate() {
+        if hole_redirects.contains_key(&i) {
+            // This node is a hole placeholder; it's never referenced
+            // directly because parents have been redirected. Emit a
+            // dummy node to keep index arithmetic correct.
+            out.push(Node::Int(0));
+        } else {
+            out.push(remap_node_with_holes(node, tpl_offset, &hole_redirects));
+        }
+    }
+    let composed_root = template_root + tpl_offset;
+
+    // 4. Verify the composed program against the original spec.
+    if !ho_verify_composed(&out, composed_root, inputs, expected, env) {
+        return None;
+    }
+
+    Some((out, composed_root, total_cands))
 }
 
 /// §9.37 Stage C: type-keyed decomposer dispatch. Walk the universe's
@@ -5208,7 +5399,8 @@ fn synthesize_with_strategies_depth(
     // §9.37 Stage A: global SELPH decomposers from `__decomposers__`
     // run BEFORE the hardcoded chain. Curriculum is in charge.
     if let Some((nodes, root, sd_explored, name_sym)) =
-        try_selph_decomposers(env, inputs, expected, flat_depth, flat_budget, &[], &[])
+        try_selph_decomposers(env, inputs, expected, flat_depth, flat_budget, &[], &[],
+            Some(HoleContext { components, universe, strategy_depth }))
     {
         return StrategyResult {
             found: true,
@@ -6402,7 +6594,7 @@ fn synthesize_inner(
     if extra_seeds_was_some {
         if let Some((nodes, root, sd_explored, name_sym)) =
             try_selph_decomposers(env, inputs, expected, flat_depth, max_candidates,
-                                  test_inputs, test_expected)
+                                  test_inputs, test_expected, None)
         {
             // §9.47.5: the chain now self-validates against test data
             // internally (via the spec ns "test" key). The external
@@ -9407,5 +9599,120 @@ mod tests {
         // matches occur before the exact match, this could be empty.
         // The important thing is the structure works — we don't assert non-empty.
         let _ = r.experience; // just verify it exists and is accessible
+    }
+
+    // ── §hole-fc: fill_template_holes tests ──────────────────────────────
+
+    #[test]
+    fn fill_holes_list_map_template() {
+        // Test the hole-filling pipeline directly: construct a template
+        // (lambda (x) (map __hole_0__ x)) with a sub-spec that demands
+        // element-wise (add x 1), then verify fill_template_holes produces
+        // a working composed program.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        // Template: (lambda (x) (map __hole_0__ x))
+        let template_nodes = vec![
+            Node::Symbol(intern("map")),           // 0
+            Node::Symbol(intern("__hole_0__")),    // 1
+            Node::Symbol(intern("x")),             // 2
+            Node::App(vec![0, 1, 2]),              // 3: (map __hole_0__ x)
+            Node::Lambda(vec![intern("x")], 3),    // 4: (lambda (x) ...)
+        ];
+        let template_root = 4;
+
+        // Sub-spec: element-wise add-1
+        let sub_spec_pairs = Value::list(vec![
+            Value::list(vec![Value::Int(1), Value::Int(2)]),
+            Value::list(vec![Value::Int(2), Value::Int(3)]),
+            Value::list(vec![Value::Int(10), Value::Int(11)]),
+            Value::list(vec![Value::Int(0), Value::Int(1)]),
+        ]);
+        let mut holes_map = NsMap::new();
+        let mut hole_spec = NsMap::new();
+        hole_spec.insert(intern("spec"), sub_spec_pairs);
+        holes_map.insert(intern("__hole_0__"), Value::ns(hole_spec));
+
+        // Full task spec: list→list where each element is +1.
+        let inputs = vec![
+            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            Value::list(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
+            Value::list(vec![Value::Int(0), Value::Int(5), Value::Int(7)]),
+        ];
+        let expected = vec![
+            Value::list(vec![Value::Int(2), Value::Int(3), Value::Int(4)]),
+            Value::list(vec![Value::Int(11), Value::Int(21), Value::Int(31)]),
+            Value::list(vec![Value::Int(1), Value::Int(6), Value::Int(8)]),
+        ];
+
+        let result = fill_template_holes(
+            &template_nodes, template_root, &holes_map,
+            &comps, &inputs, &expected, &env, &universe,
+            2, 2000, 1,
+        );
+        assert!(result.is_some(), "fill_template_holes should find a solution");
+        let (nodes, root, cands) = result.unwrap();
+        assert!(cands > 0, "should have explored some candidates");
+        // Verify the composed program works on the original spec.
+        assert!(
+            ho_verify_composed(&nodes, root, &inputs, &expected, &env),
+            "composed program should pass all examples"
+        );
+    }
+
+    #[test]
+    fn fill_holes_returns_none_on_unsolvable_hole() {
+        // If the sub-spec for a hole is unsolvable, fill_template_holes
+        // should return None.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let template_nodes = vec![
+            Node::Symbol(intern("map")),
+            Node::Symbol(intern("__hole_0__")),
+            Node::Symbol(intern("x")),
+            Node::App(vec![0, 1, 2]),
+            Node::Lambda(vec![intern("x")], 3),
+        ];
+
+        // Sub-spec: contradictory (same input → different outputs).
+        let sub_spec_pairs = Value::list(vec![
+            Value::list(vec![Value::Int(1), Value::Int(2)]),
+            Value::list(vec![Value::Int(1), Value::Int(3)]),
+            Value::list(vec![Value::Int(2), Value::Int(4)]),
+        ]);
+        let mut holes_map = NsMap::new();
+        let mut hole_spec = NsMap::new();
+        hole_spec.insert(intern("spec"), sub_spec_pairs);
+        holes_map.insert(intern("__hole_0__"), Value::ns(hole_spec));
+
+        let inputs = vec![
+            Value::list(vec![Value::Int(1), Value::Int(2)]),
+        ];
+        let expected = vec![
+            Value::list(vec![Value::Int(999), Value::Int(999)]),
+        ];
+
+        let result = fill_template_holes(
+            &template_nodes, 4, &holes_map,
+            &comps, &inputs, &expected, &env, &universe,
+            1, 500, 0,
+        );
+        assert!(result.is_none(), "should fail on unsolvable sub-spec");
+    }
+
+    #[test]
+    fn is_hole_symbol_recognizes_holes() {
+        assert!(is_hole_symbol(intern("__hole_0__")));
+        assert!(is_hole_symbol(intern("__hole_1__")));
+        assert!(is_hole_symbol(intern("__hole_42__")));
+        assert!(!is_hole_symbol(intern("x")));
+        assert!(!is_hole_symbol(intern("__decomposers__")));
+        assert!(!is_hole_symbol(intern("hole")));
     }
 }
