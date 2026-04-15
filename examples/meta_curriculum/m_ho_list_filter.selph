@@ -1,0 +1,136 @@
+; ---------------------------------------------------------------------------
+; m_ho_list_filter: list-filter decomposer using first-class holes
+; ---------------------------------------------------------------------------
+;
+; Detects list-filter patterns: all inputs and outputs are lists, and each
+; output is an ordered subset of the corresponding input. A predicate F
+; exists such that:
+;   output = filter(F, input)  for all training pairs.
+;
+; Returns an AST template with a hole for the predicate function:
+;   (lambda (x) (filter __hole_0__ x))
+; and a sub-spec of (element, Bool) pairs.
+;
+; The Rust hole-filling engine (fill_template_holes) sub-synthesizes F
+; and splices the result into the template.
+
+; -- Guard: all pairs are list->list, inputs non-empty, output is ordered subset --
+
+(define lf-is-ordered-subset
+  (lambda (inp out)
+    (let ((inp-len (length inp))
+          (out-len (length out)))
+      ; Walk through inp, matching against out elements in order.
+      ; Use reduce over input indices, tracking output pointer as state.
+      (let ((result
+              (reduce
+                (lambda (state i)
+                  (if (= (head state) "fail") state
+                    (let ((out-idx (head state)))
+                      (if (>= out-idx out-len) state
+                        (if (= (nth inp i) (nth out out-idx))
+                          (list (+ out-idx 1))
+                          state)))))
+                (range inp-len)
+                (list 0))))
+        (if (= (head result) "fail") false
+          (= (head result) out-len))))))
+
+(define lf-guard
+  (lambda (pairs)
+    (if (= (length pairs) 0) false
+      (reduce
+        (lambda (ok pair)
+          (if (not ok) false
+            (let ((inp (head pair))
+                  (out (head (tail pair))))
+              (and (list? inp)
+                   (list? out)
+                   (> (length inp) 0)
+                   (lf-is-ordered-subset inp out)))))
+        pairs
+        true))))
+
+; -- Derive predicate sub-spec -----------------------------------------------
+;
+; For each training pair (input-list, output-list), walk through input
+; elements and label each with true (appears next in output) or false.
+; Deduplicates by equality, rejects conflicting mappings (same element
+; mapped to both true and false). Returns nil if fewer than 3 unique
+; pairs or if conflicts are found.
+
+(define lf-derive-sub-spec
+  (lambda (pairs)
+    (let ((all-pairs
+            (reduce
+              (lambda (acc pair)
+                (let ((inp (head pair))
+                      (out (head (tail pair)))
+                      (inp-len (length inp)))
+                  ; Walk input, tracking output pointer
+                  (let ((result
+                          (reduce
+                            (lambda (state i)
+                              (let ((collected (head state))
+                                    (out-idx (head (tail state))))
+                                (let ((elem (nth inp i)))
+                                  (if (and (< out-idx (length out))
+                                           (= elem (nth out out-idx)))
+                                    (list (append collected (list (list elem true)))
+                                          (+ out-idx 1))
+                                    (list (append collected (list (list elem false)))
+                                          out-idx)))))
+                            (range inp-len)
+                            (list (list) 0))))
+                    (append acc (head result)))))
+              pairs
+              (list))))
+      ; Deduplicate: keep first occurrence of each input, reject conflicts.
+      (let ((unique
+              (reduce
+                (lambda (acc p)
+                  (if (nil? acc) nil
+                    (let ((in-val (head p))
+                          (out-val (head (tail p))))
+                      (let ((existing
+                              (reduce
+                                (lambda (found u)
+                                  (if found found
+                                    (if (= (head u) in-val)
+                                      (if (= (head (tail u)) out-val) "dup" "conflict")
+                                      false)))
+                                acc
+                                false)))
+                        (if (= existing "conflict") nil
+                          (if (= existing "dup") acc
+                            (append acc (list p))))))))
+                all-pairs
+                (list))))
+        (if (nil? unique) nil
+          (if (< (length unique) 3) nil
+            unique))))))
+
+; -- Main decomposer --------------------------------------------------------
+
+(define detect-list-filter
+  (lambda (synth-spec)
+    (let ((pairs (ns-get synth-spec "spec")))
+      (if (not (lf-guard pairs))
+        (ns ("found" false))
+        (let ((sub-pairs (lf-derive-sub-spec pairs)))
+          (if (nil? sub-pairs)
+            (ns ("found" false))
+            (ns ("found" true)
+                ("nodes" (make-lambda (list "x")
+                           (make-app "filter" (make-hole 0) (make-symbol "x"))))
+                ("holes" (ns ("__hole_0__" (ns ("spec" sub-pairs)))))
+                ("candidates" 1))))))))
+
+; -- Registration ------------------------------------------------------------
+;
+; Register as a separate __decomposers__ entry (after m_chain.selph).
+; Uses ns-put to add to the existing namespace without clobbering other
+; entries.
+
+(define __decomposers__
+  (ns-put __decomposers__ "m-ho-list-filter" detect-list-filter))

@@ -1,0 +1,143 @@
+; ---------------------------------------------------------------------------
+; m_ho_split_map_join: split-map-join decomposer using first-class holes
+; ---------------------------------------------------------------------------
+;
+; Detects split-map-join patterns on strings: all inputs and outputs are
+; strings, and splitting both by a common delimiter yields part lists of
+; equal length. A per-part function F exists such that:
+;   output = join(map(F, split(input, sep)), sep)  for all training pairs.
+;
+; Returns an AST template with a hole for the per-part function:
+;   (lambda (x) (string-join (map __hole_0__ (string-split x sep)) sep))
+; and a sub-spec of part-wise (input-part, output-part) pairs.
+;
+; The Rust hole-filling engine (fill_template_holes) sub-synthesizes F
+; and splices the result into the template.
+
+; -- Guard: all pairs are string->string -----------------------------------
+
+(define smj-guard
+  (lambda (pairs)
+    (if (= (length pairs) 0) false
+      (reduce
+        (lambda (ok pair)
+          (if (not ok) false
+            (let ((inp (head pair))
+                  (out (head (tail pair))))
+              (and (string? inp) (string? out)))))
+        pairs
+        true))))
+
+; -- Derive part-wise sub-spec for a given delimiter -----------------------
+;
+; Splits each input/output by the delimiter, zips parts into pairs.
+; Deduplicates and rejects conflicts. Returns nil on failure.
+
+(define smj-derive-sub-spec
+  (lambda (pairs sep)
+    (let ((all-pairs
+            (reduce
+              (lambda (acc pair)
+                (if (nil? acc) nil
+                  (let ((inp-parts (string-split (head pair) sep))
+                        (out-parts (string-split (head (tail pair)) sep)))
+                    (if (not (= (length inp-parts) (length out-parts))) nil
+                      (reduce
+                        (lambda (a i)
+                          (append a (list (list (nth inp-parts i) (nth out-parts i)))))
+                        (range (length inp-parts))
+                        acc)))))
+              pairs
+              (list))))
+      (if (nil? all-pairs) nil
+        ; Deduplicate: keep first occurrence of each input, reject conflicts.
+        (let ((unique
+                (reduce
+                  (lambda (acc p)
+                    (if (nil? acc) nil
+                      (let ((in-val (head p))
+                            (out-val (head (tail p))))
+                        (let ((existing
+                                (reduce
+                                  (lambda (found u)
+                                    (if found found
+                                      (if (= (head u) in-val)
+                                        (if (= (head (tail u)) out-val) "dup" "conflict")
+                                        false)))
+                                  acc
+                                  false)))
+                          (if (= existing "conflict") nil
+                            (if (= existing "dup") acc
+                              (append acc (list p))))))))
+                  all-pairs
+                  (list))))
+          (if (nil? unique) nil
+            (if (< (length unique) 3) nil
+              unique)))))))
+
+; -- Check if a delimiter works for all pairs ------------------------------
+;
+; Returns true if: (1) all pairs split to same part count, and
+; (2) at least one pair splits into 2+ parts.
+
+(define smj-delimiter-ok
+  (lambda (pairs sep)
+    (let ((result
+            (reduce
+              (lambda (state pair)
+                (if (= (head state) "fail") state
+                  (let ((inp-parts (string-split (head pair) sep))
+                        (out-parts (string-split (head (tail pair)) sep)))
+                    (if (not (= (length inp-parts) (length out-parts)))
+                      (list "fail" false)
+                      (list "ok" (or (head (tail state))
+                                     (> (length inp-parts) 1)))))))
+              pairs
+              (list "ok" false))))
+      (and (= (head result) "ok") (head (tail result))))))
+
+; -- Try all delimiters in priority order ----------------------------------
+
+(define smj-delimiters
+  (list " " "," "-" "." "/" ":" ";" "_" "|"))
+
+(define smj-try-delimiters
+  (lambda (pairs delims)
+    (if (= (length delims) 0) nil
+      (let ((sep (head delims)))
+        (if (smj-delimiter-ok pairs sep)
+          (let ((sub-pairs (smj-derive-sub-spec pairs sep)))
+            (if (nil? sub-pairs) (smj-try-delimiters pairs (tail delims))
+              (list sep sub-pairs)))
+          (smj-try-delimiters pairs (tail delims)))))))
+
+; -- Main decomposer --------------------------------------------------------
+
+(define detect-split-map-join
+  (lambda (synth-spec)
+    (let ((pairs (ns-get synth-spec "spec")))
+      (if (not (smj-guard pairs))
+        (ns ("found" false))
+        (let ((result (smj-try-delimiters pairs smj-delimiters)))
+          (if (nil? result)
+            (ns ("found" false))
+            (let ((sep (head result))
+                  (sub-pairs (head (tail result))))
+              (ns ("found" true)
+                  ("nodes" (make-lambda (list "x")
+                             (make-app "string-join"
+                               (make-app "map" (make-hole 0)
+                                 (make-app "string-split" (make-symbol "x")
+                                           (make-str sep)))
+                               (make-str sep))))
+                  ("holes" (ns ("__hole_0__" (ns ("spec" sub-pairs)))))
+                  ("candidates" 1)))))))))
+
+; -- Registration ------------------------------------------------------------
+;
+; Register as a separate __decomposers__ entry (after m_chain.selph).
+; Uses ns-put to add to the existing namespace without clobbering other
+; entries.
+
+(define __decomposers__
+  (ns-put __decomposers__ "m-ho-split-map-join" detect-split-map-join))

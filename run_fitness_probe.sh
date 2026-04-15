@@ -53,6 +53,11 @@ cat \
     "$META/m_refine.selph" \
     "$META/m_ho.selph" \
     "$META/m_ho_list_map.selph" \
+    "$META/m_ho_list_filter.selph" \
+    "$META/m_ho_split_map_join.selph" \
+    "$META/m_ho_char_map_join.selph" \
+    "$META/m_rd.selph" \
+    "$META/m_dc.selph" \
     "$CURRICULUM" \
     > "$COMBINED"
 
@@ -84,6 +89,11 @@ cat \
     "$META/m_refine.selph" \
     "$META/m_ho.selph" \
     "$META/m_ho_list_map.selph" \
+    "$META/m_ho_list_filter.selph" \
+    "$META/m_ho_split_map_join.selph" \
+    "$META/m_ho_char_map_join.selph" \
+    "$META/m_rd.selph" \
+    "$META/m_dc.selph" \
     "$META/m_near_miss.selph" \
     "$META/m_boost_heuristic.selph" \
     "$META/m_phase3_compose.selph" \
