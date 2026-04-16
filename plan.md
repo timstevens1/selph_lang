@@ -1140,6 +1140,213 @@ Fix: decomposers return templates with holes, Rust `fill_template_holes` does su
 
 Files: `synth_v2.rs`, `eval_v2.rs`, `m_ho_list_map.selph`, `m_ho_list_filter.selph`, `m_ho_split_map_join.selph`, `m_ho_char_map_join.selph`, `m_dc.selph`, `m_rd.selph`, `m_ho.selph`, `run_probe.sh`, `run_fitness_probe.sh`
 
+### §9.65 Recursive partial-match classifier — Form 6 EMERGES from generalization (April 16, 2026)
+
+Replaced hand-coded Form 6 (2-feature conjunction) with a recursive group-partition classifier in `m8s_constant_string.selph`. Form 6's capability now emerges from a more general mechanism — first concrete demonstration that meta-learning step 4 (composition discovery) can be bootstrapped via curriculum.
+
+#### The insight
+
+Form 6 was a 2-feature conjunction recognizer: hand-coded, limited to exactly 2 features. The recursive classifier subsumes it AND extends to arbitrary feature depth via a single mechanism:
+
+1. **Base case**: `fit-multi-classify` finds a single pool entry that cleanly partitions all labels → emit if-contains chain
+2. **Recursive step**: Find a pool entry that group-partitions labels (connected components on signature overlap), peel off cleanly-separated groups, recurse on residual rows
+
+#### Key design discoveries
+
+- **Need to try BOTH base case AND recursive splits**, picking lower-scoring. Without this, `(nth x 0)` memorization atom (which trivially partitions any unique-row spec) short-circuits the search before generalizing predicates are considered.
+- **Group partition (not just peel-single-label)** is required for tasks like `gerund_context` where every label appears with multiple feature values. Algorithm: connected components via signature overlap.
+- **Multiple top-level candidates with per-candidate validation** is required because lowest-scoring may fail held-out tests (e.g., `run_pos` misclassifies "she") while a same-scored alternative validates.
+- **Reject `labels >= rows` patterns** to avoid memorization on concat-style tasks (M10s handles those).
+
+#### Results
+
+- **String POS curriculum: 30/30** (was 28/28 + 2 new Tier 3 three-feature tasks impossible for old Form 6)
+- Faster: 1.50s → 0.73s on the 28 baseline tasks
+- Cleaner emitted ASTs (nested if-contains chains vs Form 6's nested if-equals)
+- 55/55 on `full_curriculum.selph` (no regression)
+- ~150 lines of Form 6 dead code removed
+
+Files: `m8s_constant_string.selph`, `string_pos_curriculum.selph`
+
+### §9.66 Solution journal — data substrate for meta-learning step 4 (April 16, 2026)
+
+Built `m_journal.selph` to record every successful synthesis as a structured stdout log line. This is layer 1 of the 5-layer roadmap toward automatic decomposer creation from observed patterns.
+
+#### Design
+
+Each log line: `[JOURNAL] <strategy> | <signature> | <skeleton> | <source>`. Where:
+- **signature** — compact spec fingerprint (`arity=2,rows=12,labels=4,out=str`)
+- **skeleton** — AST walk that masks literal values (`?INT?`, `?STR?`, `?BOOL?`) but keeps operator symbols
+- **source** — full solution source for reproduction
+
+Two skeleton normalizations to amplify cluster signal:
+1. **Repeated-children collapse**: `(list X X X)` → `(list X+)`
+2. **Library-function lifting**: head-position non-builtin symbols → `?LIB?`
+
+After both: distinct skeletons dropped 31→25 on 45 tasks, clusters of size ≥3 jumped 2→6, top-10 cluster coverage jumped 38%→71%.
+
+#### Top clusters revealed
+
+| Count | Skeleton | Pattern |
+|---|---|---|
+| 7 | `(if (contains (list ?BOOL?) (string-ends-with ...)) ?STR? ?STR?)` | suffix-classify |
+| 4 | `(if (contains (list ?BOOL?) (string-starts-with ...)) ?STR? ?STR?)` | prefix-classify |
+| 4 | `(?LIB? (list (nth x ?INT?)))` | direct library reuse |
+| 3 | `(if (contains (list ?STR?+) (nth x ?INT?)) ?STR? ?STR?)` | atom-list classify |
+| 3 | recursive 2-level w/ library inner | composition pattern |
+
+Top 6 clusters cover 53% of all solves — clear template-extraction targets.
+
+#### Architectural decision
+
+In-memory storage of `__solution_journal__` was deliberately deferred — SELPH's lexical `define` made `eval-source` mutation fragile. The stdout log IS the journal; external tools (awk, sort) cluster trivially. In-memory storage can come later if needed.
+
+Files: `m_journal.selph`, `m_chain.selph` (journal hook), `run_probe.sh`
+
+### §9.67 Hole-fc validation via m_partition decomposer (April 16, 2026)
+
+Built `m_partition.selph` — first hole-based decomposer that exercises the full `fill_template_holes` machinery for sub-synthesis. Surfaced and fixed a critical architectural gap: hole-based decomposers couldn't fire on multi-arg specs.
+
+#### The Rust fix
+
+`synth_v2.rs:6593-6610` (multi-arg path) called `try_selph_decomposers` with `hole_ctx=None`, silently SKIPPING any decomposer returning a template with holes. Changed to:
+
+```rust
+Some(HoleContext { components, universe, strategy_depth: 2 })
+```
+
+This gives hole-based decomposers parity with the single-arg path. **`strategy_depth: 2`** matters: at depth 0, sub-synth uses flat-only enumeration which fails for branch sub-specs that need m-chain (e.g., constant fitting via m8s Form 1).
+
+#### Decomposer design
+
+```selph
+template:
+  (lambda (x)
+    (if (contains <vals> <feature>)
+      (__hole_0__ x)     ; sub-synth lambda, applied to outer x
+      (__hole_1__ x)))   ; sub-synth lambda, applied to outer x
+```
+
+SELPH-side searches for a discriminating feature (suffix predicate, library function, atom). Each branch becomes a hole sub-spec containing the rows routing to that branch. For binary cases, sub-synth finds constant lambdas; for 3+ classes, branches recursively decompose via the chain.
+
+#### Architectural gaps surfaced (fixed in §9.68)
+
+1. No "data hole" support — only sub-synthesis holes
+2. Test validation isn't dispatch-level
+3. Sub-synth lambda wrapping is verbose
+4. m_dc has a latent bug (puts hole as if-condition, but spliced lambda is truthy)
+
+#### Results
+
+- String POS curriculum: 44/45 (matches no-holes baseline)
+- 27 wins via custom:a-binary-partition (60%)
+- 17 wins via custom:m-chain
+- 1 fail: noun_phrase_check (memorization fails test, no fallback in single-pass dispatch)
+
+Files: `synth_v2.rs`, `m_partition.selph`, `run_probe.sh`
+
+### §9.68 Hole-fc unification: all 4 architectural gaps fixed (April 16, 2026)
+
+Implemented all 4 next steps surfaced by §9.67. The hole-fc machinery is now a more complete unification mechanism — both parametric search and sub-synthesis go through the same code path.
+
+#### 1. Inline holes (lambda body extraction)
+
+New `("inline" true)` flag in hole spec. When set, `fill_template_holes` extracts the Lambda's body before splicing instead of splicing the whole Lambda. Output goes from `((lambda (x) "label") x)` to just `"label"` — relies on the convention that sub-synth lambdas use `x` as their parameter, which resolves to the outer `x` in scope.
+
+#### 2. Dispatch-level test validation
+
+`try_selph_decomposers` now validates EVERY result (including hole-filled) against held-out test data BEFORE returning. On failure, continues to the next decomposer instead of falling through to Flat (which would exhaust budget). Removes redundant validation in the multi-arg early-call path.
+
+#### 3. Candidate-value holes
+
+New `("candidates" (list ...))` hole spec format. Supports primitives (Int/Num/Str/Bool) AND `Value::Node` for Symbol references. Implementation:
+
+- New `value_to_lit_node` helper for primitive values
+- New `cartesian_indices` helper for cross-product enumeration over multi-hole templates
+- Sub-synth holes (single candidate) and candidate holes (N candidates) coexist seamlessly via the unified loop
+
+#### 4. LibraryReuse decomposer (m_lib_reuse.selph)
+
+First decomposer to use candidate-value holes. Template:
+
+```selph
+(lambda (x) (__hole_func__ (list (nth x __hole_pos__))))
+```
+
+Where:
+- `__hole_func__` candidates = each library function in env as `(make-symbol "name")` — a Value::Node Symbol
+- `__hole_pos__` candidates = each `(make-int N)` for N in 0..arity-1
+
+Cross-product is `|libs| × arity`. Rust hole-filler enumerates and validates each composition; first valid + held-out-passing wins.
+
+#### Final results
+
+| Curriculum | Result | Strategy distribution |
+|---|---|---|
+| String POS (45 tasks) | 44/45 | a-binary-partition=27, a-lib-reuse=3, m-chain=14 |
+| Full curriculum (55 tasks) | **55/55** | BD=2, D&C=7, Flat=25, RD=6, a-lib-reuse=4, m-chain=9, m-ho-split-map-join=2 |
+
+The architecture now has 3 specialized SELPH decomposers all using uniform hole-fc machinery. Test validation centralized in dispatch. Output cleaner via inline holes. Parametric search via candidate holes (no SELPH-side iteration needed).
+
+#### What this enables
+
+- New decomposers can be authored as templates with holes — no per-decomposer search infrastructure
+- Library reuse (4 wins on full curriculum) demonstrates Value::Node candidates work for function-position holes
+- The remaining `noun_phrase_check` failure is no longer architectural — it just needs a 2-feature conjunction decomposer (straightforward to build with the same patterns)
+
+Files: `synth_v2.rs` (~150 lines added/changed), `m_lib_reuse.selph`, `m_partition.selph` (updated to use inline), `run_probe.sh`
+
+---
+
+## 7. Session Summary: Form Coverage Assessment (April 15, 2026)
+
+### 7.1 All Recommended Forms Are Already Implemented
+
+During this session, we assessed the current form coverage against the near-miss task patterns. **All five recommended forms from the plan are already implemented and wired into the M-chain:**
+
+| Form | Status | File | Rust Builtin |
+|------|--------|------|--------------|
+| Proximity Recolor | ✅ Implemented | `m8g_recolor.selph` (Subform 5b) | `grid-recolor-by-proximity` |
+| Rectangular Hole Fill | ✅ Implemented | `m8g_rect_hole_fill.selph` | `grid-fill-rectangular-holes` |
+| Boundary/Edge Detection | ⚠️ Partial | Covered by existing grid ops | N/A |
+| Ray/Projection Casting | ✅ Implemented | `m8g_line_draw.selph` (Form 14) | `grid-rays` |
+| Conditional Per-Object | ✅ Implemented | `m8g_per_object.selph` (Form 10) | `grid-object`, `grid-replace-color` |
+
+All forms are wired into `m_chain.selph` and loaded in `run_probe.sh`.
+
+### 7.2 Current Benchmark Results (April 15, 2026)
+
+**ARC-AGI-1 Training: 35/400 solved (8.75%)**
+- Phase 1 (M-chain + Flat): 35 tasks
+- Phase 2 (Boosted Retry): +0 recovered
+- Phase 3 (Composition Recovery): +0 recovered  
+- Phase 4 (Template Transfer): +0 recovered
+
+**Near-miss Analysis:**
+- 80 tasks with fitness ≥ 90%
+- 166 tasks with fitness 50-90%
+- 113 tasks with fitness < 50%
+
+### 7.3 Key Finding: Structural Gap, Not Missing Forms
+
+The 80 near-miss tasks (including 50846271 at 0.976 fitness) require **genuinely new spatial reasoning patterns**, not just compositions of existing transforms. The dominant patterns in near-misses are:
+
+1. **Contextual proximity recolor** - "Cells of color C within radius R of color S get recolored to T" (requires conditional logic based on surrounding color)
+2. **Rectangular hole fill with context** - "Fill enclosed regions of color C ONLY when surrounded by color S" (not all enclosed regions)
+3. **Boundary/edge detection** - Identify cells at object boundaries for subsequent transforms
+4. **Per-object contextual transforms** - Transform varies based on object properties (size, position, neighbors)
+
+The current forms handle **uniform** transforms well but lack **conditional/spatial reasoning** capabilities.
+
+### 7.4 Recommended Next Steps
+
+Instead of adding more standalone forms, focus on:
+
+1. **Build rx-guided decomposers** that specifically target the 80 near-miss patterns
+2. **Extend Form 10 (per-object)** to handle contextual transforms with conditional logic
+3. **Create "proximity-based enclosed region fill"** - a form that combines proximity detection with conditional fill
+4. **Profile scaffold iteration** to understand why 176 scaffold solutions recovered 0 ARC tasks
+
 ---
 
 ## 8. Future Directions

@@ -1,0 +1,142 @@
+; ─────────────────────────────────────────────────────────────────────────
+; m_partition: hole-based binary partition decomposer (§9.67)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; First step toward unified hole-fc architecture. Implements the
+; "binary classification by feature" template using the hole-fc
+; mechanism instead of doing all the work in SELPH.
+;
+; Template structure:
+;   (lambda (x)
+;     (if (contains <group-1-vals> <feature-expr>)
+;       (__hole_0__ x)
+;       (__hole_1__ x)))
+;
+; The decomposer:
+;   1. Iterates pool entries (suffix predicates, prefix predicates,
+;      atoms, library functions — anything in the active pool).
+;   2. For each entry, checks if its column cleanly partitions the
+;      output labels into exactly 2 disjoint groups.
+;   3. First clean partition wins (pool is priority-ordered, so suffix
+;      predicates are tried first — Occam scoring).
+;   4. Builds template with two holes; each hole's sub-spec contains
+;      the rows routing to that branch.
+;   5. Returns to Rust hole-filler, which sub-synthesizes each branch.
+;
+; What this validates about hole-fc:
+;   - Templates can use parametric (decomposer-baked) values for
+;     non-search positions (predicate, value-set).
+;   - Sub-synth holes recursively invoke the strategy chain — for the
+;     binary case, each branch finds a constant via m8s Form 1.
+;   - For the 3+ class case (when generalized), one branch could be
+;     a constant and the other a recursive partition — true
+;     compositionality.
+;
+; Architectural gap surfaced:
+;   The (pos, suffix, value-set) values are baked in by SELPH-side
+;   search rather than being holes. Current hole-fc only supports
+;   sub-synthesis holes (each hole must have a sub-spec that
+;   sub_synthesize can solve). To make these into proper holes, we'd
+;   need "candidate-value" hole support in fill_template_holes.
+
+; ── Find a winning pool entry ────────────────────────────────────────
+;
+; Iterate the active pool in priority order (suffix/prefix predicates
+; first, then libraries, atoms last). Return the first entry whose
+; column cleanly partitions the targets into exactly 2 disjoint groups.
+;
+; The "first found" approach + priority ordering gives Occam's-razor
+; behavior for free: simpler features (boolean predicates with 2 vals)
+; are tried before higher-arity features (atoms with N vals).
+
+(define a-bp-find-winner
+  (lambda (pool target)
+    (let ((active (m8s-active-pool pool)))
+      (reduce
+        (lambda (best entry)
+          (if (not (nil? best)) best
+            (let ((col (m8s-pool-col entry)))
+              (let ((partial (try (fit-partial-classify col target) nil)))
+                (if (or (nil? partial)
+                        (not (= (length (ns-get partial "groups")) 2)))
+                  nil
+                  (ns ("entry" entry) ("partition" partial)))))))
+        active nil))))
+
+; Build the sub-spec for a branch: extract the (input, output) pairs
+; for the rows that route to this branch.
+(define a-bp-branch-spec
+  (lambda (indices pairs)
+    (map (lambda (i) (nth pairs i)) indices)))
+
+; Build the template AST + holes namespace.
+;
+; Template: (lambda (x)
+;             (if (contains <vals> <feature>)
+;               __hole_0__   ; sub-synth body (lambda body extracted via inline=true)
+;               __hole_1__)) ; sub-synth body
+;
+; Each hole's sub-spec contains the rows that route to that branch.
+; The "inline" flag tells fill_template_holes to extract the Lambda's
+; body before splicing — so we get `"label"` directly instead of
+; `((lambda (x) "label") x)`. The lambda's `x` parameter conventionally
+; matches the outer lambda's `x`, so any references in the body resolve
+; to the outer scope correctly.
+(define a-bp-emit
+  (lambda (winner pairs)
+    (let ((entry (ns-get winner "entry"))
+          (partition (ns-get winner "partition")))
+      (let ((feature-expr (m8s-pool-source entry))
+            (group-vals (ns-get partition "group-vals"))
+            (group-rows (ns-get partition "group-rows")))
+        (let ((template
+                (make-lambda (list "x")
+                  (make-if
+                    (make-app "contains"
+                      (m8s-emit-value-list (head group-vals))
+                      feature-expr)
+                    (make-hole 0)
+                    (make-hole 1)))))
+          (let ((branch-0-spec (a-bp-branch-spec (head group-rows) pairs))
+                (branch-1-spec (a-bp-branch-spec (head (tail group-rows)) pairs)))
+            (ns ("found" true)
+                ("nodes" template)
+                ("holes"
+                  (ns ("__hole_0__"
+                        (ns ("spec" branch-0-spec) ("inline" true)))
+                      ("__hole_1__"
+                        (ns ("spec" branch-1-spec) ("inline" true)))))
+                ("candidates" 1))))))))
+
+; ── Main decomposer ──────────────────────────────────────────────────
+
+(define a-binary-partition-decomposer
+  (lambda (synth-spec)
+    (try
+      (let ((pairs (ns-get synth-spec "spec"))
+            (spec (m-chain-spec-from-synth synth-spec)))
+        (let ((target (ns-get spec "outputs")))
+          (let ((labels (m8s-distinct-labels target)))
+            (if (or (not (= (length labels) 2))
+                    (>= (length labels) (length target)))
+              (ns ("found" false))
+              (if (not (m8s-str? (head target)))
+                (ns ("found" false))
+                (let ((pool (try (m8s-build-pool spec) (list))))
+                  (if (= (length pool) 0)
+                    (ns ("found" false))
+                    (let ((winner (try (a-bp-find-winner pool target) nil)))
+                      (if (nil? winner)
+                        (ns ("found" false))
+                        (a-bp-emit winner pairs))))))))))
+      (ns ("found" false)))))
+
+; ── Registration ─────────────────────────────────────────────────────
+;
+; Name "a-binary-partition" sorts alphabetically before "m-chain" so
+; this decomposer runs FIRST in try_selph_decomposers' Stage A walk.
+; If it succeeds, the chain falls through. If it returns found:false,
+; m-chain takes over.
+
+(define __decomposers__
+  (ns-put __decomposers__ "a-binary-partition" a-binary-partition-decomposer))

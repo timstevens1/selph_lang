@@ -168,14 +168,18 @@
               (lambda ()
                 (m-chain-try-or-next detect-line-draw spec
                   (lambda ()
-                    (m-chain-try-or-next detect-per-object spec
+                    (m-chain-try-or-next detect-proximity-recolor spec
                       (lambda ()
-                        (m-chain-try-or-next detect-template-stamp spec
+                        (m-chain-try-or-next detect-rectangular-hole-fill spec
                           (lambda ()
-                            (m-chain-try-or-next detect-grid-compose spec
+                            (m-chain-try-or-next detect-per-object spec
                               (lambda ()
-                                (m-chain-try-or-next detect-library-shape spec
-                                  (lambda () (ns ("found" false))))))))))))))))))))
+                                (m-chain-try-or-next detect-template-stamp spec
+                                  (lambda ()
+                                    (m-chain-try-or-next detect-grid-compose spec
+                                      (lambda ()
+                                        (m-chain-try-or-next detect-library-shape spec
+                                          (lambda () (ns ("found" false))))))))))))))))))))))))
 
 ; ── Top-level dispatcher ─────────────────────────────────────────────
 
@@ -183,10 +187,26 @@
   (lambda (synth-spec)
     (let ((spec (m-chain-spec-from-synth synth-spec)))
       (let ((kind (m-chain-output-kind spec)))
-        (if (= kind "numeric") (m-chain-numeric spec)
-          (if (= kind "string") (m-chain-string spec)
-            (if (= kind "grid") (m-chain-grid spec)
-              (ns ("found" false)))))))))
+        (let ((result
+                (if (= kind "numeric") (m-chain-numeric spec)
+                  (if (= kind "string") (m-chain-string spec)
+                    (if (= kind "grid") (m-chain-grid spec)
+                      (ns ("found" false)))))))
+          (do
+            ; §9.66 journal hook: record every successful synthesis so
+            ; future analysis can mine recurring structural patterns.
+            ; Wrapped in `try` to make journaling fully opt-in — if
+            ; m_journal.selph isn't loaded, journal-record! is undefined
+            ; and the try silently no-ops.
+            (if (try (ns-get result "found") false)
+              (try
+                (journal-record!
+                  (journal-spec-signature synth-spec)
+                  (ns-get result "nodes")
+                  (concat "m-chain-" kind))
+                nil)
+              nil)
+            result))))))
 
 ; ── Register as the global decomposer ────────────────────────────────
 ;

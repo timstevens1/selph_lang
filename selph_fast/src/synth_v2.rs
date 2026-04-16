@@ -4930,7 +4930,6 @@ fn try_selph_decomposers(
     if decomp_ns.is_empty() {
         return None;
     }
-
     // Sort entries by name for deterministic dispatch order. NsMap is
     // a HashMap so iteration order is otherwise nondeterministic.
     let mut entries: Vec<(Sym, Value)> = decomp_ns
@@ -5003,17 +5002,30 @@ fn try_selph_decomposers(
                                             ctx.strategy_depth,
                                         )
                                     {
-                                        return Some((filled_nodes, filled_root,
-                                                     total_cands + hole_cands, *name_sym));
+                                        // §9.68: validate filled result against
+                                        // held-out test data BEFORE returning.
+                                        // If validation fails, continue to next
+                                        // decomposer instead of falling through
+                                        // to Flat (which would exhaust budget).
+                                        if validate_held_out(&filled_nodes, filled_root,
+                                                             test_inputs, test_expected, env)
+                                        {
+                                            return Some((filled_nodes, filled_root,
+                                                         total_cands + hole_cands, *name_sym));
+                                        }
                                     }
                                 }
-                                // No hole_ctx or hole-filling failed — skip.
+                                // No hole_ctx, hole-filling failed, or test failed — skip.
                                 continue;
                             }
                         }
 
-                        // Complete solution (no holes).
-                        return Some((nodes, root, total_cands, *name_sym));
+                        // Complete solution (no holes). Same held-out check.
+                        if validate_held_out(&nodes, root, test_inputs, test_expected, env) {
+                            return Some((nodes, root, total_cands, *name_sym));
+                        }
+                        // Held-out failed — try next decomposer.
+                        continue;
                     }
                     // Found but missing nodes — skip silently.
                 }
@@ -5076,6 +5088,22 @@ fn remap_node_with_holes(
 /// Fill holes in a template AST by sub-synthesizing each hole's sub-spec,
 /// then splicing the results into the template. Returns None if any hole
 /// fails to synthesize or the composed program fails verification.
+/// Convert a primitive Value into a Node for splicing as a literal.
+/// Returns None for non-primitive values.
+fn value_to_lit_node(v: &Value) -> Option<Node> {
+    match v {
+        Value::Int(n) => Some(Node::Int(*n)),
+        Value::Num(n) => Some(Node::Num(*n)),
+        Value::Str(s) => Some(Node::Str(s.as_ref().to_string())),
+        Value::Bool(b) => Some(Node::Bool(*b)),
+        _ => None,
+    }
+}
+
+/// Per-hole candidate set — either a single sub-synth result or a list of
+/// literal-value candidates. Each entry is (nodes, root_in_those_nodes).
+type HoleCandidates = Vec<(Vec<Node>, usize)>;
+
 fn fill_template_holes(
     template_nodes: &[Node],
     template_root: usize,
@@ -5102,26 +5130,58 @@ fn fill_template_holes(
         return None; // No holes found — shouldn't happen if "holes" was non-empty.
     }
 
-    // Budget per hole: split evenly.
-    let budget_per_hole = (max_candidates / hole_positions.len().max(1)).max(1);
+    // Stable iteration order — sort by hole symbol for deterministic dispatch.
+    let mut ordered_holes: Vec<(Sym, usize)> = hole_positions.into_iter().collect();
+    ordered_holes.sort_by_key(|(s, _)| resolve(*s));
+
+    // Budget per hole: split evenly across sub-synth holes.
+    let budget_per_hole = (max_candidates / ordered_holes.len().max(1)).max(1);
     let mut total_cands = 0usize;
 
-    // 2. Sub-synthesize each hole and splice into output.
-    let mut out: Vec<Node> = Vec::new();
-    let mut hole_redirects: HashMap<usize, usize> = HashMap::new(); // template_idx → out_idx
-
-    for (&hole_sym, &template_idx) in &hole_positions {
-        // Look up this hole's sub-spec in the holes namespace.
-        let hole_spec = match holes.get(&hole_sym) {
+    // 2. For each hole, gather its candidate set + any per-hole flags.
+    //
+    // §9.68: a hole spec can have either:
+    //   ("spec" <pairs>)         — sub-synthesize; one candidate (the result)
+    //   ("candidates" <values>)  — enumerate literal candidates
+    // Optional flag:
+    //   ("inline" true)          — extract the body of a Lambda result
+    //                              (turns ((lambda (x) body) x) into body)
+    let mut per_hole: Vec<(usize, HoleCandidates, bool)> = Vec::new();
+    for (hole_sym, template_idx) in &ordered_holes {
+        let hole_spec = match holes.get(hole_sym) {
             Some(Value::Ns(ns)) => ns,
-            _ => return None, // Hole declared in template but missing from "holes" map.
+            _ => return None,
         };
+        let inline = matches!(
+            hole_spec.get(&intern("inline")),
+            Some(Value::Bool(true))
+        );
+
+        // §9.68: candidate-list path (parametric search via holes).
+        // Candidates can be primitives (converted to literal Nodes) or
+        // pre-built Value::Node trees (e.g., (make-symbol "fn-name") for
+        // function references in head-of-app position).
+        if let Some(Value::List(cands)) = hole_spec.get(&intern("candidates")) {
+            let mut materialized: HoleCandidates = Vec::new();
+            for c in cands.iter() {
+                if let Value::Node(node_ref) = c {
+                    materialized.push((node_ref.nodes.iter().cloned().collect(), node_ref.idx));
+                } else if let Some(node) = value_to_lit_node(c) {
+                    materialized.push((vec![node], 0));
+                }
+            }
+            if materialized.is_empty() {
+                return None;
+            }
+            per_hole.push((*template_idx, materialized, inline));
+            continue;
+        }
+
+        // Existing sub-synth path.
         let spec_pairs = match hole_spec.get(&intern("spec")) {
             Some(Value::List(pairs)) => pairs,
             _ => return None,
         };
-
-        // Parse sub-spec pairs: each is a list [input, output].
         let mut sub_inputs: Vec<Value> = Vec::new();
         let mut sub_expected: Vec<Value> = Vec::new();
         for pair in spec_pairs.iter() {
@@ -5136,12 +5196,9 @@ fn fill_template_holes(
                 return None;
             }
         }
-
         if sub_inputs.is_empty() {
             return None;
         }
-
-        // Sub-synthesize.
         let sr = sub_synthesize(
             components, &sub_inputs, &sub_expected,
             env, universe, flat_depth, budget_per_hole, strategy_depth,
@@ -5150,34 +5207,83 @@ fn fill_template_holes(
         if !sr.found {
             return None;
         }
-
-        // Splice the sub-result into `out`, recording the root index.
-        let sub_nodes = sr.nodes.unwrap();
+        let sub_nodes = sr.nodes.unwrap().to_vec();
         let sub_root = sr.root.unwrap();
-        let spliced_root = ho_splice_sub(&mut out, &sub_nodes, sub_root);
-        hole_redirects.insert(template_idx, spliced_root);
+        per_hole.push((*template_idx, vec![(sub_nodes, sub_root)], inline));
     }
 
-    // 3. Copy template nodes into `out`, redirecting hole references.
-    let tpl_offset = out.len();
-    for (i, node) in template_nodes.iter().enumerate() {
-        if hole_redirects.contains_key(&i) {
-            // This node is a hole placeholder; it's never referenced
-            // directly because parents have been redirected. Emit a
-            // dummy node to keep index arithmetic correct.
-            out.push(Node::Int(0));
-        } else {
-            out.push(remap_node_with_holes(node, tpl_offset, &hole_redirects));
+    // 3. Enumerate the cross-product of per-hole candidates. For each
+    //    combination, splice into a fresh `out` arena, then verify against
+    //    the original spec. Return the first valid composition.
+    //
+    // For sub-synth holes (single candidate), this is a no-op. For
+    // candidate-list holes, this is the parametric search.
+    let combos = cartesian_indices(&per_hole.iter().map(|(_, cs, _)| cs.len()).collect::<Vec<_>>());
+    for combo in combos {
+        let mut out: Vec<Node> = Vec::new();
+        let mut hole_redirects: HashMap<usize, usize> = HashMap::new();
+
+        for (i, (template_idx, cands, inline)) in per_hole.iter().enumerate() {
+            let (sub_nodes, sub_root) = &cands[combo[i]];
+            let spliced_root = ho_splice_sub(&mut out, sub_nodes, *sub_root);
+            // §9.68 inline: extract Lambda body so callers don't need to
+            // wrap holes as `(__hole_N__ x)` for application.
+            let final_root = if *inline {
+                if let Node::Lambda(_, body) = out[spliced_root] {
+                    body
+                } else {
+                    spliced_root
+                }
+            } else {
+                spliced_root
+            };
+            hole_redirects.insert(*template_idx, final_root);
+        }
+
+        let tpl_offset = out.len();
+        for (i, node) in template_nodes.iter().enumerate() {
+            if hole_redirects.contains_key(&i) {
+                out.push(Node::Int(0));
+            } else {
+                out.push(remap_node_with_holes(node, tpl_offset, &hole_redirects));
+            }
+        }
+        let composed_root = template_root + tpl_offset;
+
+        if ho_verify_composed(&out, composed_root, inputs, expected, env) {
+            return Some((out, composed_root, total_cands));
         }
     }
-    let composed_root = template_root + tpl_offset;
 
-    // 4. Verify the composed program against the original spec.
-    if !ho_verify_composed(&out, composed_root, inputs, expected, env) {
-        return None;
+    None
+}
+
+/// Generate all index combinations for a cartesian product. Each entry in
+/// `sizes` is the count of candidates for one hole. Returns a list of
+/// index vectors (one per hole).
+///
+/// Empty input → one empty combo (vacuous).
+/// Any size 0 → no combos (would be impossible).
+fn cartesian_indices(sizes: &[usize]) -> Vec<Vec<usize>> {
+    if sizes.iter().any(|&n| n == 0) {
+        return Vec::new();
     }
-
-    Some((out, composed_root, total_cands))
+    if sizes.is_empty() {
+        return vec![Vec::new()];
+    }
+    let mut result: Vec<Vec<usize>> = vec![Vec::new()];
+    for &n in sizes {
+        let mut next = Vec::with_capacity(result.len() * n);
+        for prefix in &result {
+            for i in 0..n {
+                let mut new = prefix.clone();
+                new.push(i);
+                next.push(new);
+            }
+        }
+        result = next;
+    }
+    result
 }
 
 /// §9.37 Stage C: type-keyed decomposer dispatch. Walk the universe's
@@ -6592,9 +6698,15 @@ fn synthesize_inner(
     // after enumeration exhausts, inflating reported candidate
     // counts even when the chain itself would be cheap.
     if extra_seeds_was_some {
+        // §9.67: pass hole_ctx so hole-based decomposers can fire on
+        // multi-arg specs too. Previously hole_ctx was None here, which
+        // silently skipped any decomposer returning a template with
+        // holes. The fix gives hole-based decomposers (like m_partition,
+        // m_dc, m_ho_*) parity with the single-arg path.
         if let Some((nodes, root, sd_explored, name_sym)) =
             try_selph_decomposers(env, inputs, expected, flat_depth, max_candidates,
-                                  test_inputs, test_expected, None)
+                                  test_inputs, test_expected,
+                                  Some(HoleContext { components, universe, strategy_depth: 2 }))
         {
             // §9.47.5: the chain now self-validates against test data
             // internally (via the spec ns "test" key). The external

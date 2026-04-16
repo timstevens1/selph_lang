@@ -1644,7 +1644,9 @@ fn legacy_value_to_v2_force_num(v: &Value) -> types_v2::Value {
 /// Errors from individual forms are reported but don't stop the
 /// loop — a typo in one helper shouldn't kill the whole curriculum.
 fn eval_curriculum_preamble(source: &str, env: &types_v2::Env) -> Result<(), String> {
+    let t0 = std::time::Instant::now();
     let (legacy_nodes, roots) = parse_file(source).map_err(|e| e.to_string())?;
+    let t1 = std::time::Instant::now();
     let task_sym = intern("task");
     let task_args_sym = intern("task-args");
 
@@ -1652,7 +1654,9 @@ fn eval_curriculum_preamble(source: &str, env: &types_v2::Env) -> Result<(), Str
     // root index.
     let v2_nodes_vec = eval_v2::convert_tree(&legacy_nodes);
     let v2_nodes: Rc<[types_v2::Node]> = v2_nodes_vec.into();
+    let t2 = std::time::Instant::now();
 
+    let mut eval_count = 0usize;
     for &root in &roots {
         // Skip task forms — those go through parse_curriculum_tasks.
         let is_task = match &legacy_nodes[root] {
@@ -1668,10 +1672,32 @@ fn eval_curriculum_preamble(source: &str, env: &types_v2::Env) -> Result<(), Str
         // Eval the form. Top-level `(define ...)` mutates env.top_scope.
         // Other expressions are evaluated for side effects (e.g.
         // `(print ...)`); their values are discarded.
+        let fe_start = std::time::Instant::now();
         if let Err(e) = eval_v2::eval(&v2_nodes, root, env) {
             eprintln!("  preamble: form failed: {}", e);
         }
+        let fe_dur = fe_start.elapsed().as_secs_f64();
+        if fe_dur > 0.05 {
+            // Find the name of this form (first child symbol of App)
+            let name = match &legacy_nodes[root] {
+                Node::App(children) if children.len() >= 2 => {
+                    if let Node::Symbol(s) = &legacy_nodes[children[0]] {
+                        if resolve(*s) == "define" {
+                            if let Node::Symbol(n) = &legacy_nodes[children[1]] {
+                                resolve(*n).to_string()
+                            } else { format!("form@{}", root) }
+                        } else { format!("({}...)", resolve(*s)) }
+                    } else { format!("form@{}", root) }
+                }
+                _ => format!("form@{}", root),
+            };
+            eprintln!("  preamble slow form: {:.3}s  {}", fe_dur, name);
+        }
+        eval_count += 1;
     }
+    let t3 = std::time::Instant::now();
+    eprintln!("  preamble timing: parse={:.3}s convert={:.3}s eval={:.3}s ({} forms)",
+        (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), (t3 - t2).as_secs_f64(), eval_count);
 
     Ok(())
 }

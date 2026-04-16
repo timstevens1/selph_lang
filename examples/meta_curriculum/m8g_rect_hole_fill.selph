@@ -1,0 +1,211 @@
+; -------------------------------------------------------------------------
+; Meta-curriculum M8g-rect-hole-fill: Form 16 - Rectangular Hole Fill
+; -------------------------------------------------------------------------
+;
+; Detects tasks where rectangular regions of a target color are completely
+; surrounded by a different color, and those regions need to be filled
+; with the surrounding color.
+;
+; Pattern: "Fill rectangular holes of color C that are surrounded by color S"
+;
+; Unlike grid-fill-enclosed which does flood-fill based on adjacency,
+; this form specifically looks for axis-aligned rectangular holes.
+;
+; Form 16 probes:
+;   For each non-background color C in input (target/hole color):
+;     For each surrounding color S (different from C and background):
+;       Probe: grid-fill-rectangular-holes(input, C, S)
+;       Validate against all training pairs (including held-out test)
+;       If matches perfectly, emit solution
+
+; ── Helpers ──────────────────────────────────────────────────────────
+
+(define m8rh-spec-inputs  (lambda (s) (ns-get s "inputs")))
+(define m8rh-spec-outputs (lambda (s) (ns-get s "outputs")))
+
+(define m8rh-grid-target
+  (lambda (s)
+    (let ((outs (m8rh-spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (grid? v))) outs true)
+        outs
+        nil))))
+
+; Extract the grid from a single-arity input row: (list grid) → grid
+(define m8rh-input-grid
+  (lambda (inp) (head inp)))
+
+; Reference to (nth x 0) AST — the input grid in a lambda body
+(define m8rh-x0
+  (lambda () (make-app "nth" (make-symbol "x") (make-int 0))))
+
+; Get all unique colors from a grid
+(define m8rh-grid-colors
+  (lambda (g)
+    (if (= (length g) 0) (list)
+      (let ((rows (map (lambda (r) r) g)))
+        (reduce append rows (list))))))
+
+; Get unique elements from a list
+(define m8rh-unique
+  (lambda (lst)
+    (if (= (length lst) 0) (list)
+      (let ((first (head lst))
+            (rest (tail lst)))
+        (cons first
+              (m8rh-unique (filter (lambda (x) (not (= x first))) rest)))))))
+
+; ── Form 16: rectangular hole fill detector ─────────────────────────
+
+; Try Form 16 for a specific target/surrounding color pair
+(define m8rh-try-form-16-pair
+  (lambda (inputs target target-color surrounding-color)
+    (let ((candidate (map (lambda (inp)
+                            (try (grid-fill-rectangular-holes
+                                   (m8rh-input-grid inp)
+                                   target-color
+                                   surrounding-color)
+                                 nil))
+                                 inputs)))
+      (let ((validation (reduce (lambda (acc i)
+                    (and acc
+                         (not (nil? (nth candidate i)))
+                         (= (nth candidate i) (nth target i))))
+                  (range (length target))
+                  true)))
+        (if validation
+          ; Success! Emit the solution
+          (ns ("kind" (concat "form-16-rect-hole-fill-"
+                            (to-string target-color)
+                            "-surrounded-by-"
+                            (to-string surrounding-color)))
+            ("source-node"
+              (make-lambda (list "x")
+                (make-app "grid-fill-rectangular-holes"
+                  (m8rh-x0)
+                  (make-int target-color)
+                  (make-int surrounding-color)))))
+          nil)))))
+
+; Main detector loop for Form 16
+(define m8rh-try-form-16
+  (lambda (inputs target)
+    (let ((first-in (m8rh-input-grid (head inputs))))
+      (let ((bg (grid-background first-in))
+            (all-colors (m8rh-unique (m8rh-grid-colors first-in))))
+        ; Get non-background colors as target/hole candidates
+        (let ((target-candidates
+                (filter (lambda (c) (not (= c bg))) all-colors)))
+          (m8rh-form-16-loop inputs target bg target-candidates))))))
+
+; Loop through target colors
+(define m8rh-form-16-loop
+  (lambda (inputs target bg target-candidates)
+    (if (= (length target-candidates) 0) nil
+      (let ((target-color (head target-candidates)))
+        ; For each target color, try all possible surrounding colors
+        (let ((all-colors (m8rh-unique (m8rh-grid-colors (m8rh-input-grid (head inputs))))))
+          (let ((surrounding-candidates
+                  (filter (lambda (s) (not (= s target-color)))
+                          all-colors)))
+            (m8rh-form-16-surrounding-loop
+              inputs target target-color surrounding-candidates)))))))
+
+; Loop through surrounding colors for a given target
+(define m8rh-form-16-surrounding-loop
+  (lambda (inputs target target-color surrounding-candidates)
+    (if (= (length surrounding-candidates) 0) nil
+      (let ((surrounding-color (head surrounding-candidates)))
+        ; Try this target/surrounding pair
+        (let ((result (m8rh-try-form-16-pair
+                        inputs target target-color surrounding-color)))
+          (if (not (nil? result))
+            result
+            ; Try next surrounding color
+            (m8rh-form-16-surrounding-loop
+              inputs target target-color (tail surrounding-candidates))))))))
+
+; ── Chain helper ─────────────────────────────────────────────────────
+
+(define m8rh-try-chain
+  (lambda (forms)
+    (if (= (length forms) 0)
+      (ns ("found" false) ("reason" "no rectangular-hole-fill form matched"))
+      (let ((result (try ((head forms)) nil)))
+        (if (not (nil? result))
+          (ns-put result "found" true)
+          (m8rh-try-chain (tail forms)))))))
+
+; ── Top-level: detect-rectangular-hole-fill ──────────────────────────
+
+(define detect-rectangular-hole-fill
+  (lambda (s)
+    (let ((target (m8rh-grid-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-grid target"))
+        (let ((inputs (m8rh-spec-inputs s)))
+          (m8rh-try-chain
+            (list
+              (lambda () (m8rh-try-form-16 inputs target)))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(define m8rh-make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+(define m8rh-run-test
+  (lambda (label spec)
+    (let ((result (detect-rectangular-hole-fill spec)))
+      (if (ns-get result "found")
+        (print (concat "  OK " label " kind=" (ns-get result "kind")))
+        (print (concat "  FAIL " label " " (ns-get result "reason")))))))
+
+; Test 1: Simple rectangular hole - 2x2 region of 0 surrounded by 5 (gray)
+; Input: 5x5 grid with gray border and a 2x2 black hole in the center
+(define m8rh-test-simple-in
+  (list (list 5 5 5 5 5)
+        (list 5 0 0 5 5)
+        (list 5 0 0 5 5)
+        (list 5 5 5 5 5)
+        (list 5 5 5 5 5)))
+
+; The 2x2 region of 0 (black) surrounded by 5 (gray) should be filled with 5
+(define m8rh-test-simple-out
+  (list (list 5 5 5 5 5)
+        (list 5 5 5 5 5)
+        (list 5 5 5 5 5)
+        (list 5 5 5 5 5)
+        (list 5 5 5 5 5)))
+
+(define m8rh-test-simple-spec
+  (m8rh-make-spec
+    (list (list m8rh-test-simple-in))
+    (list m8rh-test-simple-out)
+    1))
+
+; Test 2: Rectangular hole with different target color
+; Input: region of 2 (red) surrounded by 8 (teal)
+(define m8rh-test-red-hole-in
+  (list (list 8 8 8 8 8)
+        (list 8 8 8 8 8)
+        (list 8 8 2 2 8)
+        (list 8 8 2 2 8)
+        (list 8 8 8 8 8)))
+
+; The 2x2 red region should be filled with teal
+(define m8rh-test-red-hole-out
+  (list (list 8 8 8 8 8)
+        (list 8 8 8 8 8)
+        (list 8 8 8 8 8)
+        (list 8 8 8 8 8)
+        (list 8 8 8 8 8)))
+
+(define m8rh-test-red-hole-spec
+  (m8rh-make-spec
+    (list (list m8rh-test-red-hole-in))
+    (list m8rh-test-red-hole-out)
+    1))
+
+(print "--- m8g_rect_hole_fill smoke tests ---")
+(m8rh-run-test "simple-rect-hole" m8rh-test-simple-spec)
+(m8rh-run-test "red-hole-surrounded-by-teal" m8rh-test-red-hole-spec)

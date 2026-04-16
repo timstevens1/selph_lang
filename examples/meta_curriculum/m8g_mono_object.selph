@@ -1,0 +1,862 @@
+; -------------------------------------------------------------------------
+; Meta-curriculum M8g-mono-object: mono-color object forms
+; -------------------------------------------------------------------------
+;
+; Extends per-object detection with mono-color connected components:
+; each object is a single-color region. Uses grid-mono-* builtins.
+;
+; Forms:
+;   10-mono-a: property-based dispatch (mono-color objects)
+;   10-mono-d: neighbor-relative transform
+;   10-mono-e: attribute-driven translation
+;   10-mono-f: neighbor-based recolor
+;
+; Entry point: `detect-per-object` — tries mono forms first, then
+; falls back to `detect-per-object-dispatch` (from m8g_per_object).
+
+; ── Helpers ────────────────────────────────────────────────────────────
+
+; Count non-zero cells in a mono-object sub-grid.
+(define mm-obj-cell-count
+  (lambda (obj)
+    (reduce
+      (lambda (acc row)
+        (+ acc (reduce (lambda (a c) (if (= c 0) a (+ a 1))) row 0)))
+      obj 0)))
+
+; ── Transform catalog ──────────────────────────────────────────────────
+;
+; Each entry: (name, eval-fn, ast-builder-fn)
+; Reuses the same set as m8g_per_object but self-contained.
+
+(define mm-transform-catalog
+  (list
+    (list "identity"
+      (lambda (obj) obj)
+      (lambda (src) src))
+    (list "rotate-cw"
+      (lambda (obj) (grid-rotate-cw obj))
+      (lambda (src) (make-app "grid-rotate-cw" src)))
+    (list "rotate-ccw"
+      (lambda (obj) (grid-rotate-ccw obj))
+      (lambda (src) (make-app "grid-rotate-ccw" src)))
+    (list "rotate-180"
+      (lambda (obj) (grid-rotate-180 obj))
+      (lambda (src) (make-app "grid-rotate-180" src)))
+    (list "flip-h"
+      (lambda (obj) (grid-flip-h obj))
+      (lambda (src) (make-app "grid-flip-h" src)))
+    (list "flip-v"
+      (lambda (obj) (grid-flip-v obj))
+      (lambda (src) (make-app "grid-flip-v" src)))))
+
+; ── Property catalog ───────────────────────────────────────────────────
+;
+; Each entry: (name, extract-fn taking (grid, idx), ast-emitter-fn)
+; The extract-fn uses mono builtins; the ast-emitter builds the runtime
+; extraction node given (g-sym, i-sym).
+
+(define mm-property-catalog
+  (list
+    (list "color"
+      (lambda (g i) (grid-mono-color g i))
+      (lambda (g-sym i-sym) (make-app "grid-mono-color" g-sym i-sym)))
+    (list "cell-count"
+      (lambda (g i) (length (reduce append (grid-mono-object g i) (list))))
+      (lambda (g-sym i-sym) (make-app "mm-obj-cell-count" (make-app "grid-mono-object" g-sym i-sym))))
+    (list "bbox-height"
+      (lambda (g i) (nth (grid-mono-bbox g i) 2))
+      (lambda (g-sym i-sym) (make-app "nth" (make-app "grid-mono-bbox" g-sym i-sym) (make-int 2))))
+    (list "bbox-width"
+      (lambda (g i) (nth (grid-mono-bbox g i) 3))
+      (lambda (g-sym i-sym) (make-app "nth" (make-app "grid-mono-bbox" g-sym i-sym) (make-int 3))))))
+
+; ── Per-object transform detection ─────────────────────────────────────
+
+(define mm-detect-obj-transform
+  (lambda (in-obj out-obj)
+    (nth
+      (reduce
+        (lambda (st idx)
+          (if (not (nil? (nth st 0))) st
+            (let ((entry (nth mm-transform-catalog idx)))
+              (let ((xf-fn (nth entry 1)))
+                (let ((result (try (xf-fn in-obj) nil)))
+                  (if (nil? result) st
+                    (if (= result out-obj)
+                      (list idx)
+                      st)))))))
+        (range (length mm-transform-catalog))
+        (list nil))
+      0)))
+
+; ── Mono-color alignment ──────────────────────────────────────────────
+;
+; Match input→output mono-objects by (color first, then position).
+; Returns list of (in-idx out-idx) pairs, or nil on failure.
+
+(define mm-align-objects
+  (lambda (in-grid out-grid)
+    (let ((n-in  (grid-mono-count in-grid))
+          (n-out (grid-mono-count out-grid)))
+      (if (= n-in 0) nil
+        (if (= n-in n-out)
+          ; Same count — match by color + position
+          (mm-align-by-color-pos in-grid out-grid n-in)
+          ; Different counts — alignment fails, caller handles deletion
+          nil)))))
+
+; Align by color, breaking ties by position proximity.
+(define mm-align-by-color-pos
+  (lambda (in-grid out-grid n)
+    (let ((used (list)))
+      (let ((result
+              (reduce
+                (lambda (acc i)
+                  (if (nil? acc) nil
+                    (let ((in-color (grid-mono-color in-grid i))
+                          (in-pos  (grid-mono-pos in-grid i)))
+                      (let ((best (mm-find-best-match out-grid n in-color in-pos (nth acc 1))))
+                        (if (nil? best) nil
+                          (list
+                            (append (nth acc 0) (list (list i best)))
+                            (append (nth acc 1) (list best))))))))
+                (range n)
+                (list (list) used))))
+        (if (nil? result) nil (nth result 0))))))
+
+; Find the best unmatched output object: prefer same color, then nearest.
+(define mm-find-best-match
+  (lambda (grid n target-color target-pos used)
+    (nth
+      (reduce
+        (lambda (st j)
+          (if (contains (nth st 1) j) st
+            (let ((c (try (grid-mono-color grid j) -1))
+                  (p (try (grid-mono-pos grid j) (list 999 999))))
+              (let ((dist (+ (mm-abs (- (nth p 0) (nth target-pos 0)))
+                             (mm-abs (- (nth p 1) (nth target-pos 1))))))
+                ; color match: dist. color mismatch: dist + 10000
+                (let ((score (if (= c target-color) dist (+ dist 10000))))
+                  (if (or (nil? (nth st 0)) (< score (nth st 2)))
+                    (list j used score)
+                    st))))))
+        (range n)
+        (list nil used 999999))
+      0)))
+
+(define mm-abs (lambda (x) (if (< x 0) (- 0 x) x)))
+
+; ── Deletion detection ─────────────────────────────────────────────────
+;
+; When output has fewer objects: check if output = input with some
+; mono-objects removed. Kept objects must be identity-mapped at same pos.
+
+(define mm-try-deletion
+  (lambda (in-grid out-grid n-in n-out)
+    (if (> n-in 8) nil
+      (let ((bg (grid-background in-grid))
+            (h  (length in-grid))
+            (w  (if (> (length in-grid) 0) (length (head in-grid)) 0)))
+        (mm-try-deletion-subsets in-grid out-grid n-in n-out bg h w
+          (mm-subsets-of-size (range n-in) n-out))))))
+
+(define mm-try-deletion-subsets
+  (lambda (in-grid out-grid n-in n-out bg h w subsets)
+    (if (= (length subsets) 0) nil
+      (let ((subset (head subsets)))
+        (let ((canvas
+                (reduce
+                  (lambda (c idx)
+                    (let ((obj (grid-mono-object in-grid idx))
+                          (pos (grid-mono-pos in-grid idx)))
+                      (grid-place c obj (nth pos 0) (nth pos 1))))
+                  subset
+                  (grid-blank h w bg))))
+          (if (= canvas out-grid)
+            ; Found it. Mark kept objects 0 (identity), deleted -1.
+            (map
+              (lambda (i)
+                (list i
+                  (if (contains subset i) 0 -1)
+                  (grid-mono-color in-grid i)
+                  (try (mm-obj-cell-count (grid-mono-object in-grid i)) 0)
+                  (nth (grid-mono-bbox in-grid i) 2)
+                  (nth (grid-mono-bbox in-grid i) 3)))
+              (range n-in))
+            (mm-try-deletion-subsets in-grid out-grid n-in n-out bg h w
+              (tail subsets))))))))
+
+(define mm-subsets-of-size
+  (lambda (items k)
+    (if (= k 0) (list (list))
+      (if (= (length items) 0) (list)
+        (if (> k (length items)) (list)
+          (let ((first (head items))
+                (rest  (tail items)))
+            (append
+              (map (lambda (sub) (cons first sub))
+                   (mm-subsets-of-size rest (- k 1)))
+              (mm-subsets-of-size rest k))))))))
+
+; ── Pair analysis ──────────────────────────────────────────────────────
+;
+; Analyze one training pair using mono-color objects.
+; Returns list of (obj-idx xf-idx color cell-count bbox-h bbox-w)
+; or nil on failure.
+
+(define mm-analyze-pair
+  (lambda (in-grid out-grid)
+    (let ((alignment (try (mm-align-objects in-grid out-grid) nil)))
+      (if (nil? alignment)
+        ; Check if it's a deletion result (list of tuples already)
+        (try (mm-try-deletion in-grid out-grid
+                (grid-mono-count in-grid) (grid-mono-count out-grid))
+             nil)
+        ; alignment is list of (in-idx, out-idx) pairs
+        (let ((results
+                (map
+                  (lambda (pair)
+                    (let ((i (nth pair 0))
+                          (j (nth pair 1)))
+                      (let ((in-obj  (try (grid-mono-object in-grid i) nil))
+                            (out-obj (try (grid-mono-object out-grid j) nil)))
+                        (if (or (nil? in-obj) (nil? out-obj))
+                          nil
+                          (let ((xf-idx (mm-detect-obj-transform in-obj out-obj)))
+                            (if (nil? xf-idx) nil
+                              (list i xf-idx
+                                (grid-mono-color in-grid i)
+                                (mm-obj-cell-count in-obj)
+                                (nth (grid-mono-bbox in-grid i) 2)
+                                (nth (grid-mono-bbox in-grid i) 3))))))))
+                  alignment)))
+          (if (reduce (lambda (ok r) (and ok (not (nil? r)))) results true)
+            results
+            nil))))))
+
+; ── Cross-pair consistency ─────────────────────────────────────────────
+;
+; Find a single property that cleanly partitions transform assignments
+; across ALL pairs. Properties: color(2), cell-count(3), bbox-h(4), bbox-w(5).
+
+(define mm-find-consistent-partition
+  (lambda (all-pair-results)
+    (let ((props (list
+                   (list "color" 2)
+                   (list "cell-count" 3)
+                   (list "bbox-height" 4)
+                   (list "bbox-width" 5))))
+      (reduce
+        (lambda (found prop-entry)
+          (if (not (nil? found)) found
+            (let ((prop-name (nth prop-entry 0))
+                  (prop-idx  (nth prop-entry 1)))
+              (mm-check-property-consistency all-pair-results prop-idx prop-name))))
+        props
+        nil))))
+
+(define mm-check-property-consistency
+  (lambda (all-pair-results prop-idx prop-name)
+    (let ((mapping
+            (reduce
+              (lambda (acc pair-result)
+                (if (nil? acc) nil
+                  (reduce
+                    (lambda (m obj-info)
+                      (if (nil? m) nil
+                        (let ((pval (nth obj-info prop-idx))
+                              (xf-idx (nth obj-info 1)))
+                          (if (nil? pval) nil
+                            (let ((key (to-string pval))
+                                  (existing (try (ns-get m key) nil)))
+                              (if (nil? existing)
+                                (ns-put m key xf-idx)
+                                (if (= existing xf-idx) m nil)))))))
+                    pair-result
+                    acc)))
+              all-pair-results
+              (ns))))
+      (if (nil? mapping) nil
+        (if (< (length (ns-keys mapping)) 2) nil
+          (list prop-name mapping))))))
+
+; ── AST emission for Form 10-mono-a ───────────────────────────────────
+;
+; Shape:
+;   (lambda (x)
+;     (let ((g (nth x 0)))
+;       (reduce
+;         (lambda (canvas i)
+;           (let ((obj (grid-mono-object g i))
+;                 (pos (grid-mono-pos g i)))
+;             (if (= PROP-EXPR VALUE)
+;               (grid-place canvas (XF-A obj) (nth pos 0) (nth pos 1))
+;               (grid-place canvas (XF-B obj) (nth pos 0) (nth pos 1)))))
+;         (range (grid-mono-count g))
+;         (grid-blank (grid-height g) (grid-width g) (grid-background g)))))
+
+(define mm-emit-dispatch
+  (lambda (prop-name mapping)
+    (let ((g-sym (make-symbol "g"))
+          (i-sym (make-symbol "i"))
+          (canvas-sym (make-symbol "canvas"))
+          (obj-sym (make-symbol "obj"))
+          (pos-sym (make-symbol "pos")))
+      (let ((prop-ast (mm-emit-property-extract prop-name g-sym i-sym obj-sym))
+            (keys (ns-keys mapping)))
+        (let ((place-chain (mm-emit-if-chain prop-ast mapping keys
+                              obj-sym pos-sym canvas-sym)))
+          (make-lambda (list "x")
+            (make-app "let"
+              (make-app "list"
+                (make-app "list" (make-symbol "g")
+                  (make-app "nth" (make-symbol "x") (make-int 0))))
+              (make-app "reduce"
+                (make-lambda (list "canvas" "i")
+                  (make-app "let"
+                    (make-app "list"
+                      (make-app "list" (make-symbol "obj")
+                        (make-app "grid-mono-object" g-sym i-sym))
+                      (make-app "list" (make-symbol "pos")
+                        (make-app "grid-mono-pos" g-sym i-sym)))
+                    place-chain))
+                (make-app "range" (make-app "grid-mono-count" g-sym))
+                (make-app "grid-blank"
+                  (make-app "grid-height" g-sym)
+                  (make-app "grid-width" g-sym)
+                  (make-app "grid-background" g-sym))))))))))
+
+; Emit property extraction AST.
+; For "color" we use grid-mono-color(g, i) directly (no object needed).
+; For others we need the object sub-grid.
+(define mm-emit-property-extract
+  (lambda (prop-name g-sym i-sym obj-sym)
+    (if (= prop-name "color")
+      (make-app "grid-mono-color" g-sym i-sym)
+      (if (= prop-name "cell-count")
+        (make-app "mm-obj-cell-count" obj-sym)
+        (if (= prop-name "bbox-height")
+          (make-app "nth" (make-app "grid-mono-bbox" g-sym i-sym) (make-int 2))
+          ; bbox-width
+          (make-app "nth" (make-app "grid-mono-bbox" g-sym i-sym) (make-int 3)))))))
+
+; Build nested if-chain for dispatch.
+(define mm-emit-if-chain
+  (lambda (prop-ast mapping keys obj-sym pos-sym canvas-sym)
+    (if (= (length keys) 1)
+      (let ((xf-idx (ns-get mapping (head keys))))
+        (mm-emit-place canvas-sym obj-sym pos-sym xf-idx))
+      (let ((key (head keys))
+            (rest (tail keys)))
+        (let ((xf-idx (ns-get mapping key))
+              (pval (mm-parse-int-key key)))
+          (make-if
+            (make-app "=" prop-ast (make-int pval))
+            (mm-emit-place canvas-sym obj-sym pos-sym xf-idx)
+            (mm-emit-if-chain prop-ast mapping rest obj-sym pos-sym canvas-sym)))))))
+
+; Emit a grid-place call with a transformed object.
+(define mm-emit-place
+  (lambda (canvas-sym obj-sym pos-sym xf-idx)
+    (if (= xf-idx -1)
+      canvas-sym ; deletion: skip this object
+      (let ((xf-entry (nth mm-transform-catalog xf-idx))
+            (xf-ast-fn (nth xf-entry 2)))
+        (make-app "grid-place"
+          canvas-sym
+          (xf-ast-fn obj-sym)
+          (make-app "nth" pos-sym (make-int 0))
+          (make-app "nth" pos-sym (make-int 1)))))))
+
+; Parse a string key back to an integer (0..99 and negatives).
+(define mm-parse-int-key
+  (lambda (key)
+    (let ((neg? (if (> (string-length key) 0)
+                  (= (string-take key 1) "-") false)))
+      (let ((abs-key (if neg? (string-drop key 1) key)))
+        (let ((val (reduce
+                     (lambda (found v)
+                       (if (not (nil? found)) found
+                         (if (= (to-string v) abs-key) v nil)))
+                     (range 100)
+                     nil)))
+          (if (nil? val) 0
+            (if neg? (- 0 val) val)))))))
+
+(define mm-dedup
+  (lambda (xs)
+    (reduce
+      (lambda (acc x)
+        (if (contains acc x) acc (append acc (list x))))
+      xs (list))))
+
+; ── AST emission for Form 10-mono-f (recolor) ─────────────────────────
+;
+; Shape: for each object, replace its color with the color of its
+; nearest neighbor.
+;
+;   (lambda (x)
+;     (let ((g (nth x 0)))
+;       (reduce
+;         (lambda (canvas i)
+;           (let ((obj (grid-mono-object g i))
+;                 (pos (grid-mono-pos g i))
+;                 (new-color (grid-mono-color g (grid-mono-nearest g i))))
+;             (grid-place canvas
+;               (grid-replace-color obj (grid-mono-color g i) new-color)
+;               (nth pos 0) (nth pos 1))))
+;         (range (grid-mono-count g))
+;         (grid-blank (grid-height g) (grid-width g) (grid-background g)))))
+
+(define mm-emit-recolor-by-neighbor
+  (lambda (neighbor-prop)
+    ; neighbor-prop is "color" for now
+    (let ((g-sym (make-symbol "g"))
+          (i-sym (make-symbol "i"))
+          (canvas-sym (make-symbol "canvas")))
+      (make-lambda (list "x")
+        (make-app "let"
+          (make-app "list"
+            (make-app "list" (make-symbol "g")
+              (make-app "nth" (make-symbol "x") (make-int 0))))
+          (make-app "reduce"
+            (make-lambda (list "canvas" "i")
+              (make-app "let"
+                (make-app "list"
+                  (make-app "list" (make-symbol "obj")
+                    (make-app "grid-mono-object" g-sym i-sym))
+                  (make-app "list" (make-symbol "pos")
+                    (make-app "grid-mono-pos" g-sym i-sym))
+                  (make-app "list" (make-symbol "nc")
+                    (make-app "grid-mono-color" g-sym
+                      (make-app "grid-mono-nearest" g-sym i-sym))))
+                (make-app "grid-place"
+                  canvas-sym
+                  (make-app "grid-replace-color"
+                    (make-symbol "obj")
+                    (make-app "grid-mono-color" g-sym i-sym)
+                    (make-symbol "nc"))
+                  (make-app "nth" (make-symbol "pos") (make-int 0))
+                  (make-app "nth" (make-symbol "pos") (make-int 1)))))
+            (make-app "range" (make-app "grid-mono-count" g-sym))
+            (make-app "grid-blank"
+              (make-app "grid-height" g-sym)
+              (make-app "grid-width" g-sym)
+              (make-app "grid-background" g-sym))))))))
+
+; ── AST emission for Form 10-mono-e (translation) ─────────────────────
+;
+; Shape: each object moves to the position of its nearest neighbor.
+;
+;   (lambda (x)
+;     (let ((g (nth x 0)))
+;       (reduce
+;         (lambda (canvas i)
+;           (let ((obj (grid-mono-object g i))
+;                 (npos (grid-mono-pos g (grid-mono-nearest g i))))
+;             (grid-place canvas obj (nth npos 0) (nth npos 1))))
+;         (range (grid-mono-count g))
+;         (grid-blank (grid-height g) (grid-width g) (grid-background g)))))
+
+(define mm-emit-translate-to-neighbor
+  (lambda ()
+    (let ((g-sym (make-symbol "g"))
+          (i-sym (make-symbol "i"))
+          (canvas-sym (make-symbol "canvas")))
+      (make-lambda (list "x")
+        (make-app "let"
+          (make-app "list"
+            (make-app "list" (make-symbol "g")
+              (make-app "nth" (make-symbol "x") (make-int 0))))
+          (make-app "reduce"
+            (make-lambda (list "canvas" "i")
+              (make-app "let"
+                (make-app "list"
+                  (make-app "list" (make-symbol "obj")
+                    (make-app "grid-mono-object" g-sym i-sym))
+                  (make-app "list" (make-symbol "npos")
+                    (make-app "grid-mono-pos" g-sym
+                      (make-app "grid-mono-nearest" g-sym i-sym))))
+                (make-app "grid-place"
+                  canvas-sym
+                  (make-symbol "obj")
+                  (make-app "nth" (make-symbol "npos") (make-int 0))
+                  (make-app "nth" (make-symbol "npos") (make-int 1)))))
+            (make-app "range" (make-app "grid-mono-count" g-sym))
+            (make-app "grid-blank"
+              (make-app "grid-height" g-sym)
+              (make-app "grid-width" g-sym)
+              (make-app "grid-background" g-sym))))))))
+
+; ── AST emission for Form 10-mono-d (neighbor-relative dispatch) ──────
+;
+; Shape: transform depends on nearest neighbor's property.
+;
+;   (lambda (x)
+;     (let ((g (nth x 0)))
+;       (reduce
+;         (lambda (canvas i)
+;           (let ((obj (grid-mono-object g i))
+;                 (pos (grid-mono-pos g i))
+;                 (nprop (PROP-EXTRACT g (grid-mono-nearest g i))))
+;             (if (= nprop VALUE)
+;               (grid-place canvas (XF-A obj) ...)
+;               (grid-place canvas (XF-B obj) ...))))
+;         ...)))
+
+(define mm-emit-neighbor-dispatch
+  (lambda (prop-name mapping)
+    (let ((g-sym (make-symbol "g"))
+          (i-sym (make-symbol "i"))
+          (canvas-sym (make-symbol "canvas"))
+          (obj-sym (make-symbol "obj"))
+          (pos-sym (make-symbol "pos")))
+      (let ((nearest-sym (make-app "grid-mono-nearest" g-sym i-sym)))
+        (let ((prop-ast (mm-emit-property-extract prop-name g-sym nearest-sym obj-sym))
+              (keys (ns-keys mapping)))
+          (let ((place-chain (mm-emit-if-chain prop-ast mapping keys
+                                obj-sym pos-sym canvas-sym)))
+            (make-lambda (list "x")
+              (make-app "let"
+                (make-app "list"
+                  (make-app "list" (make-symbol "g")
+                    (make-app "nth" (make-symbol "x") (make-int 0))))
+                (make-app "reduce"
+                  (make-lambda (list "canvas" "i")
+                    (make-app "let"
+                      (make-app "list"
+                        (make-app "list" (make-symbol "obj")
+                          (make-app "grid-mono-object" g-sym i-sym))
+                        (make-app "list" (make-symbol "pos")
+                          (make-app "grid-mono-pos" g-sym i-sym)))
+                      place-chain))
+                  (make-app "range" (make-app "grid-mono-count" g-sym))
+                  (make-app "grid-blank"
+                    (make-app "grid-height" g-sym)
+                    (make-app "grid-width" g-sym)
+                    (make-app "grid-background" g-sym)))))))))))
+
+; ── Detector: Form 10-mono-a (property dispatch) ──────────────────────
+
+(define mm-detect-dispatch
+  (lambda (s)
+    (let ((inputs  (ns-get s "inputs"))
+          (outputs (ns-get s "outputs")))
+      (let ((in-grids  (map head inputs))
+            (out-grids outputs))
+        (let ((all-results
+                (map (lambda (i)
+                       (try (mm-analyze-pair (nth in-grids i) (nth out-grids i))
+                            nil))
+                     (range (length in-grids)))))
+          (if (reduce (lambda (ok r) (and ok (not (nil? r)))) all-results true)
+            (let ((partition (mm-find-consistent-partition all-results)))
+              (if (nil? partition)
+                (ns ("found" false) ("reason" "no consistent partition"))
+                (let ((prop-name (nth partition 0))
+                      (mapping   (nth partition 1)))
+                  (let ((has-deletion
+                          (reduce
+                            (lambda (acc key)
+                              (or acc (= (ns-get mapping key) -1)))
+                            (ns-keys mapping) false)))
+                    (let ((xf-values (map (lambda (k) (ns-get mapping k))
+                                          (ns-keys mapping))))
+                      (if (and (not has-deletion) (= (length (mm-dedup xf-values)) 1))
+                        (ns ("found" false) ("reason" "uniform transform"))
+                        (ns ("kind" (concat "form-10-mono-a-" prop-name))
+                            ("source-node" (mm-emit-dispatch prop-name mapping))
+                            ("found" true))))))))
+            (ns ("found" false) ("reason" "pair analysis failed"))))))))
+
+; ── Detector: Form 10-mono-f (neighbor recolor) ──────────────────────
+;
+; Check if each object's color changed to match its nearest neighbor's
+; color, while shape and position stay the same.
+
+(define mm-detect-recolor
+  (lambda (s)
+    (let ((inputs  (ns-get s "inputs"))
+          (outputs (ns-get s "outputs")))
+      (let ((in-grids  (map head inputs))
+            (out-grids outputs))
+        (let ((ok
+                (reduce
+                  (lambda (acc i)
+                    (if (not acc) false
+                      (let ((ig (nth in-grids i))
+                            (og (nth out-grids i)))
+                        (let ((n (try (grid-mono-count ig) 0)))
+                          (if (< n 2) false
+                            (if (not (= n (try (grid-mono-count og) 0))) false
+                              (reduce
+                                (lambda (ok2 j)
+                                  (if (not ok2) false
+                                    (let ((in-obj  (grid-mono-object ig j))
+                                          (out-obj (grid-mono-object og j))
+                                          (in-pos  (grid-mono-pos ig j))
+                                          (out-pos (grid-mono-pos og j)))
+                                      ; Position must match
+                                      (if (not (= in-pos out-pos)) false
+                                        ; Shape must match (same dims, same non-zero pattern)
+                                        (if (not (= (length in-obj) (length out-obj))) false
+                                          ; Color should == nearest neighbor's color
+                                          (let ((expected-color
+                                                  (grid-mono-color ig (grid-mono-nearest ig j)))
+                                                (actual-color
+                                                  (grid-mono-color og j)))
+                                            (= expected-color actual-color)))))))
+                                (range n) true)))))))
+                  (range (length in-grids)) true)))
+          (if ok
+            (ns ("kind" "form-10-mono-f-recolor-by-neighbor")
+                ("source-node" (mm-emit-recolor-by-neighbor "color"))
+                ("found" true))
+            (ns ("found" false) ("reason" "not neighbor-recolor"))))))))
+
+; ── Detector: Form 10-mono-e (translate to neighbor) ──────────────────
+;
+; Check if each object moved to its nearest neighbor's position while
+; shape is preserved.
+
+(define mm-detect-translate
+  (lambda (s)
+    (let ((inputs  (ns-get s "inputs"))
+          (outputs (ns-get s "outputs")))
+      (let ((in-grids  (map head inputs))
+            (out-grids outputs))
+        (let ((ok
+                (reduce
+                  (lambda (acc i)
+                    (if (not acc) false
+                      (let ((ig (nth in-grids i))
+                            (og (nth out-grids i)))
+                        (let ((n (try (grid-mono-count ig) 0)))
+                          (if (< n 2) false
+                            (if (not (= n (try (grid-mono-count og) 0))) false
+                              (reduce
+                                (lambda (ok2 j)
+                                  (if (not ok2) false
+                                    (let ((in-obj  (grid-mono-object ig j))
+                                          (out-obj (grid-mono-object og j))
+                                          (out-pos (grid-mono-pos og j))
+                                          (neighbor-pos
+                                            (grid-mono-pos ig (grid-mono-nearest ig j))))
+                                      ; Shape preserved and moved to neighbor's position
+                                      (and (= in-obj out-obj)
+                                           (= out-pos neighbor-pos)))))
+                                (range n) true)))))))
+                  (range (length in-grids)) true)))
+          (if ok
+            (ns ("kind" "form-10-mono-e-translate-to-neighbor")
+                ("source-node" (mm-emit-translate-to-neighbor))
+                ("found" true))
+            (ns ("found" false) ("reason" "not translate-to-neighbor"))))))))
+
+; ── Detector: Form 10-mono-d (neighbor-relative dispatch) ─────────────
+;
+; Each object's transform depends on its nearest neighbor's property.
+
+(define mm-detect-neighbor-dispatch
+  (lambda (s)
+    (let ((inputs  (ns-get s "inputs"))
+          (outputs (ns-get s "outputs")))
+      (let ((in-grids  (map head inputs))
+            (out-grids outputs))
+        ; Analyze pairs — get per-object (idx, xf-idx, props...)
+        (let ((all-results
+                (map (lambda (i)
+                       (try (mm-analyze-pair (nth in-grids i) (nth out-grids i))
+                            nil))
+                     (range (length in-grids)))))
+          (if (not (reduce (lambda (ok r) (and ok (not (nil? r)))) all-results true))
+            (ns ("found" false) ("reason" "pair analysis failed"))
+            ; For each object, get its nearest neighbor's properties and
+            ; check if neighbor-property → transform is consistent.
+            (let ((augmented
+                    (map (lambda (pair-idx)
+                           (let ((ig (nth in-grids pair-idx))
+                                 (pair-result (nth all-results pair-idx)))
+                             (map (lambda (obj-info)
+                                    (let ((i (nth obj-info 0))
+                                          (xf-idx (nth obj-info 1)))
+                                      (let ((nearest (try (grid-mono-nearest ig i) -1)))
+                                        (if (= nearest -1) nil
+                                          (list i xf-idx
+                                            (try (grid-mono-color ig nearest) -1)
+                                            (try (mm-obj-cell-count (grid-mono-object ig nearest)) 0)
+                                            (try (nth (grid-mono-bbox ig nearest) 2) 0)
+                                            (try (nth (grid-mono-bbox ig nearest) 3) 0))))))
+                                  pair-result)))
+                         (range (length in-grids)))))
+              (if (reduce (lambda (ok r) (and ok (reduce (lambda (ok2 x) (and ok2 (not (nil? x)))) r true))) augmented true)
+                (let ((partition (mm-find-consistent-partition augmented)))
+                  (if (nil? partition)
+                    (ns ("found" false) ("reason" "no consistent neighbor partition"))
+                    (let ((prop-name (nth partition 0))
+                          (mapping   (nth partition 1)))
+                      (let ((xf-values (map (lambda (k) (ns-get mapping k))
+                                            (ns-keys mapping))))
+                        (if (= (length (mm-dedup xf-values)) 1)
+                          (ns ("found" false) ("reason" "uniform neighbor transform"))
+                          (ns ("kind" (concat "form-10-mono-d-neighbor-" prop-name))
+                              ("source-node" (mm-emit-neighbor-dispatch prop-name mapping))
+                              ("found" true)))))))
+                (ns ("found" false) ("reason" "neighbor augmentation failed"))))))))))
+
+; ── Top-level: detect-per-object ──────────────────────────────────────
+;
+; Entry point called by m_chain. Tries mono-color forms in order:
+;   1. mono-a (property dispatch)
+;   2. mono-f (neighbor recolor)
+;   3. mono-e (translate to neighbor)
+;   4. mono-d (neighbor-relative dispatch)
+;   5. fallback: detect-per-object-dispatch (multi-color, from m8g_per_object)
+
+(define detect-per-object
+  (lambda (s)
+    (let ((target (try (reduce
+                    (lambda (acc v)
+                      (if (and acc (grid? v)) acc nil))
+                    (ns-get s "outputs") true) nil)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-grid target"))
+        (let ((r1 (try (mm-detect-dispatch s) nil)))
+          (if (and (not (nil? r1)) (try (ns-get r1 "found") false))
+            r1
+            (let ((r2 (try (mm-detect-recolor s) nil)))
+              (if (and (not (nil? r2)) (try (ns-get r2 "found") false))
+                r2
+                (let ((r3 (try (mm-detect-translate s) nil)))
+                  (if (and (not (nil? r3)) (try (ns-get r3 "found") false))
+                    r3
+                    (let ((r4 (try (mm-detect-neighbor-dispatch s) nil)))
+                      (if (and (not (nil? r4)) (try (ns-get r4 "found") false))
+                        r4
+                        ; Fallback to multi-color per-object dispatch
+                        (try (detect-per-object-dispatch s)
+                             (ns ("found" false)))))))))))))))
+
+; ── Smoke tests ───────────────────────────────────────────────────────
+
+(define mm-make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+; Test 1: Form 10-mono-a — two mono-color objects, different transforms by color.
+; Red (1) object gets flip-h, blue (2) stays identity.
+(define mm-test1-in1
+  (list (list 1 1 0 0)
+        (list 1 0 0 0)
+        (list 0 0 2 2)
+        (list 0 0 2 2)))
+
+(define mm-test1-out1
+  (list (list 1 1 0 0)
+        (list 0 1 0 0)
+        (list 0 0 2 2)
+        (list 0 0 2 2)))
+
+(define mm-test1-in2
+  (list (list 0 0 0 0 0)
+        (list 0 1 1 0 0)
+        (list 0 1 0 0 0)
+        (list 0 0 0 2 0)
+        (list 0 0 0 0 0)))
+
+(define mm-test1-out2
+  (list (list 0 0 0 0 0)
+        (list 0 1 1 0 0)
+        (list 0 0 1 0 0)
+        (list 0 0 0 2 0)
+        (list 0 0 0 0 0)))
+
+(define mm-test1-spec
+  (mm-make-spec
+    (list (list mm-test1-in1) (list mm-test1-in2))
+    (list mm-test1-out1 mm-test1-out2)
+    1))
+
+; Test 2: Form 10-mono-f — objects recolor to nearest neighbor's color.
+; Two objects: color 1 at top-left, color 3 at bottom-right.
+; After: both become color of their nearest neighbor.
+; (Since they are each other's nearest, 1→3 and 3→1.)
+(define mm-test2-in1
+  (list (list 1 0 0 0)
+        (list 0 0 0 0)
+        (list 0 0 0 3)
+        (list 0 0 0 0)))
+
+(define mm-test2-out1
+  (list (list 3 0 0 0)
+        (list 0 0 0 0)
+        (list 0 0 0 1)
+        (list 0 0 0 0)))
+
+(define mm-test2-in2
+  (list (list 0 0 0 0 0)
+        (list 0 1 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 3 0)
+        (list 0 0 0 0 0)))
+
+(define mm-test2-out2
+  (list (list 0 0 0 0 0)
+        (list 0 3 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 1 0)
+        (list 0 0 0 0 0)))
+
+(define mm-test2-spec
+  (mm-make-spec
+    (list (list mm-test2-in1) (list mm-test2-in2))
+    (list mm-test2-out1 mm-test2-out2)
+    1))
+
+; Test 3: Form 10-mono-a — deletion by color.
+; Delete color-1 objects, keep color-2 objects.
+(define mm-test3-in1
+  (list (list 1 0 0 0)
+        (list 1 0 2 2)
+        (list 0 0 2 0)
+        (list 0 0 0 0)))
+
+(define mm-test3-out1
+  (list (list 0 0 0 0)
+        (list 0 0 2 2)
+        (list 0 0 2 0)
+        (list 0 0 0 0)))
+
+(define mm-test3-in2
+  (list (list 0 1 1 0)
+        (list 0 0 0 0)
+        (list 2 2 0 0)
+        (list 2 0 0 0)))
+
+(define mm-test3-out2
+  (list (list 0 0 0 0)
+        (list 0 0 0 0)
+        (list 2 2 0 0)
+        (list 2 0 0 0)))
+
+(define mm-test3-spec
+  (mm-make-spec
+    (list (list mm-test3-in1) (list mm-test3-in2))
+    (list mm-test3-out1 mm-test3-out2)
+    1))
+
+(define mm-run-test
+  (lambda (label spec)
+    (let ((result (try (detect-per-object spec) nil)))
+      (if (nil? result)
+        (print (concat "  ERR  " label " — exception"))
+        (if (ns-get result "found")
+          (print (concat "  OK   " label " kind=" (ns-get result "kind")))
+          (print (concat "  FAIL " label " "
+            (try (ns-get result "reason") "?"))))))))
+
+(print "--- m8g_mono_object smoke tests ---")
+(mm-run-test "10-mono-a color dispatch" mm-test1-spec)
+(mm-run-test "10-mono-f neighbor recolor" mm-test2-spec)
+(mm-run-test "10-mono-a color deletion" mm-test3-spec)

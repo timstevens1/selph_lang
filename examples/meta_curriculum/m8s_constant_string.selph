@@ -81,11 +81,12 @@
 (define m8s-pool-col    (lambda (e) (ns-get e "col")))
 (define m8s-pool-kind   (lambda (e) (ns-get e "kind")))
 
-(define m8s-form6-priority-order
+; Pool-entry kind priorities for the recursive classifier. Boolean
+; derived features (suffix/prefix/capital) come first since they
+; generalize best; literal atoms last to avoid memorization.
+(define m8s-pool-priority-order
   (list "string-ends-with" "string-starts-with" "first-upper"
         "lib-" "atom" "numeric-atom" "wrap-" "const-"))
-
-(define m8s-form6-budget 2000)
 
 (define m8s-kind-matches-prefix?
   (lambda (kind pfx)
@@ -99,7 +100,7 @@
             (map (lambda (pfx)
                    (filter (lambda (e) (m8s-kind-matches-prefix? (m8s-pool-kind e) pfx))
                            pool))
-                 m8s-form6-priority-order)))
+                 m8s-pool-priority-order)))
       (reduce append buckets (list)))))
 
 ; ── fit-multi-classify primitive ─────────────────────────────────────
@@ -193,6 +194,174 @@
 
 ; Backwards-compat alias kept for the smoke test.
 (define fit-binary-classify fit-multi-classify)
+
+; ── Recursive partial-match helpers (replaces hard-coded Form 6) ─────
+;
+; The recursive classifier discovers conjunction patterns by:
+;   1. Finding a pool entry that cleanly separates AT LEAST ONE label
+;      (a "partial discriminator") from the rest.
+;   2. Peeling off the cleanly-separated labels into an if-contains
+;      chain.
+;   3. Recursing on the remaining (ambiguous) rows.
+;
+; This subsumes Form 6 (2-feature conjunction) and extends to arbitrary
+; feature depth — a 3-feature task that Form 6 cannot represent solves
+; trivially via 3 levels of recursion.
+
+; Project a column to a subset of row indices.
+(define m8s-project-col
+  (lambda (col indices)
+    (map (lambda (i) (nth col i)) indices)))
+
+; Union the value lists for all labels EXCEPT the one at index `excl`.
+; Returns a deduped list.
+(define m8s-union-vals-except
+  (lambda (vals-by-label excl)
+    (reduce
+      (lambda (acc i)
+        (if (= i excl)
+          acc
+          (reduce
+            (lambda (a v) (if (contains a v) a (append a (list v))))
+            (nth vals-by-label i)
+            acc)))
+      (range (length vals-by-label))
+      (list))))
+
+; Group partition: discovers any feature that splits the labels into
+; 2+ disjoint groups based on connected-component analysis of label
+; signatures (a label's "signature" is the set of feature values it
+; appears with).
+;
+; Two labels are LINKED if their signatures share any value (i.e.,
+; some row has feature value v with label L1 AND some row has feature
+; value v with label L2 — meaning v alone can't determine the label).
+; Connected components are the partition groups.
+;
+; This subsumes the simpler "peel single label" pattern: a label whose
+; signature is disjoint from all others forms a singleton group.
+;
+; Examples:
+;   verb_form ends-in-ing: groups are [{gerund}, {past, base}]
+;     (gerund's sig={true} disjoint from past's sig={false} = base's sig)
+;   gerund_context ends-in-ing: groups are [{gerund-noun, verb-progressive},
+;                                           {common-noun, other}]
+;     (gerund-noun and verb-progressive both have sig={true})
+;
+; Returns nil if only 1 group (no useful split). Returns a namespace
+; with groups, group-vals, group-rows on a partition.
+
+; Get the signature of a label = set of feature values appearing in
+; rows with that label.
+(define m8s-label-sig
+  (lambda (e-col target label)
+    (m8s-vals-for-label e-col target label)))
+
+; Compute combined signature for a group of labels.
+(define m8s-dedup-list
+  (lambda (xs)
+    (reduce
+      (lambda (acc x) (if (contains acc x) acc (append acc (list x))))
+      xs (list))))
+
+(define m8s-group-sig
+  (lambda (group e-col target)
+    (m8s-dedup-list
+      (reduce append
+        (map (lambda (l) (m8s-label-sig e-col target l)) group)
+        (list)))))
+
+; Two label-groups are linked if their signatures share at least one
+; feature value (transitive: if any pair of labels across the groups
+; share a value).
+(define m8s-groups-linked?
+  (lambda (g1 g2 e-col target)
+    (not (m8s-disjoint?
+           (m8s-group-sig g1 e-col target)
+           (m8s-group-sig g2 e-col target)))))
+
+; Find the first (i, j) pair (i < j) of linked groups, or nil.
+(define m8s-find-link
+  (lambda (groups e-col target)
+    (let ((n (length groups)))
+      (reduce
+        (lambda (acc i)
+          (if (not (nil? acc)) acc
+            (reduce
+              (lambda (acc2 j)
+                (if (not (nil? acc2)) acc2
+                  (if (<= j i) nil
+                    (if (m8s-groups-linked?
+                          (nth groups i) (nth groups j) e-col target)
+                      (list i j) nil))))
+              (range n) nil)))
+        (range n) nil))))
+
+; Merge groups at positions i and j into one combined group. The merged
+; group goes at the end; the originals are removed.
+(define m8s-merge-at
+  (lambda (groups i j)
+    (let ((merged (append (nth groups i) (nth groups j))))
+      (let ((kept-indices
+              (filter (lambda (k) (not (or (= k i) (= k j))))
+                      (range (length groups)))))
+        (append
+          (map (lambda (k) (nth groups k)) kept-indices)
+          (list merged))))))
+
+; Iteratively merge until no two groups share any feature value.
+(define m8s-fixpoint-merge
+  (lambda (groups e-col target)
+    (let ((link (m8s-find-link groups e-col target)))
+      (if (nil? link) groups
+        (m8s-fixpoint-merge
+          (m8s-merge-at groups (head link) (head (tail link)))
+          e-col target)))))
+
+; The main partition function. Returns nil (no useful split) or a
+; namespace with the groups, their value sets, and their row indices.
+;
+; Label cap: 8. Above this, the pool space + recursion explodes.
+(define fit-partial-classify
+  (lambda (e-col target)
+    (let ((labels (m8s-distinct-labels target)))
+      (if (or (< (length labels) 2) (> (length labels) 8))
+        nil
+        (let ((distinct-vals (m8s-dedup-list e-col)))
+          (if (<= (length distinct-vals) 1)
+            nil  ; constant feature column — no split possible
+            (let ((initial (map (lambda (l) (list l)) labels)))
+              (let ((groups (m8s-fixpoint-merge initial e-col target)))
+                (if (<= (length groups) 1)
+                  nil  ; All labels merged into one group → no partition
+                  (let ((group-vals
+                          (map (lambda (g) (m8s-group-sig g e-col target))
+                               groups))
+                        (group-rows
+                          (map (lambda (g)
+                                 (filter
+                                   (lambda (i) (contains g (nth target i)))
+                                   (range (length target))))
+                               groups)))
+                    (ns ("groups" groups)
+                        ("group-vals" group-vals)
+                        ("group-rows" group-rows))))))))))))
+
+; Build (if (contains g1-vals e) <body1>
+;        (if (contains g2-vals e) <body2>
+;          ... <last-body>))
+; The last group is the else fall-through (no test).
+(define m8s-build-group-chain
+  (lambda (e-source group-vals sub-bodies)
+    (if (= (length group-vals) 1)
+      (head sub-bodies)
+      (make-if
+        (make-app "contains"
+          (m8s-emit-value-list (head group-vals))
+          e-source)
+        (head sub-bodies)
+        (m8s-build-group-chain
+          e-source (tail group-vals) (tail sub-bodies))))))
 
 ; ── Source emission ──────────────────────────────────────────────────
 
@@ -299,7 +468,7 @@
         col
         (list)))))
 
-(define m8s-form6-active-pool
+(define m8s-active-pool
   (lambda (pool)
     (let ((sorted (m8s-prioritize-pool pool)))
       (filter
@@ -486,154 +655,6 @@
         numerics
         nil))))
 
-; ── Form 6: feature conjunction (§9.47.3) ────────────────────────────
-;
-; Pair-classify by joint column values. For each ordered pair (e1, e2)
-; of distinct pool entries, build a "joint column" where each cell is
-; a 2-element list `(e1[i], e2[i])`. Run fit-multi-classify on the
-; joint column. The first clean partition of joint values into label
-; classes wins, scored by the distinct joint-value count.
-;
-; This is the recognizer for k>2 morphology cases like verb_form,
-; where no single feature discriminates all classes but a pair of
-; features does:
-;   (ends-in-ing, ends-in-ed)
-;   (true,  false) → gerund
-;   (false, true ) → past
-;   (false, false) → base
-;
-; The emit is a chain of `(if (and (= e1 a) (= e2 b)) label ...)`
-; tests with the last label as the else fall-through. Each test is
-; a conjunction of two equalities, hence "feature conjunction."
-;
-; Cost: O(pool² × rows) per spec. Pool with all flags is ~30 entries
-; on a typical 2-arg spec → ~900 pairs × 6 rows = 5400 ops. Cheap.
-
-(define m8s-pair-col
-  (lambda (col-a col-b)
-    (map (lambda (i) (list (nth col-a i) (nth col-b i)))
-         (range (length col-a)))))
-
-; Build a `(if (and (= e1 v1) (= e2 v2)) label ...)` chain. Each
-; element of `pair-vals` is a 2-element list of joint values; each
-; element of `labels` is the corresponding output label. The last
-; label has no test — it's the else fall-through.
-(define m8s-build-conjunction-chain
-  (lambda (e1-source e2-source labels pair-vals)
-    (let ((k (length labels)))
-      (if (= k 1)
-        (m8s-value-to-node (head labels))
-        (let ((pv (head pair-vals)))
-          (let ((v1 (head pv))
-                (v2 (head (tail pv))))
-            ; NOTE: can't use (make-app "and" ...) because eval_v2 treats
-            ; `and` as a SpecialApp, not a regular App. Use nested make-if
-            ; to encode the conjunction: (if test1 (if test2 then else) else).
-            (let ((test1 (make-app "=" e1-source (m8s-value-to-node v1)))
-                  (test2 (make-app "=" e2-source (m8s-value-to-node v2)))
-                  (then-val (m8s-value-to-node (head labels)))
-                  (else-val (m8s-build-conjunction-chain
-                              e1-source e2-source
-                              (tail labels) (tail pair-vals))))
-              (make-if test1
-                (make-if test2 then-val else-val)
-                else-val))))))))
-
-; For Form 6, vals-by-label[i] is a list of 2-element lists. We need
-; one representative joint value per label for the emit. Since the
-; partition is clean, every joint value in label i maps to label i
-; uniquely — but a single label may have multiple distinct joint
-; values (e.g., (true, true) and (true, false) both map to gerund).
-; The emit needs to test for ALL of them.
-;
-; Simpler implementation: flatten labels × vals-by-label into a flat
-; list of (joint-val, label) pairs, then build the chain with one
-; test per joint value. The last entry becomes the else.
-
-(define m8s-flatten-conjunction-vals
-  (lambda (labels vals-by-label)
-    (reduce append
-      (map
-        (lambda (i)
-          (let ((label (nth labels i))
-                (vals (nth vals-by-label i)))
-            (map (lambda (v) (list v label)) vals)))
-        (range (length labels)))
-      (list))))
-
-; Build the conjunction chain from a flat list of (joint-val, label)
-; pairs. The last pair's label becomes the else.
-(define m8s-build-conjunction-from-pairs
-  (lambda (e1-source e2-source pairs)
-    (let ((n (length pairs)))
-      (if (= n 1)
-        (m8s-value-to-node (head (tail (head pairs))))
-        (let ((p (head pairs)))
-          (let ((joint (head p))
-                (label (head (tail p))))
-            (let ((v1 (head joint))
-                  (v2 (head (tail joint))))
-              (let ((test1 (make-app "=" e1-source (m8s-value-to-node v1)))
-                    (test2 (make-app "=" e2-source (m8s-value-to-node v2)))
-                    (then-val (m8s-value-to-node label))
-                    (else-val (m8s-build-conjunction-from-pairs
-                                e1-source e2-source (tail pairs))))
-                (make-if test1
-                  (make-if test2 then-val else-val)
-                  else-val)))))))))
-
-(define m8s-fit-conjunction
-  (lambda (e1 e2 target)
-    (if (= (m8s-pool-col e1) (m8s-pool-col e2))
-      nil
-      (let ((joint (m8s-pair-col (m8s-pool-col e1) (m8s-pool-col e2))))
-        (let ((fit (fit-multi-classify joint target)))
-          (if (nil? fit)
-            nil
-            (let ((labels (ns-get fit "labels"))
-                  (vals (ns-get fit "vals-by-label")))
-              (let ((flat (m8s-flatten-conjunction-vals labels vals)))
-                (ns ("kind" "form-6-conjunction")
-                    ("k" (length labels))
-                    ("score" (length flat))
-                    ("source-node"
-                      (m8s-wrap-lambda
-                        (m8s-build-conjunction-from-pairs
-                          (m8s-pool-source e1)
-                          (m8s-pool-source e2)
-                          flat))))))))))))
-
-(define m8s-try-form-6
-  (lambda (pool target)
-    (let ((active (m8s-form6-active-pool pool)))
-      (let ((result
-              (reduce
-                (lambda (state e1)
-                  (if (>= (nth state 1) m8s-form6-budget)
-                    state
-                    (reduce
-                      (lambda (st e2)
-                        (if (>= (nth st 1) m8s-form6-budget)
-                          st
-                          (let ((hit (try (m8s-fit-conjunction e1 e2 target) nil)))
-                            (list
-                              (if (nil? hit) (nth st 0) (append (nth st 0) (list hit)))
-                              (+ (nth st 1) 1)))))
-                      active
-                      state)))
-                active
-                (list (list) 0))))
-        (let ((hits (nth result 0)))
-          (if (= (length hits) 0)
-            nil
-            (reduce
-              (lambda (acc h)
-                (if (or (nil? acc) (< (ns-get h "score") (ns-get acc "score")))
-                  h
-                  acc))
-              hits
-              nil)))))))
-
 ; Attempt the equality-classify fit for an (e1, e2) pair. Returns the
 ; result ns on success, or nil. Pulled out of m8s-try-form-4 to keep
 ; nesting depth manageable.
@@ -712,65 +733,272 @@
                       (ns-get fit "vals-by-label")))))))
         pool))))
 
-; §9.47.6: short-circuit Form 6 with inline validation.
-; Returns the single best validated candidate (or nil).
-; State: (best-candidate, pair-count).
-(define m8s-form6-best-validated
-  (lambda (pool target test-ins test-outs)
-    (let ((active (m8s-form6-active-pool pool)))
-      (let ((k (length (m8s-distinct-labels target))))
-        (let ((has-test (> (length test-ins) 0)))
-          (nth
-            (reduce
-              (lambda (state e1)
-                (let ((best (nth state 0))
-                      (count (nth state 1)))
-                  (if (and (not (nil? best)) (= (ns-get best "score") k))
-                    state
-                    (if (>= count m8s-form6-budget)
-                      state
-                      (reduce
-                        (lambda (st e2)
-                          (let ((b (nth st 0))
-                                (c (nth st 1)))
-                            (if (and (not (nil? b)) (= (ns-get b "score") k))
-                              st
-                              (if (>= c m8s-form6-budget)
-                                st
-                                (let ((hit (try (m8s-fit-conjunction e1 e2 target) nil)))
-                                  (if (nil? hit)
-                                    (list b (+ c 1))
-                                    (let ((dominated (and (not (nil? b))
-                                                          (>= (ns-get hit "score")
-                                                              (ns-get b "score")))))
-                                      (if dominated
-                                        (list b (+ c 1))
-                                        (let ((ok (if has-test
-                                                    (try (m8s-validate-candidate
-                                                           (ns-get hit "source-node")
-                                                           test-ins test-outs)
-                                                         false)
-                                                    true)))
-                                          (if ok
-                                            (list hit (+ c 1))
-                                            (list b (+ c 1))))))))))))
-                        active
-                        state)))))
-              active
-              (list nil 0))
-            0))))))
-
 ; Pick the result with the smallest score among non-nil candidates.
-; Used to merge Form 3 and Form 6 results: both can succeed on the
-; same spec, and we want the one whose discriminator has fewest
-; distinct values (proxy for "simplest rule"). Form 6 wins for
-; multi-class morphology (verb_form), Form 3 wins for binary or
-; truly single-feature shapes.
+; Used to merge Form 3-style and recursive results: both can succeed
+; on the same spec, and we want the one whose discriminator has fewest
+; distinct values (proxy for "simplest rule").
 (define m8s-pick-smaller-score
   (lambda (a b)
     (if (nil? a) b
       (if (nil? b) a
         (if (< (ns-get b "score") (ns-get a "score")) b a)))))
+
+; ── Recursive classifier (replaces hand-coded Form 6) ────────────────
+;
+; m8s-recursive-classify-body returns (list body-node total-score) or
+; nil. The body-node is a raw AST (no lambda wrapper) — only the
+; top-level wrapper m8s-try-recursive wraps it in (lambda (x) ...).
+;
+; row-indices is the list of original row positions still under
+; consideration. The pool itself is NOT projected — pool source nodes
+; reference (nth x i) which is invariant across recursion levels.
+;
+; Algorithm:
+;   1. If only one distinct label in projected target → return that label.
+;   2. Try Form 3 base case: any pool entry whose projected column
+;      cleanly partitions all remaining labels → emit classify chain.
+;   3. If depth >= max → fail.
+;   4. For each active pool entry:
+;        - Project its column to row-indices.
+;        - Try fit-partial-classify.
+;        - If a partial match found, recurse on residual indices.
+;        - Track best (lowest total-score) composition.
+;   5. Return best or nil.
+
+(define m8s-recursive-max-depth 4)
+
+; Try Form 3 (full clean partition) on the projected target. Returns
+; (list body-node score) or nil.
+(define m8s-try-form3-projected
+  (lambda (pool target row-indices)
+    (let ((proj-target (m8s-project-col target row-indices)))
+      (let ((labels (m8s-distinct-labels proj-target)))
+        (if (or (< (length labels) 2) (> (length labels) 8))
+          nil
+          ; Iterate pool, find best clean partition (smallest distinct count).
+          (let ((hits
+                  (filter (lambda (e) (not (nil? e)))
+                    (map
+                      (lambda (entry)
+                        (let ((proj-col (m8s-project-col
+                                          (m8s-pool-col entry) row-indices)))
+                          (let ((fit (fit-multi-classify proj-col proj-target)))
+                            (if (nil? fit)
+                              nil
+                              (ns ("entry" entry)
+                                  ("fit"   fit)
+                                  ("score" (m8s-distinct-count proj-col)))))))
+                      pool))))
+            (if (= (length hits) 0)
+              nil
+              (let ((best
+                      (reduce
+                        (lambda (acc h)
+                          (if (or (nil? acc)
+                                  (< (ns-get h "score") (ns-get acc "score")))
+                            h acc))
+                        hits nil)))
+                (let ((entry (ns-get best "entry"))
+                      (fit   (ns-get best "fit")))
+                  (list
+                    (m8s-build-classify-chain
+                      (m8s-pool-source entry)
+                      (ns-get fit "labels")
+                      (ns-get fit "vals-by-label"))
+                    (ns-get best "score")))))))))))
+
+; Recursive body builder. Returns (list body-node total-score) or nil.
+;
+; KEY DESIGN: try BOTH the Form 3 base case AND recursive partial splits,
+; then pick the lower-scoring result. Without this, Form 3 returns the
+; (nth x i) memorization atom (which trivially partitions any spec
+; where each row's input is unique) and short-circuits the search
+; before the proper generalizing split (suffix/prefix predicates) is
+; considered. Held-out validation rejects memorization but the dispatch
+; would return no candidate at all.
+;
+; The recursive step uses fit-partial-classify to find a feature that
+; splits labels into 2+ groups, then recurses on each group's rows.
+; This subsumes the simpler "peel single label" pattern AND handles
+; cases where every group has multiple labels (e.g., gerund_context).
+(define m8s-recursive-classify-body
+  (lambda (pool target row-indices depth)
+    (let ((proj-target (m8s-project-col target row-indices))
+          (labels-here (m8s-distinct-labels (m8s-project-col target row-indices))))
+      (if (= (length labels-here) 1)
+        ; Single-label residual → emit the constant. Score 0.
+        (list (m8s-value-to-node (head labels-here)) 0)
+        (let ((base-hit (m8s-try-form3-projected pool target row-indices))
+              (rec-hit
+                (if (>= depth m8s-recursive-max-depth)
+                  nil
+                  (let ((active (m8s-active-pool pool)))
+                    (reduce
+                      (lambda (best entry)
+                        (let ((proj-col (m8s-project-col
+                                          (m8s-pool-col entry) row-indices)))
+                          (let ((partial (fit-partial-classify proj-col proj-target)))
+                            (if (nil? partial)
+                              best
+                              (let ((group-vals (ns-get partial "group-vals"))
+                                    (group-rows-rel (ns-get partial "group-rows")))
+                                ; group-rows-rel are indices into row-indices
+                                ; (since we used proj-target). Translate to
+                                ; absolute row positions in the original target.
+                                (let ((group-rows-abs
+                                        (map
+                                          (lambda (rel)
+                                            (map (lambda (j) (nth row-indices j))
+                                                 rel))
+                                          group-rows-rel)))
+                                  ; Recurse on each group. If any sub-recursion
+                                  ; returns nil (e.g., depth exhausted), this
+                                  ; entry is unusable.
+                                  (let ((sub-results
+                                          (map
+                                            (lambda (g-rows)
+                                              (m8s-recursive-classify-body
+                                                pool target g-rows (+ depth 1)))
+                                            group-rows-abs)))
+                                    (let ((all-ok
+                                            (reduce
+                                              (lambda (a r)
+                                                (and a (not (nil? r))))
+                                              sub-results true)))
+                                      (if (not all-ok) best
+                                        (let ((sub-bodies (map head sub-results))
+                                              (sub-scores
+                                                (map (lambda (r) (head (tail r)))
+                                                     sub-results)))
+                                          (let ((my-score
+                                                  (+ (m8s-distinct-count proj-col)
+                                                     (reduce + sub-scores 0))))
+                                            (let ((composed
+                                                    (m8s-build-group-chain
+                                                      (m8s-pool-source entry)
+                                                      group-vals sub-bodies)))
+                                              (if (or (nil? best)
+                                                      (< my-score
+                                                         (head (tail best))))
+                                                (list composed my-score)
+                                                best)))))))))))))
+                      active
+                      nil)))))
+          ; Pick lower-scoring of base case vs recursive split.
+          (if (nil? base-hit) rec-hit
+            (if (nil? rec-hit) base-hit
+              (if (< (head (tail rec-hit)) (head (tail base-hit)))
+                rec-hit
+                base-hit))))))))
+
+; Try one specific outer pool entry. Returns (list body score) or nil.
+; Used by m8s-try-recursive to generate multiple top-level candidates;
+; the recursive sub-calls pick their own (single) best inner.
+(define m8s-try-with-outer
+  (lambda (pool target row-indices entry)
+    (let ((proj-target (m8s-project-col target row-indices))
+          (proj-col (m8s-project-col
+                      (m8s-pool-col entry) row-indices)))
+      (let ((partial (fit-partial-classify proj-col proj-target)))
+        (if (nil? partial) nil
+          (let ((group-vals (ns-get partial "group-vals"))
+                (group-rows-rel (ns-get partial "group-rows")))
+            (let ((group-rows-abs
+                    (map (lambda (rel)
+                           (map (lambda (j) (nth row-indices j)) rel))
+                         group-rows-rel)))
+              (let ((sub-results
+                      (map
+                        (lambda (g-rows)
+                          (m8s-recursive-classify-body
+                            pool target g-rows 1))
+                        group-rows-abs)))
+                (let ((all-ok
+                        (reduce
+                          (lambda (a r) (and a (not (nil? r))))
+                          sub-results true)))
+                  (if (not all-ok) nil
+                    (let ((sub-bodies (map head sub-results))
+                          (sub-scores
+                            (map (lambda (r) (head (tail r))) sub-results)))
+                      (let ((my-score
+                              (+ (m8s-distinct-count proj-col)
+                                 (reduce + sub-scores 0))))
+                        (let ((composed
+                                (m8s-build-group-chain
+                                  (m8s-pool-source entry)
+                                  group-vals sub-bodies)))
+                          (list composed my-score))))))))))))))
+
+; Top-level wrapper. Returns the same shape as the (now-replaced)
+; m8s-form6-best-validated — namespace with "kind", "score",
+; "source-node", or nil.
+;
+; KEY DESIGN: generate ONE candidate per top-level pool entry (not just
+; the single best). Then validate each against held-out test data and
+; pick the lowest-scoring candidate that passes. Without this, the
+; classifier picks the lowest-scoring candidate (which may use a
+; library function with a wrong partition like run_pos misclassifying
+; "she") and gives up if it fails validation, even though another
+; candidate with the same score validates correctly.
+;
+; REJECTS specs where every row has a unique output (labels = rows).
+; These are not classification tasks — they are typically string
+; composition patterns (concat, repeat) handled by M10s/M11s. Without
+; this guard, the recursive classifier "succeeds" via pure memorization
+; and short-circuits the chain before M10s gets a chance.
+(define m8s-try-recursive
+  (lambda (pool target test-ins test-outs)
+    (let ((distinct-labels (length (m8s-distinct-labels target))))
+      (if (>= distinct-labels (length target))
+        nil  ; every row is unique — not a classification task
+        (let ((row-indices (range (length target)))
+              (active (m8s-active-pool pool)))
+          ; Generate one candidate per active pool entry as outer split
+          (let ((rec-candidates
+                  (filter (lambda (c) (not (nil? c)))
+                    (map
+                      (lambda (entry)
+                        (try (m8s-try-with-outer
+                               pool target row-indices entry)
+                             nil))
+                      active))))
+            ; Also include the Form 3 base case (single-feature classify)
+            (let ((base-hit (m8s-try-form3-projected
+                              pool target row-indices)))
+              (let ((all-cands
+                      (if (nil? base-hit)
+                        rec-candidates
+                        (append rec-candidates (list base-hit)))))
+                (if (= (length all-cands) 0)
+                  nil
+                  ; Validate each. If no test data, skip validation.
+                  (let ((survivors
+                          (if (= (length test-ins) 0)
+                            all-cands
+                            (filter
+                              (lambda (c)
+                                (try (m8s-validate-candidate
+                                       (m8s-wrap-lambda (head c))
+                                       test-ins test-outs)
+                                     false))
+                              all-cands))))
+                    (if (= (length survivors) 0)
+                      nil
+                      ; Pick lowest-scoring survivor.
+                      (let ((best
+                              (reduce
+                                (lambda (acc c)
+                                  (if (or (nil? acc)
+                                          (< (head (tail c))
+                                             (head (tail acc))))
+                                    c acc))
+                                survivors nil)))
+                        (let ((body  (head best))
+                              (score (head (tail best))))
+                          (ns ("kind" "form-recursive-classify")
+                              ("score" score)
+                              ("source-node" (m8s-wrap-lambda body))))))))))))))))
 
 (define detect-constant-string
   (lambda (s)
@@ -815,8 +1043,11 @@
                                   (let ((r5 (m8s-try-form-5 pool target)))
                                     (if (nil? r5) (list) (list (ns-put r5 "score" 2))))
                                   (list))))))
-                      ; §9.47.6: Form 6 uses short-circuit validated search.
-                      (let ((f6-best (try (m8s-form6-best-validated
+                      ; Recursive partial-match classifier replaces hand-coded
+                      ; Form 6. Subsumes 2-feature conjunction and extends to
+                      ; arbitrary depth (3+ features). Internally validates
+                      ; against held-out test pairs and discards if invalid.
+                      (let ((f6-best (try (m8s-try-recursive
                                             pool target test-ins test-outs) nil)))
                         (let ((valid-non-f6
                                 (if (= (length test-ins) 0)
@@ -877,3 +1108,51 @@
     2))
 
 (m8s-run-test "run pos (binary classify)" m8s-run-pos-spec)
+
+; Recursive classify smoke: verb_form (3 classes via 2 features).
+; Form 3 alone fails (no single feature cleanly partitions all 3 classes).
+; The recursive classifier should find:
+;   ends-in-ing → "gerund" else recurse
+;   ends-in-ed  → "past"   else "base"
+(define m8s-verb-form-spec
+  (m8s-make-spec
+    (list (list "running") (list "playing") (list "eating")
+          (list "walked") (list "played") (list "opened")
+          (list "run") (list "walk") (list "eat"))
+    (list "gerund" "gerund" "gerund" "past" "past" "past" "base" "base" "base")
+    1))
+
+(m8s-run-test "verb_form (via dispatch)" m8s-verb-form-spec)
+
+; Direct test of the recursive classifier on verb_form. This bypasses
+; detect-constant-string and exercises m8s-try-recursive directly.
+(let ((pool (m8s-build-pool m8s-verb-form-spec))
+      (target (ns-get m8s-verb-form-spec "outputs")))
+  (let ((r (try (m8s-try-recursive pool target (list) (list)) nil)))
+    (if (nil? r)
+      (print "─── recursive verb_form: ✗ NIL")
+      (print (concat "─── recursive verb_form: ✓ score="
+               (to-string (ns-get r "score")))))))
+
+; gerund_context smoke (4-class, requires 2-feature group partition where
+; every group has 2 labels — no single label can be cleanly peeled).
+(define m8s-gerund-context-spec
+  (m8s-make-spec
+    (list (list "the" "running") (list "a" "swimming") (list "the" "playing")
+          (list "i" "running") (list "we" "swimming") (list "they" "playing")
+          (list "the" "cat") (list "a" "dog") (list "the" "house")
+          (list "i" "cat") (list "we" "dog") (list "they" "house"))
+    (list "gerund-noun" "gerund-noun" "gerund-noun"
+          "verb-progressive" "verb-progressive" "verb-progressive"
+          "common-noun" "common-noun" "common-noun"
+          "other" "other" "other")
+    2))
+
+(let ((pool (m8s-build-pool m8s-gerund-context-spec))
+      (target (ns-get m8s-gerund-context-spec "outputs")))
+  (let ((r (try (m8s-try-recursive pool target (list) (list)) nil)))
+    (if (nil? r)
+      (print "─── recursive gerund_context: ✗ NIL")
+      (print (concat "─── recursive gerund_context: ✓ score="
+               (to-string (ns-get r "score"))
+               " src=" (to-string (ns-get r "source-node")))))))

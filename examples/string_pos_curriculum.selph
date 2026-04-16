@@ -295,3 +295,194 @@
 (task-args "pos_match" 2
   ((1 1) "match") ((2 2) "match") ((5 5) "match")
   ((1 2) "diff") ((3 5) "diff") ((0 4) "diff"))
+
+; ── Stage 10: Three-feature classification (Tier 3) ──────────────────
+; These tasks require THREE features to discriminate all labels —
+; impossible for the previous hand-coded Form 6 which iterated
+; pairwise pool entries. They prove that the recursive partial-match
+; classifier generalizes beyond Form 6 to arbitrary feature depth.
+;
+; Each task has 6 distinct labels formed from the cross-product of
+; three boolean features. The recursive classifier should discover the
+; nested structure via 3 levels of recursion.
+
+; capital × ing × ed: 6 labels from 3 morphological features.
+; capital  ing  ed → label
+;   T       T   F → proper-gerund
+;   T       F   T → proper-past
+;   T       F   F → proper-base
+;   F       T   F → common-gerund
+;   F       F   T → common-past
+;   F       F   F → common-base
+(task-args "word_class_3feat" 1
+  (("Running") "proper-gerund") (("Playing") "proper-gerund")
+  (("Walked") "proper-past") (("Opened") "proper-past")
+  (("Run") "proper-base") (("Walk") "proper-base")
+  (("running") "common-gerund") (("playing") "common-gerund")
+  (("walked") "common-past") (("opened") "common-past")
+  (("run") "common-base") (("walk") "common-base")
+  (test ("Dancing") "proper-gerund") (test ("dancing") "common-gerund")
+  (test ("Closed") "proper-past") (test ("closed") "common-past")
+  (test ("Dance") "proper-base") (test ("dance") "common-base"))
+
+; prev-word-class × ing × ed: 6 labels from prev-word morphology +
+; target morphology. Prev-word = article ({the, a}) vs pronoun
+; ({i, we, they}). Target morphology = ing/ed/neither.
+(task-args "morph_context_3feat" 2
+  (("the" "running") "art-gerund") (("a" "swimming") "art-gerund")
+  (("the" "walked") "art-past") (("a" "opened") "art-past")
+  (("the" "cat") "art-base") (("a" "dog") "art-base")
+  (("i" "running") "pro-gerund") (("we" "swimming") "pro-gerund")
+  (("i" "walked") "pro-past") (("we" "opened") "pro-past")
+  (("i" "cat") "pro-base") (("we" "dog") "pro-base")
+  (test ("the" "dancing") "art-gerund") (test ("they" "dancing") "pro-gerund")
+  (test ("a" "closed") "art-past") (test ("they" "closed") "pro-past")
+  (test ("the" "bird") "art-base") (test ("they" "bird") "pro-base"))
+
+; ── Stage 11: Morphological feature expansion ────────────────────────
+; Each task is a single-feature suffix or prefix classifier.
+; Goal: amplify the "(if (contains (list ?BOOL?) (string-X (nth x ?INT?)
+; ?STR?)) ?STR? ?STR?)" cluster in the journal so its frequency makes
+; it a clear candidate for template extraction. Currently 3 instances
+; (gerund_by_ing, past_by_ed, plural_by_s); after this stage: 10+.
+; All suffixes/prefixes used here are in the m_pool_string catalogue.
+
+(task-args "adverb_by_ly" 1
+  (("quickly") "adverb") (("slowly") "adverb") (("happily") "adverb")
+  (("kindly") "adverb") (("badly") "adverb")
+  (("cat") "other") (("dog") "other") (("house") "other") (("tree") "other")
+  (test ("brightly") "adverb") (test ("clearly") "adverb")
+  (test ("bird") "other") (test ("table") "other"))
+
+(task-args "comparative_by_er" 1
+  (("bigger") "comparative") (("faster") "comparative") (("smarter") "comparative")
+  (("warmer") "comparative") (("kinder") "comparative")
+  (("big") "base") (("fast") "base") (("smart") "base") (("warm") "base")
+  (test ("smaller") "comparative") (test ("colder") "comparative")
+  (test ("small") "base") (test ("cold") "base"))
+
+(task-args "superlative_by_est" 1
+  (("biggest") "superlative") (("fastest") "superlative") (("smartest") "superlative")
+  (("warmest") "superlative") (("kindest") "superlative")
+  (("big") "base") (("fast") "base") (("smart") "base") (("warm") "base")
+  (test ("smallest") "superlative") (test ("coldest") "superlative")
+  (test ("small") "base") (test ("cold") "base"))
+
+(task-args "nominal_by_tion" 1
+  (("creation") "nominal") (("invention") "nominal") (("station") "nominal")
+  (("nation") "nominal") (("suggestion") "nominal")
+  (("create") "verbal") (("invent") "verbal") (("walk") "verbal") (("run") "verbal")
+  (test ("attention") "nominal") (test ("dance") "verbal"))
+
+(task-args "redo_by_re" 1
+  (("redo") "redo") (("rewrite") "redo") (("rebuild") "redo")
+  (("retry") "redo") (("renew") "redo")
+  (("undo") "other") (("dislike") "other") (("preview") "other") (("see") "other")
+  (test ("repeat") "redo") (test ("write") "other"))
+
+(task-args "negation_by_dis" 1
+  (("dislike") "negation") (("disagree") "negation") (("disconnect") "negation")
+  (("disable") "negation") (("disappear") "negation")
+  (("like") "neutral") (("agree") "neutral") (("redo") "neutral") (("see") "neutral")
+  (test ("dismiss") "negation") (test ("connect") "neutral"))
+
+(task-args "temporal_by_pre" 1
+  (("preview") "temporal") (("predict") "temporal") (("prepay") "temporal")
+  (("preheat") "temporal") (("preset") "temporal")
+  (("view") "neutral") (("dict") "neutral") (("undo") "neutral") (("see") "neutral")
+  (test ("prefix") "temporal") (test ("pay") "neutral"))
+
+; ── Stage 12: 2-feature recursive (more verb_form-like) ──────────────
+; Tests whether the recursive classifier discovers different 2-feature
+; combinations beyond the 2 we already have (verb_form, gerund_context).
+
+; 3 classes by 2 suffixes: -er → comparative, -est → superlative, else → base
+(task-args "adj_form_3way" 1
+  (("bigger") "comparative") (("faster") "comparative") (("warmer") "comparative")
+  (("biggest") "superlative") (("fastest") "superlative") (("warmest") "superlative")
+  (("big") "base") (("fast") "base") (("warm") "base")
+  (test ("smaller") "comparative") (test ("smallest") "superlative") (test ("small") "base"))
+
+; 3 classes mixing suffix types: -ly → adverb, -ed → past-verb, else → noun
+(task-args "word_role_3way" 1
+  (("quickly") "adverb") (("slowly") "adverb") (("kindly") "adverb")
+  (("walked") "past-verb") (("played") "past-verb") (("opened") "past-verb")
+  (("cat") "noun") (("dog") "noun") (("house") "noun")
+  (test ("brightly") "adverb") (test ("danced") "past-verb") (test ("bird") "noun"))
+
+; 3-way prefix split: re- → repeat, dis- → negate, else → other
+(task-args "verb_prefix_3way" 1
+  (("redo") "repeat") (("rewrite") "repeat") (("retry") "repeat")
+  (("dislike") "negate") (("disagree") "negate") (("disable") "negate")
+  (("walk") "other") (("see") "other") (("eat") "other")
+  (test ("rebuild") "repeat") (test ("disconnect") "negate") (test ("run") "other"))
+
+; ── Stage 13: 3-feature recursive (Tier 3 expansion) ─────────────────
+
+; 6 classes via 3 features: capital × ly × ed
+;   Capital + ly        → proper-adverb
+;   Capital + ed        → proper-past
+;   Capital + neither   → proper-base
+;   lower   + ly        → common-adverb
+;   lower   + ed        → common-past
+;   lower   + neither   → common-base
+(task-args "word_3feat_lyEd" 1
+  (("Quickly") "proper-adverb") (("Slowly") "proper-adverb")
+  (("Walked") "proper-past") (("Opened") "proper-past")
+  (("Run") "proper-base") (("Walk") "proper-base")
+  (("quickly") "common-adverb") (("slowly") "common-adverb")
+  (("walked") "common-past") (("opened") "common-past")
+  (("run") "common-base") (("walk") "common-base")
+  (test ("Brightly") "proper-adverb") (test ("brightly") "common-adverb")
+  (test ("Closed") "proper-past") (test ("closed") "common-past")
+  (test ("Dance") "proper-base") (test ("dance") "common-base"))
+
+; ── Stage 14: 4-feature recursive (push depth to 4) ──────────────────
+; This is intentionally beyond what was previously demonstrated.
+; The recursive classifier has max-depth 4; this exercises that limit.
+
+; 8 classes by capital × ing × ed × ly
+;   First feature splits proper/common (2 groups)
+;   Each group splits by ing/ed/ly/none into 4 sub-classes (8 total)
+(task-args "word_4feat" 1
+  (("Running") "proper-gerund") (("Playing") "proper-gerund")
+  (("Walked") "proper-past") (("Opened") "proper-past")
+  (("Quickly") "proper-adverb") (("Slowly") "proper-adverb")
+  (("Run") "proper-base") (("Walk") "proper-base")
+  (("running") "common-gerund") (("playing") "common-gerund")
+  (("walked") "common-past") (("opened") "common-past")
+  (("quickly") "common-adverb") (("slowly") "common-adverb")
+  (("run") "common-base") (("walk") "common-base")
+  (test ("Dancing") "proper-gerund") (test ("dancing") "common-gerund")
+  (test ("Closed") "proper-past") (test ("closed") "common-past")
+  (test ("Brightly") "proper-adverb") (test ("brightly") "common-adverb")
+  (test ("Dance") "proper-base") (test ("dance") "common-base"))
+
+; ── Stage 15: Library composition (reuse previous solutions) ─────────
+; Tasks where the natural solution composes a previously-solved task
+; as a library function. Goal: surface library-reuse patterns in
+; the journal — solutions like (lambda (x) (prev_task_name (list ...)))
+; or (if (contains ... (prev_task_name ...)) ...).
+
+; Should solve via direct reuse of gerund_by_ing
+(task-args "is_gerund_alias" 1
+  (("running") "gerund") (("playing") "gerund") (("eating") "gerund")
+  (("cat") "other") (("dog") "other") (("house") "other") (("tree") "other")
+  (test ("singing") "gerund") (test ("bird") "other"))
+
+; Should compose: if comparative_by_er then "more", else if superlative_by_est then "most", else "base"
+(task-args "intensity_3way" 1
+  (("bigger") "more") (("faster") "more") (("warmer") "more")
+  (("biggest") "most") (("fastest") "most") (("warmest") "most")
+  (("big") "base") (("fast") "base") (("warm") "base")
+  (test ("smaller") "more") (test ("smallest") "most") (test ("small") "base"))
+
+; Should reuse has_article: prev=article + target=ing → "noun-phrase", else → "other"
+(task-args "noun_phrase_check" 2
+  (("the" "running") "noun-phrase") (("a" "swimming") "noun-phrase")
+  (("the" "playing") "noun-phrase") (("an" "eating") "noun-phrase")
+  (("i" "running") "other") (("we" "swimming") "other")
+  (("the" "cat") "other") (("a" "dog") "other")
+  (("they" "playing") "other") (("i" "cat") "other")
+  (test ("the" "dancing") "noun-phrase") (test ("they" "dancing") "other")
+  (test ("a" "bird") "other"))
