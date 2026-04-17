@@ -71,6 +71,18 @@
 ; State: (next-hole-idx, holes-ns)
 ; Returns: (body-node, next-hole-idx, holes-ns) or nil on failure.
 
+; All hole specs set ("inline" true): sub-synthesis always produces a
+; `(lambda (x) <body>)`, but each hole occurs in a position where we
+; need the raw value/expression, not a callable. With inline, Rust
+; fill_template_holes extracts `<body>` and splices it directly — its
+; `x` references resolve to the outer lambda's x parameter.
+;
+; Positions and why inline is required:
+;   - separator hole (if-condition): without inline, the Lambda value
+;     is truthy, so the if always takes the then-branch (silent bug).
+;   - branch hole (then-position): without inline, the Lambda itself
+;     is the value returned by the if, but we need its applied result.
+;   - base-case hole (else-position of innermost if): same as branch.
 (define dc-build-template
   (lambda (groups pairs hole-idx)
     (if (= (length groups) 1)
@@ -80,7 +92,7 @@
               (hole-name (concat "__hole_" (to-string hole-idx) "__")))
           (list (make-hole hole-idx)
                 (+ hole-idx 1)
-                (list (list hole-name (ns ("spec" spec)))))))
+                (list (list hole-name (ns ("spec" spec) ("inline" true)))))))
       ; Recursive case: separator hole + first-branch hole + recurse on rest
       (let ((first-group (head groups))
             (rest-groups (tail groups)))
@@ -107,8 +119,10 @@
                                (make-hole branch-hole-idx)
                                rest-body)
                       next-idx
-                      (append (list (list sep-hole-name (ns ("spec" sep-spec)))
-                                    (list branch-hole-name (ns ("spec" branch-spec))))
+                      (append (list (list sep-hole-name
+                                          (ns ("spec" sep-spec) ("inline" true)))
+                                    (list branch-hole-name
+                                          (ns ("spec" branch-spec) ("inline" true))))
                               rest-holes))))))))))))
 
 ; -- Main decomposer ----------------------------------------------------------

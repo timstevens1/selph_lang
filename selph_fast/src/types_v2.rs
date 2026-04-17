@@ -388,6 +388,28 @@ impl Env {
         }
         out
     }
+
+    /// Return the Sym names of all user-defined `Value::Function` bindings,
+    /// excluding those in `skip`. Walks the scope chain like
+    /// `collect_bindings` but does NOT clone values — only checks the type
+    /// tag. Much cheaper than `collect_bindings` + filter.
+    pub fn function_name_syms(&self, skip: &std::collections::HashSet<Sym>) -> Vec<Sym> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut node = Some(&self.inner);
+        while let Some(n) = node {
+            for (k, v) in n.scope.borrow().iter() {
+                if !seen.insert(*k) || skip.contains(k) {
+                    continue;
+                }
+                if matches!(v, Value::Function(_)) {
+                    out.push(*k);
+                }
+            }
+            node = n.parent.as_ref();
+        }
+        out
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────

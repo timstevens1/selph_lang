@@ -771,6 +771,8 @@ fn build_builtin_table() -> BuiltinTable {
     // library functions; `function-arity` and `function-param-types`
     // expose the same metadata `library_components_from_env` reads.
     t.register(intern("env-functions"), bi_env_functions);
+    t.register(intern("env-function-names"), bi_env_function_names);
+    t.register(intern("env-lookup"), bi_env_lookup);
     t.register(intern("function-arity"), bi_function_arity);
     t.register(intern("function-param-types"), bi_function_param_types);
 
@@ -905,7 +907,8 @@ fn build_default_scope() -> Scope {
         // §9.36 AST homoiconicity — parsing
         "parse-source", "parse-file",
         // §9.45 P1 — env/function introspection (M7 prerequisites)
-        "env-functions", "function-arity", "function-param-types",
+        "env-functions", "env-function-names", "env-lookup",
+        "function-arity", "function-param-types",
         // §9.48 P2: grid builtins
         "grid?", "grid-height", "grid-width",
         "grid-rotate-cw", "grid-rotate-ccw", "grid-rotate-180",
@@ -2421,6 +2424,44 @@ fn bi_env_functions(args: &[Value], env: &Env) -> Result<Value, String> {
         out.insert(*sym, val.clone());
     }
     Ok(Value::ns(out))
+}
+
+/// `(env-function-names)` — return a list of function name strings for
+/// all user-defined (non-builtin) functions in the env. Walks the scope
+/// chain but does NOT clone function values — much cheaper than
+/// `env-functions` which clones every Value.
+fn bi_env_function_names(args: &[Value], env: &Env) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(format!(
+            "env-function-names: expected 0 args, got {}",
+            args.len()
+        ));
+    }
+    let skip = crate::synth_v2::default_skip_set();
+    let names: Vec<Value> = env
+        .function_name_syms(&skip)
+        .into_iter()
+        .map(|s| Value::Str(resolve(s).into()))
+        .collect();
+    Ok(Value::list(names))
+}
+
+/// `(env-lookup name)` — look up a single binding by name string.
+/// Returns the value or nil if not found. Uses `env.lookup()` which is
+/// O(scope-depth) per call — much cheaper than building a full
+/// env-functions namespace when you only need a few entries.
+fn bi_env_lookup(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "env-lookup: expected 1 arg, got {}",
+            args.len()
+        ));
+    }
+    let name = match &args[0] {
+        Value::Str(s) => intern(s),
+        _ => return Err("env-lookup: expected string name".into()),
+    };
+    Ok(env.lookup(name).unwrap_or(Value::Nil))
 }
 
 /// `(function-arity f)` — return the arity of `f` as an Int. For

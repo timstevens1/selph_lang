@@ -121,10 +121,14 @@
       (if (= (length outs) 0)
         "unknown"
         (let ((first-out (head outs)))
-          (if (or (int? first-out) (num? first-out)) "numeric"
-            (if (string? first-out) "string"
-              (if (grid? first-out) "grid"
-                "unknown"))))))))
+          ; §Option A: Bool branch added for hole-fc sub-spec support.
+          ; Check bool? BEFORE numeric — some platforms return true for
+          ; (int? true), so order matters.
+          (if (bool? first-out) "bool"
+            (if (or (int? first-out) (num? first-out)) "numeric"
+              (if (string? first-out) "string"
+                (if (grid? first-out) "grid"
+                  "unknown")))))))))
 
 ; ── Numeric branch ───────────────────────────────────────────────────
 
@@ -191,7 +195,8 @@
                 (if (= kind "numeric") (m-chain-numeric spec)
                   (if (= kind "string") (m-chain-string spec)
                     (if (= kind "grid") (m-chain-grid spec)
-                      (ns ("found" false)))))))
+                      (if (= kind "bool") (m-chain-bool spec)
+                        (ns ("found" false))))))))
           (do
             ; §9.66 journal hook: record every successful synthesis so
             ; future analysis can mine recurring structural patterns.

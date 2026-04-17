@@ -91,7 +91,12 @@
                       ("nodes" (make-lambda (list "x")
                                  (make-app (make-symbol name) (make-symbol "x"))))
                       ("candidates" 1))
-                  ; Bridge needed: template with hole
+                  ; Bridge needed: template with hole.
+                  ; The hole sits in the let-body position. Sub-synth
+                  ; produces `(lambda (x) <body>)`; without inline, the
+                  ; let would RETURN that Lambda instead of the applied
+                  ; value. inline=true extracts <body>, whose `x`
+                  ; references resolve to the let-bound x (= (m x)).
                   (let ((sub-spec
                           (map (lambda (i)
                                  (list (nth intermediates i) (nth outputs i)))
@@ -102,7 +107,8 @@
                                      (list (list "x" (make-app (make-symbol name)
                                                                (make-symbol "x"))))
                                      (make-hole 0))))
-                        ("holes" (ns ("__hole_0__" (ns ("spec" sub-spec)))))
+                        ("holes" (ns ("__hole_0__"
+                                       (ns ("spec" sub-spec) ("inline" true)))))
                         ("candidates" 1))))))))))))
 
 ; -- Main bridge search --------------------------------------------------------

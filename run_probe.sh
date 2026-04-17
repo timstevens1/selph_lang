@@ -62,6 +62,8 @@ FILES=(
     "$META/m8g_compose.selph"
     "$META/m_journal.selph"
     "$META/m_chain.selph"
+    "$META/m_bd.selph"
+    "$META/m_chain_bool.selph"
     "$META/m_partition.selph"
     "$META/m_lib_reuse.selph"
     "$META/m_fitness_grid.selph"
@@ -72,6 +74,7 @@ FILES=(
     "$META/m_ho_split_map_join.selph"
     "$META/m_ho_char_map_join.selph"
     "$META/m_rd.selph"
+    "$META/m_induction.selph"
     "$META/m_dc.selph"
     "$CURRICULUM"
 )

@@ -5143,9 +5143,12 @@ fn fill_template_holes(
     // §9.68: a hole spec can have either:
     //   ("spec" <pairs>)         — sub-synthesize; one candidate (the result)
     //   ("candidates" <values>)  — enumerate literal candidates
-    // Optional flag:
+    // Optional flags:
     //   ("inline" true)          — extract the body of a Lambda result
     //                              (turns ((lambda (x) body) x) into body)
+    //   ("flat-only" true)       — sub-synthesize with strategy_depth=0 (Flat only,
+    //                              no decomposers). Prevents memorizing decomposers
+    //                              from blocking simple solutions in sub-synthesis.
     let mut per_hole: Vec<(usize, HoleCandidates, bool)> = Vec::new();
     for (hole_sym, template_idx) in &ordered_holes {
         let hole_spec = match holes.get(hole_sym) {
@@ -5199,9 +5202,19 @@ fn fill_template_holes(
         if sub_inputs.is_empty() {
             return None;
         }
+        // §m-induction: flat-only flag forces strategy_depth=0 for this hole,
+        // preventing memorizing decomposers from blocking simple solutions.
+        let hole_depth = if matches!(
+            hole_spec.get(&intern("flat-only")),
+            Some(Value::Bool(true))
+        ) {
+            0
+        } else {
+            strategy_depth
+        };
         let sr = sub_synthesize(
             components, &sub_inputs, &sub_expected,
-            env, universe, flat_depth, budget_per_hole, strategy_depth,
+            env, universe, flat_depth, budget_per_hole, hole_depth,
         );
         total_cands += sr.candidates_explored;
         if !sr.found {
@@ -5414,9 +5427,13 @@ fn sub_synthesize(
     strategy_depth: usize,
 ) -> SynthResult {
     if strategy_depth > 0 {
+        // Sub-synthesis doesn't carry held-out tests — the sub-spec is
+        // derived from the parent's training split, so there are no
+        // independent validation pairs available here.
         let sr = synthesize_with_strategies_depth(
             components, inputs, expected, env, universe,
             flat_depth, max_candidates, strategy_depth - 1, 0,
+            &[], &[],
         );
         SynthResult {
             found: sr.found,
@@ -5449,7 +5466,35 @@ pub fn synthesize_with_strategies(
     strategy_depth: usize,
 ) -> StrategyResult {
     synthesize_with_strategies_depth(
-        components, inputs, expected, env, universe, flat_depth, flat_budget, strategy_depth, 0,
+        components, inputs, expected, env, universe,
+        flat_depth, flat_budget, strategy_depth, 0, &[], &[],
+    )
+}
+
+/// Like `synthesize_with_strategies` but plumbs held-out test pairs into
+/// the decomposer dispatcher. Without this, `task` (single-arg) runs
+/// accept memorization solutions that fail held-out validation, because
+/// `try_selph_decomposers` is called with empty test slices.
+///
+/// Prefer this over `synthesize_with_strategies` whenever the caller
+/// has test pairs; it mirrors `synthesize_args_with_test` on the
+/// multi-arg path.
+pub fn synthesize_with_strategies_and_test(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    flat_depth: usize,
+    flat_budget: usize,
+    strategy_depth: usize,
+    test_inputs: &[Value],
+    test_expected: &[Value],
+) -> StrategyResult {
+    synthesize_with_strategies_depth(
+        components, inputs, expected, env, universe,
+        flat_depth, flat_budget, strategy_depth, 0,
+        test_inputs, test_expected,
     )
 }
 
@@ -5471,15 +5516,31 @@ pub fn synthesize_with_strategies_beam(
     beam_width: usize,
 ) -> StrategyResult {
     synthesize_with_strategies_depth(
-        components, inputs, expected, env, universe, flat_depth, flat_budget, strategy_depth, beam_width,
+        components, inputs, expected, env, universe,
+        flat_depth, flat_budget, strategy_depth, beam_width, &[], &[],
     )
 }
+
+/// Gate the Rust decomposition strategies (RD / BD / HO / D&C / IN)
+/// in `synthesize_with_strategies_depth`. SELPH decomposers (m_partition,
+/// m_chain_bool, m_ho_*, m_rd, m_dc, etc.) cover most of their roles,
+/// but some — notably BD's `(or P Q)` / `(and P Q)` compositions and
+/// RD's inverse-function discovery — still produce genuine structural
+/// solutions that no SELPH equivalent reaches at the default budget.
+///
+/// Keep enabled until the remaining gaps are plugged on the SELPH side;
+/// top-level `validate_held_out` in `main.rs::cmd_grow_v2` rejects any
+/// Rust-strategy result that memorizes without generalizing.
+const ENABLE_RUST_DECOMPOSERS: bool = true;
 
 /// Inner dispatcher with explicit `strategy_depth` tracking.
 /// When `strategy_depth > 0`, sub-synthesis in HO/D&C/Induction/RD
 /// routes through the full strategy chain (decrementing depth).
 /// At `strategy_depth == 0`, sub-synthesis uses flat enumeration only.
 /// When `beam_width > 0`, the Flat stage collects top-K beam entries.
+/// `test_inputs` / `test_expected` are held-out validation pairs passed
+/// into `try_selph_decomposers` so decomposer results that memorize
+/// training without generalizing to test are rejected.
 fn synthesize_with_strategies_depth(
     components: &[SynthComponent],
     inputs: &[Value],
@@ -5490,6 +5551,8 @@ fn synthesize_with_strategies_depth(
     flat_budget: usize,
     strategy_depth: usize,
     beam_width: usize,
+    test_inputs: &[Value],
+    test_expected: &[Value],
 ) -> StrategyResult {
     // §9.49 post-mortem diagnostics: infer output type tag once.
     let output_type_str = infer_uniform_type_sym(expected)
@@ -5504,8 +5567,13 @@ fn synthesize_with_strategies_depth(
 
     // §9.37 Stage A: global SELPH decomposers from `__decomposers__`
     // run BEFORE the hardcoded chain. Curriculum is in charge.
+    //
+    // Held-out test pairs are passed through so the dispatcher's
+    // `validate_held_out` check rejects memorization solutions that
+    // match training but fail on the held-out examples.
     if let Some((nodes, root, sd_explored, name_sym)) =
-        try_selph_decomposers(env, inputs, expected, flat_depth, flat_budget, &[], &[],
+        try_selph_decomposers(env, inputs, expected, flat_depth, flat_budget,
+            test_inputs, test_expected,
             Some(HoleContext { components, universe, strategy_depth }))
     {
         return StrategyResult {
@@ -5568,148 +5636,141 @@ fn synthesize_with_strategies_depth(
         return stamp(StrategyResult::from_synth(flat, Strategy::Flat));
     }
 
-    // Strategy 2: Recursive decomposition. Top-down family prediction +
-    // outermost-function inversion. Cheap when the family doesn't apply
-    // (each helper bails fast); valuable when an arithmetic / string-op
-    // / library composition is the answer and Flat couldn't reach it
-    // within `flat_budget`.
-    if let Some((nodes, root, rd_explored)) = recursive_decompose(
-        components,
-        inputs,
-        expected,
-        env,
-        universe,
-        flat_depth,
-        flat_budget,
-        strategy_depth,
-    ) {
-        total_explored += rd_explored;
-        return stamp(StrategyResult {
-            found: true,
-            nodes: Some(nodes),
-            root: Some(root),
-            candidates_explored: total_explored,
-            strategy: Some(Strategy::RecursiveDecomposition),
-            output_type: None,
-            m_chain_ran: false,
-            best_fitness: 1.0,
-            best_source: None,
-            beam: Vec::new(),
-            experience: Vec::new(),
-        });
-    }
+    // §Option-A-followup: Rust decomposition strategies (RD, BD, HO,
+    // D&C, IN) are gated behind this constant. With SELPH decomposers
+    // (m_partition, m_chain_bool, m_ho_*, m_rd, m_dc, etc.) absorbing
+    // their responsibilities, these Rust strategies are no longer
+    // needed for the default curricula. Keep implementations available
+    // in case a future workload wants to re-enable them.
+    if ENABLE_RUST_DECOMPOSERS {
+        // Strategy 2: Recursive decomposition. Top-down family
+        // prediction + outermost-function inversion.
+        if let Some((nodes, root, rd_explored)) = recursive_decompose(
+            components,
+            inputs,
+            expected,
+            env,
+            universe,
+            flat_depth,
+            flat_budget,
+            strategy_depth,
+        ) {
+            total_explored += rd_explored;
+            return stamp(StrategyResult {
+                found: true,
+                nodes: Some(nodes),
+                root: Some(root),
+                candidates_explored: total_explored,
+                strategy: Some(Strategy::RecursiveDecomposition),
+                output_type: None,
+                m_chain_ran: false,
+                best_fitness: 1.0,
+                best_source: None,
+                beam: Vec::new(),
+                experience: Vec::new(),
+            });
+        }
 
-    // Strategy 3: Boolean decomposition. Cheap and only applies to
-    // bool-output tasks (it filters internally), so we run it before
-    // Memo: it produces a structured program when it fires, whereas
-    // Memo is a lookup-table fallback that is correct on training but
-    // generalizes by accident on bool output.
-    if let Some((nodes, root, bd_explored)) =
-        bool_decompose(components, inputs, expected, env)
-    {
-        total_explored += bd_explored;
-        return stamp(StrategyResult {
-            found: true,
-            nodes: Some(nodes),
-            root: Some(root),
-            candidates_explored: total_explored,
-            strategy: Some(Strategy::BoolDecomp),
-            output_type: None,
-            m_chain_ran: false,
-            best_fitness: 1.0,
-            best_source: None,
-            beam: Vec::new(),
-            experience: Vec::new(),
-        });
-    }
+        // Strategy 3: Boolean decomposition.
+        if let Some((nodes, root, bd_explored)) =
+            bool_decompose(components, inputs, expected, env)
+        {
+            total_explored += bd_explored;
+            return stamp(StrategyResult {
+                found: true,
+                nodes: Some(nodes),
+                root: Some(root),
+                candidates_explored: total_explored,
+                strategy: Some(Strategy::BoolDecomp),
+                output_type: None,
+                m_chain_ran: false,
+                best_fitness: 1.0,
+                best_source: None,
+                beam: Vec::new(),
+                experience: Vec::new(),
+            });
+        }
 
-    // Strategy 3: Higher-order decomposition. Each template is shape-
-    // gated (list→list, str→str, etc.) and bails immediately if not
-    // applicable, so cost is dominated by the inner sub-synthesis.
-    if let Some((nodes, root, ho_explored)) = higher_order_decompose(
-        components,
-        inputs,
-        expected,
-        env,
-        universe,
-        flat_depth,
-        flat_budget,
-        strategy_depth,
-    ) {
-        total_explored += ho_explored;
-        return stamp(StrategyResult {
-            found: true,
-            nodes: Some(nodes),
-            root: Some(root),
-            candidates_explored: total_explored,
-            strategy: Some(Strategy::HigherOrder),
-            output_type: None,
-            m_chain_ran: false,
-            best_fitness: 1.0,
-            best_source: None,
-            beam: Vec::new(),
-            experience: Vec::new(),
-        });
-    }
+        // Strategy 4: Higher-order decomposition.
+        if let Some((nodes, root, ho_explored)) = higher_order_decompose(
+            components,
+            inputs,
+            expected,
+            env,
+            universe,
+            flat_depth,
+            flat_budget,
+            strategy_depth,
+        ) {
+            total_explored += ho_explored;
+            return stamp(StrategyResult {
+                found: true,
+                nodes: Some(nodes),
+                root: Some(root),
+                candidates_explored: total_explored,
+                strategy: Some(Strategy::HigherOrder),
+                output_type: None,
+                m_chain_ran: false,
+                best_fitness: 1.0,
+                best_source: None,
+                beam: Vec::new(),
+                experience: Vec::new(),
+            });
+        }
 
-    // Strategy 4: Divide-and-conquer. Only meaningful for tasks with
-    // multiple distinct outputs (it filters internally). The recursive
-    // structure means worst-case cost is N partition attempts × the
-    // sub-synthesis budget for separators and branches.
-    if let Some((nodes, root, dc_explored)) = divide_and_conquer(
-        components,
-        inputs,
-        expected,
-        env,
-        universe,
-        flat_depth,
-        flat_budget,
-        strategy_depth,
-    ) {
-        total_explored += dc_explored;
-        return stamp(StrategyResult {
-            found: true,
-            nodes: Some(nodes),
-            root: Some(root),
-            candidates_explored: total_explored,
-            strategy: Some(Strategy::DivideConquer),
-            output_type: None,
-            m_chain_ran: false,
-            best_fitness: 1.0,
-            best_source: None,
-            beam: Vec::new(),
-            experience: Vec::new(),
-        });
-    }
+        // Strategy 5: Divide-and-conquer.
+        if let Some((nodes, root, dc_explored)) = divide_and_conquer(
+            components,
+            inputs,
+            expected,
+            env,
+            universe,
+            flat_depth,
+            flat_budget,
+            strategy_depth,
+        ) {
+            total_explored += dc_explored;
+            return stamp(StrategyResult {
+                found: true,
+                nodes: Some(nodes),
+                root: Some(root),
+                candidates_explored: total_explored,
+                strategy: Some(Strategy::DivideConquer),
+                output_type: None,
+                m_chain_ran: false,
+                best_fitness: 1.0,
+                best_source: None,
+                beam: Vec::new(),
+                experience: Vec::new(),
+            });
+        }
 
-    // Strategy 5: Induction (intermediate value decomposition). Probes
-    // a curated set of unary/binary builtins for an intermediate value
-    // sequence, then sub-synthesizes input→intermediate and
-    // intermediate→expected. Composes via Node::Let.
-    if let Some((nodes, root, in_explored)) = induce_decomposition(
-        components,
-        inputs,
-        expected,
-        env,
-        universe,
-        flat_depth,
-        flat_budget,
-        strategy_depth,
-    ) {
-        total_explored += in_explored;
-        return stamp(StrategyResult {
-            found: true,
-            nodes: Some(nodes),
-            root: Some(root),
-            candidates_explored: total_explored,
-            strategy: Some(Strategy::Induction),
-            output_type: None,
-            m_chain_ran: false,
-            best_fitness: 1.0,
-            best_source: None,
-            beam: Vec::new(),
-            experience: Vec::new(),
-        });
+        // Strategy 6: Induction (intermediate value decomposition).
+        if let Some((nodes, root, in_explored)) = induce_decomposition(
+            components,
+            inputs,
+            expected,
+            env,
+            universe,
+            flat_depth,
+            flat_budget,
+            strategy_depth,
+        ) {
+            total_explored += in_explored;
+            return stamp(StrategyResult {
+                found: true,
+                nodes: Some(nodes),
+                root: Some(root),
+                candidates_explored: total_explored,
+                strategy: Some(Strategy::Induction),
+                output_type: None,
+                m_chain_ran: false,
+                best_fitness: 1.0,
+                best_source: None,
+                beam: Vec::new(),
+                experience: Vec::new(),
+            });
+        }
     }
 
     // Strategy 6: Memo. Always candidate-cost 0 (no enumeration).

@@ -1,142 +1,229 @@
 ; ─────────────────────────────────────────────────────────────────────────
-; m_partition: hole-based binary partition decomposer (§9.67)
+; m_partition: hole-based N-class partition decomposer
 ; ─────────────────────────────────────────────────────────────────────────
 ;
-; First step toward unified hole-fc architecture. Implements the
-; "binary classification by feature" template using the hole-fc
-; mechanism instead of doing all the work in SELPH.
+; Generalizes the 2-class binary-partition (§9.67) to any N ≥ 2 labels
+; via recursive sub-spec holes. This absorbs m_dc's responsibilities:
 ;
-; Template structure:
-;   (lambda (x)
-;     (if (contains <group-1-vals> <feature-expr>)
-;       (__hole_0__ x)
-;       (__hole_1__ x)))
+;   2 labels  → (if (contains <V> feat) L1 L2)
+;   3 labels  → (if (contains <V1> feat1) L1 <recursive-hole-for-L2-L3>)
+;   4+ labels → same pattern, recurses until 1 or 2 labels remain
 ;
-; The decomposer:
-;   1. Iterates pool entries (suffix predicates, prefix predicates,
-;      atoms, library functions — anything in the active pool).
-;   2. For each entry, checks if its column cleanly partitions the
-;      output labels into exactly 2 disjoint groups.
-;   3. First clean partition wins (pool is priority-ordered, so suffix
-;      predicates are tried first — Occam scoring).
-;   4. Builds template with two holes; each hole's sub-spec contains
-;      the rows routing to that branch.
-;   5. Returns to Rust hole-filler, which sub-synthesizes each branch.
+; On each step: find a pool feature that cleanly ISOLATES one label
+; from the rest. The "isolated branch" is that label as a constant; the
+; "rest branch" is a sub-spec hole containing rows for the other N-1
+; labels. Sub-synth re-enters the chain, which dispatches back through
+; this decomposer for another level of partition, bottoming out at N=1
+; (constant via m-chain-string Form 1 or m-chain-bool Form 1) or a
+; 2-label case where both branches become constants.
 ;
-; What this validates about hole-fc:
-;   - Templates can use parametric (decomposer-baked) values for
-;     non-search positions (predicate, value-set).
-;   - Sub-synth holes recursively invoke the strategy chain — for the
-;     binary case, each branch finds a constant via m8s Form 1.
-;   - For the 3+ class case (when generalized), one branch could be
-;     a constant and the other a recursive partition — true
-;     compositionality.
+; Benefits:
+;   - Subsumes m_dc's role (no need for separator sub-synth holes,
+;     which previously couldn't find Bool predicates without a Bool
+;     chain branch — now moot)
+;   - Non-string outputs supported (emit uses m8s-value-to-node)
+;   - Occam's-razor: simplest feature and smallest isolation set win
 ;
-; Architectural gap surfaced:
-;   The (pos, suffix, value-set) values are baked in by SELPH-side
-;   search rather than being holes. Current hole-fc only supports
-;   sub-synthesis holes (each hole must have a sub-spec that
-;   sub_synthesize can solve). To make these into proper holes, we'd
-;   need "candidate-value" hole support in fill_template_holes.
+; Registered as "a-binary-partition" (kept for load-order stability).
 
-; ── Find a winning pool entry ────────────────────────────────────────
-;
-; Iterate the active pool in priority order (suffix/prefix predicates
-; first, then libraries, atoms last). Return the first entry whose
-; column cleanly partitions the targets into exactly 2 disjoint groups.
-;
-; The "first found" approach + priority ordering gives Occam's-razor
-; behavior for free: simpler features (boolean predicates with 2 vals)
-; are tried before higher-arity features (atoms with N vals).
+; ── Helpers ──────────────────────────────────────────────────────────
 
-(define a-bp-find-winner
+; Values appearing in `col` at rows where `target[i] = label`.
+(define a-bp-col-vals-for-label
+  (lambda (col target label)
+    (reduce
+      (lambda (acc i)
+        (if (= (nth target i) label)
+          (let ((v (nth col i)))
+            (if (contains acc v) acc (append acc (list v))))
+          acc))
+      (range (length target))
+      (list))))
+
+; Values appearing in `col` at rows where `target[i] ≠ label`.
+(define a-bp-col-vals-for-rest
+  (lambda (col target label)
+    (reduce
+      (lambda (acc i)
+        (if (not (= (nth target i) label))
+          (let ((v (nth col i)))
+            (if (contains acc v) acc (append acc (list v))))
+          acc))
+      (range (length target))
+      (list))))
+
+; Returns the value set that cleanly isolates `label` via this column,
+; or nil if no clean isolation exists. A "clean isolation" means the
+; set of column values seen in rows labeled L is disjoint from the set
+; seen in rows labeled anything-but-L.
+(define a-bp-isolates-label?
+  (lambda (col target label)
+    (let ((l-vals    (a-bp-col-vals-for-label col target label))
+          (rest-vals (a-bp-col-vals-for-rest  col target label)))
+      (if (and (> (length l-vals) 0)
+               (m8s-disjoint? l-vals rest-vals))
+        l-vals
+        nil))))
+
+; Iterate labels in first-occurrence order; return the first label that
+; this column can cleanly isolate, along with the isolating value set.
+; Returns (ns ("label" L) ("vals" V)) or nil.
+(define a-bp-try-isolate-any
+  (lambda (col target)
+    (let ((labels (m8s-distinct-labels target)))
+      (reduce
+        (lambda (best label)
+          (if (not (nil? best)) best
+            (let ((vals (a-bp-isolates-label? col target label)))
+              (if (nil? vals) nil
+                (ns ("label" label) ("vals" vals))))))
+        labels nil))))
+
+; Iterate the priority-sorted active pool; return the first (entry,
+; label, vals) triple that yields a clean isolation. Pool priority
+; order puts simpler features (suffix/prefix predicates) before
+; libraries and atoms — Occam's razor for free.
+(define a-bp-find-isolating-winner
   (lambda (pool target)
     (let ((active (m8s-active-pool pool)))
       (reduce
         (lambda (best entry)
           (if (not (nil? best)) best
             (let ((col (m8s-pool-col entry)))
-              (let ((partial (try (fit-partial-classify col target) nil)))
-                (if (or (nil? partial)
-                        (not (= (length (ns-get partial "groups")) 2)))
-                  nil
-                  (ns ("entry" entry) ("partition" partial)))))))
+              (let ((iso (a-bp-try-isolate-any col target)))
+                (if (nil? iso) nil
+                  (ns ("entry" entry)
+                      ("label" (ns-get iso "label"))
+                      ("vals"  (ns-get iso "vals"))))))))
         active nil))))
 
-; Build the sub-spec for a branch: extract the (input, output) pairs
-; for the rows that route to this branch.
-(define a-bp-branch-spec
-  (lambda (indices pairs)
-    (map (lambda (i) (nth pairs i)) indices)))
+; ── Template emit ────────────────────────────────────────────────────
+;
+; Template:
+;   (lambda (x)
+;     (if (contains <iso-vals> <feat>)
+;       <iso-label-as-literal>
+;       __hole_0__))            ; sub-spec = rows with target ≠ iso-label
+;
+; The isolated-label branch is baked in as a literal (via
+; m8s-value-to-node so it works for string / bool / int / num labels).
+; The rest branch is a sub-synth hole with `("inline" true)` so the
+; returned Lambda body is extracted and spliced directly.
+;
+; Recursion: when the sub-spec has N-1 labels and sub-synth re-enters
+; the chain, this decomposer runs again and peels off another label.
+; For a 1-label sub-spec, m-chain-{string,bool,numeric} Form 1 emits a
+; constant — natural termination.
 
-; Build the template AST + holes namespace.
-;
-; Template: (lambda (x)
-;             (if (contains <vals> <feature>)
-;               __hole_0__   ; sub-synth body (lambda body extracted via inline=true)
-;               __hole_1__)) ; sub-synth body
-;
-; Each hole's sub-spec contains the rows that route to that branch.
-; The "inline" flag tells fill_template_holes to extract the Lambda's
-; body before splicing — so we get `"label"` directly instead of
-; `((lambda (x) "label") x)`. The lambda's `x` parameter conventionally
-; matches the outer lambda's `x`, so any references in the body resolve
-; to the outer scope correctly.
+(define a-bp-rest-spec
+  (lambda (pairs target iso-label)
+    (filter (lambda (p) (not (nil? p)))
+      (map (lambda (i)
+             (if (= (nth target i) iso-label) nil (nth pairs i)))
+           (range (length target))))))
+
+; Wrap body so `(nth x 0)` in the pool's feature source keeps working
+; when the outer caller passes a bare value. For list-shaped inputs,
+; body is returned unchanged.
+(define a-bp-lambda-body
+  (lambda (bare? body)
+    (if bare?
+      (make-let (list (list "x" (make-app "list" (make-symbol "x")))) body)
+      body)))
+
+; Wrap the input half of each (input, output) pair to list-wrap shape
+; when the outer spec was bare. The inline-spliced sub-synth result
+; will operate on the outer's already-coerced `x` (which IS list-
+; shaped), so the sub-spec must also be list-shaped — otherwise the
+; inner decomposer normalizes AGAIN and emits a double `(let ((x (list
+; x))))` that breaks evaluation.
+(define a-bp-wrap-pairs-inputs
+  (lambda (pairs bare?)
+    (if bare?
+      (map (lambda (p) (list (list (head p)) (head (tail p)))) pairs)
+      pairs)))
+
 (define a-bp-emit
-  (lambda (winner pairs)
+  (lambda (winner pairs target bare?)
     (let ((entry (ns-get winner "entry"))
-          (partition (ns-get winner "partition")))
+          (iso-label (ns-get winner "label"))
+          (iso-vals (ns-get winner "vals")))
       (let ((feature-expr (m8s-pool-source entry))
-            (group-vals (ns-get partition "group-vals"))
-            (group-rows (ns-get partition "group-rows")))
-        (let ((template
-                (make-lambda (list "x")
+            (wrapped-pairs (a-bp-wrap-pairs-inputs pairs bare?)))
+        (let ((rest-spec (a-bp-rest-spec wrapped-pairs target iso-label)))
+          (let ((inner-body
                   (make-if
                     (make-app "contains"
-                      (m8s-emit-value-list (head group-vals))
+                      (m8s-emit-value-list iso-vals)
                       feature-expr)
-                    (make-hole 0)
-                    (make-hole 1)))))
-          (let ((branch-0-spec (a-bp-branch-spec (head group-rows) pairs))
-                (branch-1-spec (a-bp-branch-spec (head (tail group-rows)) pairs)))
-            (ns ("found" true)
-                ("nodes" template)
-                ("holes"
-                  (ns ("__hole_0__"
-                        (ns ("spec" branch-0-spec) ("inline" true)))
-                      ("__hole_1__"
-                        (ns ("spec" branch-1-spec) ("inline" true)))))
-                ("candidates" 1))))))))
+                    (m8s-value-to-node iso-label)
+                    (make-hole 0))))
+            (let ((template
+                    (make-lambda (list "x")
+                      (a-bp-lambda-body bare? inner-body))))
+              (ns ("found" true)
+                  ("nodes" template)
+                  ("holes"
+                    (ns ("__hole_0__"
+                          (ns ("spec" rest-spec) ("inline" true)))))
+                  ("candidates" 1)))))))))
+
+; Normalize a spec so m8s-build-pool can consume it. The pool builder
+; expects inputs as list-of-lists (each row is a list of arg values).
+; For single-arg bare-input specs (e.g. `(task ...)` form), rows are
+; bare values — wrap them in singletons. This is the same trick
+; m_chain_bool uses (§Option A).
+(define a-bp-normalize-spec
+  (lambda (spec)
+    (let ((rows (ns-get spec "inputs")))
+      (if (or (= (length rows) 0) (list? (head rows)))
+        spec
+        (ns-put spec "inputs" (map (lambda (x) (list x)) rows))))))
+
+; True iff the original (pre-normalized) spec's inputs are bare values.
+(define a-bp-spec-bare?
+  (lambda (spec)
+    (let ((rows (ns-get spec "inputs")))
+      (and (> (length rows) 0)
+           (not (list? (head rows)))))))
 
 ; ── Main decomposer ──────────────────────────────────────────────────
+;
+; N-class partition via recursive isolation. Handles N ≥ 2; with N < 2
+; returns found:false (single-label specs are handled by m-chain's
+; Form 1 constant detectors).
+;
+; Label count cap at 8 mirrors fit-multi-classify's cap. Above that the
+; if-chain depth + search cost exceeds the value.
+
+(define a-bp-max-labels 8)
 
 (define a-binary-partition-decomposer
   (lambda (synth-spec)
     (try
       (let ((pairs (ns-get synth-spec "spec"))
             (spec (m-chain-spec-from-synth synth-spec)))
-        (let ((target (ns-get spec "outputs")))
+        (let ((target (ns-get spec "outputs"))
+              (bare? (a-bp-spec-bare? spec))
+              (norm-spec (a-bp-normalize-spec spec)))
           (let ((labels (m8s-distinct-labels target)))
-            (if (or (not (= (length labels) 2))
+            (if (or (< (length labels) 2)
+                    (> (length labels) a-bp-max-labels)
                     (>= (length labels) (length target)))
               (ns ("found" false))
-              (if (not (m8s-str? (head target)))
-                (ns ("found" false))
-                (let ((pool (try (m8s-build-pool spec) (list))))
-                  (if (= (length pool) 0)
-                    (ns ("found" false))
-                    (let ((winner (try (a-bp-find-winner pool target) nil)))
-                      (if (nil? winner)
-                        (ns ("found" false))
-                        (a-bp-emit winner pairs))))))))))
+              (let ((pool (try (m8s-build-pool norm-spec) (list))))
+                (if (= (length pool) 0)
+                  (ns ("found" false))
+                  (let ((winner (try (a-bp-find-isolating-winner pool target) nil)))
+                    (if (nil? winner)
+                      (ns ("found" false))
+                      (a-bp-emit winner pairs target bare?)))))))))
       (ns ("found" false)))))
 
 ; ── Registration ─────────────────────────────────────────────────────
 ;
-; Name "a-binary-partition" sorts alphabetically before "m-chain" so
-; this decomposer runs FIRST in try_selph_decomposers' Stage A walk.
-; If it succeeds, the chain falls through. If it returns found:false,
-; m-chain takes over.
+; Name "a-binary-partition" kept for load-order stability. Despite the
+; name, this now handles N ≥ 2 partitions.
 
 (define __decomposers__
   (ns-put __decomposers__ "a-binary-partition" a-binary-partition-decomposer))

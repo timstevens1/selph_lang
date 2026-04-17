@@ -50,9 +50,9 @@ The architecture IS the curriculum. Change the curriculum, change the architectu
 - Auto-constant extraction, probe-and-filter, observational equivalence dedup
 - Epsilon-equivalence for float dedup
 
-**Strategy pipeline:** SELPH decomposers (M-chain + hole-fc decomposers) → RD → Flat → BD → HO → D&C → Memo
+**Strategy pipeline:** SELPH decomposers (M-chain + hole-fc decomposers) → RD → Flat → BD → HO → D&C → IN → Memo
 
-- **SELPH hole-fc decomposers (§hole-fc):** Return AST templates with `__hole_N__` placeholders + sub-specs. Rust fills holes via `sub_synthesize`. Includes: list-map, list-filter, split-map-join, char-map-join, D&C (nested if-trees), RD (library bridge).
+- **SELPH hole-fc decomposers (§hole-fc):** Return AST templates with `__hole_N__` placeholders + sub-specs. Rust fills holes via `sub_synthesize`. Includes: list-map, list-filter, split-map-join, char-map-join, D&C (nested if-trees), RD (library bridge), Induction (binary-builtin intermediates).
 - **Recursive Decomposition (RD):** Top-down prediction — classify outermost function family, invert to derive subspecs, recursively solve. 6 family inversions (arithmetic, string-op, count, compare, HO, if-expr). Macro-aware bridge decomposition.
 - **Boolean Decomposition (BD):** Tries `(and P Q)`, `(or P Q)`, `(not P)` compositions of bool-returning macros.
 - **Higher-Order (HO):** Template decomposition — list-map, split-map-join, char-map-join, list-filter. Fills function holes via recursive sub-synthesis.
@@ -1115,9 +1115,10 @@ Holes are `Node::Symbol` with reserved names — no new `Node` or `Value` varian
 | `m_ho_char_map_join.selph` | `(string-join (map __hole_0__ (string-chars x)) "")` | string→string, equal char count |
 | `m_dc.selph` | nested `(if __hole_N__ __hole_N+1__ ...)` | 2+ distinct output values |
 | `m_rd.selph` | `(let ((x (m x))) __hole_0__)` | library bridge composition |
+| `m_induction.selph` | `(let ((x (binop x k))) __hole_0__)` | binary-builtin intermediate value |
 | `m_ho.selph` | `reduce` over grid objects | grid→grid, same object count |
 
-All HO decomposers use dedup + conflict detection + ≥3 unique pairs. D&C uses variable hole count (2N−1 for N groups). RD enumerates library functions, returns first promising match with bridge hole.
+All HO decomposers use dedup + conflict detection + ≥3 unique pairs. D&C uses variable hole count (2N−1 for N groups). RD enumerates library functions, returns first promising match with bridge hole. Induction probes binary builtins (add/subtract/multiply × small constants) for intermediate values, uses `flat-only` holes to prevent memorizing decomposers from blocking simple solutions in sub-synthesis.
 
 #### Key design decision: no `synthesize` calls from SELPH decomposers
 
@@ -1136,7 +1137,7 @@ Fix: decomposers return templates with holes, Rust `fill_template_holes` does su
 
 - SELPH-side strategy logic: observe spec features → choose decomposition template
 - Eventually synthesizable observers and policies (the RL formulation)
-- Port Induction strategy to SELPH hole-fc decomposer
+- ~~Port Induction strategy to SELPH hole-fc decomposer~~ → Done (§m-induction, April 16 2026)
 
 Files: `synth_v2.rs`, `eval_v2.rs`, `m_ho_list_map.selph`, `m_ho_list_filter.selph`, `m_ho_split_map_join.selph`, `m_ho_char_map_join.selph`, `m_dc.selph`, `m_rd.selph`, `m_ho.selph`, `run_probe.sh`, `run_fitness_probe.sh`
 
@@ -1295,6 +1296,46 @@ The architecture now has 3 specialized SELPH decomposers all using uniform hole-
 - The remaining `noun_phrase_check` failure is no longer architectural — it just needs a 2-feature conjunction decomposer (straightforward to build with the same patterns)
 
 Files: `synth_v2.rs` (~150 lines added/changed), `m_lib_reuse.selph`, `m_partition.selph` (updated to use inline), `run_probe.sh`
+
+### §m-induction Induction strategy migration to SELPH (April 16, 2026)
+
+Ported the last remaining Rust decomposer (Induction / intermediate-value decomposition) to a SELPH hole-fc decomposer. All six Rust strategies (BD, HO, RD, D&C, Induction, Memo) now have SELPH equivalents. Rust strategies remain gated behind `ENABLE_RUST_DECOMPOSERS` as fallback.
+
+#### Design
+
+`m_induction.selph` complements `m_rd.selph` to cover the full Rust Induction strategy:
+- **m_rd**: unary library function as inner transform — `f(bridge(x))`
+- **m_induction**: binary builtin + constant as inner transform — `f(binop(x, k))`
+
+Template: `(lambda (x) (let ((x (binop x k))) __hole_0__))` where binop ∈ {add, subtract, multiply}, k ∈ {1, 2, -1, 5}. Direct match when intermediates == outputs.
+
+#### Key discoveries
+
+1. **`env-functions` excludes builtins** — `env-lookup` needed to access `add`/`subtract`/`multiply`
+2. **Memorizing decomposers block simple solutions** — m_dc inside sub-synthesis memorizes training intermediates, passes (no sub-level test data), then fails top-level held-out. Fixed with new `("flat-only" true)` hole spec flag forcing `strategy_depth=0`
+3. **Numeric guard required** — without restricting to numeric inputs AND outputs, m_induction fires on string/bool sub-problems from other decomposers, consuming budget and causing regressions
+
+#### Rust infrastructure
+
+- `("flat-only" true)` hole spec flag in `fill_template_holes` — forces `strategy_depth=0` for sub-synthesis. Available to any decomposer, not m_induction-specific.
+
+#### Results
+
+- **Full curriculum: 40/55** (no regression from baseline)
+- Test task `abs(x+1)` solved in 0.15s, 24 candidates, via `custom:m-induction` → `(lambda (x) (let ((x (add x 1))) (abs x)))`
+
+#### All Rust strategies now have SELPH equivalents
+
+| Rust strategy | SELPH equivalent(s) |
+|---|---|
+| BD (bool decompose) | `m_bd.selph` + `m_chain_bool.selph` |
+| HO (higher-order) | `m_ho_list_map.selph`, `m_ho_list_filter.selph`, `m_ho_split_map_join.selph`, `m_ho_char_map_join.selph`, `m_ho.selph` |
+| RD (recursive decomp) | `m_rd.selph` |
+| D&C (divide & conquer) | `m_dc.selph` |
+| IN (induction) | `m_induction.selph` (+ `m_rd.selph` for unary case) |
+| Memo | No separate file; handled by Flat strategy + env lookup |
+
+Files: `m_induction.selph` (new), `synth_v2.rs` (flat-only flag), `run_probe.sh`, `run_fitness_probe.sh`
 
 ---
 

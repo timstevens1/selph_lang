@@ -1141,7 +1141,7 @@ fn cmd_grow_v2(args: &[String]) {
         // example and dispatch through `synthesize_args` (Flat-only,
         // skipping the strategy chain whose decomposers all assume
         // a single-input lambda).
-        let result = if let Some(arity) = arity_hint {
+        let mut result = if let Some(arity) = arity_hint {
             // Per-position type inference from the first input list.
             let first = match inputs.first() {
                 Some(types_v2::Value::List(items)) if items.len() == *arity => items.clone(),
@@ -1210,7 +1210,12 @@ fn cmd_grow_v2(args: &[String]) {
                 experience: Vec::new(),
             }
         } else {
-            synth_v2::synthesize_with_strategies(
+            // Single-arg `task` path: use the _and_test variant so
+            // held-out pairs reach try_selph_decomposers and
+            // memorization-only solutions get rejected. Without this,
+            // single-arg tasks silently accept ns-get-or lookup tables
+            // that pass training but fail test.
+            synth_v2::synthesize_with_strategies_and_test(
                 &components,
                 &inputs,
                 &expected,
@@ -1219,10 +1224,33 @@ fn cmd_grow_v2(args: &[String]) {
                 *task_depth,
                 default_budget,
                 default_strategy_depth,
+                &test_inputs,
+                &test_expected,
             )
         };
         let elapsed = start.elapsed();
         total_candidates += result.candidates_explored;
+
+        // §Option-A-followup: top-level held-out validation. SELPH
+        // decomposers self-validate via try_selph_decomposers's test
+        // plumbing, but Rust strategies (Flat/Memo and gated RD/BD/
+        // HO/D&C/IN) don't. Without this check, a Memo lookup table
+        // that perfectly matches training but fails on held-out test
+        // pairs would be accepted as "solved". Apply the check once
+        // here so every strategy's result is test-validated before
+        // counting as a solve.
+        if result.found && !test_inputs.is_empty() {
+            let nodes_vec = result.nodes.as_ref().expect("found implies nodes");
+            let root = result.root.expect("found implies root");
+            if !synth_v2::validate_held_out(
+                nodes_vec, root, &test_inputs, &test_expected, &env,
+            ) {
+                // Convert to a not-found so the summary reflects
+                // reality — the candidate fails generalization.
+                result.found = false;
+                result.strategy = None;
+            }
+        }
 
         if result.found {
             let nodes_vec = result.nodes.expect("found implies nodes");

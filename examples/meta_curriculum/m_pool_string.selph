@@ -169,22 +169,48 @@
   (lambda (f arg-list)
     (try (apply f arg-list) nil)))
 
-(define m-pool-str-effective-arity
+; Probe a library function against the parent input shape and return
+; its calling convention, or nil if it's unusable.
+;
+; Returns (ns ("arity" k) ("shape" S)) where S is "list" or "bare":
+;   "list": lib takes ONE argument, a list of k values.
+;           Call: (lib (list a_0 ... a_{k-1}))
+;   "bare": lib takes k positional args.
+;           Call: (lib a_0 ... a_{k-1})
+;
+; For each candidate arity k (1..max), list-shape is tried first
+; (preserves behaviour for existing curricula that synthesized libs
+; under task-args form), then bare-shape as a fallback. First match
+; wins. This lets the pool include libs written either way —
+; essential when the curriculum mixes `task` (bare-input synthesis,
+; producing bare-arg libs) with `task-args` (list-input synthesis,
+; producing list-arg libs).
+(define m-pool-str-probe-lib
   (lambda (lib-fn parent-inputs)
     (let ((sample-row (head parent-inputs)))
-      (if (list? sample-row)
+      (if (not (list? sample-row))
+        nil
         (let ((max-k (length sample-row)))
           (reduce
             (lambda (acc i)
               (if (not (nil? acc))
                 acc
                 (let ((k (+ i 1)))
-                  (let ((sublist (slice sample-row 0 k)))
-                    (let ((res (m-pool-str-safe-apply lib-fn (list sublist))))
-                      (if (nil? res) nil k))))))
+                  (let ((sub-args (map (lambda (j) (nth sample-row j))
+                                       (range k))))
+                    ; Try list shape first.
+                    (let ((list-res (m-pool-str-safe-apply
+                                      lib-fn (list sub-args))))
+                      (if (not (nil? list-res))
+                        (ns ("arity" k) ("shape" "list"))
+                        ; Fall back to bare shape.
+                        (let ((bare-res (m-pool-str-safe-apply
+                                          lib-fn sub-args)))
+                          (if (not (nil? bare-res))
+                            (ns ("arity" k) ("shape" "bare"))
+                            nil))))))))
             (range max-k)
-            nil))
-        nil))))
+            nil))))))
 
 (define m-pool-str-ordered-tuples
   (lambda (n k)
@@ -202,14 +228,22 @@
             shorter)
           (list))))))
 
+; Emit the AST call site. `shape` controls the calling convention:
+;   "list" → (lib (list (nth x p_0) ... (nth x p_{k-1})))
+;   "bare" → (lib (nth x p_0) ... (nth x p_{k-1}))
 (define m-pool-str-build-lib-call
-  (lambda (lib-name positions)
+  (lambda (lib-name positions shape)
     (let ((nth-args (map (lambda (i) (make-app "nth" (make-symbol "x") (make-int i))) positions)))
-      (let ((list-node (apply make-app (cons (make-symbol "list") nth-args))))
-        (make-app lib-name list-node)))))
+      (if (= shape "list")
+        (let ((list-node (apply make-app (cons (make-symbol "list") nth-args))))
+          (make-app lib-name list-node))
+        (apply make-app (cons (make-symbol lib-name) nth-args))))))
 
+; Compute the lib's column using the probed shape. For "list" shape,
+; pass the extracted sublist as a single arg. For "bare" shape, pass
+; the sublist elements as positional args.
 (define m-pool-str-lib-column
-  (lambda (lib-fn positions inputs)
+  (lambda (lib-fn positions shape inputs)
     ; §9.47.5: wrap the entire column-building map in `try` so that
     ; library functions that error on some input rows (e.g., nth out
     ; of bounds when arity doesn't match) don't crash the pool builder.
@@ -218,7 +252,9 @@
                   (map
                     (lambda (row)
                       (let ((sub (map (lambda (p) (nth row p)) positions)))
-                        (m-pool-str-safe-apply lib-fn (list sub))))
+                        (if (= shape "list")
+                          (m-pool-str-safe-apply lib-fn (list sub))
+                          (m-pool-str-safe-apply lib-fn sub))))
                     inputs)
                   nil)))
       (if (nil? cols)
@@ -247,28 +283,33 @@
           (map
             (lambda (name)
               (let ((lib-fn (ns-get (env-functions) name)))
-                (let ((eff-arity (m-pool-str-effective-arity lib-fn inputs)))
-                  (if (or (nil? eff-arity) (> eff-arity parent-arity))
+                (let ((probe (m-pool-str-probe-lib lib-fn inputs)))
+                  (if (or (nil? probe)
+                          (> (ns-get probe "arity") parent-arity))
                     (list)
-                    (let ((tuples (m-pool-str-ordered-tuples parent-arity eff-arity)))
-                      (filter (lambda (e) (not (nil? e)))
-                        (map
-                          (lambda (positions)
-                            (let ((col (m-pool-str-lib-column lib-fn positions inputs)))
-                              (if (nil? col)
-                                nil
-                                ; §9.47.6: skip degenerate columns (constant across
-                                ; all rows). A library function that maps every input
-                                ; to the same output can't discriminate anything —
-                                ; it's noise in the pool, especially for Form 6's
-                                ; O(pool²) pair iteration.
-                                (if (<= (length (m-pool-str-dedup col)) 1)
+                    (let ((eff-arity (ns-get probe "arity"))
+                          (shape (ns-get probe "shape")))
+                      (let ((tuples (m-pool-str-ordered-tuples parent-arity eff-arity)))
+                        (filter (lambda (e) (not (nil? e)))
+                          (map
+                            (lambda (positions)
+                              (let ((col (m-pool-str-lib-column
+                                           lib-fn positions shape inputs)))
+                                (if (nil? col)
                                   nil
-                                  (m-pool-str-entry
-                                    (m-pool-str-build-lib-call name positions)
-                                    col
-                                    (concat "lib-" name))))))
-                          tuples)))))))
+                                  ; §9.47.6: skip degenerate columns (constant across
+                                  ; all rows). A library function that maps every input
+                                  ; to the same output can't discriminate anything —
+                                  ; it's noise in the pool, especially for Form 6's
+                                  ; O(pool²) pair iteration.
+                                  (if (<= (length (m-pool-str-dedup col)) 1)
+                                    nil
+                                    (m-pool-str-entry
+                                      (m-pool-str-build-lib-call
+                                        name positions shape)
+                                      col
+                                      (concat "lib-" name))))))
+                            tuples))))))))
             lib-names)
           (list))))))
 

@@ -1,0 +1,264 @@
+; ─────────────────────────────────────────────────────────────────────────
+; m_chain_bool: Bool-output branch of the M-chain (§Option A)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Closes the sub-synth gap exposed by m_dc / hole-fc: when a decomposer
+; emits a Bool sub-spec (e.g. a separator predicate), sub-synthesis
+; previously had no chain branch for Bool outputs and would fall through
+; to Flat (usually exhausting) or the Memo `(ns-get-or ...)` fallback
+; that memorizes training without generalizing.
+;
+; Detectors (cheapest first; simpler discriminators preferred):
+;   Form 1  bool-constant     — all outputs same
+;   Form 2  bool-pool-direct  — pool entry's Bool column IS the target
+;   Form 3  bool-pool-classify— (contains V feat) via fit-multi-classify
+;   Form 4  bool-pool-neg     — same as 3, but for NEGATED column
+;
+; Inputs handled: strings (reuses m8s-pool). Other input kinds fall
+; through silently — rare enough to defer until a real need surfaces.
+
+; ── Emit helpers ──────────────────────────────────────────────────────
+;
+; The pool emits feature source ASTs that assume x is a list (e.g.
+; `(nth x 0)` to index arg 0). If the outer caller passes bare values
+; (single-arg `(task ...)` form), we wrap the body in a `(let ((x
+; (list x))) ...)` so `(nth x 0)` keeps working. `bare?` captures this
+; from the spec — true when mcb-spec-bare? returned true.
+
+; Wrap the body so `(nth x 0)` (from the pool) coerces bare x into a
+; singleton list. For already-wrapped inputs, leave body alone.
+(define mcb-lambda-body
+  (lambda (bare? body)
+    (if bare?
+      (make-let (list (list "x" (make-app "list" (make-symbol "x")))) body)
+      body)))
+
+(define mcb-wrap-lambda
+  (lambda (bare? body)
+    (make-lambda (list "x") (mcb-lambda-body bare? body))))
+
+(define mcb-emit-const-bool
+  (lambda (b) (make-lambda (list "x") (make-bool b))))
+
+; (lambda (x) feat-expr) — use the pool entry's feature AST directly.
+(define mcb-emit-feat
+  (lambda (bare? feat-src) (mcb-wrap-lambda bare? feat-src)))
+
+; (lambda (x) (not feat-expr))
+(define mcb-emit-feat-neg
+  (lambda (bare? feat-src)
+    (mcb-wrap-lambda bare? (make-app "not" feat-src))))
+
+; (lambda (x) (contains (list v...) feat-expr))
+(define mcb-emit-contains
+  (lambda (bare? vals feat-src)
+    (mcb-wrap-lambda bare?
+      (make-app "contains"
+        (m8s-emit-value-list vals)
+        feat-src))))
+
+; (lambda (x) (not (contains (list v...) feat-expr)))
+(define mcb-emit-contains-neg
+  (lambda (bare? vals feat-src)
+    (mcb-wrap-lambda bare?
+      (make-app "not"
+        (make-app "contains"
+          (m8s-emit-value-list vals)
+          feat-src)))))
+
+; True iff the spec's inputs are bare values (not list-wrapped). In
+; that case emitted code must coerce x into a list before using pool
+; feature sources.
+(define mcb-spec-bare?
+  (lambda (s)
+    (let ((rows (ns-get s "inputs")))
+      (and (> (length rows) 0)
+           (not (list? (head rows)))))))
+
+; ── Bool target helpers ───────────────────────────────────────────────
+
+(define mcb-all-same?
+  (lambda (xs)
+    (if (<= (length xs) 1) true
+      (let ((h (head xs)))
+        (reduce (lambda (acc v) (and acc (= v h))) (tail xs) true)))))
+
+; Negate each Bool in a list.
+(define mcb-negate-col
+  (lambda (col) (map (lambda (v) (not v)) col)))
+
+; Normalize a spec so m8s-build-pool can consume it. The pool builder
+; expects inputs as list-of-lists (each row is a list of arg values).
+; For single-arg `(task ...)` specs, rows are bare values — wrap them.
+(define mcb-normalize-spec
+  (lambda (s)
+    (let ((inputs (ns-get s "outputs"))   ; dummy to detect empty
+          (rows   (ns-get s "inputs")))
+      (if (or (= (length rows) 0) (list? (head rows)))
+        s
+        (ns-put s "inputs" (map (lambda (x) (list x)) rows))))))
+
+; Given a spec ns with "outputs" being a Bool column, build the m8s
+; pool. Returns empty list if pool construction fails (e.g. inputs
+; aren't strings or list-of-strings).
+(define mcb-try-build-pool
+  (lambda (s)
+    (try (m8s-build-pool (mcb-normalize-spec s)) (list))))
+
+; ── Form 1: all-same Bool ─────────────────────────────────────────────
+
+(define detect-bool-constant
+  (lambda (s)
+    (let ((target (ns-get s "outputs")))
+      (if (= (length target) 0)
+        (ns ("found" false))
+        (if (and (bool? (head target)) (mcb-all-same? target))
+          (ns ("found" true)
+              ("kind" "bool-constant")
+              ("score" 0)
+              ("source-node" (mcb-emit-const-bool (head target))))
+          (ns ("found" false)))))))
+
+; ── Form 2: pool column IS the Bool target (direct feat reuse) ────────
+;
+; If a pool entry's column already IS the Bool target (e.g. the pool
+; ships a `(string-ends-with x "er")` entry that matches true/false
+; exactly), emit `(lambda (x) feat)` — the simplest possible solution.
+
+(define detect-bool-pool-direct
+  (lambda (s)
+    (let ((target (ns-get s "outputs"))
+          (pool (mcb-try-build-pool s))
+          (bare? (mcb-spec-bare? s)))
+      (if (or (= (length target) 0)
+              (= (length pool) 0)
+              (not (bool? (head target))))
+        (ns ("found" false))
+        (let ((hit
+                (reduce
+                  (lambda (acc entry)
+                    (if (not (nil? acc)) acc
+                      (if (m8s-cols-equal? (m8s-pool-col entry) target)
+                        (ns ("kind" "bool-pool-direct")
+                            ("score" 1)
+                            ("source-node"
+                              (mcb-emit-feat bare? (m8s-pool-source entry))))
+                        (if (m8s-cols-equal? (mcb-negate-col (m8s-pool-col entry)) target)
+                          (ns ("kind" "bool-pool-direct-neg")
+                              ("score" 2)
+                              ("source-node"
+                                (mcb-emit-feat-neg bare? (m8s-pool-source entry))))
+                          nil))))
+                  (m8s-active-pool pool)
+                  nil)))
+          (if (nil? hit) (ns ("found" false)) (ns-put hit "found" true)))))))
+
+; ── Form 3: clean partition via fit-multi-classify ────────────────────
+;
+; Pool feature's column cleanly separates true-rows from false-rows.
+; Uses the SAME primitive as m8s-try-form-3 (string classifier), just
+; with a Bool target — the emit shape is `(contains <true-vals> feat)`.
+; Occam's-razor scoring: prefer features with fewer distinct values
+; (mirrors m8s-try-form-3's behaviour).
+
+(define mcb-true-vals-from-fit
+  (lambda (fit)
+    (let ((labels (ns-get fit "labels"))
+          (vals-by-label (ns-get fit "vals-by-label")))
+      (let ((true-idx
+              (reduce
+                (lambda (acc i)
+                  (if (>= acc 0) acc
+                    (if (= (nth labels i) true) i acc)))
+                (range (length labels))
+                -1)))
+        (if (< true-idx 0) nil (nth vals-by-label true-idx))))))
+
+(define detect-bool-pool-classify
+  (lambda (s)
+    (let ((target (ns-get s "outputs"))
+          (pool (mcb-try-build-pool s))
+          (bare? (mcb-spec-bare? s)))
+      (if (or (= (length target) 0)
+              (= (length pool) 0)
+              (not (bool? (head target))))
+        (ns ("found" false))
+        (let ((active (m8s-active-pool pool))
+              (distinct-labels (m8s-distinct-labels target)))
+          (if (< (length distinct-labels) 2)
+            (ns ("found" false))  ; covered by Form 1
+            (let ((hits
+                    (filter (lambda (e) (not (nil? e)))
+                      (map
+                        (lambda (entry)
+                          (let ((fit (try
+                                       (fit-multi-classify
+                                         (m8s-pool-col entry) target)
+                                       nil)))
+                            (if (nil? fit)
+                              nil
+                              (ns ("entry" entry)
+                                  ("fit" fit)
+                                  ("score" (m8s-distinct-count
+                                             (m8s-pool-col entry)))))))
+                        active))))
+              (if (= (length hits) 0)
+                (ns ("found" false))
+                (let ((best
+                        (reduce
+                          (lambda (acc h)
+                            (if (or (nil? acc)
+                                    (< (ns-get h "score") (ns-get acc "score")))
+                              h acc))
+                          hits nil)))
+                  (let ((entry (ns-get best "entry"))
+                        (fit (ns-get best "fit")))
+                    (let ((feat-src (m8s-pool-source entry))
+                          (true-vals (mcb-true-vals-from-fit fit)))
+                      (if (nil? true-vals)
+                        (ns ("found" false))
+                        (ns ("found" true)
+                            ("kind" "bool-pool-classify")
+                            ("score" (+ 3 (ns-get best "score")))
+                            ("source-node"
+                              (mcb-emit-contains bare? true-vals feat-src)))))))))))))))
+
+; ── Top-level Bool chain ──────────────────────────────────────────────
+;
+; Order: constant → pool-direct → pool-classify → bool-decompose → library
+;
+; bool-decompose (from m_bd.selph) runs after the cheap pool-based
+; detectors. It probes unary library predicates and tries
+; single/not/and/or/and-not/not-and compositions. O(N + N²) where
+; N is the number of Bool-returning library functions (typically
+; small — the hyphen filter excludes all M-stage helpers).
+(define m-chain-bool
+  (lambda (spec)
+    (m-chain-try-or-next detect-bool-constant spec
+      (lambda ()
+        (m-chain-try-or-next detect-bool-pool-direct spec
+          (lambda ()
+            (m-chain-try-or-next detect-bool-pool-classify spec
+              (lambda ()
+                (m-chain-try-or-next detect-bool-decompose spec
+                  (lambda ()
+                    (m-chain-try-or-next detect-library-shape spec
+                      (lambda () (ns ("found" false))))))))))))))
+
+; ── Smoke test ────────────────────────────────────────────────────────
+
+(define mcb-smoke-spec-wrapped
+  (ns ("inputs"  (list (list "bigger") (list "faster") (list "big") (list "fast")))
+      ("outputs" (list true true false false))
+      ("arity"   1)))
+
+(define mcb-smoke-spec-bare
+  (ns ("inputs"  (list "bigger" "faster" "big" "fast"))
+      ("outputs" (list true true false false))
+      ("arity"   1)))
+
+(print "── m_chain_bool smoke tests ──")
+(let ((r1 (try (m-chain-bool mcb-smoke-spec-wrapped) (ns ("found" false)))))
+  (print (concat "  wrapped: found=" (to-string (try (ns-get r1 "found") false)))))
+(let ((r2 (try (m-chain-bool mcb-smoke-spec-bare) (ns ("found" false)))))
+  (print (concat "  bare: found="    (to-string (try (ns-get r2 "found") false)))))
