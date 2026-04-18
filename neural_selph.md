@@ -272,6 +272,22 @@ Small lift. The grounding constraint works (prevents literal answer smuggling) b
 
 **Insight:** The RL reward correctly shapes behavior but the training distribution needs more examples where composition is *required by the grounding constraint* — queries where no shortcut exists that uses only prompt constants.
 
+### Exp 4: GRPO on MMLU-Pro Business (2026-04-17)
+
+**Setup:** 560 business calculation questions, 4 completions per prompt, temp 0.7. Think-with-SELPH generation (model can use `<tool_call>` during `<think>`). Reward = correct MC answer. Base model start (no adapter).
+
+**MMLU-Pro baseline:** 25.9% overall, ~16% business.
+
+| Epoch | Accuracy | SELPH Uses | Training Examples |
+|---|---|---|---|
+| 1 (base) | 8.3% | 56 | 174 |
+| 2 | 10.0% | 5 | 162 |
+| 3 | **14.9%** | 0 | 266 |
+
+**Key finding:** GRPO nearly doubled accuracy (8.3% → 14.9%) in 3 epochs. But the model learned to answer via better NL reasoning, not via SELPH computation — SELPH usage dropped to zero. The reward signal teaches "get the right answer" and the model finds the easiest path, which for conceptual business questions is NL reasoning, not computation.
+
+**Implication:** For SELPH usage to be reinforced, the reward must specifically advantage SELPH-computed answers, or the questions must be ones where computation is genuinely necessary (not just conceptual MC).
+
 ## Long-Term Future Directions
 
 ### Holes as Subagents
