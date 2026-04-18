@@ -288,6 +288,23 @@ Small lift. The grounding constraint works (prevents literal answer smuggling) b
 
 **Implication:** For SELPH usage to be reinforced, the reward must specifically advantage SELPH-computed answers, or the questions must be ones where computation is genuinely necessary (not just conceptual MC).
 
+### Exp 5: 122B Trace Generation + SFT + GRPO All Categories (2026-04-18)
+
+**122B trace generation:** Qwen3.5-122B-A10B generated 691 think+SELPH traces across all 14 MMLU-Pro categories. 38 traces (5.5%) include `<tool_call>` expressions. The 122B correctly identifies SELPH is most useful for business/math/economics and unnecessary for conceptual categories.
+
+**SFT results (best result of the project):**
+
+| Model | MMLU-Pro Overall |
+|---|---|
+| Base Qwen3.5-0.8B | 25.9% |
+| + SFT on 122B traces (2000 iters) | **31.7%** (+5.8pp) |
+
+Gains across 11/14 categories. Biggest: psychology +16, biology +14, business +12, law/philosophy/physics/math +8.
+
+**GRPO all-categories:** Collapsed — epoch 1→2 improved (8%→11%) but epoch 3 hit 0%. The think-mode prompt format in GRPO conflicted with standard MC eval format, causing catastrophic forgetting.
+
+**Lesson:** GRPO fine-tuning must match the eval prompt format, or mix in format-preserving examples to prevent collapse.
+
 ## Long-Term Future Directions
 
 ### Holes as Subagents
