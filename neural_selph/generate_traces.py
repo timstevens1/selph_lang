@@ -28,12 +28,19 @@ SCRIPT_DIR = Path(__file__).parent
 LETTERS = "ABCDEFGHIJ"
 
 # Multi-domain SELPH function signatures
-SELPH_FUNCTIONS = """Available SELPH functions (use inside <tool_call>...</tool_call> during thinking):
-Arithmetic: (add a b), (subtract a b), (multiply a b), (divide a b), (power base exp), (sqrt x), (abs x), (floor x), (round x n)
-Percentage: (multiply value (divide percent 100)) for "X% of Y"
-Finance: (multiply P (power (add 1 r) n)) for compound interest, (divide FV (power (add 1 r) n)) for present value
-Comparison: use to verify which option matches a computed value
-Note: Only use <tool_call> when you need to compute a numeric result. For conceptual/factual questions, reason in natural language."""
+SELPH_FUNCTIONS = """You have access to SELPH, a symbolic computation and knowledge system. Use <tool_call>(expression)</tool_call> during thinking to evaluate expressions. Results replace the tool_call block.
+
+Core functions:
+  Arithmetic: (add a b), (subtract a b), (multiply a b), (divide a b), (power base exp), (sqrt x), (abs x), (floor x), (round x n)
+  Percentage: (multiply value (divide percent 100)) for "X% of Y"
+  Finance: (multiply P (power (add 1 r) n)) for compound interest, (divide FV (power (add 1 r) n)) for present value
+  Knowledge: (lookup concept) for definitions and facts, (related concept relation) for relationships between concepts
+
+Discovery:
+  (apropos "keyword") — search for functions by name
+  (apropos-by-type "input-type" "output-type") — search functions by type signature
+
+Use <tool_call> whenever you need to compute a value or look up a fact you are unsure about."""
 
 
 def build_prompt_for_122b(question, options, answer):
@@ -186,7 +193,7 @@ def format_for_training(question, options, trace, answer_letter):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default=str(Path.home() / ".omlx/models/Qwen3.5-122B-A10B-4bit"))
+    parser.add_argument("--model", default=str(Path.home() / ".omlx/models/Qwen3.6-35B-A3B-8bit"))
     parser.add_argument("--per-category", type=int, default=50,
                         help="Examples to generate per category")
     parser.add_argument("--max-tokens", type=int, default=512)

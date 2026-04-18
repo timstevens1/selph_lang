@@ -22,10 +22,26 @@ SCRIPT_DIR = Path(__file__).parent
 
 ANSWER_LETTERS = "ABCDEFGHIJ"
 
+SELPH_SYSTEM = """You have access to SELPH, a symbolic computation and knowledge system. Use <tool_call>(expression)</tool_call> during thinking to evaluate expressions. Results replace the tool_call block.
 
-def format_prompt(question, options):
+Core functions:
+  Arithmetic: (add a b), (subtract a b), (multiply a b), (divide a b), (power base exp), (sqrt x), (abs x), (floor x), (round x n)
+  Percentage: (multiply value (divide percent 100)) for "X% of Y"
+  Finance: (multiply P (power (add 1 r) n)) for compound interest, (divide FV (power (add 1 r) n)) for present value
+  Knowledge: (lookup concept) for definitions and facts, (related concept relation) for relationships between concepts
+
+Discovery:
+  (apropos "keyword") — search for functions by name
+  (apropos-by-type "input-type" "output-type") — search functions by type signature
+
+Use <tool_call> whenever you need to compute a value or look up a fact you are unsure about."""
+
+
+def format_prompt(question, options, with_selph=False):
     """Format an MMLU-Pro question as a prompt."""
     opts = "\n".join(f"{ANSWER_LETTERS[i]}. {opt}" for i, opt in enumerate(options))
+    if with_selph:
+        return f"{SELPH_SYSTEM}\n\nQuestion: {question}\n{opts}\nAnswer:"
     return f"Question: {question}\n{opts}\nAnswer:"
 
 
@@ -40,7 +56,8 @@ def extract_answer(response):
     return None
 
 
-def evaluate_baseline(model, tokenizer, dataset, num_examples=0, categories=None):
+def evaluate_baseline(model, tokenizer, dataset, num_examples=0, categories=None,
+                      with_selph=False):
     """Evaluate base model on MMLU-Pro (standard MC)."""
     examples = list(dataset)
     if categories:
@@ -55,7 +72,7 @@ def evaluate_baseline(model, tokenizer, dataset, num_examples=0, categories=None
 
     t0 = time.time()
     for i, ex in enumerate(examples):
-        prompt = format_prompt(ex["question"], ex["options"])
+        prompt = format_prompt(ex["question"], ex["options"], with_selph=with_selph)
         response = generate(model, tokenizer, prompt=prompt, max_tokens=32)
         pred = extract_answer(response)
         expected = ex["answer"]
@@ -99,6 +116,8 @@ def main():
                         help="Number of examples (0 = all)")
     parser.add_argument("--categories", nargs="*", default=None,
                         help="Filter to specific categories")
+    parser.add_argument("--with-selph", action="store_true",
+                        help="Include SELPH function signatures in prompt")
     args = parser.parse_args()
 
     print(f"Loading model: {args.model}")
@@ -116,6 +135,7 @@ def main():
         model, tokenizer, ds["test"],
         num_examples=args.num_examples,
         categories=args.categories,
+        with_selph=args.with_selph,
     )
 
 

@@ -33,6 +33,51 @@ THINK_CLOSE_ID = 248069
 EOS_ID = 248044
 LETTERS = "ABCDEFGHIJ"
 
+# Knowledge KB
+KNOWLEDGE_KB = None
+
+def load_knowledge_kb():
+    global KNOWLEDGE_KB
+    kb_path = SCRIPT_DIR / "data" / "knowledge_kb_clean.json"
+    if kb_path.exists():
+        KNOWLEDGE_KB = json.loads(kb_path.read_text())
+        print(f"Knowledge KB loaded: {len(KNOWLEDGE_KB)} entries")
+    else:
+        KNOWLEDGE_KB = {}
+
+def kb_lookup(concept):
+    if not KNOWLEDGE_KB:
+        return f"Unknown concept: {concept}"
+    key = concept.lower().strip()
+    if key in KNOWLEDGE_KB:
+        return KNOWLEDGE_KB[key]["definition"]
+    for k, v in KNOWLEDGE_KB.items():
+        if key in k or k in key:
+            return v["definition"]
+    return f"Unknown concept: {concept}"
+
+def kb_apropos(keyword):
+    if not KNOWLEDGE_KB:
+        return "No entries found"
+    keyword = keyword.lower().strip()
+    matches = [v["term"] for k, v in KNOWLEDGE_KB.items()
+               if keyword in k or keyword in v.get("definition", "").lower()[:200]]
+    return ", ".join(matches[:10]) if matches else "No entries found"
+
+SELPH_SYSTEM = """You have access to SELPH, a symbolic computation and knowledge system. Use <tool_call>(expression)</tool_call> during thinking to evaluate expressions. Results replace the tool_call block.
+
+Core functions:
+  Arithmetic: (add a b), (subtract a b), (multiply a b), (divide a b), (power base exp), (sqrt x), (abs x), (floor x), (round x n)
+  Percentage: (multiply value (divide percent 100)) for "X% of Y"
+  Finance: (multiply P (power (add 1 r) n)) for compound interest, (divide FV (power (add 1 r) n)) for present value
+  Knowledge: (lookup concept) for definitions and facts, (related concept relation) for relationships between concepts
+
+Discovery:
+  (apropos "keyword") — search for functions by name
+  (apropos-by-type "input-type" "output-type") — search functions by type signature
+
+Use <tool_call> whenever you need to compute a value or look up a fact you are unsure about."""
+
 
 def eval_sexpr(s):
     """Evaluate a SELPH s-expression."""
@@ -99,6 +144,10 @@ def eval_sexpr(s):
                 elif op == "log": return math.log(vals[0]) if vals[0] > 0 else None
                 elif op == "max": return max(vals)
                 elif op == "min": return min(vals)
+                # Knowledge operations
+                elif op == "lookup": return kb_lookup(str(vals[0]))
+                elif op == "related": return kb_lookup(f"{vals[0]} {vals[1]}")
+                elif op == "apropos": return kb_apropos(str(vals[0]))
                 else: return None
             except: return None
         return ev(parse())
@@ -233,6 +282,10 @@ def main():
     parser.add_argument("--save-every", type=int, default=5,
                         help="Save adapter every N epochs")
     parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "adapters_grpo"))
+    parser.add_argument("--preserve-data", default=str(SCRIPT_DIR / "training_data_traces" / "train.jsonl"),
+                        help="SFT data to mix in for format preservation (prevents catastrophic forgetting)")
+    parser.add_argument("--preserve-ratio", type=float, default=0.5,
+                        help="Ratio of preservation data to GRPO data")
     args = parser.parse_args()
 
     # Prepare training data from MMLU-Pro business calc
@@ -249,7 +302,7 @@ def main():
         for ex in calc_qs:
             opts = "\n".join(f"{LETTERS[i]}. {opt}" for i, opt in enumerate(ex["options"]))
             train_data.append({
-                "prompt": f"Question: {ex['question']}\n{opts}\n\n<think>\nLet me work through this. I can use <tool_call>(expr)</tool_call> to compute.\n",
+                "prompt": f"{SELPH_SYSTEM}\n\nQuestion: {ex['question']}\n{opts}\n\n<think>\n",
                 "answer": ex["answer"],
                 "options": ex["options"],
             })
@@ -262,6 +315,36 @@ def main():
     with open(data_path) as f:
         train_data = json.load(f)
     print(f"Training data: {len(train_data)} questions")
+
+    # Load knowledge KB
+    load_knowledge_kb()
+
+    # Load format preservation data (SFT traces + standard MC examples)
+    preserve_data = []
+    preserve_path = Path(args.preserve_data)
+    if preserve_path.exists():
+        with open(preserve_path) as f:
+            preserve_data = [json.loads(line) for line in f]
+        print(f"Format preservation data: {len(preserve_data)} examples from {preserve_path}")
+
+        # Also generate standard-format MC examples from the training questions
+        # These teach the model to answer "Question:...\nAnswer: X" without thinking
+        standard_mc = []
+        for ex in train_data:
+            # Extract question+options, strip SELPH system prompt and <think>
+            parts = ex["prompt"].split("\n\nQuestion: ")
+            if len(parts) > 1:
+                q_and_opts = "Question: " + parts[1].split("\n\n<think>")[0]
+            else:
+                q_and_opts = ex["prompt"].split("\n\n<think>")[0]
+            standard_mc.append({
+                "prompt": q_and_opts + "\nAnswer:",
+                "completion": f" {ex['answer']}",
+            })
+        preserve_data.extend(standard_mc)
+        print(f"  + {len(standard_mc)} standard MC format examples = {len(preserve_data)} total")
+    else:
+        print(f"No preservation data at {preserve_path}")
 
     # Load model
     print(f"Loading model: {args.model}")
@@ -380,18 +463,32 @@ def main():
         round_data_dir = out_dir / f"data_epoch{epoch+1}"
         round_data_dir.mkdir(parents=True, exist_ok=True)
 
+        # Mix in format preservation data to prevent catastrophic forgetting
+        mixed_data = list(training_data)
+        if preserve_data:
+            n_preserve = int(len(training_data) * args.preserve_ratio)
+            preserve_sample = random.sample(
+                preserve_data, min(n_preserve, len(preserve_data))
+            )
+            mixed_data.extend(preserve_sample)
+            print(f"  Mixed: {len(training_data)} GRPO + {len(preserve_sample)} preservation = {len(mixed_data)} total")
+
         # Split 90/10
-        random.shuffle(training_data)
-        split = max(1, int(len(training_data) * 0.9))
-        for name, data in [("train", training_data[:split]),
-                           ("valid", training_data[split:])]:
+        random.shuffle(mixed_data)
+        split = max(1, int(len(mixed_data) * 0.9))
+        for name, data in [("train", mixed_data[:split]),
+                           ("valid", mixed_data[split:])]:
             with open(round_data_dir / f"{name}.jsonl", "w") as f:
                 for item in data:
                     f.write(json.dumps(item) + "\n")
 
+        # Create test.jsonl (copy of valid) for mlx_lm
+        import shutil
+        shutil.copy(round_data_dir / "valid.jsonl", round_data_dir / "test.jsonl")
+
         # Fine-tune with mlx_lm lora
         next_adapter = str(out_dir / f"adapter_epoch{epoch+1}")
-        lora_iters = min(200, len(training_data) // args.batch_size)
+        lora_iters = min(200, len(mixed_data) // args.batch_size)
 
         print(f"\nPhase 3: Fine-tuning for {lora_iters} iterations...")
 

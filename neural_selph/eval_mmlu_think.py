@@ -5,15 +5,10 @@ When it emits <tool_call>...</tool_call>, the s-expression is immediately
 evaluated and the entire block is replaced with the result in context.
 The model sees the computed value and continues reasoning.
 
-Example thinking trace:
-  <think>
-  Compound interest: P(1+r)^n
+Supports both computation and knowledge lookup:
   <tool_call>(multiply 1000 (power (add 1 0.05) 4))</tool_call>1215.51
-  That matches option C.
-  </think>
-  C
-
-The model never sees the raw s-expression after evaluation — just the result.
+  <tool_call>(lookup "vitamin A")</tool_call>Vitamin A is a fat-soluble vitamin...
+  <tool_call>(apropos "vitamin")</tool_call>["vitamin A", "vitamin K", ...]
 """
 import json
 import re
@@ -36,6 +31,47 @@ TOOL_CALL_OPEN_ID = 248058   # <tool_call>
 TOOL_CALL_CLOSE_ID = 248059  # </tool_call>
 THINK_CLOSE_ID = 248069      # </think>
 EOS_ID = 248044               # <|endoftext|>
+
+# Global knowledge KB (loaded once)
+KNOWLEDGE_KB = None
+
+def load_knowledge_kb(path=None):
+    """Load the knowledge KB for lookup/apropos support."""
+    global KNOWLEDGE_KB
+    if path is None:
+        path = SCRIPT_DIR / "data" / "knowledge_kb_clean.json"
+    if path.exists():
+        KNOWLEDGE_KB = json.loads(path.read_text())
+        print(f"Knowledge KB loaded: {len(KNOWLEDGE_KB)} entries")
+    else:
+        KNOWLEDGE_KB = {}
+        print(f"No knowledge KB at {path}")
+
+
+def kb_lookup(concept):
+    """Look up a concept in the knowledge KB."""
+    if not KNOWLEDGE_KB:
+        return f"Unknown concept: {concept}"
+    key = concept.lower().strip()
+    if key in KNOWLEDGE_KB:
+        return KNOWLEDGE_KB[key]["definition"]
+    # Fuzzy match: check if any key contains the query
+    for k, v in KNOWLEDGE_KB.items():
+        if key in k or k in key:
+            return v["definition"]
+    return f"Unknown concept: {concept}"
+
+
+def kb_apropos(keyword):
+    """Search KB for entries matching a keyword."""
+    if not KNOWLEDGE_KB:
+        return "No entries found"
+    keyword = keyword.lower().strip()
+    matches = [v["term"] for k, v in KNOWLEDGE_KB.items()
+               if keyword in k or keyword in v.get("definition", "").lower()[:200]]
+    if matches:
+        return ", ".join(matches[:10])
+    return "No entries found"
 
 
 def eval_sexpr_string(s):
@@ -110,6 +146,10 @@ def eval_sexpr_string(s):
                 elif op == "gcd": return math.gcd(int(vals[0]), int(vals[1]))
                 elif op == "abs": return abs(vals[0])
                 elif op == "round": return round(vals[0], int(vals[1]) if len(vals) > 1 else 0)
+                # Knowledge operations
+                elif op == "lookup": return kb_lookup(str(vals[0]))
+                elif op == "related": return kb_lookup(f"{vals[0]} {vals[1]}")
+                elif op == "apropos": return kb_apropos(str(vals[0]))
                 else: return None
             except: return None
 
@@ -224,13 +264,28 @@ def extract_answer(response):
     return m.group(1) if m else None
 
 
+SELPH_SYSTEM = """You have access to SELPH, a symbolic computation and knowledge system. Use <tool_call>(expression)</tool_call> during thinking to evaluate expressions. Results replace the tool_call block.
+
+Core functions:
+  Arithmetic: (add a b), (subtract a b), (multiply a b), (divide a b), (power base exp), (sqrt x), (abs x), (floor x), (round x n)
+  Percentage: (multiply value (divide percent 100)) for "X% of Y"
+  Finance: (multiply P (power (add 1 r) n)) for compound interest, (divide FV (power (add 1 r) n)) for present value
+  Knowledge: (lookup concept) for definitions and facts, (related concept relation) for relationships between concepts
+
+Discovery:
+  (apropos "keyword") - search for functions by name
+  (apropos-by-type "input-type" "output-type") - search functions by type signature
+
+Use <tool_call> whenever you need to compute a value or look up a fact you are unsure about."""
+
+
 def format_prompt_think(question, options):
-    """Format prompt with thinking mode."""
+    """Format prompt with thinking mode + SELPH system prompt."""
     opts = "\n".join(f"{LETTERS[i]}. {opt}" for i, opt in enumerate(options))
     return (
+        f"{SELPH_SYSTEM}\n\n"
         f"Question: {question}\n{opts}\n\n"
-        f"<think>\nLet me work through this step by step. "
-        f"I can use <tool_call>(expression)</tool_call> to compute values.\n"
+        f"<think>\n"
     )
 
 
@@ -249,6 +304,9 @@ def main():
     parser.add_argument("--mode", choices=["baseline", "think", "think-selph"], default="think-selph")
     parser.add_argument("--src-filter", default=None, help="Filter by source (e.g. stemez-Business)")
     args = parser.parse_args()
+
+    # Load knowledge KB for lookup/apropos
+    load_knowledge_kb()
 
     print(f"Loading model: {args.model}")
     if args.adapter_path:
