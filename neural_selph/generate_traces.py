@@ -27,6 +27,31 @@ from mlx_lm.sample_utils import make_sampler
 SCRIPT_DIR = Path(__file__).parent
 LETTERS = "ABCDEFGHIJ"
 
+# Load knowledge KB
+KNOWLEDGE_KB = {}
+_kb_path = SCRIPT_DIR / "data" / "knowledge_kb_clean.json"
+if _kb_path.exists():
+    KNOWLEDGE_KB = json.loads(_kb_path.read_text())
+
+def kb_lookup(concept):
+    if not KNOWLEDGE_KB:
+        return None
+    key = concept.lower().strip()
+    if key in KNOWLEDGE_KB:
+        return KNOWLEDGE_KB[key]["definition"]
+    for k, v in KNOWLEDGE_KB.items():
+        if key in k or k in key:
+            return v["definition"]
+    return None
+
+def kb_apropos(keyword):
+    if not KNOWLEDGE_KB:
+        return None
+    keyword = keyword.lower().strip()
+    matches = [v["term"] for k, v in KNOWLEDGE_KB.items()
+               if keyword in k or keyword in v.get("definition", "").lower()[:200]]
+    return ", ".join(matches[:10]) if matches else None
+
 # Multi-domain SELPH function signatures
 SELPH_FUNCTIONS = """You have access to SELPH, a symbolic computation and knowledge system. Use <tool_call>(expression)</tool_call> during thinking to evaluate expressions. Results replace the tool_call block.
 
@@ -77,13 +102,17 @@ def eval_sexpr(s):
             c = s[i]
             if c in '()': tokens.append(c); i += 1
             elif c in ' \t\n': i += 1
+            elif c == '"':
+                j = i + 1
+                while j < len(s) and s[j] != '"': j += 1
+                tokens.append(s[i+1:j]); i = j + 1  # Strip quotes
             elif c == '-' and i+1 < len(s) and (s[i+1].isdigit() or s[i+1] == '.'):
                 j = i+1
                 while j < len(s) and (s[j].isdigit() or s[j]=='.'): j += 1
                 tokens.append(s[i:j]); i = j
             else:
                 j = i
-                while j < len(s) and s[j] not in '() \t\n': j += 1
+                while j < len(s) and s[j] not in '() \t\n"': j += 1
                 tokens.append(s[i:j]); i = j
         return tokens
     try:
@@ -102,6 +131,7 @@ def eval_sexpr(s):
                 except: return tok
         def ev(tree):
             if isinstance(tree, (int, float)): return tree
+            if isinstance(tree, str): return tree  # string literal — not None
             if tree is None: return None
             op, args = tree
             vals = [ev(a) for a in args]
@@ -122,6 +152,10 @@ def eval_sexpr(s):
                 elif op == "max": return max(vals)
                 elif op == "min": return min(vals)
                 elif op == "remainder": return vals[0]%vals[1] if vals[1]!=0 else None
+                elif op == "lookup": return kb_lookup(str(vals[0]))
+                elif op == "related":
+                    return kb_lookup(f"{vals[0]} {vals[1]}") if len(vals) > 1 else kb_lookup(str(vals[0]))
+                elif op == "apropos": return kb_apropos(str(vals[0]))
                 else: return None
             except: return None
         return ev(parse())
@@ -146,7 +180,13 @@ def post_process_trace(raw_trace, answer_letter):
     def replace_tool_call(match):
         sexpr = match.group(1).strip()
         result = eval_sexpr(sexpr)
-        result_str = format_number(result)
+        if result is None:
+            result_str = "ERROR"
+        elif isinstance(result, str):
+            # Knowledge lookup result — truncate for trace readability
+            result_str = result[:200]
+        else:
+            result_str = format_number(result)
         return f"<tool_call>{sexpr}</tool_call>{result_str}"
 
     processed = re.sub(
