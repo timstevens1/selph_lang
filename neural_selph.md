@@ -303,7 +303,66 @@ Gains across 11/14 categories. Biggest: psychology +16, biology +14, business +1
 
 **GRPO all-categories:** Collapsed — epoch 1→2 improved (8%→11%) but epoch 3 hit 0%. The think-mode prompt format in GRPO conflicted with standard MC eval format, causing catastrophic forgetting.
 
-**Lesson:** GRPO fine-tuning must match the eval prompt format, or mix in format-preserving examples to prevent collapse.
+**Lesson:** GRPO fine-tuning must match the eval prompt format, or mix in format-preserving examples to prevent collapse. Format preservation fix implemented (mix SFT traces + standard MC examples into GRPO data).
+
+### Exp 6: Knowledge KB + v3 Traces (2026-04-18)
+
+**Knowledge KB built:** 398 Wikipedia-backed entries across all MMLU-Pro categories. Supports `(lookup concept)`, `(related concept relation)`, `(apropos keyword)`. KB expanded with 69 entries derived from actual model query patterns (85% hit rate).
+
+**System prompt updated:** Removed "only use for numeric results" restriction. Now encourages both computation AND knowledge lookup. Added `apropos` discovery. Qwen3.6-35B naturally uses `<tool_call>` for knowledge queries across all categories with this prompt.
+
+**v3 traces (35B, KB-resolved):** 644 traces, 73 with SELPH. 172 lookup calls resolved with real Wikipedia definitions (vs 0 in v2). Arithmetic calls continue to work (33 ok).
+
+**SFT v3 results:**
+
+| Model | MMLU-Pro |
+|---|---|
+| Base | 25.9% |
+| SFT v1 (122B, computation-only) | **31.7%** |
+| SFT v2 (35B, knowledge-enabled, ERROR results) | 29.9% |
+| SFT v3 (35B, KB-resolved lookups) | 30.6% |
+
+**Key finding:** 122B traces (v1) remain best despite older system prompt. Teacher model quality (122B > 35B) matters more than KB integration. KB lookup results may add noise by inserting long Wikipedia passages into reasoning traces.
+
+**Next steps:**
+1. Regenerate traces with 122B + new system prompt + working KB backend
+2. GRPO with format preservation across all categories
+3. Scale KB with more targeted entries
+
+## Summary of Results
+
+| Experiment | MMLU-Pro | Delta | Key Insight |
+|---|---|---|---|
+| Base Qwen3.5-0.8B | 25.9% | — | Baseline |
+| GRPO business-only | 25.6% | -0.3% | Specialization hurts other categories |
+| SFT v1 (122B traces) | **31.7%** | **+5.8%** | Best result; teacher quality is key |
+| SFT v2 (35B, errors) | 29.9% | +4.0% | 35B weaker teacher |
+| SFT v3 (35B, KB-backed) | 30.6% | +4.7% | KB helps slightly vs errors |
+| GRPO all-categories | 0% | collapsed | Format mismatch (fixed) |
+
+## Infrastructure Built
+
+| Component | File | Purpose |
+|---|---|---|
+| MathQA converter | `convert_mathqa.py` | 29K math → SELPH s-expressions |
+| Geo KB builder | `build_geo_kb.py` | Wikidata → SELPH geography KB |
+| Knowledge KB builder | `build_knowledge_kb.py` | Wikipedia → 398-entry multi-domain KB |
+| Passage annotator | `annotate_passages.py` | Inline `<tool_call>` in natural text |
+| Trace generator | `generate_traces.py` | Large model → think+SELPH training traces |
+| Training data prep | `prepare_training_data.py` | MLX LoRA format with `<tool_call>` delimiters |
+| Reward function | `reward.py` | Grounding check (no smuggled knowledge) |
+| GRPO trainer | `grpo_train.py` | Advantage-weighted RL with format preservation |
+| MMLU-Pro eval | `eval_mmlu_pro.py` | Standard MC evaluation |
+| Think+SELPH eval | `eval_mmlu_think.py` | Inline SELPH evaluation during `<think>` |
+| Constrained decode | `constrained_decode.py` | Outlines grammar for s-expressions |
+| Training launcher | `train.sh` | MLX LoRA training script |
+| Evaluation | `evaluate.py` | Generation eval with prefix injection |
+
+## SELPH Changes
+
+- `apropos` builtin: search library functions by name substring
+- `apropos-by-type` builtin: search by parameter/return type signature
+- Both added to `eval_v2.rs` with tests
 
 ## Long-Term Future Directions
 
