@@ -1,0 +1,135 @@
+; ---------------------------------------------------------------------------
+; m_induction: Intermediate-value decomposition via binary builtins (hole-fc)
+; ---------------------------------------------------------------------------
+;
+; Decomposer that finds compositions of the form:
+;
+;   solution(x) = f(binop(x, k))
+;
+; where `binop` is add/subtract/multiply, `k` is a small integer constant,
+; and `f` is sub-synthesized by the Rust hole-filling engine.
+;
+; Complements m_rd (which handles unary library functions). Together they
+; cover the full Rust Induction strategy:
+;   - m_rd:        unary library fn as inner transform
+;   - m_induction: binary builtin + constant as inner transform
+;
+; Algorithm:
+;   1. For each (binop, k) pair, compute intermediates = map(binop(_, k), inputs)
+;   2. Skip if: identity, constant, all-same, or any application errors
+;   3. If intermediates == expected, emit (lambda (x) (binop x k)) directly
+;   4. Otherwise, return template with hole for outer function:
+;      (lambda (x) (let ((x (binop x k))) __hole_0__))
+;      with sub-spec = [(intermediate_i, expected_i), ...]
+;
+; Registered as "m-induction" in __decomposers__.
+
+; -- Constants ---------------------------------------------------------------
+
+(define in-binary-fns (list "add" "subtract" "multiply"))
+(define in-small-ints (list 1 2 -1 5))
+
+; -- Helpers -----------------------------------------------------------------
+; Reuses rd-lists-equal? and rd-all-same? from m_rd.selph (loaded earlier).
+
+(define in-safe-binop
+  (lambda (f x k)
+    (try (f x k) nil)))
+
+(define in-compute-intermediates
+  (lambda (f k inputs)
+    (let ((results (map (lambda (inp) (in-safe-binop f inp k)) inputs)))
+      (if (member? nil results)
+        nil
+        results))))
+
+; -- Try one (binop, k) pair -------------------------------------------------
+;
+; Returns:
+;   - Direct match: (ns ("found" true) ("nodes" ...) ("candidates" 1))
+;   - Bridge needed: (ns ("found" true) ("nodes" ...) ("holes" ...) ("candidates" 1))
+;   - No match: (ns ("found" false))
+
+(define in-try-one
+  (lambda (name f k inputs outputs)
+    (let ((intermediates (in-compute-intermediates f k inputs)))
+      (if (nil? intermediates)
+        (ns ("found" false))
+        (if (rd-lists-equal? intermediates inputs)
+          (ns ("found" false))
+          (if (rd-all-same? intermediates)
+            (ns ("found" false))
+            (if (rd-lists-equal? intermediates outputs)
+              ; Direct match: (lambda (x) (binop x k))
+              (ns ("found" true)
+                  ("nodes" (make-lambda (list "x")
+                             (make-app (make-symbol name)
+                                       (make-symbol "x")
+                                       (make-int k))))
+                  ("candidates" 1))
+              ; Bridge needed: template with hole.
+              ; The hole sits in the let-body position. Sub-synth
+              ; produces (lambda (x) <body>); inline=true extracts
+              ; <body>, whose x references resolve to the let-bound
+              ; x (= (binop x k)).
+              (let ((sub-spec
+                      (map (lambda (i)
+                             (list (nth intermediates i) (nth outputs i)))
+                           (range (length inputs)))))
+                (ns ("found" true)
+                    ("nodes" (make-lambda (list "x")
+                               (make-let
+                                 (list (list "x" (make-app (make-symbol name)
+                                                           (make-symbol "x")
+                                                           (make-int k))))
+                                 (make-hole 0))))
+                    ("holes" (ns ("__hole_0__"
+                                   (ns ("spec" sub-spec) ("inline" true) ("flat-only" true)))))
+                    ("candidates" 1))))))))))
+
+; -- Main search -------------------------------------------------------------
+;
+; Walk all (binop, k) pairs, return first match (direct or with holes).
+
+(define in-try-all
+  (lambda (inputs outputs)
+    (reduce
+      (lambda (best name)
+        (if (ns-get best "found") best
+          (let ((f (try (env-lookup name) nil)))
+            (if (nil? f) best
+              (reduce
+                (lambda (best2 k)
+                  (if (ns-get best2 "found") best2
+                    (try (in-try-one name f k inputs outputs)
+                         best2)))
+                in-small-ints
+                best)))))
+      in-binary-fns
+      (ns ("found" false)))))
+
+; -- Entry point -------------------------------------------------------------
+
+; Check if a value is numeric (Int or Num).
+(define in-numeric?
+  (lambda (v) (or (int? v) (num? v))))
+
+(define detect-induction
+  (lambda (synth-spec)
+    (let ((pairs (ns-get synth-spec "spec")))
+      (if (< (length pairs) 3)
+        (ns ("found" false))
+        ; Only handle unary tasks with scalar numeric inputs AND outputs.
+        ; Binary arithmetic intermediates only make sense for numeric domains.
+        (let ((inputs (map head pairs))
+              (outputs (map (lambda (p) (head (tail p))) pairs)))
+          (if (not (in-numeric? (head inputs)))
+            (ns ("found" false))
+            (if (not (in-numeric? (head outputs)))
+              (ns ("found" false))
+              (in-try-all inputs outputs))))))))
+
+; -- Registration ------------------------------------------------------------
+
+(define __decomposers__
+  (ns-put __decomposers__ "m-induction" detect-induction))

@@ -1,0 +1,284 @@
+; -------------------------------------------------------------------------
+; Meta-curriculum M8g-proximity-recolor: Form 15 - Radius-based proximity recoloring
+; -------------------------------------------------------------------------
+;
+; Detects tasks where cells of a source color within Manhattan distance N
+; of a non-source, non-background cell get recolored to a target color.
+;
+; Pattern: "All cells within 2 steps of a red cell become blue"
+;
+; Form 15 probes:
+;   For each non-background color C in input:
+;     For each target color T (0-9, T != C):
+;       For radius R in 1..3:
+;         Generate candidate: grid-recolor-by-proximity-radius(input, C, T, R)
+;         Validate against all training pairs (including held-out test)
+;         If matches perfectly, emit solution
+
+; ── Helpers ──────────────────────────────────────────────────────────
+
+(define m8pr-spec-inputs  (lambda (s) (ns-get s "inputs")))
+(define m8pr-spec-outputs (lambda (s) (ns-get s "outputs")))
+
+(define m8pr-grid-target
+  (lambda (s)
+    (let ((outs (m8pr-spec-outputs s)))
+      (if (reduce (lambda (acc v) (and acc (grid? v))) outs true)
+        outs
+        nil))))
+
+; Extract the grid from spec input - just return the input as-is
+(define m8pr-input-grid
+  (lambda (inp) inp))
+
+; Reference to (nth x 0) AST — the input grid in a lambda body
+(define m8pr-x0
+  (lambda () (make-app "nth" (make-symbol "x") (make-int 0))))
+
+(define m8pr-wrap-lambda
+  (lambda (body) (make-lambda (list "x") body)))
+
+; ── Form 15: proximity recolor with radius ──────────────────────────
+;
+; For each non-background color C in the first input:
+;   For each target color T (0-9, T != C):
+;     For radius R in 1..3:
+;       Try grid-recolor-by-proximity-radius(input, C, T, R)
+;       If it matches all training pairs, emit the solution
+
+(define m8pr-try-form-15
+  (lambda (inputs target)
+    (let ((first-in (m8pr-input-grid (head inputs))))
+      (let ((bg (grid-background first-in))
+            (colors (grid-colors first-in)))
+        ; Get non-background colors as source candidates
+        (let ((source-candidates (filter (lambda (c) (not (= c bg))) colors)))
+          ; Try each source color, target color, and radius combination
+          (m8pr-form-15-loop inputs target bg source-candidates))))))
+
+(define m8pr-form-15-loop
+  (lambda (inputs target bg source-candidates)
+    (if (= (length source-candidates) 0) nil
+      (let ((source-color (head source-candidates)))
+        ; Try all target colors (0-9) except source and background
+        (let ((target-candidates
+                (filter (lambda (t) (not (= t source-color)))
+                        (range 10))))
+          (let ((result (m8pr-form-15-target-loop inputs target bg source-color target-candidates)))
+            (if (not (nil? result))
+              result
+              (m8pr-form-15-loop inputs target bg (tail source-candidates)))))))))
+
+(define m8pr-form-15-target-loop
+  (lambda (inputs target bg source-color target-candidates)
+    (if (= (length target-candidates) 0) nil
+      (let ((target-color (head target-candidates)))
+        ; Try radius 1, 2, 3
+        (let ((result (m8pr-form-15-radius-loop inputs target bg source-color target-color 1)))
+          (if (not (nil? result))
+            result
+            (m8pr-form-15-target-loop inputs target bg source-color (tail target-candidates))))))))
+
+(define m8pr-form-15-radius-loop
+  (lambda (inputs target bg source-color target-color radius)
+    (if (> radius 3) nil
+      (let ((candidate (map (lambda (inp)
+                              (try (grid-recolor-by-proximity-radius
+                                     (m8pr-input-grid inp)
+                                     source-color
+                                     target-color
+                                     radius)
+                                   nil))
+                            inputs)))
+        (if (reduce (lambda (acc i)
+                      (and acc
+                           (not (nil? (nth candidate i)))
+                           (= (nth candidate i) (nth target i))))
+                    (range (length target))
+                    true)
+          ; Success! Emit the solution
+          (ns ("kind" (concat "form-15-proximity-recolor-"
+                              (to-string source-color)
+                              "-to-"
+                              (to-string target-color)
+                              "-radius-"
+                              (to-string radius)))
+              ("source-node"
+                (m8pr-wrap-lambda
+                  (make-app "grid-recolor-by-proximity-radius"
+                    (m8pr-x0)
+                    (make-int source-color)
+                    (make-int target-color)
+                    (make-int radius)))))
+          ; Try next radius
+          (m8pr-form-15-radius-loop inputs target bg source-color target-color (+ radius 1)))))))
+
+; ── Chain helper ─────────────────────────────────────────────────────
+
+(define m8pr-try-chain
+  (lambda (forms)
+    (if (= (length forms) 0)
+      (ns ("found" false) ("reason" "no proximity-recolor form matched"))
+      (let ((result (try ((head forms)) nil)))
+        (if (not (nil? result))
+          (ns-put result "found" true)
+          (m8pr-try-chain (tail forms)))))))
+
+; ── Top-level: detect-proximity-recolor ──────────────────────────────
+
+(define detect-proximity-recolor
+  (lambda (s)
+    (let ((target (m8pr-grid-target s)))
+      (if (nil? target)
+        (ns ("found" false) ("reason" "non-grid target"))
+        (let ((inputs (m8pr-spec-inputs s)))
+          (m8pr-try-chain
+            (list
+              (lambda () (m8pr-try-form-15 inputs target)))))))))
+
+; ── Smoke tests ──────────────────────────────────────────────────────
+
+(define m8pr-make-spec
+  (lambda (inputs outputs arity)
+    (ns ("inputs" inputs) ("outputs" outputs) ("arity" arity))))
+
+(define m8pr-run-test
+  (lambda (label spec)
+    (let ((result (detect-proximity-recolor spec)))
+      (if (ns-get result "found")
+        (print (concat "  OK " label " kind=" (ns-get result "kind")))
+        (print (concat "  FAIL " label " " (ns-get result "reason")))))))
+
+; Test 1: Simple proximity recolor - cells of color 3 within radius 1
+; of color 2 get recolored to color 8
+; Input:  3x3 grid with center 2, corners 3
+; Output: corners become 8 (within distance 1 of center)
+(define m8pr-test-simple-in
+  (list (list 3 0 3)
+        (list 0 2 0)
+        (list 3 0 3)))
+
+; With radius 1, only cells at distance 1 from center get recolored
+; Center (2) is at (1,1). Cells at distance 1: (0,1), (1,0), (1,2), (2,1)
+; Cells at distance 2: corners (0,0), (0,2), (2,0), (2,2)
+; So corners should NOT be recolored with radius 1
+(define m8pr-test-simple-out
+  (list (list 3 0 3)
+        (list 0 2 0)
+        (list 3 0 3)))
+
+; Actually, let's design a test where radius 1 works
+; Input: 3x3 grid with 2 at (0,0), 3 at (0,1) and (1,0)
+; Output: 3s become 8 (within distance 1 of 2)
+(define m8pr-test-radius1-in
+  (list (list 2 3 0)
+        (list 3 0 0)
+        (list 0 0 0)))
+
+(define m8pr-test-radius1-out
+  (list (list 2 8 0)
+        (list 8 0 0)
+        (list 0 0 0)))
+
+(define m8pr-test-radius1-spec
+  (m8pr-make-spec
+    (list m8pr-test-radius1-in)
+    (list m8pr-test-radius1-out)
+    1))
+
+; Test 2: Radius 2 - cells within distance 2 of source get recolored
+; Input: 7x7 grid with 2 at center (3,3), 3s at distance 1-2, lots of 0 so bg=0
+; Output: 3s within distance 2 become 8
+(define m8pr-test-radius2-in
+  (list (list 0 0 0 0 0 0 0)
+        (list 0 0 0 3 0 0 0)
+        (list 0 0 3 3 3 0 0)
+        (list 0 3 3 2 3 3 0)
+        (list 0 0 3 3 3 0 0)
+        (list 0 0 0 3 0 0 0)
+        (list 0 0 0 0 0 0 0)))
+
+; All 3s are within distance 2 of center (3,3), so all become 8
+(define m8pr-test-radius2-out
+  (list (list 0 0 0 0 0 0 0)
+        (list 0 0 0 8 0 0 0)
+        (list 0 0 8 8 8 0 0)
+        (list 0 8 8 2 8 8 0)
+        (list 0 0 8 8 8 0 0)
+        (list 0 0 0 8 0 0 0)
+        (list 0 0 0 0 0 0 0)))
+
+(define m8pr-test-radius2-spec
+  (m8pr-make-spec
+    (list m8pr-test-radius2-in)
+    (list m8pr-test-radius2-out)
+    1))
+
+; Test 3: Multiple source cells - all 2s are sources, 3s near any 2 become 8
+(define m8pr-test-multi-source-in
+  (list (list 3 3 0 0 0)
+        (list 3 2 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 2 3)
+        (list 0 0 0 3 3)))
+
+; 3s near (1,1) or (3,3) become 8
+(define m8pr-test-multi-source-out
+  (list (list 8 8 0 0 0)
+        (list 8 2 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 2 8)
+        (list 0 0 0 8 8)))
+
+(define m8pr-test-multi-source-spec
+  (m8pr-make-spec
+    (list m8pr-test-multi-source-in)
+    (list m8pr-test-multi-source-out)
+    1))
+
+; Test 4: No match - 3s are too far from any 2
+(define m8pr-test-no-match-in
+  (list (list 3 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 2)))
+
+; 3 at (0,0) is distance 8 from 2 at (4,4), so with radius 1-3, no change
+(define m8pr-test-no-match-out
+  (list (list 3 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 0)
+        (list 0 0 0 0 2)))
+
+(define m8pr-test-no-match-spec
+  (m8pr-make-spec
+    (list m8pr-test-no-match-in)
+    (list m8pr-test-no-match-out)
+    1))
+
+; Test 5: Target color = 0 (background) - remove 3s near 2s
+(define m8pr-test-target-bg-in
+  (list (list 3 3 0)
+        (list 3 2 0)
+        (list 0 0 0)))
+
+; 3s near 2 become 0 (background)
+(define m8pr-test-target-bg-out
+  (list (list 0 0 0)
+        (list 0 2 0)
+        (list 0 0 0)))
+
+(define m8pr-test-target-bg-spec
+  (m8pr-make-spec
+    (list m8pr-test-target-bg-in)
+    (list m8pr-test-target-bg-out)
+    1))
+
+(print "--- m8g_proximity_recolor smoke tests ---")
+(m8pr-run-test "radius-1" m8pr-test-radius1-spec)
+(m8pr-run-test "radius-2" m8pr-test-radius2-spec)
+(m8pr-run-test "multi-source" m8pr-test-multi-source-spec)
+(m8pr-run-test "no-match" m8pr-test-no-match-spec)
+(m8pr-run-test "target-bg" m8pr-test-target-bg-spec)

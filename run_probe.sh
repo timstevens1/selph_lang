@@ -35,33 +35,59 @@ fi
 COMBINED="$(mktemp -t probe.XXXXXX.selph)"
 trap 'rm -f "$COMBINED"' EXIT
 
-cat \
-    "$META/m_pool.selph" \
-    "$META/m13_data_atoms.selph" \
-    "$META/m7_library_detection.selph" \
-    "$META/m8_constant_fit.selph" \
-    "$META/m9_unary_wrap.selph" \
-    "$META/m10_affine_combination.selph" \
-    "$META/m11_product_fit.selph" \
-    "$META/m12_structural_pair_fit.selph" \
-    "$META/m_pool_string.selph" \
-    "$META/m8s_constant_string.selph" \
-    "$META/m10s_concat_pair.selph" \
-    "$META/m11s_string_repeat.selph" \
-    "$META/m_pool_grid.selph" \
-    "$META/m8g_constant_grid.selph" \
-    "$META/m8g_symmetry.selph" \
-    "$META/m8g_recolor.selph" \
-    "$META/m8g_line_draw.selph" \
-    "$META/m8g_per_object.selph" \
-    "$META/m8g_template_stamp.selph" \
-    "$META/m8g_compose.selph" \
-    "$META/m_chain.selph" \
-    "$META/m_fitness_grid.selph" \
-    "$META/m_refine.selph" \
-    "$META/m_ho.selph" \
-    "$CURRICULUM" \
-    > "$COMBINED"
+# List of files in concat order (for offset tracking)
+FILES=(
+    "$META/m_pool.selph"
+    "$META/m13_data_atoms.selph"
+    "$META/m7_library_detection.selph"
+    "$META/m8_constant_fit.selph"
+    "$META/m9_unary_wrap.selph"
+    "$META/m10_affine_combination.selph"
+    "$META/m11_product_fit.selph"
+    "$META/m12_structural_pair_fit.selph"
+    "$META/m_pool_string.selph"
+    "$META/m8s_constant_string.selph"
+    "$META/m10s_concat_pair.selph"
+    "$META/m11s_string_repeat.selph"
+    "$META/m_pool_grid.selph"
+    "$META/m8g_constant_grid.selph"
+    "$META/m8g_symmetry.selph"
+    "$META/m8g_recolor.selph"
+    "$META/m8g_line_draw.selph"
+    "$META/m8g_proximity_recolor.selph"
+    "$META/m8g_rect_hole_fill.selph"
+    "$META/m8g_per_object.selph"
+    "$META/m8g_mono_object.selph"
+    "$META/m8g_template_stamp.selph"
+    "$META/m8g_compose.selph"
+    "$META/m_journal.selph"
+    "$META/m_chain.selph"
+    "$META/m_bd.selph"
+    "$META/m_chain_bool.selph"
+    "$META/m_partition.selph"
+    "$META/m_lib_reuse.selph"
+    "$META/m_fitness_grid.selph"
+    "$META/m_refine.selph"
+    "$META/m_ho.selph"
+    "$META/m_ho_list_map.selph"
+    "$META/m_ho_list_filter.selph"
+    "$META/m_ho_split_map_join.selph"
+    "$META/m_ho_char_map_join.selph"
+    "$META/m_rd.selph"
+    "$META/m_induction.selph"
+    "$META/m_dc.selph"
+    "$CURRICULUM"
+)
 
-echo "Combined file: $COMBINED ($(wc -l < "$COMBINED") lines)" >&2
+# Concatenate files and track offsets/line counts
+OFFSET=0
+echo "File offsets in combined file:" >&2
+for f in "${FILES[@]}"; do
+    LINES=$(wc -l < "$f")
+    echo "  $f: offset=$OFFSET, lines=$LINES" >&2
+    OFFSET=$((OFFSET + LINES))
+done
+cat "${FILES[@]}" > "$COMBINED"
+
+echo "Combined file: $COMBINED ($OFFSET lines total)" >&2
 exec "$SELPH" grow-v2 "$COMBINED" "$@"

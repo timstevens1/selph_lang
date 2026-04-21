@@ -1,0 +1,106 @@
+; ---------------------------------------------------------------------------
+; m_ho_char_map_join: char-map-join decomposer using first-class holes
+; ---------------------------------------------------------------------------
+;
+; Detects character-wise map patterns on strings: all inputs and outputs
+; are non-empty strings of identical length, and a per-character function
+; F exists such that:
+;   output = join(map(F, chars(input)), "")  for all training pairs.
+;
+; Returns an AST template with a hole for the per-character function:
+;   (lambda (x) (string-join (map __hole_0__ (string-chars x)) ""))
+; and a sub-spec of character-wise (input-char, output-char) pairs.
+;
+; The Rust hole-filling engine (fill_template_holes) sub-synthesizes F
+; and splices the result into the template.
+
+; -- Guard: all pairs are non-empty string->string of same length ----------
+
+(define cmj-guard
+  (lambda (pairs)
+    (if (= (length pairs) 0) false
+      (reduce
+        (lambda (ok pair)
+          (if (not ok) false
+            (let ((inp (head pair))
+                  (out (head (tail pair))))
+              (and (string? inp)
+                   (string? out)
+                   (> (string-length inp) 0)
+                   (= (string-length inp) (string-length out))))))
+        pairs
+        true))))
+
+; -- Derive character-wise sub-spec ----------------------------------------
+;
+; For each training pair, extract character lists from input and output
+; via string-chars, then zip them into (input-char, output-char) pairs.
+; Deduplicates and rejects conflicts. Returns nil if fewer than 3 unique
+; pairs or if conflicts are found.
+
+(define cmj-derive-sub-spec
+  (lambda (pairs)
+    (let ((all-pairs
+            (reduce
+              (lambda (acc pair)
+                (let ((inp-chars (string-chars (head pair)))
+                      (out-chars (string-chars (head (tail pair)))))
+                  (reduce
+                    (lambda (a i)
+                      (append a (list (list (nth inp-chars i) (nth out-chars i)))))
+                    (range (length inp-chars))
+                    acc)))
+              pairs
+              (list))))
+      ; Deduplicate: keep first occurrence of each input, reject conflicts.
+      (let ((unique
+              (reduce
+                (lambda (acc p)
+                  (if (nil? acc) nil
+                    (let ((in-val (head p))
+                          (out-val (head (tail p))))
+                      (let ((existing
+                              (reduce
+                                (lambda (found u)
+                                  (if found found
+                                    (if (= (head u) in-val)
+                                      (if (= (head (tail u)) out-val) "dup" "conflict")
+                                      false)))
+                                acc
+                                false)))
+                        (if (= existing "conflict") nil
+                          (if (= existing "dup") acc
+                            (append acc (list p))))))))
+                all-pairs
+                (list))))
+        (if (nil? unique) nil
+          (if (< (length unique) 3) nil
+            unique))))))
+
+; -- Main decomposer --------------------------------------------------------
+
+(define detect-char-map-join
+  (lambda (synth-spec)
+    (let ((pairs (ns-get synth-spec "spec")))
+      (if (not (cmj-guard pairs))
+        (ns ("found" false))
+        (let ((sub-pairs (cmj-derive-sub-spec pairs)))
+          (if (nil? sub-pairs)
+            (ns ("found" false))
+            (ns ("found" true)
+                ("nodes" (make-lambda (list "x")
+                           (make-app "string-join"
+                             (make-app "map" (make-hole 0)
+                               (make-app "string-chars" (make-symbol "x")))
+                             (make-str ""))))
+                ("holes" (ns ("__hole_0__" (ns ("spec" sub-pairs)))))
+                ("candidates" 1))))))))
+
+; -- Registration ------------------------------------------------------------
+;
+; Register as a separate __decomposers__ entry (after m_chain.selph).
+; Uses ns-put to add to the existing namespace without clobbering other
+; entries.
+
+(define __decomposers__
+  (ns-put __decomposers__ "m-ho-char-map-join" detect-char-map-join))

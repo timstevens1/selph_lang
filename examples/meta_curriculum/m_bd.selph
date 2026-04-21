@@ -1,0 +1,241 @@
+; ─────────────────────────────────────────────────────────────────────────
+; m_bd: Boolean decomposition via logical composition of library predicates
+; ─────────────────────────────────────────────────────────────────────────
+;
+; For Bool-output specs, probes unary library predicates on the task's
+; inputs, collects those that return Bool on every row, then tries
+; compositions of 1–2 predicates:
+;
+;   Single:   (pred x)
+;   Not:      (not (pred x))
+;   And:      (and (p x) (q x))
+;   Or:       (or (p x) (q x))
+;   And-not:  (and (p x) (not (q x)))
+;   Not-and:  (and (not (p x)) (q x))
+;
+; First matching composition wins. Pairs iterated i < j to avoid
+; duplicates (and/or are commutative; and-not / not-and are the two
+; asymmetric forms).
+;
+; Ported from worktree ast-mod's m_bd.selph, adapted for the current
+; hole-fc chain + shared skip set conventions. Called from
+; m-chain-bool's dispatcher after the cheap pool-based detectors
+; and before the library-shape fallback.
+;
+; Cost: O(N + N²) predicate evaluations per task, where N is the number
+; of Bool-returning library functions. `__synth_skip__` excludes helper
+; functions (m-*, journal-*, etc.) so N stays small in practice.
+
+; ── Input shape helpers ────────────────────────────────────────────────
+
+; Predicates are probed by applying directly to the spec's input rows.
+; For task-form specs with bare values, preds take bare; for task-args
+; with list rows, preds take lists. The emit mirrors the probe —
+; `(pred x)` where x has the same shape as the probed inputs. No
+; list-wrap coercion needed (the pool's `(nth x 0)` trick doesn't
+; apply here — BD doesn't use the pool).
+
+(define m-bd-all-bool?
+  (lambda (vals)
+    (reduce (lambda (acc v) (and acc (or (= v true) (= v false))))
+            vals true)))
+
+(define m-bd-col-matches?
+  (lambda (col expected)
+    (if (not (= (length col) (length expected))) false
+      (reduce (lambda (acc i)
+                (and acc (= (nth col i) (nth expected i))))
+              (range (length col)) true))))
+
+(define m-bd-negate-col
+  (lambda (col)
+    (map (lambda (v) (not v)) col)))
+
+(define m-bd-and-cols
+  (lambda (a b)
+    (map (lambda (i) (and (nth a i) (nth b i))) (range (length a)))))
+
+(define m-bd-or-cols
+  (lambda (a b)
+    (map (lambda (i) (or (nth a i) (nth b i))) (range (length a)))))
+
+; ── Skip list ──────────────────────────────────────────────────────────
+;
+; Share the pool's skip set so m_bd doesn't probe the ~900 M-stage
+; helper functions in env at m-chain load time. Only true curriculum
+; libraries make it through.
+
+(define m-bd-skip-set
+  (lambda () (try __synth_skip__ (list))))
+
+; Heuristic: curriculum library functions use underscores
+; (count_a, is_noun, first_of_sentence, ...). Internal helper
+; functions defined across m_*/m8*/m_chain*/m_bd/etc. files use
+; hyphens (m-bd-in-skip?, m8s-pool-col, rd-all-same?, ...). So
+; skipping names with hyphens excludes the hundreds of helpers that
+; would otherwise balloon the probe cost.
+;
+; The hyphen filter makes the O(N) __synth_skip__ `contains` check
+; redundant — every entry in __synth_skip__ is a hyphenated helper
+; (captured from the preamble's M-stage files). Dropping the skip
+; check cuts per-probe cost from O(skip_size) ≈ 900 to O(1).
+(define m-bd-has-hyphen?
+  (lambda (name) (contains (string-chars name) "-")))
+
+(define m-bd-in-skip?
+  (lambda (name)
+    (or (and (>= (string-length name) 2)
+             (= (string-take name 2) "__"))
+        (m-bd-has-hyphen? name))))
+
+; ── Probe predicates ───────────────────────────────────────────────────
+;
+; Walk env-functions for unary functions that return Bool on all input
+; rows. Returns a list of (name, bool-column) pairs.
+
+(define m-bd-probe-predicates
+  (lambda (inputs)
+    (let ((fns (env-function-names)))
+      (reduce
+        (lambda (acc name)
+          (if (m-bd-in-skip? name) acc
+            (let ((f (try (env-lookup name) nil)))
+              (if (nil? f) acc
+                (if (not (= (try (function-arity f) -1) 1)) acc
+                  (let ((col (try (map f inputs) nil)))
+                    (if (nil? col) acc
+                      (if (not (= (length col) (length inputs))) acc
+                        (if (m-bd-all-bool? col)
+                          (append acc (list (list name col)))
+                          acc)))))))))
+        fns
+        (list)))))
+
+; ── Template matching ──────────────────────────────────────────────────
+
+(define m-bd-try-single
+  (lambda (preds expected)
+    (reduce
+      (lambda (acc entry)
+        (if (not (nil? acc)) acc
+          (let ((name (head entry))
+                (col  (head (tail entry))))
+            (if (m-bd-col-matches? col expected)
+              (list "single" name nil)
+              nil))))
+      preds nil)))
+
+(define m-bd-try-not
+  (lambda (preds expected)
+    (reduce
+      (lambda (acc entry)
+        (if (not (nil? acc)) acc
+          (let ((name (head entry))
+                (col  (head (tail entry))))
+            (if (m-bd-col-matches? (m-bd-negate-col col) expected)
+              (list "not" name nil)
+              nil))))
+      preds nil)))
+
+; Pairs — iterate i < j to cover (and / or) once and both asymmetric
+; and-not / not-and variants.
+(define m-bd-try-pairs
+  (lambda (preds expected)
+    (let ((n (length preds)))
+      (reduce
+        (lambda (acc i)
+          (if (not (nil? acc)) acc
+            (reduce
+              (lambda (acc2 j)
+                (if (not (nil? acc2)) acc2
+                  (if (<= j i) nil
+                    (let ((pi (nth preds i))
+                          (pj (nth preds j)))
+                      (let ((ni (head pi)) (ci (head (tail pi)))
+                            (nj (head pj)) (cj (head (tail pj))))
+                        (if (m-bd-col-matches? (m-bd-and-cols ci cj) expected)
+                          (list "and" ni nj)
+                          (if (m-bd-col-matches? (m-bd-or-cols ci cj) expected)
+                            (list "or" ni nj)
+                            (if (m-bd-col-matches? (m-bd-and-cols ci (m-bd-negate-col cj)) expected)
+                              (list "and-not" ni nj)
+                              (if (m-bd-col-matches? (m-bd-and-cols (m-bd-negate-col ci) cj) expected)
+                                (list "not-and" ni nj)
+                                nil)))))))))
+              (range n) nil)))
+        (range n) nil))))
+
+; ── AST construction ───────────────────────────────────────────────────
+;
+; Emit `(lambda (x) <body>)` where body references predicate names via
+; make-symbol so they resolve at eval time against the current env.
+
+(define m-bd-emit
+  (lambda (template)
+    (let ((kind (head template))
+          (p    (head (tail template)))
+          (q    (head (tail (tail template)))))
+      (if (= kind "single")
+        (make-lambda (list "x")
+          (make-app (make-symbol p) (make-symbol "x")))
+        (if (= kind "not")
+          (make-lambda (list "x")
+            (make-app "not"
+              (make-app (make-symbol p) (make-symbol "x"))))
+          (if (= kind "and")
+            (make-lambda (list "x")
+              (make-app "and"
+                (make-app (make-symbol p) (make-symbol "x"))
+                (make-app (make-symbol q) (make-symbol "x"))))
+            (if (= kind "or")
+              (make-lambda (list "x")
+                (make-app "or"
+                  (make-app (make-symbol p) (make-symbol "x"))
+                  (make-app (make-symbol q) (make-symbol "x"))))
+              (if (= kind "and-not")
+                (make-lambda (list "x")
+                  (make-app "and"
+                    (make-app (make-symbol p) (make-symbol "x"))
+                    (make-app "not"
+                      (make-app (make-symbol q) (make-symbol "x")))))
+                ; "not-and"
+                (make-lambda (list "x")
+                  (make-app "and"
+                    (make-app "not"
+                      (make-app (make-symbol p) (make-symbol "x")))
+                    (make-app (make-symbol q) (make-symbol "x"))))))))))))
+
+; ── Entry point ────────────────────────────────────────────────────────
+;
+; Called from m-chain-bool's dispatcher. Returns the m-chain detector
+; shape: (ns ("found" bool) ("source-node" <Node>) ("kind" <str>)
+; ("score" <int>)).
+
+(define detect-bool-decompose
+  (lambda (spec)
+    (try
+      (let ((outs (ns-get spec "outputs")))
+        (if (or (= (length outs) 0) (not (m-bd-all-bool? outs)))
+          (ns ("found" false))
+          (let ((inputs (ns-get spec "inputs")))
+            (let ((preds (m-bd-probe-predicates inputs)))
+              (if (= (length preds) 0)
+                (ns ("found" false))
+                (let ((result
+                        (let ((r1 (m-bd-try-single preds outs)))
+                          (if (not (nil? r1)) r1
+                            (let ((r2 (m-bd-try-not preds outs)))
+                              (if (not (nil? r2)) r2
+                                (m-bd-try-pairs preds outs)))))))
+                  (if (nil? result)
+                    (ns ("found" false))
+                    (ns ("found" true)
+                        ("kind" (concat "bool-decompose-" (head result)))
+                        ("score" (if (= (head result) "single") 1 4))
+                        ("source-node" (m-bd-emit result))))))))))
+      (ns ("found" false)))))
+
+; ── Register as decomposer ────────────────────────────────────────────
+;
+; Wired into m-chain-bool's dispatcher after the cheap pool-based
+; detectors, before the library-shape fallback.

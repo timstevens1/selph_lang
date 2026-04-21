@@ -1,0 +1,102 @@
+; ─────────────────────────────────────────────────────────────────────────
+; m_lib_reuse: hole-based library-reuse decomposer (§9.68)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; The third-largest cluster in the solution journal is "direct library
+; reuse" — `(?LIB? (list (nth x ?INT?)))` (4 of 45 string POS tasks).
+; This decomposer recognizes the pattern using candidate-value holes
+; for both the library function reference and the input position.
+;
+; Template:
+;   (lambda (x) (__hole_func__ (list (nth x __hole_pos__))))
+;
+; Holes:
+;   __hole_func__ — candidate Symbol nodes, one per env-visible library
+;                   function (excluding skip set). Splices as the head
+;                   of the call.
+;   __hole_pos__  — candidate Int values 0..arity-1. Splices as the
+;                   nth index.
+;
+; Cross-product: |libs| × arity. Typically <50 combinations per task.
+; Rust hole-filler enumerates and validates each composition against
+; the original training spec; held-out validation in the dispatch
+; rejects overfit candidates.
+;
+; This is the FIRST decomposer to use candidate-value holes. It validates
+; that the parametric-hole architecture works for both literal values
+; (Int positions) and Node references (Symbol function names).
+
+; ── Library function discovery ───────────────────────────────────────
+;
+; Walk env-functions, exclude the skip set (built-in M-stage helpers
+; and other infra). What remains are user-defined functions from
+; previously-solved tasks plus core builtins.
+
+(define lib-reuse-skip-set
+  (lambda () (try __synth_skip__ (list))))
+
+(define lib-reuse-candidate-funcs
+  (lambda ()
+    (let ((all-names (ns-keys (env-functions))))
+      (let ((skip (lib-reuse-skip-set)))
+        (filter (lambda (n) (not (contains skip n))) all-names)))))
+
+; Build a candidate Node for each library function name. Each is a
+; Symbol node that, when spliced as App head, gets looked up at eval
+; time and applied.
+(define lib-reuse-func-candidates
+  (lambda ()
+    (map (lambda (name) (make-symbol name))
+         (lib-reuse-candidate-funcs))))
+
+; Build position candidates: integers 0..arity-1.
+(define lib-reuse-pos-candidates
+  (lambda (arity)
+    (map make-int (range arity))))
+
+; ── Template construction ────────────────────────────────────────────
+
+(define lib-reuse-emit
+  (lambda (arity)
+    (let ((template
+            (make-lambda (list "x")
+              (make-app (make-hole 0)
+                (make-app "list"
+                  (make-app "nth"
+                    (make-symbol "x")
+                    (make-hole 1)))))))
+      (let ((func-cands (lib-reuse-func-candidates))
+            (pos-cands (lib-reuse-pos-candidates arity)))
+        (if (or (= (length func-cands) 0) (= (length pos-cands) 0))
+          nil
+          (ns ("found" true)
+              ("nodes" template)
+              ("holes"
+                (ns ("__hole_0__" (ns ("candidates" func-cands)))
+                    ("__hole_1__" (ns ("candidates" pos-cands)))))
+              ("candidates"
+                (* (length func-cands) (length pos-cands)))))))))
+
+; ── Main decomposer ──────────────────────────────────────────────────
+
+(define a-lib-reuse-decomposer
+  (lambda (synth-spec)
+    (try
+      (let ((pairs (ns-get synth-spec "spec")))
+        (if (= (length pairs) 0)
+          (ns ("found" false))
+          (let ((arity (length (head (head pairs)))))
+            (let ((emitted (try (lib-reuse-emit arity) nil)))
+              (if (nil? emitted)
+                (ns ("found" false))
+                emitted)))))
+      (ns ("found" false)))))
+
+; ── Registration ─────────────────────────────────────────────────────
+;
+; Name "a-lib-reuse" sorts BEFORE "a-binary-partition" (alphabetically)
+; so library-reuse is tried before binary-partition. This matches the
+; intuition that direct reuse is simpler than classification.
+
+(define __decomposers__
+  (ns-put __decomposers__ "a-lib-reuse" a-lib-reuse-decomposer))

@@ -1,0 +1,159 @@
+; ---------------------------------------------------------------------------
+; m_dc: Divide & Conquer decomposer using first-class holes
+; ---------------------------------------------------------------------------
+;
+; For specs with 2+ distinct output values, partition examples by output
+; and return a nested if-tree template with holes for separators and branches.
+;
+; The Rust hole-filling engine (fill_template_holes) sub-synthesizes each
+; separator and branch function, avoiding cascading SELPH decomposer calls.
+;
+; Template for 3 groups [A, B, C]:
+;   (lambda (x) (if __hole_0__ __hole_1__ (if __hole_2__ __hole_3__ __hole_4__)))
+;
+; Holes:
+;   __hole_0__: separator spec (A-indices → true, rest → false)
+;   __hole_1__: branch spec for group A
+;   __hole_2__: separator spec (B-indices → true, C-indices → false)
+;   __hole_3__: branch spec for group B
+;   __hole_4__: branch spec for group C
+
+; -- Group examples by output value -------------------------------------------
+;
+; Returns a list of (output-value (idx1 idx2 ...)) pairs.
+
+(define dc-group-by-output
+  (lambda (pairs)
+    (let ((outputs (map (lambda (p) (head (tail p))) pairs)))
+      (reduce
+        (lambda (groups i)
+          (let ((out (nth outputs i)))
+            (let ((found-idx
+                    (reduce
+                      (lambda (acc j)
+                        (if (>= acc 0) acc
+                          (if (= (head (nth groups j)) out) j acc)))
+                      (range (length groups))
+                      -1)))
+              (if (>= found-idx 0)
+                (map (lambda (j)
+                       (if (= j found-idx)
+                         (list (head (nth groups j))
+                               (append (head (tail (nth groups j))) (list i)))
+                         (nth groups j)))
+                     (range (length groups)))
+                (append groups (list (list out (list i))))))))
+        (range (length outputs))
+        (list)))))
+
+; -- Build separator sub-spec -------------------------------------------------
+;
+; Given true-indices and false-indices, build (input, Bool) pairs.
+
+(define dc-separator-spec
+  (lambda (true-indices false-indices pairs)
+    (append
+      (map (lambda (i) (list (head (nth pairs i)) true))  true-indices)
+      (map (lambda (i) (list (head (nth pairs i)) false)) false-indices))))
+
+; -- Build branch sub-spec ----------------------------------------------------
+;
+; Extract (input, output) pairs for a group's indices.
+
+(define dc-branch-spec
+  (lambda (indices pairs)
+    (map (lambda (i) (nth pairs i)) indices)))
+
+; -- Build nested if-tree template with holes ---------------------------------
+;
+; Recursively builds template + accumulates holes.
+;
+; State: (next-hole-idx, holes-ns)
+; Returns: (body-node, next-hole-idx, holes-ns) or nil on failure.
+
+; All hole specs set ("inline" true): sub-synthesis always produces a
+; `(lambda (x) <body>)`, but each hole occurs in a position where we
+; need the raw value/expression, not a callable. With inline, Rust
+; fill_template_holes extracts `<body>` and splices it directly — its
+; `x` references resolve to the outer lambda's x parameter.
+;
+; Positions and why inline is required:
+;   - separator hole (if-condition): without inline, the Lambda value
+;     is truthy, so the if always takes the then-branch (silent bug).
+;   - branch hole (then-position): without inline, the Lambda itself
+;     is the value returned by the if, but we need its applied result.
+;   - base-case hole (else-position of innermost if): same as branch.
+(define dc-build-template
+  (lambda (groups pairs hole-idx)
+    (if (= (length groups) 1)
+      ; Base case: single group — one branch hole
+      (let ((indices (head (tail (head groups)))))
+        (let ((spec (dc-branch-spec indices pairs))
+              (hole-name (concat "__hole_" (to-string hole-idx) "__")))
+          (list (make-hole hole-idx)
+                (+ hole-idx 1)
+                (list (list hole-name (ns ("spec" spec) ("inline" true)))))))
+      ; Recursive case: separator hole + first-branch hole + recurse on rest
+      (let ((first-group (head groups))
+            (rest-groups (tail groups)))
+        (let ((first-indices (head (tail first-group)))
+              (rest-indices (reduce
+                              (lambda (acc g) (append acc (head (tail g))))
+                              rest-groups (list))))
+          ; Separator hole
+          (let ((sep-hole-idx hole-idx)
+                (sep-spec (dc-separator-spec first-indices rest-indices pairs))
+                (sep-hole-name (concat "__hole_" (to-string hole-idx) "__")))
+            ; Branch hole for first group
+            (let ((branch-hole-idx (+ hole-idx 1))
+                  (branch-spec (dc-branch-spec first-indices pairs))
+                  (branch-hole-name (concat "__hole_" (to-string (+ hole-idx 1)) "__")))
+              ; Recurse on rest groups
+              (let ((rest-result (dc-build-template rest-groups pairs (+ hole-idx 2))))
+                (if (nil? rest-result) nil
+                  (let ((rest-body (nth rest-result 0))
+                        (next-idx  (nth rest-result 1))
+                        (rest-holes (nth rest-result 2)))
+                    (list
+                      (make-if (make-hole sep-hole-idx)
+                               (make-hole branch-hole-idx)
+                               rest-body)
+                      next-idx
+                      (append (list (list sep-hole-name
+                                          (ns ("spec" sep-spec) ("inline" true)))
+                                    (list branch-hole-name
+                                          (ns ("spec" branch-spec) ("inline" true))))
+                              rest-holes))))))))))))
+
+; -- Main decomposer ----------------------------------------------------------
+
+(define detect-divide-conquer
+  (lambda (synth-spec)
+    (let ((pairs (ns-get synth-spec "spec")))
+      (if (< (length pairs) 2)
+        (ns ("found" false))
+        ; Group by output value
+        (let ((groups (dc-group-by-output pairs)))
+          (if (< (length groups) 2)
+            (ns ("found" false))
+            ; Build template with holes
+            (let ((result (try (dc-build-template groups pairs 0) nil)))
+              (if (nil? result)
+                (ns ("found" false))
+                (let ((body-node (nth result 0))
+                      (holes-list (nth result 2)))
+                  ; Build holes namespace from list of (name, spec-ns) pairs
+                  (let ((holes-ns (reduce
+                                    (lambda (ns-acc entry)
+                                      (ns-put ns-acc (head entry) (head (tail entry))))
+                                    holes-list
+                                    (ns))))
+                    (ns ("found" true)
+                        ("nodes" (make-lambda (list "x") body-node))
+                        ("holes" holes-ns)
+                        ("candidates" 1))))))))))))
+
+; -- Registration --------------------------------------------------------------
+
+(define __decomposers__
+  (ns-put __decomposers__ "m-dc" detect-divide-conquer))

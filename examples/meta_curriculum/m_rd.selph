@@ -1,0 +1,151 @@
+; ---------------------------------------------------------------------------
+; m_rd: Recursive Decomposition via library function bridging (hole-fc)
+; ---------------------------------------------------------------------------
+;
+; Decomposer that finds compositions of the form:
+;
+;   solution(x) = f(m(x))
+;
+; where `m` is an existing unary library function and `f` is sub-synthesized
+; by the Rust hole-filling engine.
+;
+; Algorithm:
+;   1. Enumerate all unary functions in the environment
+;   2. For each function m, compute intermediates = map(m, inputs)
+;   3. Skip if: identity, constant, or any application errors
+;   4. If intermediates == expected, emit (lambda (x) (m x)) directly
+;   5. Otherwise, return template with hole for bridge function:
+;      (lambda (x) (let ((x (m x))) __hole_0__))
+;      with sub-spec = [(intermediate_i, expected_i), ...]
+;
+; The Rust fill_template_holes engine sub-synthesizes the bridge function,
+; avoiding cascading SELPH decomposer calls.
+;
+; Registered as "m-rd" in __decomposers__.
+
+; -- Skip-list filtering -------------------------------------------------------
+
+(define rd-skip-set
+  (lambda ()
+    (try __synth_skip__ (list))))
+
+(define rd-in-skip?
+  (lambda (name)
+    (or (and (>= (length name) 2)
+             (= (slice name 0 2) "__"))
+        (contains (rd-skip-set) name))))
+
+; -- Helpers -------------------------------------------------------------------
+
+(define rd-lists-equal?
+  (lambda (xs ys)
+    (if (not (= (length xs) (length ys)))
+      false
+      (reduce
+        (lambda (acc i) (and acc (= (nth xs i) (nth ys i))))
+        (range (length xs))
+        true))))
+
+(define rd-all-same?
+  (lambda (xs)
+    (if (<= (length xs) 1) true
+      (let ((first-val (head xs)))
+        (reduce
+          (lambda (acc x) (and acc (= x first-val)))
+          (tail xs)
+          true)))))
+
+(define rd-safe-apply
+  (lambda (f x)
+    (try (f x) nil)))
+
+(define rd-compute-intermediates
+  (lambda (f inputs)
+    (let ((results (map (lambda (inp) (rd-safe-apply f inp)) inputs)))
+      (if (member? nil results)
+        nil
+        results))))
+
+; -- Try one library function --------------------------------------------------
+;
+; Returns:
+;   - Direct match: (ns ("found" true) ("nodes" ...) ("candidates" 1))
+;   - Bridge needed: (ns ("found" true) ("nodes" ...) ("holes" ...) ("candidates" 1))
+;   - No match: (ns ("found" false))
+
+(define rd-try-one-bridge
+  (lambda (name lib-fn inputs outputs)
+    (let ((test-val (rd-safe-apply lib-fn (head inputs))))
+      (if (nil? test-val)
+        (ns ("found" false))
+        (let ((intermediates (rd-compute-intermediates lib-fn inputs)))
+          (if (nil? intermediates)
+            (ns ("found" false))
+            (if (rd-lists-equal? intermediates inputs)
+              (ns ("found" false))
+              (if (rd-all-same? intermediates)
+                (ns ("found" false))
+                (if (rd-lists-equal? intermediates outputs)
+                  ; Direct match: (lambda (x) (m x))
+                  (ns ("found" true)
+                      ("nodes" (make-lambda (list "x")
+                                 (make-app (make-symbol name) (make-symbol "x"))))
+                      ("candidates" 1))
+                  ; Bridge needed: template with hole.
+                  ; The hole sits in the let-body position. Sub-synth
+                  ; produces `(lambda (x) <body>)`; without inline, the
+                  ; let would RETURN that Lambda instead of the applied
+                  ; value. inline=true extracts <body>, whose `x`
+                  ; references resolve to the let-bound x (= (m x)).
+                  (let ((sub-spec
+                          (map (lambda (i)
+                                 (list (nth intermediates i) (nth outputs i)))
+                               (range (length inputs)))))
+                    (ns ("found" true)
+                        ("nodes" (make-lambda (list "x")
+                                   (make-let
+                                     (list (list "x" (make-app (make-symbol name)
+                                                               (make-symbol "x"))))
+                                     (make-hole 0))))
+                        ("holes" (ns ("__hole_0__"
+                                       (ns ("spec" sub-spec) ("inline" true)))))
+                        ("candidates" 1))))))))))))
+
+; -- Main bridge search --------------------------------------------------------
+;
+; Walk library functions, return first match (direct or with holes).
+
+(define rd-try-bridges
+  (lambda (inputs outputs)
+    (let ((libs (env-functions))
+          (lib-names (filter (lambda (n) (not (rd-in-skip? n)))
+                             (ns-keys (env-functions)))))
+      (reduce
+        (lambda (best name)
+          (if (ns-get best "found") best
+            (let ((lib-fn (ns-get libs name)))
+              (try (rd-try-one-bridge name lib-fn inputs outputs)
+                   best))))
+        lib-names
+        (ns ("found" false))))))
+
+; -- Entry point ---------------------------------------------------------------
+
+(define detect-recursive-bridge
+  (lambda (synth-spec)
+    (let ((pairs (ns-get synth-spec "spec")))
+      (if (< (length pairs) 2)
+        (ns ("found" false))
+        ; Only handle unary tasks with non-grid inputs.
+        (let ((inputs (map head pairs))
+              (outputs (map (lambda (p) (head (tail p))) pairs)))
+          (if (list? (head inputs))
+            (ns ("found" false))
+            (if (grid? (head inputs))
+              (ns ("found" false))
+              (rd-try-bridges inputs outputs))))))))
+
+; -- Registration --------------------------------------------------------------
+
+(define __decomposers__
+  (ns-put __decomposers__ "m-rd" detect-recursive-bridge))

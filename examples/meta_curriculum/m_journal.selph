@@ -1,0 +1,234 @@
+; ─────────────────────────────────────────────────────────────────────────
+; m_journal: solution journal for meta-learning bootstrap (sketch)
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Records every successful synthesis as a structured log line so future
+; analysis can mine recurring structural patterns. This is the data
+; substrate for "step 4" meta-learning: once we can SEE which patterns
+; recur across solutions, we can abstract them into new decomposers.
+;
+; Design choice for the SKETCH: the journal is just stdout lines, not
+; an in-memory data structure. SELPH's `define` is lexically scoped so
+; mutating a top-level binding from inside the chain requires
+; eval-source gymnastics that proved fragile during prototyping.
+; The log lines are easy to grep/parse with external tools.
+;
+; Each log line: [JOURNAL] <strategy> | <signature> | <skeleton> | <source>
+;
+; Fields:
+;   strategy  — which decomposer fired (e.g. "m-chain-string")
+;   signature — compact spec fingerprint: arity, rows, labels, output type
+;   skeleton  — AST shape with literals masked (?STR?, ?INT?, etc.)
+;   source    — full solution source (for reproduction / inspection)
+;
+; Two solutions with identical SKELETONS share the same structural
+; pattern. Sorting/uniq'ing the skeleton column is the simplest
+; "cluster" — groups that recur often are candidates for abstraction.
+
+; ── Spec signature ───────────────────────────────────────────────────
+
+(define journal-spec-signature
+  (lambda (synth-spec)
+    (let ((rows (try (ns-get synth-spec "spec") (list))))
+      (if (= (length rows) 0)
+        "empty"
+        (let ((first-row (head rows)))
+          (let ((arity (if (list? (head first-row))
+                         (length (head first-row))
+                         1))
+                (n-rows (length rows))
+                (n-labels
+                  (length
+                    (reduce
+                      (lambda (acc p)
+                        (let ((out (head (tail p))))
+                          (if (contains acc out)
+                            acc (append acc (list out)))))
+                      rows (list))))
+                (out-type
+                  (let ((first-out (head (tail first-row))))
+                    (if (string? first-out) "str"
+                      (if (int? first-out) "int"
+                        (if (num? first-out) "num"
+                          (if (bool? first-out) "bool"
+                            (if (grid? first-out) "grid"
+                              (if (list? first-out) "list" "other")))))))))
+            (concat "arity=" (to-string arity)
+              ",rows=" (to-string n-rows)
+              ",labels=" (to-string n-labels)
+              ",out=" out-type)))))))
+
+; ── Skeleton extraction ──────────────────────────────────────────────
+;
+; Walks an AST and produces a STRING that captures structure but masks
+; concrete literal values. Two solutions with identical skeletons
+; share the same structural pattern even if their constants differ.
+;
+; Two normalizations beyond literal masking, to amplify cluster signal:
+;
+;   1. Repeated-children collapse: (list X X X) → (list X+)
+;      So (list "a") and (list "a" "b" "c") cluster together as
+;      (list ?STR?+) when they're really the same pattern with
+;      different cardinality.
+;
+;   2. Library-function lifting: head-position symbols that are NOT
+;      built-in operators get rendered as ?LIB?. So `(has_article ...)`,
+;      `(run_pos ...)`, and `(verb_form ...)` all cluster as
+;      `(?LIB? (list (nth x ?INT?)))`. This unifies "any task that
+;      reuses a previously-solved function" into one pattern.
+;
+; Examples (with both normalizations active):
+;   (if (contains (list "the") (nth x 0)) "A" "B")
+;     → (if (contains (list ?STR?) (nth x ?INT?)) ?STR? ?STR?)
+;
+;   (if (contains (list "the" "a" "an") (nth x 0)) "yes" "no")
+;     → (if (contains (list ?STR?+) (nth x ?INT?)) ?STR? ?STR?)
+;     (collapsed: 3 ?STR? args become ?STR?+)
+;
+;   (if (contains (list "verb") (fly_pos (list (nth x 0)))) "X" "Y")
+;     → (if (contains (list ?STR?) (?LIB? (list (nth x ?INT?)))) ?STR? ?STR?)
+;     (lifted: fly_pos is not a builtin)
+
+; Built-in operators kept as-is in head-of-app position. Anything not
+; in this list becomes ?LIB?. Variable references (which appear in
+; non-head positions) are unaffected — they're rendered as their bare
+; symbol so that lambda parameters like x stay readable.
+(define journal-builtin-symbols
+  (list
+    ; Control flow + try
+    "if" "lambda" "let" "do" "try"
+    ; List ops
+    "list" "nth" "head" "tail" "cons" "append" "length" "range"
+    "filter" "map" "reduce" "zip" "apply" "slice" "contains" "member?"
+    ; Comparison/logic
+    "=" "<" ">" ">=" "<=" "!=" "and" "or" "not"
+    ; Arithmetic
+    "+" "-" "*" "/" "modulo" "max" "min" "abs" "floor" "ceiling"
+    ; String ops
+    "concat" "string-ends-with" "string-starts-with"
+    "string-upper" "string-lower" "string-reverse" "string-take"
+    "string-length" "string-join" "string-split"
+    ; Char
+    "char-code" "code-char"
+    ; Type predicates
+    "int?" "num?" "str?" "string?" "bool?" "list?" "nil?" "grid?"
+    ; Conversion
+    "to-string"
+    ; Namespace
+    "ns" "ns-get" "ns-put" "ns-has" "ns-keys"
+    ; AST builtins (rare in solutions but include for completeness)
+    "make-int" "make-num" "make-str" "make-bool" "make-symbol"
+    "make-app" "make-if" "make-lambda" "make-let" "make-hole"
+    "node-kind" "node-children" "node-symbol"
+    "parse-source" "eval-source" "eval-node"
+    ; IO
+    "print"))
+
+(define journal-builtin?
+  (lambda (sym) (contains journal-builtin-symbols sym)))
+
+; True iff every element of xs equals the first element. Empty / single
+; lists are vacuously "all same".
+(define journal-all-same?
+  (lambda (xs)
+    (if (<= (length xs) 1) true
+      (reduce (lambda (acc x) (and acc (= x (head xs))))
+              (tail xs) true))))
+
+; Concatenate strings with single-space separator.
+(define journal-strs-join
+  (lambda (strs)
+    (if (= (length strs) 0) ""
+      (if (= (length strs) 1) (head strs)
+        (concat (head strs) " " (journal-strs-join (tail strs)))))))
+
+; Render an app's children with both normalizations applied:
+;   - Head symbol: if not a builtin, becomes ?LIB?
+;   - Args: if 2+ identical skeletons after the head, collapse to <one>+
+(define journal-skeleton-app
+  (lambda (children)
+    (if (= (length children) 0) ""
+      (let ((head-skel
+              (let ((c (head children)))
+                (if (= (try (node-kind c) "?") "symbol")
+                  (let ((sym (try (node-symbol c) "?SYM?")))
+                    (if (journal-builtin? sym) sym "?LIB?"))
+                  (journal-skeleton c)))))
+        (let ((rest (tail children)))
+          (if (= (length rest) 0) head-skel
+            (let ((rest-skels (map journal-skeleton rest)))
+              (if (and (>= (length rest-skels) 2)
+                       (journal-all-same? rest-skels))
+                (concat head-skel " " (head rest-skels) "+")
+                (concat head-skel " " (journal-strs-join rest-skels))))))))))
+
+(define journal-skeleton
+  (lambda (node)
+    (let ((kind (try (node-kind node) "?")))
+      (if (= kind "int")    "?INT?"
+        (if (= kind "num")  "?NUM?"
+          (if (= kind "str")  "?STR?"
+            (if (= kind "bool") "?BOOL?"
+              (if (= kind "symbol")
+                ; Bare symbols (in non-head position — head case is
+                ; handled inside journal-skeleton-app). These are
+                ; usually variable references like x, y, i. Keep as-is.
+                (try (node-symbol node) "?SYM?")
+                (if (= kind "app")
+                  (concat "(" (journal-skeleton-app
+                                (try (node-children node) (list))) ")")
+                  (if (= kind "if")
+                    (concat "(if "
+                      (journal-skeleton-list
+                        (try (node-children node) (list)))
+                      ")")
+                    (if (= kind "lambda")
+                      (concat "(lambda "
+                        (journal-skeleton-list
+                          (try (node-children node) (list)))
+                        ")")
+                      (if (= kind "let")
+                        (concat "(let "
+                          (journal-skeleton-list
+                            (try (node-children node) (list)))
+                          ")")
+                        (concat "<" kind ">")))))))))))))
+
+; Used by if/lambda/let where children are heterogeneous — no collapse.
+(define journal-skeleton-list
+  (lambda (nodes)
+    (if (= (length nodes) 0)
+      ""
+      (if (= (length nodes) 1)
+        (journal-skeleton (head nodes))
+        (concat (journal-skeleton (head nodes))
+          " "
+          (journal-skeleton-list (tail nodes)))))))
+
+; ── Recording ────────────────────────────────────────────────────────
+;
+; Just prints. The log line IS the journal entry. External tools can
+; grep '[JOURNAL]' to extract, then sort/uniq the skeleton column to
+; find recurring patterns. Future iteration: stash entries in
+; __solution_journal__ for SELPH-side analysis.
+
+(define journal-record!
+  (lambda (signature source-node strategy)
+    (let ((skeleton (try (journal-skeleton source-node) "?ERR?"))
+          (source-str (try (to-string source-node) "?ERR?")))
+      (print (concat "[JOURNAL] " strategy
+        " | " signature
+        " | " skeleton
+        " | " source-str)))))
+
+; ── Smoke test ───────────────────────────────────────────────────────
+
+(let ((fake-spec (ns ("spec" (list (list (list "a" "b") "x")
+                                   (list (list "c" "d") "y")))))
+      (fake-node (parse-source "(lambda (x) (if (contains (list \"the\") (nth x 0)) \"A\" \"B\"))")))
+  (do
+    (print "── m_journal smoke test ──")
+    (journal-record!
+      (journal-spec-signature fake-spec)
+      fake-node
+      "smoke")))

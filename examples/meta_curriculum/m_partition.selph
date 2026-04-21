@@ -1,0 +1,229 @@
+; ─────────────────────────────────────────────────────────────────────────
+; m_partition: hole-based N-class partition decomposer
+; ─────────────────────────────────────────────────────────────────────────
+;
+; Generalizes the 2-class binary-partition (§9.67) to any N ≥ 2 labels
+; via recursive sub-spec holes. This absorbs m_dc's responsibilities:
+;
+;   2 labels  → (if (contains <V> feat) L1 L2)
+;   3 labels  → (if (contains <V1> feat1) L1 <recursive-hole-for-L2-L3>)
+;   4+ labels → same pattern, recurses until 1 or 2 labels remain
+;
+; On each step: find a pool feature that cleanly ISOLATES one label
+; from the rest. The "isolated branch" is that label as a constant; the
+; "rest branch" is a sub-spec hole containing rows for the other N-1
+; labels. Sub-synth re-enters the chain, which dispatches back through
+; this decomposer for another level of partition, bottoming out at N=1
+; (constant via m-chain-string Form 1 or m-chain-bool Form 1) or a
+; 2-label case where both branches become constants.
+;
+; Benefits:
+;   - Subsumes m_dc's role (no need for separator sub-synth holes,
+;     which previously couldn't find Bool predicates without a Bool
+;     chain branch — now moot)
+;   - Non-string outputs supported (emit uses m8s-value-to-node)
+;   - Occam's-razor: simplest feature and smallest isolation set win
+;
+; Registered as "a-binary-partition" (kept for load-order stability).
+
+; ── Helpers ──────────────────────────────────────────────────────────
+
+; Values appearing in `col` at rows where `target[i] = label`.
+(define a-bp-col-vals-for-label
+  (lambda (col target label)
+    (reduce
+      (lambda (acc i)
+        (if (= (nth target i) label)
+          (let ((v (nth col i)))
+            (if (contains acc v) acc (append acc (list v))))
+          acc))
+      (range (length target))
+      (list))))
+
+; Values appearing in `col` at rows where `target[i] ≠ label`.
+(define a-bp-col-vals-for-rest
+  (lambda (col target label)
+    (reduce
+      (lambda (acc i)
+        (if (not (= (nth target i) label))
+          (let ((v (nth col i)))
+            (if (contains acc v) acc (append acc (list v))))
+          acc))
+      (range (length target))
+      (list))))
+
+; Returns the value set that cleanly isolates `label` via this column,
+; or nil if no clean isolation exists. A "clean isolation" means the
+; set of column values seen in rows labeled L is disjoint from the set
+; seen in rows labeled anything-but-L.
+(define a-bp-isolates-label?
+  (lambda (col target label)
+    (let ((l-vals    (a-bp-col-vals-for-label col target label))
+          (rest-vals (a-bp-col-vals-for-rest  col target label)))
+      (if (and (> (length l-vals) 0)
+               (m8s-disjoint? l-vals rest-vals))
+        l-vals
+        nil))))
+
+; Iterate labels in first-occurrence order; return the first label that
+; this column can cleanly isolate, along with the isolating value set.
+; Returns (ns ("label" L) ("vals" V)) or nil.
+(define a-bp-try-isolate-any
+  (lambda (col target)
+    (let ((labels (m8s-distinct-labels target)))
+      (reduce
+        (lambda (best label)
+          (if (not (nil? best)) best
+            (let ((vals (a-bp-isolates-label? col target label)))
+              (if (nil? vals) nil
+                (ns ("label" label) ("vals" vals))))))
+        labels nil))))
+
+; Iterate the priority-sorted active pool; return the first (entry,
+; label, vals) triple that yields a clean isolation. Pool priority
+; order puts simpler features (suffix/prefix predicates) before
+; libraries and atoms — Occam's razor for free.
+(define a-bp-find-isolating-winner
+  (lambda (pool target)
+    (let ((active (m8s-active-pool pool)))
+      (reduce
+        (lambda (best entry)
+          (if (not (nil? best)) best
+            (let ((col (m8s-pool-col entry)))
+              (let ((iso (a-bp-try-isolate-any col target)))
+                (if (nil? iso) nil
+                  (ns ("entry" entry)
+                      ("label" (ns-get iso "label"))
+                      ("vals"  (ns-get iso "vals"))))))))
+        active nil))))
+
+; ── Template emit ────────────────────────────────────────────────────
+;
+; Template:
+;   (lambda (x)
+;     (if (contains <iso-vals> <feat>)
+;       <iso-label-as-literal>
+;       __hole_0__))            ; sub-spec = rows with target ≠ iso-label
+;
+; The isolated-label branch is baked in as a literal (via
+; m8s-value-to-node so it works for string / bool / int / num labels).
+; The rest branch is a sub-synth hole with `("inline" true)` so the
+; returned Lambda body is extracted and spliced directly.
+;
+; Recursion: when the sub-spec has N-1 labels and sub-synth re-enters
+; the chain, this decomposer runs again and peels off another label.
+; For a 1-label sub-spec, m-chain-{string,bool,numeric} Form 1 emits a
+; constant — natural termination.
+
+(define a-bp-rest-spec
+  (lambda (pairs target iso-label)
+    (filter (lambda (p) (not (nil? p)))
+      (map (lambda (i)
+             (if (= (nth target i) iso-label) nil (nth pairs i)))
+           (range (length target))))))
+
+; Wrap body so `(nth x 0)` in the pool's feature source keeps working
+; when the outer caller passes a bare value. For list-shaped inputs,
+; body is returned unchanged.
+(define a-bp-lambda-body
+  (lambda (bare? body)
+    (if bare?
+      (make-let (list (list "x" (make-app "list" (make-symbol "x")))) body)
+      body)))
+
+; Wrap the input half of each (input, output) pair to list-wrap shape
+; when the outer spec was bare. The inline-spliced sub-synth result
+; will operate on the outer's already-coerced `x` (which IS list-
+; shaped), so the sub-spec must also be list-shaped — otherwise the
+; inner decomposer normalizes AGAIN and emits a double `(let ((x (list
+; x))))` that breaks evaluation.
+(define a-bp-wrap-pairs-inputs
+  (lambda (pairs bare?)
+    (if bare?
+      (map (lambda (p) (list (list (head p)) (head (tail p)))) pairs)
+      pairs)))
+
+(define a-bp-emit
+  (lambda (winner pairs target bare?)
+    (let ((entry (ns-get winner "entry"))
+          (iso-label (ns-get winner "label"))
+          (iso-vals (ns-get winner "vals")))
+      (let ((feature-expr (m8s-pool-source entry))
+            (wrapped-pairs (a-bp-wrap-pairs-inputs pairs bare?)))
+        (let ((rest-spec (a-bp-rest-spec wrapped-pairs target iso-label)))
+          (let ((inner-body
+                  (make-if
+                    (make-app "contains"
+                      (m8s-emit-value-list iso-vals)
+                      feature-expr)
+                    (m8s-value-to-node iso-label)
+                    (make-hole 0))))
+            (let ((template
+                    (make-lambda (list "x")
+                      (a-bp-lambda-body bare? inner-body))))
+              (ns ("found" true)
+                  ("nodes" template)
+                  ("holes"
+                    (ns ("__hole_0__"
+                          (ns ("spec" rest-spec) ("inline" true)))))
+                  ("candidates" 1)))))))))
+
+; Normalize a spec so m8s-build-pool can consume it. The pool builder
+; expects inputs as list-of-lists (each row is a list of arg values).
+; For single-arg bare-input specs (e.g. `(task ...)` form), rows are
+; bare values — wrap them in singletons. This is the same trick
+; m_chain_bool uses (§Option A).
+(define a-bp-normalize-spec
+  (lambda (spec)
+    (let ((rows (ns-get spec "inputs")))
+      (if (or (= (length rows) 0) (list? (head rows)))
+        spec
+        (ns-put spec "inputs" (map (lambda (x) (list x)) rows))))))
+
+; True iff the original (pre-normalized) spec's inputs are bare values.
+(define a-bp-spec-bare?
+  (lambda (spec)
+    (let ((rows (ns-get spec "inputs")))
+      (and (> (length rows) 0)
+           (not (list? (head rows)))))))
+
+; ── Main decomposer ──────────────────────────────────────────────────
+;
+; N-class partition via recursive isolation. Handles N ≥ 2; with N < 2
+; returns found:false (single-label specs are handled by m-chain's
+; Form 1 constant detectors).
+;
+; Label count cap at 8 mirrors fit-multi-classify's cap. Above that the
+; if-chain depth + search cost exceeds the value.
+
+(define a-bp-max-labels 8)
+
+(define a-binary-partition-decomposer
+  (lambda (synth-spec)
+    (try
+      (let ((pairs (ns-get synth-spec "spec"))
+            (spec (m-chain-spec-from-synth synth-spec)))
+        (let ((target (ns-get spec "outputs"))
+              (bare? (a-bp-spec-bare? spec))
+              (norm-spec (a-bp-normalize-spec spec)))
+          (let ((labels (m8s-distinct-labels target)))
+            (if (or (< (length labels) 2)
+                    (> (length labels) a-bp-max-labels)
+                    (>= (length labels) (length target)))
+              (ns ("found" false))
+              (let ((pool (try (m8s-build-pool norm-spec) (list))))
+                (if (= (length pool) 0)
+                  (ns ("found" false))
+                  (let ((winner (try (a-bp-find-isolating-winner pool target) nil)))
+                    (if (nil? winner)
+                      (ns ("found" false))
+                      (a-bp-emit winner pairs target bare?)))))))))
+      (ns ("found" false)))))
+
+; ── Registration ─────────────────────────────────────────────────────
+;
+; Name "a-binary-partition" kept for load-order stability. Despite the
+; name, this now handles N ≥ 2 partitions.
+
+(define __decomposers__
+  (ns-put __decomposers__ "a-binary-partition" a-binary-partition-decomposer))

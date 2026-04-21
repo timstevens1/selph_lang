@@ -4877,12 +4877,27 @@ pub fn recursive_decompose(
 /// `flat_budget` is the candidate budget for the Flat strategy and is
 /// also passed to RD/HO/D&C/Induction sub-syntheses. BD and Memo are
 /// bounded by their own intrinsic costs and ignore it.
+/// §hole-fc: context for filling holes in decomposer templates.
+/// When provided, decomposers may return AST templates with named hole
+/// symbols (`__hole_0__`, `__hole_1__`, ...) alongside a `"holes"` key
+/// mapping each name to a sub-spec. The engine fills each hole via
+/// `sub_synthesize` and splices the results into the template.
+struct HoleContext<'a> {
+    components: &'a [SynthComponent],
+    universe: &'a TypeUniverse,
+    strategy_depth: usize,
+}
+
 /// §9.37 Stage A: walk the env's `__decomposers__` namespace, calling
 /// each entry as a SELPH decomposer until one returns a `found: true`
 /// result. Each decomposer is a SELPH lambda accepting one argument
 /// (the spec namespace, in the same shape `bi_synthesize` accepts) and
 /// returning either `nil` (doesn't apply) or a result namespace
 /// `(ns ("found" true) ("nodes" <Node>) ("candidates" <Int>))`.
+///
+/// §hole-fc: decomposers may also return a `"holes"` key with named
+/// sub-specs. When `hole_ctx` is Some, the engine fills each hole via
+/// sub-synthesis and splices the results into the template.
 ///
 /// Returns `Some((nodes, root, candidates, name_sym))` on the first
 /// successful decomposer, where `name_sym` is the entry's key in the
@@ -4904,6 +4919,9 @@ fn try_selph_decomposers(
     max_budget: usize,
     test_inputs: &[Value],
     test_expected: &[Value],
+    // §hole-fc: extra params for hole-filling sub-synthesis.
+    // When None, hole-returning decomposers are skipped (backward compat).
+    hole_ctx: Option<HoleContext<'_>>,
 ) -> Option<(Vec<Node>, usize, usize, Sym)> {
     let decomp_ns = match env.lookup(intern("__decomposers__")) {
         Some(Value::Ns(map)) => map,
@@ -4912,7 +4930,6 @@ fn try_selph_decomposers(
     if decomp_ns.is_empty() {
         return None;
     }
-
     // Sort entries by name for deterministic dispatch order. NsMap is
     // a HashMap so iteration order is otherwise nondeterministic.
     let mut entries: Vec<(Sym, Value)> = decomp_ns
@@ -4969,16 +4986,48 @@ fn try_selph_decomposers(
                     if let Some(Value::Node(node_ref)) =
                         result.get(&intern("nodes"))
                     {
-                        // Materialize the constructed AST into a fresh
-                        // owned Vec<Node>. The NodeRef's arena is Rc-shared
-                        // and may live longer than this dispatcher call;
-                        // owning the Vec keeps the StrategyResult
-                        // self-contained.
                         let nodes: Vec<Node> = node_ref.nodes.iter().cloned().collect();
-                        return Some((nodes, node_ref.idx, total_cands, *name_sym));
+                        let root = node_ref.idx;
+
+                        // §hole-fc: check for holes in the template.
+                        if let Some(Value::Ns(holes_map)) = result.get(&intern("holes")) {
+                            if !holes_map.is_empty() {
+                                if let Some(ref ctx) = hole_ctx {
+                                    if let Some((filled_nodes, filled_root, hole_cands)) =
+                                        fill_template_holes(
+                                            &nodes, root, holes_map,
+                                            ctx.components, inputs, expected,
+                                            env, ctx.universe,
+                                            flat_depth, max_budget,
+                                            ctx.strategy_depth,
+                                        )
+                                    {
+                                        // §9.68: validate filled result against
+                                        // held-out test data BEFORE returning.
+                                        // If validation fails, continue to next
+                                        // decomposer instead of falling through
+                                        // to Flat (which would exhaust budget).
+                                        if validate_held_out(&filled_nodes, filled_root,
+                                                             test_inputs, test_expected, env)
+                                        {
+                                            return Some((filled_nodes, filled_root,
+                                                         total_cands + hole_cands, *name_sym));
+                                        }
+                                    }
+                                }
+                                // No hole_ctx, hole-filling failed, or test failed — skip.
+                                continue;
+                            }
+                        }
+
+                        // Complete solution (no holes). Same held-out check.
+                        if validate_held_out(&nodes, root, test_inputs, test_expected, env) {
+                            return Some((nodes, root, total_cands, *name_sym));
+                        }
+                        // Held-out failed — try next decomposer.
+                        continue;
                     }
-                    // Found but missing nodes — skip silently. A future
-                    // version could log this as a curriculum bug.
+                    // Found but missing nodes — skip silently.
                 }
             }
             Ok(Value::Nil) => continue,
@@ -4987,6 +5036,267 @@ fn try_selph_decomposers(
         }
     }
     None
+}
+
+// ── §hole-fc: template hole filling ──────────────────────────────────────
+//
+// When a SELPH decomposer returns a template AST with named hole symbols
+// (`__hole_0__`, `__hole_1__`, ...) and a `"holes"` namespace mapping each
+// name to a sub-spec, this function:
+//   1. Identifies hole positions in the template
+//   2. Sub-synthesizes a program for each hole's sub-spec
+//   3. Splices the sub-programs into the template
+//   4. Verifies the composed result against the original spec
+
+/// Returns true if `sym` is a hole placeholder symbol (__hole_N__).
+fn is_hole_symbol(sym: Sym) -> bool {
+    let name = resolve(sym);
+    name.starts_with("__hole_") && name.ends_with("__")
+}
+
+/// Remap node indices by `offset`, but redirect any child index that
+/// pointed to a hole position to the corresponding sub-tree root instead.
+fn remap_node_with_holes(
+    node: &Node,
+    offset: usize,
+    hole_redirects: &HashMap<usize, usize>,
+) -> Node {
+    let remap = |i: usize| -> usize {
+        if let Some(&target) = hole_redirects.get(&i) {
+            target
+        } else {
+            i + offset
+        }
+    };
+    match node {
+        Node::App(c) => Node::App(c.iter().map(|&i| remap(i)).collect()),
+        Node::SpecialApp(form, c) => {
+            Node::SpecialApp(*form, c.iter().map(|&i| remap(i)).collect())
+        }
+        Node::If(a, b, c) => Node::If(remap(*a), remap(*b), remap(*c)),
+        Node::Lambda(p, b) => Node::Lambda(p.clone(), remap(*b)),
+        Node::Let(bs, b) => Node::Let(
+            bs.iter().map(|(n, i)| (*n, remap(*i))).collect(),
+            remap(*b),
+        ),
+        Node::Int(_) | Node::Num(_) | Node::Str(_) | Node::Bool(_) | Node::Symbol(_) => {
+            node.clone()
+        }
+    }
+}
+
+/// Fill holes in a template AST by sub-synthesizing each hole's sub-spec,
+/// then splicing the results into the template. Returns None if any hole
+/// fails to synthesize or the composed program fails verification.
+/// Convert a primitive Value into a Node for splicing as a literal.
+/// Returns None for non-primitive values.
+fn value_to_lit_node(v: &Value) -> Option<Node> {
+    match v {
+        Value::Int(n) => Some(Node::Int(*n)),
+        Value::Num(n) => Some(Node::Num(*n)),
+        Value::Str(s) => Some(Node::Str(s.as_ref().to_string())),
+        Value::Bool(b) => Some(Node::Bool(*b)),
+        _ => None,
+    }
+}
+
+/// Per-hole candidate set — either a single sub-synth result or a list of
+/// literal-value candidates. Each entry is (nodes, root_in_those_nodes).
+type HoleCandidates = Vec<(Vec<Node>, usize)>;
+
+fn fill_template_holes(
+    template_nodes: &[Node],
+    template_root: usize,
+    holes: &NsMap,
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    flat_depth: usize,
+    max_candidates: usize,
+    strategy_depth: usize,
+) -> Option<(Vec<Node>, usize, usize)> {
+    // 1. Find hole positions in the template.
+    let mut hole_positions: HashMap<Sym, usize> = HashMap::new();
+    for (i, node) in template_nodes.iter().enumerate() {
+        if let Node::Symbol(sym) = node {
+            if is_hole_symbol(*sym) {
+                hole_positions.insert(*sym, i);
+            }
+        }
+    }
+    if hole_positions.is_empty() {
+        return None; // No holes found — shouldn't happen if "holes" was non-empty.
+    }
+
+    // Stable iteration order — sort by hole symbol for deterministic dispatch.
+    let mut ordered_holes: Vec<(Sym, usize)> = hole_positions.into_iter().collect();
+    ordered_holes.sort_by_key(|(s, _)| resolve(*s));
+
+    // Budget per hole: split evenly across sub-synth holes.
+    let budget_per_hole = (max_candidates / ordered_holes.len().max(1)).max(1);
+    let mut total_cands = 0usize;
+
+    // 2. For each hole, gather its candidate set + any per-hole flags.
+    //
+    // §9.68: a hole spec can have either:
+    //   ("spec" <pairs>)         — sub-synthesize; one candidate (the result)
+    //   ("candidates" <values>)  — enumerate literal candidates
+    // Optional flags:
+    //   ("inline" true)          — extract the body of a Lambda result
+    //                              (turns ((lambda (x) body) x) into body)
+    //   ("flat-only" true)       — sub-synthesize with strategy_depth=0 (Flat only,
+    //                              no decomposers). Prevents memorizing decomposers
+    //                              from blocking simple solutions in sub-synthesis.
+    let mut per_hole: Vec<(usize, HoleCandidates, bool)> = Vec::new();
+    for (hole_sym, template_idx) in &ordered_holes {
+        let hole_spec = match holes.get(hole_sym) {
+            Some(Value::Ns(ns)) => ns,
+            _ => return None,
+        };
+        let inline = matches!(
+            hole_spec.get(&intern("inline")),
+            Some(Value::Bool(true))
+        );
+
+        // §9.68: candidate-list path (parametric search via holes).
+        // Candidates can be primitives (converted to literal Nodes) or
+        // pre-built Value::Node trees (e.g., (make-symbol "fn-name") for
+        // function references in head-of-app position).
+        if let Some(Value::List(cands)) = hole_spec.get(&intern("candidates")) {
+            let mut materialized: HoleCandidates = Vec::new();
+            for c in cands.iter() {
+                if let Value::Node(node_ref) = c {
+                    materialized.push((node_ref.nodes.iter().cloned().collect(), node_ref.idx));
+                } else if let Some(node) = value_to_lit_node(c) {
+                    materialized.push((vec![node], 0));
+                }
+            }
+            if materialized.is_empty() {
+                return None;
+            }
+            per_hole.push((*template_idx, materialized, inline));
+            continue;
+        }
+
+        // Existing sub-synth path.
+        let spec_pairs = match hole_spec.get(&intern("spec")) {
+            Some(Value::List(pairs)) => pairs,
+            _ => return None,
+        };
+        let mut sub_inputs: Vec<Value> = Vec::new();
+        let mut sub_expected: Vec<Value> = Vec::new();
+        for pair in spec_pairs.iter() {
+            if let Value::List(p) = pair {
+                if p.len() >= 2 {
+                    sub_inputs.push(p[0].clone());
+                    sub_expected.push(p[1].clone());
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+        if sub_inputs.is_empty() {
+            return None;
+        }
+        // §m-induction: flat-only flag forces strategy_depth=0 for this hole,
+        // preventing memorizing decomposers from blocking simple solutions.
+        let hole_depth = if matches!(
+            hole_spec.get(&intern("flat-only")),
+            Some(Value::Bool(true))
+        ) {
+            0
+        } else {
+            strategy_depth
+        };
+        let sr = sub_synthesize(
+            components, &sub_inputs, &sub_expected,
+            env, universe, flat_depth, budget_per_hole, hole_depth,
+        );
+        total_cands += sr.candidates_explored;
+        if !sr.found {
+            return None;
+        }
+        let sub_nodes = sr.nodes.unwrap().to_vec();
+        let sub_root = sr.root.unwrap();
+        per_hole.push((*template_idx, vec![(sub_nodes, sub_root)], inline));
+    }
+
+    // 3. Enumerate the cross-product of per-hole candidates. For each
+    //    combination, splice into a fresh `out` arena, then verify against
+    //    the original spec. Return the first valid composition.
+    //
+    // For sub-synth holes (single candidate), this is a no-op. For
+    // candidate-list holes, this is the parametric search.
+    let combos = cartesian_indices(&per_hole.iter().map(|(_, cs, _)| cs.len()).collect::<Vec<_>>());
+    for combo in combos {
+        let mut out: Vec<Node> = Vec::new();
+        let mut hole_redirects: HashMap<usize, usize> = HashMap::new();
+
+        for (i, (template_idx, cands, inline)) in per_hole.iter().enumerate() {
+            let (sub_nodes, sub_root) = &cands[combo[i]];
+            let spliced_root = ho_splice_sub(&mut out, sub_nodes, *sub_root);
+            // §9.68 inline: extract Lambda body so callers don't need to
+            // wrap holes as `(__hole_N__ x)` for application.
+            let final_root = if *inline {
+                if let Node::Lambda(_, body) = out[spliced_root] {
+                    body
+                } else {
+                    spliced_root
+                }
+            } else {
+                spliced_root
+            };
+            hole_redirects.insert(*template_idx, final_root);
+        }
+
+        let tpl_offset = out.len();
+        for (i, node) in template_nodes.iter().enumerate() {
+            if hole_redirects.contains_key(&i) {
+                out.push(Node::Int(0));
+            } else {
+                out.push(remap_node_with_holes(node, tpl_offset, &hole_redirects));
+            }
+        }
+        let composed_root = template_root + tpl_offset;
+
+        if ho_verify_composed(&out, composed_root, inputs, expected, env) {
+            return Some((out, composed_root, total_cands));
+        }
+    }
+
+    None
+}
+
+/// Generate all index combinations for a cartesian product. Each entry in
+/// `sizes` is the count of candidates for one hole. Returns a list of
+/// index vectors (one per hole).
+///
+/// Empty input → one empty combo (vacuous).
+/// Any size 0 → no combos (would be impossible).
+fn cartesian_indices(sizes: &[usize]) -> Vec<Vec<usize>> {
+    if sizes.iter().any(|&n| n == 0) {
+        return Vec::new();
+    }
+    if sizes.is_empty() {
+        return vec![Vec::new()];
+    }
+    let mut result: Vec<Vec<usize>> = vec![Vec::new()];
+    for &n in sizes {
+        let mut next = Vec::with_capacity(result.len() * n);
+        for prefix in &result {
+            for i in 0..n {
+                let mut new = prefix.clone();
+                new.push(i);
+                next.push(new);
+            }
+        }
+        result = next;
+    }
+    result
 }
 
 /// §9.37 Stage C: type-keyed decomposer dispatch. Walk the universe's
@@ -5117,9 +5427,13 @@ fn sub_synthesize(
     strategy_depth: usize,
 ) -> SynthResult {
     if strategy_depth > 0 {
+        // Sub-synthesis doesn't carry held-out tests — the sub-spec is
+        // derived from the parent's training split, so there are no
+        // independent validation pairs available here.
         let sr = synthesize_with_strategies_depth(
             components, inputs, expected, env, universe,
             flat_depth, max_candidates, strategy_depth - 1, 0,
+            &[], &[],
         );
         SynthResult {
             found: sr.found,
@@ -5152,7 +5466,35 @@ pub fn synthesize_with_strategies(
     strategy_depth: usize,
 ) -> StrategyResult {
     synthesize_with_strategies_depth(
-        components, inputs, expected, env, universe, flat_depth, flat_budget, strategy_depth, 0,
+        components, inputs, expected, env, universe,
+        flat_depth, flat_budget, strategy_depth, 0, &[], &[],
+    )
+}
+
+/// Like `synthesize_with_strategies` but plumbs held-out test pairs into
+/// the decomposer dispatcher. Without this, `task` (single-arg) runs
+/// accept memorization solutions that fail held-out validation, because
+/// `try_selph_decomposers` is called with empty test slices.
+///
+/// Prefer this over `synthesize_with_strategies` whenever the caller
+/// has test pairs; it mirrors `synthesize_args_with_test` on the
+/// multi-arg path.
+pub fn synthesize_with_strategies_and_test(
+    components: &[SynthComponent],
+    inputs: &[Value],
+    expected: &[Value],
+    env: &Env,
+    universe: &TypeUniverse,
+    flat_depth: usize,
+    flat_budget: usize,
+    strategy_depth: usize,
+    test_inputs: &[Value],
+    test_expected: &[Value],
+) -> StrategyResult {
+    synthesize_with_strategies_depth(
+        components, inputs, expected, env, universe,
+        flat_depth, flat_budget, strategy_depth, 0,
+        test_inputs, test_expected,
     )
 }
 
@@ -5174,15 +5516,31 @@ pub fn synthesize_with_strategies_beam(
     beam_width: usize,
 ) -> StrategyResult {
     synthesize_with_strategies_depth(
-        components, inputs, expected, env, universe, flat_depth, flat_budget, strategy_depth, beam_width,
+        components, inputs, expected, env, universe,
+        flat_depth, flat_budget, strategy_depth, beam_width, &[], &[],
     )
 }
+
+/// Gate the Rust decomposition strategies (RD / BD / HO / D&C / IN)
+/// in `synthesize_with_strategies_depth`. SELPH decomposers (m_partition,
+/// m_chain_bool, m_ho_*, m_rd, m_dc, etc.) cover most of their roles,
+/// but some — notably BD's `(or P Q)` / `(and P Q)` compositions and
+/// RD's inverse-function discovery — still produce genuine structural
+/// solutions that no SELPH equivalent reaches at the default budget.
+///
+/// Keep enabled until the remaining gaps are plugged on the SELPH side;
+/// top-level `validate_held_out` in `main.rs::cmd_grow_v2` rejects any
+/// Rust-strategy result that memorizes without generalizing.
+const ENABLE_RUST_DECOMPOSERS: bool = true;
 
 /// Inner dispatcher with explicit `strategy_depth` tracking.
 /// When `strategy_depth > 0`, sub-synthesis in HO/D&C/Induction/RD
 /// routes through the full strategy chain (decrementing depth).
 /// At `strategy_depth == 0`, sub-synthesis uses flat enumeration only.
 /// When `beam_width > 0`, the Flat stage collects top-K beam entries.
+/// `test_inputs` / `test_expected` are held-out validation pairs passed
+/// into `try_selph_decomposers` so decomposer results that memorize
+/// training without generalizing to test are rejected.
 fn synthesize_with_strategies_depth(
     components: &[SynthComponent],
     inputs: &[Value],
@@ -5193,6 +5551,8 @@ fn synthesize_with_strategies_depth(
     flat_budget: usize,
     strategy_depth: usize,
     beam_width: usize,
+    test_inputs: &[Value],
+    test_expected: &[Value],
 ) -> StrategyResult {
     // §9.49 post-mortem diagnostics: infer output type tag once.
     let output_type_str = infer_uniform_type_sym(expected)
@@ -5207,8 +5567,14 @@ fn synthesize_with_strategies_depth(
 
     // §9.37 Stage A: global SELPH decomposers from `__decomposers__`
     // run BEFORE the hardcoded chain. Curriculum is in charge.
+    //
+    // Held-out test pairs are passed through so the dispatcher's
+    // `validate_held_out` check rejects memorization solutions that
+    // match training but fail on the held-out examples.
     if let Some((nodes, root, sd_explored, name_sym)) =
-        try_selph_decomposers(env, inputs, expected, flat_depth, flat_budget, &[], &[])
+        try_selph_decomposers(env, inputs, expected, flat_depth, flat_budget,
+            test_inputs, test_expected,
+            Some(HoleContext { components, universe, strategy_depth }))
     {
         return StrategyResult {
             found: true,
@@ -5270,148 +5636,141 @@ fn synthesize_with_strategies_depth(
         return stamp(StrategyResult::from_synth(flat, Strategy::Flat));
     }
 
-    // Strategy 2: Recursive decomposition. Top-down family prediction +
-    // outermost-function inversion. Cheap when the family doesn't apply
-    // (each helper bails fast); valuable when an arithmetic / string-op
-    // / library composition is the answer and Flat couldn't reach it
-    // within `flat_budget`.
-    if let Some((nodes, root, rd_explored)) = recursive_decompose(
-        components,
-        inputs,
-        expected,
-        env,
-        universe,
-        flat_depth,
-        flat_budget,
-        strategy_depth,
-    ) {
-        total_explored += rd_explored;
-        return stamp(StrategyResult {
-            found: true,
-            nodes: Some(nodes),
-            root: Some(root),
-            candidates_explored: total_explored,
-            strategy: Some(Strategy::RecursiveDecomposition),
-            output_type: None,
-            m_chain_ran: false,
-            best_fitness: 1.0,
-            best_source: None,
-            beam: Vec::new(),
-            experience: Vec::new(),
-        });
-    }
+    // §Option-A-followup: Rust decomposition strategies (RD, BD, HO,
+    // D&C, IN) are gated behind this constant. With SELPH decomposers
+    // (m_partition, m_chain_bool, m_ho_*, m_rd, m_dc, etc.) absorbing
+    // their responsibilities, these Rust strategies are no longer
+    // needed for the default curricula. Keep implementations available
+    // in case a future workload wants to re-enable them.
+    if ENABLE_RUST_DECOMPOSERS {
+        // Strategy 2: Recursive decomposition. Top-down family
+        // prediction + outermost-function inversion.
+        if let Some((nodes, root, rd_explored)) = recursive_decompose(
+            components,
+            inputs,
+            expected,
+            env,
+            universe,
+            flat_depth,
+            flat_budget,
+            strategy_depth,
+        ) {
+            total_explored += rd_explored;
+            return stamp(StrategyResult {
+                found: true,
+                nodes: Some(nodes),
+                root: Some(root),
+                candidates_explored: total_explored,
+                strategy: Some(Strategy::RecursiveDecomposition),
+                output_type: None,
+                m_chain_ran: false,
+                best_fitness: 1.0,
+                best_source: None,
+                beam: Vec::new(),
+                experience: Vec::new(),
+            });
+        }
 
-    // Strategy 3: Boolean decomposition. Cheap and only applies to
-    // bool-output tasks (it filters internally), so we run it before
-    // Memo: it produces a structured program when it fires, whereas
-    // Memo is a lookup-table fallback that is correct on training but
-    // generalizes by accident on bool output.
-    if let Some((nodes, root, bd_explored)) =
-        bool_decompose(components, inputs, expected, env)
-    {
-        total_explored += bd_explored;
-        return stamp(StrategyResult {
-            found: true,
-            nodes: Some(nodes),
-            root: Some(root),
-            candidates_explored: total_explored,
-            strategy: Some(Strategy::BoolDecomp),
-            output_type: None,
-            m_chain_ran: false,
-            best_fitness: 1.0,
-            best_source: None,
-            beam: Vec::new(),
-            experience: Vec::new(),
-        });
-    }
+        // Strategy 3: Boolean decomposition.
+        if let Some((nodes, root, bd_explored)) =
+            bool_decompose(components, inputs, expected, env)
+        {
+            total_explored += bd_explored;
+            return stamp(StrategyResult {
+                found: true,
+                nodes: Some(nodes),
+                root: Some(root),
+                candidates_explored: total_explored,
+                strategy: Some(Strategy::BoolDecomp),
+                output_type: None,
+                m_chain_ran: false,
+                best_fitness: 1.0,
+                best_source: None,
+                beam: Vec::new(),
+                experience: Vec::new(),
+            });
+        }
 
-    // Strategy 3: Higher-order decomposition. Each template is shape-
-    // gated (list→list, str→str, etc.) and bails immediately if not
-    // applicable, so cost is dominated by the inner sub-synthesis.
-    if let Some((nodes, root, ho_explored)) = higher_order_decompose(
-        components,
-        inputs,
-        expected,
-        env,
-        universe,
-        flat_depth,
-        flat_budget,
-        strategy_depth,
-    ) {
-        total_explored += ho_explored;
-        return stamp(StrategyResult {
-            found: true,
-            nodes: Some(nodes),
-            root: Some(root),
-            candidates_explored: total_explored,
-            strategy: Some(Strategy::HigherOrder),
-            output_type: None,
-            m_chain_ran: false,
-            best_fitness: 1.0,
-            best_source: None,
-            beam: Vec::new(),
-            experience: Vec::new(),
-        });
-    }
+        // Strategy 4: Higher-order decomposition.
+        if let Some((nodes, root, ho_explored)) = higher_order_decompose(
+            components,
+            inputs,
+            expected,
+            env,
+            universe,
+            flat_depth,
+            flat_budget,
+            strategy_depth,
+        ) {
+            total_explored += ho_explored;
+            return stamp(StrategyResult {
+                found: true,
+                nodes: Some(nodes),
+                root: Some(root),
+                candidates_explored: total_explored,
+                strategy: Some(Strategy::HigherOrder),
+                output_type: None,
+                m_chain_ran: false,
+                best_fitness: 1.0,
+                best_source: None,
+                beam: Vec::new(),
+                experience: Vec::new(),
+            });
+        }
 
-    // Strategy 4: Divide-and-conquer. Only meaningful for tasks with
-    // multiple distinct outputs (it filters internally). The recursive
-    // structure means worst-case cost is N partition attempts × the
-    // sub-synthesis budget for separators and branches.
-    if let Some((nodes, root, dc_explored)) = divide_and_conquer(
-        components,
-        inputs,
-        expected,
-        env,
-        universe,
-        flat_depth,
-        flat_budget,
-        strategy_depth,
-    ) {
-        total_explored += dc_explored;
-        return stamp(StrategyResult {
-            found: true,
-            nodes: Some(nodes),
-            root: Some(root),
-            candidates_explored: total_explored,
-            strategy: Some(Strategy::DivideConquer),
-            output_type: None,
-            m_chain_ran: false,
-            best_fitness: 1.0,
-            best_source: None,
-            beam: Vec::new(),
-            experience: Vec::new(),
-        });
-    }
+        // Strategy 5: Divide-and-conquer.
+        if let Some((nodes, root, dc_explored)) = divide_and_conquer(
+            components,
+            inputs,
+            expected,
+            env,
+            universe,
+            flat_depth,
+            flat_budget,
+            strategy_depth,
+        ) {
+            total_explored += dc_explored;
+            return stamp(StrategyResult {
+                found: true,
+                nodes: Some(nodes),
+                root: Some(root),
+                candidates_explored: total_explored,
+                strategy: Some(Strategy::DivideConquer),
+                output_type: None,
+                m_chain_ran: false,
+                best_fitness: 1.0,
+                best_source: None,
+                beam: Vec::new(),
+                experience: Vec::new(),
+            });
+        }
 
-    // Strategy 5: Induction (intermediate value decomposition). Probes
-    // a curated set of unary/binary builtins for an intermediate value
-    // sequence, then sub-synthesizes input→intermediate and
-    // intermediate→expected. Composes via Node::Let.
-    if let Some((nodes, root, in_explored)) = induce_decomposition(
-        components,
-        inputs,
-        expected,
-        env,
-        universe,
-        flat_depth,
-        flat_budget,
-        strategy_depth,
-    ) {
-        total_explored += in_explored;
-        return stamp(StrategyResult {
-            found: true,
-            nodes: Some(nodes),
-            root: Some(root),
-            candidates_explored: total_explored,
-            strategy: Some(Strategy::Induction),
-            output_type: None,
-            m_chain_ran: false,
-            best_fitness: 1.0,
-            best_source: None,
-            beam: Vec::new(),
-            experience: Vec::new(),
-        });
+        // Strategy 6: Induction (intermediate value decomposition).
+        if let Some((nodes, root, in_explored)) = induce_decomposition(
+            components,
+            inputs,
+            expected,
+            env,
+            universe,
+            flat_depth,
+            flat_budget,
+            strategy_depth,
+        ) {
+            total_explored += in_explored;
+            return stamp(StrategyResult {
+                found: true,
+                nodes: Some(nodes),
+                root: Some(root),
+                candidates_explored: total_explored,
+                strategy: Some(Strategy::Induction),
+                output_type: None,
+                m_chain_ran: false,
+                best_fitness: 1.0,
+                best_source: None,
+                beam: Vec::new(),
+                experience: Vec::new(),
+            });
+        }
     }
 
     // Strategy 6: Memo. Always candidate-cost 0 (no enumeration).
@@ -6400,9 +6759,15 @@ fn synthesize_inner(
     // after enumeration exhausts, inflating reported candidate
     // counts even when the chain itself would be cheap.
     if extra_seeds_was_some {
+        // §9.67: pass hole_ctx so hole-based decomposers can fire on
+        // multi-arg specs too. Previously hole_ctx was None here, which
+        // silently skipped any decomposer returning a template with
+        // holes. The fix gives hole-based decomposers (like m_partition,
+        // m_dc, m_ho_*) parity with the single-arg path.
         if let Some((nodes, root, sd_explored, name_sym)) =
             try_selph_decomposers(env, inputs, expected, flat_depth, max_candidates,
-                                  test_inputs, test_expected)
+                                  test_inputs, test_expected,
+                                  Some(HoleContext { components, universe, strategy_depth: 2 }))
         {
             // §9.47.5: the chain now self-validates against test data
             // internally (via the spec ns "test" key). The external
@@ -9407,5 +9772,120 @@ mod tests {
         // matches occur before the exact match, this could be empty.
         // The important thing is the structure works — we don't assert non-empty.
         let _ = r.experience; // just verify it exists and is accessible
+    }
+
+    // ── §hole-fc: fill_template_holes tests ──────────────────────────────
+
+    #[test]
+    fn fill_holes_list_map_template() {
+        // Test the hole-filling pipeline directly: construct a template
+        // (lambda (x) (map __hole_0__ x)) with a sub-spec that demands
+        // element-wise (add x 1), then verify fill_template_holes produces
+        // a working composed program.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        // Template: (lambda (x) (map __hole_0__ x))
+        let template_nodes = vec![
+            Node::Symbol(intern("map")),           // 0
+            Node::Symbol(intern("__hole_0__")),    // 1
+            Node::Symbol(intern("x")),             // 2
+            Node::App(vec![0, 1, 2]),              // 3: (map __hole_0__ x)
+            Node::Lambda(vec![intern("x")], 3),    // 4: (lambda (x) ...)
+        ];
+        let template_root = 4;
+
+        // Sub-spec: element-wise add-1
+        let sub_spec_pairs = Value::list(vec![
+            Value::list(vec![Value::Int(1), Value::Int(2)]),
+            Value::list(vec![Value::Int(2), Value::Int(3)]),
+            Value::list(vec![Value::Int(10), Value::Int(11)]),
+            Value::list(vec![Value::Int(0), Value::Int(1)]),
+        ]);
+        let mut holes_map = NsMap::new();
+        let mut hole_spec = NsMap::new();
+        hole_spec.insert(intern("spec"), sub_spec_pairs);
+        holes_map.insert(intern("__hole_0__"), Value::ns(hole_spec));
+
+        // Full task spec: list→list where each element is +1.
+        let inputs = vec![
+            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            Value::list(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
+            Value::list(vec![Value::Int(0), Value::Int(5), Value::Int(7)]),
+        ];
+        let expected = vec![
+            Value::list(vec![Value::Int(2), Value::Int(3), Value::Int(4)]),
+            Value::list(vec![Value::Int(11), Value::Int(21), Value::Int(31)]),
+            Value::list(vec![Value::Int(1), Value::Int(6), Value::Int(8)]),
+        ];
+
+        let result = fill_template_holes(
+            &template_nodes, template_root, &holes_map,
+            &comps, &inputs, &expected, &env, &universe,
+            2, 2000, 1,
+        );
+        assert!(result.is_some(), "fill_template_holes should find a solution");
+        let (nodes, root, cands) = result.unwrap();
+        assert!(cands > 0, "should have explored some candidates");
+        // Verify the composed program works on the original spec.
+        assert!(
+            ho_verify_composed(&nodes, root, &inputs, &expected, &env),
+            "composed program should pass all examples"
+        );
+    }
+
+    #[test]
+    fn fill_holes_returns_none_on_unsolvable_hole() {
+        // If the sub-spec for a hole is unsolvable, fill_template_holes
+        // should return None.
+        init_special_forms();
+        let env = eval_v2::make_default_env();
+        let universe = TypeUniverse::primitives();
+        let comps = primitive_components();
+
+        let template_nodes = vec![
+            Node::Symbol(intern("map")),
+            Node::Symbol(intern("__hole_0__")),
+            Node::Symbol(intern("x")),
+            Node::App(vec![0, 1, 2]),
+            Node::Lambda(vec![intern("x")], 3),
+        ];
+
+        // Sub-spec: contradictory (same input → different outputs).
+        let sub_spec_pairs = Value::list(vec![
+            Value::list(vec![Value::Int(1), Value::Int(2)]),
+            Value::list(vec![Value::Int(1), Value::Int(3)]),
+            Value::list(vec![Value::Int(2), Value::Int(4)]),
+        ]);
+        let mut holes_map = NsMap::new();
+        let mut hole_spec = NsMap::new();
+        hole_spec.insert(intern("spec"), sub_spec_pairs);
+        holes_map.insert(intern("__hole_0__"), Value::ns(hole_spec));
+
+        let inputs = vec![
+            Value::list(vec![Value::Int(1), Value::Int(2)]),
+        ];
+        let expected = vec![
+            Value::list(vec![Value::Int(999), Value::Int(999)]),
+        ];
+
+        let result = fill_template_holes(
+            &template_nodes, 4, &holes_map,
+            &comps, &inputs, &expected, &env, &universe,
+            1, 500, 0,
+        );
+        assert!(result.is_none(), "should fail on unsolvable sub-spec");
+    }
+
+    #[test]
+    fn is_hole_symbol_recognizes_holes() {
+        assert!(is_hole_symbol(intern("__hole_0__")));
+        assert!(is_hole_symbol(intern("__hole_1__")));
+        assert!(is_hole_symbol(intern("__hole_42__")));
+        assert!(!is_hole_symbol(intern("x")));
+        assert!(!is_hole_symbol(intern("__decomposers__")));
+        assert!(!is_hole_symbol(intern("hole")));
     }
 }

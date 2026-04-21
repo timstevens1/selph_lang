@@ -1141,7 +1141,7 @@ fn cmd_grow_v2(args: &[String]) {
         // example and dispatch through `synthesize_args` (Flat-only,
         // skipping the strategy chain whose decomposers all assume
         // a single-input lambda).
-        let result = if let Some(arity) = arity_hint {
+        let mut result = if let Some(arity) = arity_hint {
             // Per-position type inference from the first input list.
             let first = match inputs.first() {
                 Some(types_v2::Value::List(items)) if items.len() == *arity => items.clone(),
@@ -1210,7 +1210,12 @@ fn cmd_grow_v2(args: &[String]) {
                 experience: Vec::new(),
             }
         } else {
-            synth_v2::synthesize_with_strategies(
+            // Single-arg `task` path: use the _and_test variant so
+            // held-out pairs reach try_selph_decomposers and
+            // memorization-only solutions get rejected. Without this,
+            // single-arg tasks silently accept ns-get-or lookup tables
+            // that pass training but fail test.
+            synth_v2::synthesize_with_strategies_and_test(
                 &components,
                 &inputs,
                 &expected,
@@ -1219,10 +1224,33 @@ fn cmd_grow_v2(args: &[String]) {
                 *task_depth,
                 default_budget,
                 default_strategy_depth,
+                &test_inputs,
+                &test_expected,
             )
         };
         let elapsed = start.elapsed();
         total_candidates += result.candidates_explored;
+
+        // §Option-A-followup: top-level held-out validation. SELPH
+        // decomposers self-validate via try_selph_decomposers's test
+        // plumbing, but Rust strategies (Flat/Memo and gated RD/BD/
+        // HO/D&C/IN) don't. Without this check, a Memo lookup table
+        // that perfectly matches training but fails on held-out test
+        // pairs would be accepted as "solved". Apply the check once
+        // here so every strategy's result is test-validated before
+        // counting as a solve.
+        if result.found && !test_inputs.is_empty() {
+            let nodes_vec = result.nodes.as_ref().expect("found implies nodes");
+            let root = result.root.expect("found implies root");
+            if !synth_v2::validate_held_out(
+                nodes_vec, root, &test_inputs, &test_expected, &env,
+            ) {
+                // Convert to a not-found so the summary reflects
+                // reality — the candidate fails generalization.
+                result.found = false;
+                result.strategy = None;
+            }
+        }
 
         if result.found {
             let nodes_vec = result.nodes.expect("found implies nodes");
@@ -1644,7 +1672,9 @@ fn legacy_value_to_v2_force_num(v: &Value) -> types_v2::Value {
 /// Errors from individual forms are reported but don't stop the
 /// loop — a typo in one helper shouldn't kill the whole curriculum.
 fn eval_curriculum_preamble(source: &str, env: &types_v2::Env) -> Result<(), String> {
+    let t0 = std::time::Instant::now();
     let (legacy_nodes, roots) = parse_file(source).map_err(|e| e.to_string())?;
+    let t1 = std::time::Instant::now();
     let task_sym = intern("task");
     let task_args_sym = intern("task-args");
 
@@ -1652,7 +1682,9 @@ fn eval_curriculum_preamble(source: &str, env: &types_v2::Env) -> Result<(), Str
     // root index.
     let v2_nodes_vec = eval_v2::convert_tree(&legacy_nodes);
     let v2_nodes: Rc<[types_v2::Node]> = v2_nodes_vec.into();
+    let t2 = std::time::Instant::now();
 
+    let mut eval_count = 0usize;
     for &root in &roots {
         // Skip task forms — those go through parse_curriculum_tasks.
         let is_task = match &legacy_nodes[root] {
@@ -1668,10 +1700,32 @@ fn eval_curriculum_preamble(source: &str, env: &types_v2::Env) -> Result<(), Str
         // Eval the form. Top-level `(define ...)` mutates env.top_scope.
         // Other expressions are evaluated for side effects (e.g.
         // `(print ...)`); their values are discarded.
+        let fe_start = std::time::Instant::now();
         if let Err(e) = eval_v2::eval(&v2_nodes, root, env) {
             eprintln!("  preamble: form failed: {}", e);
         }
+        let fe_dur = fe_start.elapsed().as_secs_f64();
+        if fe_dur > 0.05 {
+            // Find the name of this form (first child symbol of App)
+            let name = match &legacy_nodes[root] {
+                Node::App(children) if children.len() >= 2 => {
+                    if let Node::Symbol(s) = &legacy_nodes[children[0]] {
+                        if resolve(*s) == "define" {
+                            if let Node::Symbol(n) = &legacy_nodes[children[1]] {
+                                resolve(*n).to_string()
+                            } else { format!("form@{}", root) }
+                        } else { format!("({}...)", resolve(*s)) }
+                    } else { format!("form@{}", root) }
+                }
+                _ => format!("form@{}", root),
+            };
+            eprintln!("  preamble slow form: {:.3}s  {}", fe_dur, name);
+        }
+        eval_count += 1;
     }
+    let t3 = std::time::Instant::now();
+    eprintln!("  preamble timing: parse={:.3}s convert={:.3}s eval={:.3}s ({} forms)",
+        (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), (t3 - t2).as_secs_f64(), eval_count);
 
     Ok(())
 }

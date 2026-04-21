@@ -750,6 +750,7 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("make-if"), bi_make_if);
     t.register(intern("make-lambda"), bi_make_lambda);
     t.register(intern("make-let"), bi_make_let);
+    t.register(intern("make-hole"), bi_make_hole);
     t.register(intern("node?"), bi_is_node);
     t.register(intern("node-kind"), bi_node_kind);
     t.register(intern("node-int"), bi_node_int);
@@ -770,6 +771,8 @@ fn build_builtin_table() -> BuiltinTable {
     // library functions; `function-arity` and `function-param-types`
     // expose the same metadata `library_components_from_env` reads.
     t.register(intern("env-functions"), bi_env_functions);
+    t.register(intern("env-function-names"), bi_env_function_names);
+    t.register(intern("env-lookup"), bi_env_lookup);
     t.register(intern("function-arity"), bi_function_arity);
     t.register(intern("function-param-types"), bi_function_param_types);
     t.register(intern("apropos"), bi_apropos);
@@ -831,11 +834,24 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("grid-diagnose-spec"), bi_grid_diagnose_spec);
     t.register(intern("grid-color-voronoi"), bi_grid_color_voronoi);
     t.register(intern("grid-recolor-by-proximity"), bi_grid_recolor_by_proximity);
+    // §9.60: proximity recolor with radius (Form 15)
+    t.register(intern("grid-recolor-by-proximity-radius"), bi_grid_recolor_by_proximity_radius);
+    // Form 16: rectangular hole fill
+    t.register(intern("grid-fill-rectangular-holes"), bi_grid_fill_rectangular_holes);
     // §9.59: diagonal line / ray-casting builtins
     t.register(intern("grid-draw-line"), bi_grid_draw_line);
     t.register(intern("grid-extend-lines"), bi_grid_extend_lines);
     t.register(intern("grid-connect-same-color"), bi_grid_connect_same_color);
     t.register(intern("grid-rays"), bi_grid_rays);
+    // Mono-color object builtins
+    t.register(intern("grid-objects-mono"), bi_grid_objects_mono);
+    t.register(intern("grid-mono-count"), bi_grid_mono_count);
+    t.register(intern("grid-mono-object"), bi_grid_mono_object);
+    t.register(intern("grid-mono-pos"), bi_grid_mono_pos);
+    t.register(intern("grid-mono-color"), bi_grid_mono_color);
+    t.register(intern("grid-mono-bbox"), bi_grid_mono_bbox);
+    t.register(intern("grid-mono-neighbors"), bi_grid_mono_neighbors);
+    t.register(intern("grid-mono-nearest"), bi_grid_mono_nearest);
 
     t
 }
@@ -883,7 +899,7 @@ fn build_default_scope() -> Scope {
         "test-spec", "memorize", "eval-source",
         // §9.36 AST homoiconicity — construction
         "make-int", "make-num", "make-str", "make-bool", "make-symbol",
-        "make-app", "make-if", "make-lambda", "make-let",
+        "make-app", "make-if", "make-lambda", "make-let", "make-hole",
         // §9.36 AST homoiconicity — inspection
         "node?", "node-kind", "node-int", "node-num", "node-str",
         "node-bool", "node-symbol", "node-children", "node-params",
@@ -893,7 +909,8 @@ fn build_default_scope() -> Scope {
         // §9.36 AST homoiconicity — parsing
         "parse-source", "parse-file",
         // §9.45 P1 — env/function introspection (M7 prerequisites)
-        "env-functions", "function-arity", "function-param-types",
+        "env-functions", "env-function-names", "env-lookup",
+        "function-arity", "function-param-types",
         "apropos", "apropos-by-type",
         // §9.48 P2: grid builtins
         "grid?", "grid-height", "grid-width",
@@ -915,8 +932,15 @@ fn build_default_scope() -> Scope {
         "grid-probe-recomp", "grid-probe-extract", "grid-probe-scale",
         "grid-diagnose-spec",
         "grid-color-voronoi", "grid-recolor-by-proximity",
+        // §9.60: proximity recolor with radius (Form 15)
+        "grid-recolor-by-proximity-radius",
+        // Form 16: rectangular hole fill
+        "grid-fill-rectangular-holes",
         // §9.59: diagonal line / ray-casting
         "grid-draw-line", "grid-extend-lines", "grid-connect-same-color", "grid-rays",
+        // Mono-color object builtins
+        "grid-objects-mono", "grid-mono-count", "grid-mono-object", "grid-mono-pos",
+        "grid-mono-color", "grid-mono-bbox", "grid-mono-neighbors", "grid-mono-nearest",
     ];
     for name in names {
         let sym = intern(name);
@@ -1911,6 +1935,21 @@ fn bi_make_symbol(args: &[Value], _env: &Env) -> Result<Value, String> {
     Ok(single_node_value(Node::Symbol(sym)))
 }
 
+/// §hole-fc: convenience for constructing hole placeholder symbols.
+/// `(make-hole 0)` → `Node::Symbol(intern("__hole_0__"))`.
+fn bi_make_hole(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("make-hole: expected 1 arg (index), got {}", args.len()));
+    }
+    let idx = match &args[0] {
+        Value::Int(n) => *n,
+        other => return Err(format!("make-hole: expected int index, got {:?}", other)),
+    };
+    let name = format!("__hole_{}__", idx);
+    let sym = intern(&name);
+    Ok(single_node_value(Node::Symbol(sym)))
+}
+
 /// Internal: copy a NodeRef's nodes into `out`, applying offset, and return
 /// the new index of the root. Used by all multi-arg constructors.
 fn copy_subtree(node_ref: &NodeRef, out: &mut Vec<Node>) -> usize {
@@ -2388,6 +2427,44 @@ fn bi_env_functions(args: &[Value], env: &Env) -> Result<Value, String> {
         out.insert(*sym, val.clone());
     }
     Ok(Value::ns(out))
+}
+
+/// `(env-function-names)` — return a list of function name strings for
+/// all user-defined (non-builtin) functions in the env. Walks the scope
+/// chain but does NOT clone function values — much cheaper than
+/// `env-functions` which clones every Value.
+fn bi_env_function_names(args: &[Value], env: &Env) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(format!(
+            "env-function-names: expected 0 args, got {}",
+            args.len()
+        ));
+    }
+    let skip = crate::synth_v2::default_skip_set();
+    let names: Vec<Value> = env
+        .function_name_syms(&skip)
+        .into_iter()
+        .map(|s| Value::Str(resolve(s).into()))
+        .collect();
+    Ok(Value::list(names))
+}
+
+/// `(env-lookup name)` — look up a single binding by name string.
+/// Returns the value or nil if not found. Uses `env.lookup()` which is
+/// O(scope-depth) per call — much cheaper than building a full
+/// env-functions namespace when you only need a few entries.
+fn bi_env_lookup(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "env-lookup: expected 1 arg, got {}",
+            args.len()
+        ));
+    }
+    let name = match &args[0] {
+        Value::Str(s) => intern(s),
+        _ => return Err("env-lookup: expected string name".into()),
+    };
+    Ok(env.lookup(name).unwrap_or(Value::Nil))
 }
 
 /// `(function-arity f)` — return the arity of `f` as an Int. For
@@ -3825,6 +3902,242 @@ fn grid_cc_with_pos(g: &[Vec<i64>], eight_connected: bool) -> Vec<ObjectInfo> {
     results
 }
 
+// ── Mono-color connected components (same-color BFS) ────────────────────────
+
+struct MonoObjectInfo {
+    grid: Vec<Vec<i64>>,
+    row: usize,
+    col: usize,
+    size: usize,
+    color: i64,
+}
+
+/// Like `grid_cc_with_pos` but BFS only follows cells of the *same* color.
+/// Each mono-color connected component becomes a separate object.
+fn grid_mono_cc_with_pos(g: &[Vec<i64>], eight_connected: bool) -> Vec<MonoObjectInfo> {
+    let h = g.len();
+    let w = g.first().map_or(0, |r| r.len());
+    if h == 0 || w == 0 { return vec![]; }
+    let bg = grid_background(g);
+    let mut labels = vec![vec![0u32; w]; h];
+    let mut next_label = 1u32;
+    let dirs4: &[(i32, i32)] = &[(-1, 0), (1, 0), (0, -1), (0, 1)];
+    let dirs8: &[(i32, i32)] = &[(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)];
+    let dirs = if eight_connected { dirs8 } else { dirs4 };
+    let mut label_colors: Vec<i64> = vec![0]; // index 0 unused; label 1 → index 1
+    for r in 0..h { for c in 0..w {
+        if g[r][c] != bg && labels[r][c] == 0 {
+            let seed_color = g[r][c];
+            let label = next_label;
+            next_label += 1;
+            label_colors.push(seed_color);
+            labels[r][c] = label;
+            let mut queue = vec![(r, c)];
+            while let Some((cr, cc)) = queue.pop() {
+                for &(dr, dc) in dirs {
+                    let (nr, nc) = (cr as i32 + dr, cc as i32 + dc);
+                    if nr >= 0 && nr < h as i32 && nc >= 0 && nc < w as i32 {
+                        let (nr, nc) = (nr as usize, nc as usize);
+                        if labels[nr][nc] == 0 && g[nr][nc] == seed_color {
+                            labels[nr][nc] = label;
+                            queue.push((nr, nc));
+                        }
+                    }
+                }
+            }
+        }
+    }}
+    let mut results = Vec::with_capacity((next_label - 1) as usize);
+    for lbl in 1..next_label {
+        let (mut min_r, mut min_c, mut max_r, mut max_c, mut count) = (h, w, 0usize, 0usize, 0usize);
+        for r in 0..h { for c in 0..w {
+            if labels[r][c] == lbl {
+                min_r = min_r.min(r); min_c = min_c.min(c);
+                max_r = max_r.max(r); max_c = max_c.max(c);
+                count += 1;
+            }
+        }}
+        if max_r >= min_r {
+            let mut comp = vec![vec![0i64; max_c - min_c + 1]; max_r - min_r + 1];
+            for r in min_r..=max_r { for c in min_c..=max_c {
+                if labels[r][c] == lbl { comp[r - min_r][c - min_c] = g[r][c]; }
+            }}
+            results.push(MonoObjectInfo {
+                grid: comp, row: min_r, col: min_c, size: count,
+                color: label_colors[lbl as usize],
+            });
+        }
+    }
+    // Sort by size descending (largest first)
+    results.sort_by(|a, b| b.size.cmp(&a.size));
+    results
+}
+
+// ── Mono-color object builtins ──────────────────────────────────────────────
+
+fn bi_grid_objects_mono(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-objects-mono: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let objects = grid_mono_cc_with_pos(&g, false);
+    let vals: Vec<Value> = objects.into_iter().map(|o| grid_to_value(o.grid)).collect();
+    Ok(Value::list(vals))
+}
+
+fn bi_grid_mono_count(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("grid-mono-count: expected 1 arg, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    Ok(Value::Int(grid_mono_cc_with_pos(&g, false).len() as i64))
+}
+
+fn bi_grid_mono_object(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-mono-object: expected 2 args (grid, index), got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let idx = match &args[1] {
+        Value::Int(n) => *n as usize,
+        Value::Num(n) => *n as usize,
+        _ => return Err("grid-mono-object: index must be a number".into()),
+    };
+    let objects = grid_mono_cc_with_pos(&g, false);
+    if idx >= objects.len() {
+        return Err(format!("grid-mono-object: index {} out of range (have {} objects)", idx, objects.len()));
+    }
+    Ok(grid_to_value(objects[idx].grid.clone()))
+}
+
+fn bi_grid_mono_pos(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-mono-pos: expected 2 args, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let idx = match &args[1] {
+        Value::Int(n) => *n as usize,
+        Value::Num(n) => *n as usize,
+        _ => return Err("grid-mono-pos: index must be a number".into()),
+    };
+    let objects = grid_mono_cc_with_pos(&g, false);
+    if idx >= objects.len() {
+        return Err(format!("grid-mono-pos: index {} out of range", idx));
+    }
+    Ok(Value::list(vec![Value::Int(objects[idx].row as i64), Value::Int(objects[idx].col as i64)]))
+}
+
+fn bi_grid_mono_color(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-mono-color: expected 2 args, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let idx = match &args[1] {
+        Value::Int(n) => *n as usize,
+        Value::Num(n) => *n as usize,
+        _ => return Err("grid-mono-color: index must be a number".into()),
+    };
+    let objects = grid_mono_cc_with_pos(&g, false);
+    if idx >= objects.len() {
+        return Err(format!("grid-mono-color: index {} out of range", idx));
+    }
+    Ok(Value::Int(objects[idx].color))
+}
+
+fn bi_grid_mono_bbox(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-mono-bbox: expected 2 args, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let idx = match &args[1] {
+        Value::Int(n) => *n as usize,
+        Value::Num(n) => *n as usize,
+        _ => return Err("grid-mono-bbox: index must be a number".into()),
+    };
+    let objects = grid_mono_cc_with_pos(&g, false);
+    if idx >= objects.len() {
+        return Err(format!("grid-mono-bbox: index {} out of range", idx));
+    }
+    let o = &objects[idx];
+    let h = o.grid.len() as i64;
+    let w = o.grid.first().map_or(0, |r| r.len()) as i64;
+    Ok(Value::list(vec![
+        Value::Int(o.row as i64), Value::Int(o.col as i64),
+        Value::Int(h), Value::Int(w),
+    ]))
+}
+
+fn bi_grid_mono_neighbors(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-mono-neighbors: expected 2 args, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let idx = match &args[1] {
+        Value::Int(n) => *n as usize,
+        Value::Num(n) => *n as usize,
+        _ => return Err("grid-mono-neighbors: index must be a number".into()),
+    };
+    let objects = grid_mono_cc_with_pos(&g, false);
+    if idx >= objects.len() {
+        return Err(format!("grid-mono-neighbors: index {} out of range", idx));
+    }
+    // Two objects are neighbors if their bounding boxes are within gap <= 1
+    let a = &objects[idx];
+    let a_r1 = a.row as i64;
+    let a_c1 = a.col as i64;
+    let a_r2 = a_r1 + a.grid.len() as i64 - 1;
+    let a_c2 = a_c1 + a.grid[0].len() as i64 - 1;
+    let mut result = Vec::new();
+    for (j, b) in objects.iter().enumerate() {
+        if j == idx { continue; }
+        let b_r1 = b.row as i64;
+        let b_c1 = b.col as i64;
+        let b_r2 = b_r1 + b.grid.len() as i64 - 1;
+        let b_c2 = b_c1 + b.grid[0].len() as i64 - 1;
+        // Neighbor if the bboxes (expanded by 1 cell) overlap
+        if a_r1 - 1 <= b_r2 && b_r1 <= a_r2 + 1 && a_c1 - 1 <= b_c2 && b_c1 <= a_c2 + 1 {
+            result.push(Value::Int(j as i64));
+        }
+    }
+    Ok(Value::list(result))
+}
+
+fn bi_grid_mono_nearest(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("grid-mono-nearest: expected 2 args, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let idx = match &args[1] {
+        Value::Int(n) => *n as usize,
+        Value::Num(n) => *n as usize,
+        _ => return Err("grid-mono-nearest: index must be a number".into()),
+    };
+    let objects = grid_mono_cc_with_pos(&g, false);
+    if idx >= objects.len() {
+        return Err(format!("grid-mono-nearest: index {} out of range", idx));
+    }
+    if objects.len() < 2 {
+        return Err("grid-mono-nearest: need at least 2 objects".into());
+    }
+    // Centroid of object = (row + h/2, col + w/2)
+    let a = &objects[idx];
+    let a_cr = a.row as f64 + a.grid.len() as f64 / 2.0;
+    let a_cc = a.col as f64 + a.grid[0].len() as f64 / 2.0;
+    let mut best_idx = 0;
+    let mut best_dist = f64::MAX;
+    for (j, b) in objects.iter().enumerate() {
+        if j == idx { continue; }
+        let b_cr = b.row as f64 + b.grid.len() as f64 / 2.0;
+        let b_cc = b.col as f64 + b.grid[0].len() as f64 / 2.0;
+        let dist = (a_cr - b_cr).abs() + (a_cc - b_cc).abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best_idx = j;
+        }
+    }
+    Ok(Value::Int(best_idx as i64))
+}
+
 // ── Spec parsing helper ─────────────────────────────────────────────────────
 
 fn parse_spec_grid_pairs(spec: &Value) -> Result<Vec<(Vec<Vec<i64>>, Vec<Vec<i64>>)>, String> {
@@ -4368,6 +4681,201 @@ fn bi_grid_recolor_by_proximity(args: &[Value], _env: &Env) -> Result<Value, Str
         }
     }
     Ok(grid_to_value(out))
+}
+
+/// `(grid-recolor-by-proximity-radius grid source-color target-color radius)` — radius-based proximity recoloring.
+/// Every cell of `source_color` within Manhattan distance `radius` of a non-source, non-background
+/// cell gets recolored to `target_color`. Other cells are unchanged.
+fn bi_grid_recolor_by_proximity_radius(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err(format!("grid-recolor-by-proximity-radius: expected 4 args, got {}", args.len()));
+    }
+    let g = as_grid(&args[0])?;
+    let source = int_arg(&args[1], "grid-recolor-by-proximity-radius")?;
+    let target = int_arg(&args[2], "grid-recolor-by-proximity-radius")?;
+    let radius = int_arg(&args[3], "grid-recolor-by-proximity-radius")?;
+    let h = g.len();
+    if h == 0 { return Ok(grid_to_value(g)); }
+    let w = g[0].len();
+
+    // Background = most common color (or 0).
+    let mut counts = std::collections::HashMap::new();
+    for r in &g { for &c in r { *counts.entry(c).or_insert(0usize) += 1; } }
+    let bg = counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or(0);
+
+    // Find all source cells and all non-source, non-background cells
+    let mut source_cells = Vec::new();
+    let mut source_cells_set = vec![vec![false; w]; h];
+    let mut source_cells_near = vec![vec![false; w]; h];
+
+    for r in 0..h {
+        for c in 0..w {
+            if g[r][c] == source {
+                source_cells.push((r, c));
+                source_cells_set[r][c] = true;
+            }
+        }
+    }
+
+    // For each source cell, check if it's within radius of a non-source, non-background cell
+    for (sr, sc) in &source_cells {
+        // BFS from this source cell up to radius distance
+        let mut visited = vec![vec![false; w]; h];
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back((*sr, *sc, 0)); // (row, col, distance)
+        visited[*sr][*sc] = true;
+
+        while let Some((r, c, dist)) = queue.pop_front() {
+            if dist > radius as usize {
+                continue;
+            }
+            // Check if this cell is non-source, non-background
+            if dist > 0 && g[r][c] != source && g[r][c] != bg {
+                // This source cell is near a non-source, non-background cell
+                // Mark this source cell for recoloring
+                source_cells_near[*sr][*sc] = true;
+                break;
+            }
+            if dist == radius as usize {
+                continue; // Don't expand further
+            }
+            // Expand to neighbors
+            for &(dr, dc) in &[(0isize, 1isize), (0, -1), (1, 0), (-1, 0)] {
+                let nr = r as isize + dr;
+                let nc = c as isize + dc;
+                if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
+                    let (nr, nc) = (nr as usize, nc as usize);
+                    if !visited[nr][nc] {
+                        visited[nr][nc] = true;
+                        queue.push_back((nr, nc, dist + 1));
+                    }
+                }
+            }
+        }
+    }
+
+    // Build output: replace source cells that are within radius of non-source, non-background
+    let mut out = g.clone();
+    for (sr, sc) in &source_cells {
+        if source_cells_near[*sr][*sc] {
+            out[*sr][*sc] = target;
+        }
+    }
+    Ok(grid_to_value(out))
+}
+
+/// `(grid-fill-rectangular-holes grid target-color fill-color)` — fill rectangular holes.
+/// Finds all rectangular regions where:
+/// - All cells in the rectangle are target-color
+/// - All cells on the rectangle's border (outside the rect) are fill-color or grid edge
+/// Fills those rectangles with fill-color.
+fn bi_grid_fill_rectangular_holes(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(format!("grid-fill-rectangular-holes: expected 3 args, got {}", args.len()));
+    }
+    let mut g = as_grid(&args[0])?;
+    let target = int_arg(&args[1], "grid-fill-rectangular-holes")?;
+    let fill = int_arg(&args[2], "grid-fill-rectangular-holes")?;
+    let h = g.len();
+    if h == 0 { return Ok(grid_to_value(g)); }
+    let w = g[0].len();
+
+    // Find all rectangular regions of target-color that are completely surrounded by fill-color
+    // or grid edge
+    let mut to_fill: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut visited = vec![vec![false; w]; h];
+
+    // Helper: check if a cell is on the "surrounding" (fill-color or edge)
+    let is_surrounding = |r: isize, c: isize| -> bool {
+        if r < 0 || r >= h as isize || c < 0 || c >= w as isize {
+            return true; // grid edge
+        }
+        let (r, c) = (r as usize, c as usize);
+        g[r][c] == fill
+    };
+
+    // For each unvisited target-color cell, find the maximal rectangle
+    for r in 0..h {
+        for c in 0..w {
+            if g[r][c] != target || visited[r][c] {
+                continue;
+            }
+
+            // Find the bounding box of this connected component of target-color
+            let mut min_r = r;
+            let mut max_r = r;
+            let mut min_c = c;
+            let mut max_c = c;
+            let mut component: Vec<(usize, usize)> = Vec::new();
+            let mut queue = vec![(r, c)];
+            visited[r][c] = true;
+
+            while let Some((cr, cc)) = queue.pop() {
+                component.push((cr, cc));
+                for &(dr, dc) in &[(0isize, 1isize), (0, -1), (1, 0), (-1, 0)] {
+                    let nr = cr as isize + dr;
+                    let nc = cc as isize + dc;
+                    if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
+                        let (nr, cc) = (nr as usize, nc as usize);
+                        if !visited[nr][cc] && g[nr][cc] == target {
+                            visited[nr][cc] = true;
+                            queue.push((nr, cc));
+                            min_r = min_r.min(nr);
+                            max_r = max_r.max(nr);
+                            min_c = min_c.min(cc);
+                            max_c = max_c.max(cc);
+                        }
+                    }
+                }
+            }
+
+            // Check if this component forms a perfect rectangle
+            let rect_area = (max_r - min_r + 1) * (max_c - min_c + 1);
+            if component.len() == rect_area {
+                // It's a perfect rectangle. Now check if it's surrounded by fill-color or edge.
+                // Check top and bottom rows
+                let mut surrounded = true;
+                for cc in min_c..=max_c {
+                    if !is_surrounding((min_r as isize) - 1, cc as isize) {
+                        surrounded = false;
+                        break;
+                    }
+                    if !is_surrounding((max_r as isize) + 1, cc as isize) {
+                        surrounded = false;
+                        break;
+                    }
+                }
+                if surrounded {
+                    // Check left and right columns
+                    for rr in min_r..=max_r {
+                        if !is_surrounding(rr as isize, (min_c as isize) - 1) {
+                            surrounded = false;
+                            break;
+                        }
+                        if !is_surrounding(rr as isize, (max_c as isize) + 1) {
+                            surrounded = false;
+                            break;
+                        }
+                    }
+                }
+
+                if surrounded {
+                    to_fill.push((min_r, min_c, max_r, max_c));
+                }
+            }
+        }
+    }
+
+    // Fill all identified rectangles
+    for (r0, c0, r1, c1) in to_fill {
+        for rr in r0..=r1 {
+            for cc in c0..=c1 {
+                g[rr][cc] = fill;
+            }
+        }
+    }
+
+    Ok(grid_to_value(g))
 }
 
 // ── Original connected components (kept for existing callers) ───────────────
@@ -8119,5 +8627,23 @@ mod tests {
               (fib 10))
         "#).unwrap();
         assert!(matches!(r, Value::Int(55)), "expected 55, got {:?}", r);
+    }
+
+    // ── grid-fill-rectangular-holes builtin ──────────────────────────
+
+    #[test]
+    fn grid_fill_rectangular_holes_basic() {
+        // Basic smoke test: ensure the builtin can be called and returns a grid
+        // Simple 3x3 grid with center hole
+        let src = r#"
+            (do
+              (define g (list (list 5 5 5)
+                              (list 5 0 5)
+                              (list 5 5 5)))
+              (grid-fill-rectangular-holes g 0 5))
+        "#;
+        let r = run_file(src).unwrap();
+        // Should return a list (grid)
+        assert!(matches!(r, Value::List(_)), "expected List, got {:?}", r);
     }
 }
