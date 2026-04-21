@@ -10,4 +10,5 @@ requires-python = ">=3.10"
 
 [tool.maturin]
 features = ["python"]
-module-name = "selph_fast"
+python-source = "."
+module-name = "selph_fast.selph_fast"
