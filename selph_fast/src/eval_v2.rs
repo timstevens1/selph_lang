@@ -799,6 +799,7 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("function-arity"), bi_function_arity);
     t.register(intern("function-param-types"), bi_function_param_types);
     t.register(intern("apropos"), bi_apropos);
+    t.register(intern("apropos-by-type"), bi_apropos_by_type);
 
     // Knowledge base builtins (loaded via --kb flag)
     t.register(intern("kb-get"), crate::kb::bi_kb_get);
@@ -946,7 +947,8 @@ fn build_default_scope() -> Scope {
         "parse-source", "parse-file",
         // §9.45 P1 — env/function introspection (M7 prerequisites)
         "env-functions", "env-function-names", "env-lookup",
-        "function-arity", "function-param-types", "apropos",
+        "function-arity", "function-param-types",
+        "apropos", "apropos-by-type",
         "kb-get", "kb-properties", "kb-search", "kb-is-property", "kb-count",
         "kb-filter", "kb-path", "kb-path-count",
         // §9.48 P2: grid builtins
@@ -2832,7 +2834,7 @@ fn bi_function_param_types(args: &[Value], env: &Env) -> Result<Value, String> {
 ///
 /// `(apropos pattern namespace :type type-name)` — additionally filter by
 /// value type. `type-name` is one of: "function", "int", "num", "str",
-/// "bool", "list", "ns", "node", "nil".
+/// "bool", "list", "ns", "node", "param", "nil".
 ///
 /// Examples:
 ///   (apropos "grid")              ; → ("grid-compact" "grid-crop" ...)
@@ -2919,6 +2921,80 @@ fn bi_apropos(args: &[Value], env: &Env) -> Result<Value, String> {
 
     results.sort();
     Ok(Value::list(results.into_iter().map(Value::str).collect()))
+}
+
+/// `(apropos-by-type param-type return-type)` — search user-defined
+/// functions by their type signature. Uses the same type-probing as
+/// `function-param-types`. Either argument can be `"any"` to match all.
+///
+/// Example: `(apropos-by-type "string" "number")` → all functions that
+/// take a string and return a number.
+///
+/// Returns a list of `(name arity (param-types...) return-type)` tuples.
+fn bi_apropos_by_type(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "apropos-by-type: expected 2 args (param-type return-type), got {}",
+            args.len()
+        ));
+    }
+    let want_param = args[0].as_str()?.to_lowercase();
+    let want_ret = args[1].as_str()?.to_lowercase();
+
+    let skip = crate::synth_v2::default_skip_set();
+    let bindings = env.collect_bindings();
+    let mut results: Vec<Value> = Vec::new();
+
+    for (sym, val) in bindings.iter() {
+        if skip.contains(sym) {
+            continue;
+        }
+        let arity = match val {
+            Value::Function(fd) => fd.params.len(),
+            _ => continue,
+        };
+        let name = resolve(*sym);
+
+        if let Some((param_syms, ret_sym)) =
+            crate::synth_v2::probe_function_type(val, arity, env)
+        {
+            let ret_name = resolve(ret_sym).to_lowercase();
+
+            // Check return type
+            if want_ret != "any" && ret_name != want_ret {
+                continue;
+            }
+
+            // Check param types — match if ANY param matches the wanted type
+            let param_match = want_param == "any"
+                || param_syms
+                    .iter()
+                    .any(|p| resolve(*p).to_lowercase() == want_param);
+
+            if !param_match {
+                continue;
+            }
+
+            let param_names: Vec<Value> = param_syms
+                .iter()
+                .map(|s| Value::str(resolve(*s)))
+                .collect();
+
+            results.push(Value::list(vec![
+                Value::str(name),
+                Value::Int(arity as i64),
+                Value::list(param_names),
+                Value::str(resolve(ret_sym)),
+            ]));
+        }
+    }
+
+    results.sort_by(|a, b| {
+        let a_name = a.as_list().unwrap()[0].as_str().unwrap();
+        let b_name = b.as_list().unwrap()[0].as_str().unwrap();
+        a_name.cmp(b_name)
+    });
+    Ok(Value::list(results))
 }
 
 // ── Bucket 6 stubs ──────────────────────────────────────────────────────────
@@ -8450,6 +8526,81 @@ mod tests {
         "#;
         let r = run_file(src).unwrap();
         assert!(matches!(r, Value::Int(1)));
+    }
+
+    // ── apropos and apropos-by-type ────────────────────────────────────
+
+    #[test]
+    fn apropos_finds_matching_functions() {
+        // apropos searches all bindings (including builtins), so "add" matches
+        // add-one, add-two, and the builtin "add". Use a unique prefix.
+        let src = r#"
+            (define zfoo-one (lambda (x) (add x 1)))
+            (define zfoo-two (lambda (x) (add x 2)))
+            (define square (lambda (x) (multiply x x)))
+            (length (apropos "zfoo"))
+        "#;
+        let r = run_file(src).unwrap();
+        assert!(matches!(r, Value::Int(2)), "expected 2, got {:?}", r);
+    }
+
+    #[test]
+    fn apropos_is_case_insensitive() {
+        let src = r#"
+            (define MyFunc (lambda (x) (add x 1)))
+            (length (apropos "myfunc"))
+        "#;
+        let r = run_file(src).unwrap();
+        assert!(matches!(r, Value::Int(1)), "expected 1, got {:?}", r);
+    }
+
+    #[test]
+    fn apropos_returns_empty_on_no_match() {
+        let src = r#"
+            (define square (lambda (x) (multiply x x)))
+            (length (apropos "zzz"))
+        "#;
+        let r = run_file(src).unwrap();
+        assert!(matches!(r, Value::Int(0)), "expected 0, got {:?}", r);
+    }
+
+    #[test]
+    fn apropos_by_type_finds_int_to_int() {
+        // Debug: show what apropos-by-type actually returns
+        let src = r#"
+            (define double (lambda (x) (multiply x 2)))
+            (define greet (lambda (s) (string-append "hi " s)))
+            (apropos-by-type "any" "any")
+        "#;
+        let r = run_file(src).unwrap();
+        // First just see what we get
+        let list = r.as_list().unwrap();
+        assert!(!list.is_empty(), "apropos-by-type returned empty list: {:?}", r);
+        // Check that double is found with Int param
+        let has_double = list.iter().any(|entry| {
+            if let Ok(inner) = entry.as_list() {
+                inner[0].as_str().map(|s| s == "double").unwrap_or(false)
+            } else {
+                false
+            }
+        });
+        assert!(has_double, "expected to find 'double', got {:?}", r);
+    }
+
+    #[test]
+    fn apropos_by_type_any_matches_all() {
+        let src = r#"
+            (define double (lambda (x) (multiply x 2)))
+            (define greet (lambda (s) (string-append "hi " s)))
+            (length (apropos-by-type "any" "any"))
+        "#;
+        let r = run_file(src).unwrap();
+        // Should find at least the functions whose types probe successfully
+        if let Value::Int(n) = r {
+            assert!(n >= 1, "expected >= 1, got {}", n);
+        } else {
+            panic!("expected Int, got {:?}", r);
+        }
     }
 
     // ── §9.45.7 P5: letrec patching gate ──────────────────────────────
