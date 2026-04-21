@@ -7,6 +7,16 @@ edition = "2024"
 name = "selph"
 path = "src/main.rs"
 
+[lib]
+name = "selph_core"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 rayon = "1.10"
 libc = "0.2"
+pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
+
+[features]
+default = []
+python = ["pyo3"]

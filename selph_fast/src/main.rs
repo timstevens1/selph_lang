@@ -7,17 +7,16 @@
 //!   selph synth <spec.selph>          — synthesize from a spec file
 //!   selph run <curriculum.selph>      — run a curriculum
 
-// Core modules
-mod intern;
-mod types;
-mod parser;
-mod arc;
-mod types_v2;
-mod eval_v2;
-mod synth_v2;
-mod meta_v2;
-mod ast_tools;
-mod kb;
+use selph_core::intern;
+use selph_core::types;
+use selph_core::parser;
+use selph_core::arc;
+use selph_core::types_v2;
+use selph_core::eval_v2;
+use selph_core::synth_v2;
+use selph_core::meta_v2;
+use selph_core::ast_tools;
+use selph_core::kb;
 
 use std::env;
 use std::fs;
