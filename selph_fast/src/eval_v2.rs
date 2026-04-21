@@ -775,6 +775,17 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("env-lookup"), bi_env_lookup);
     t.register(intern("function-arity"), bi_function_arity);
     t.register(intern("function-param-types"), bi_function_param_types);
+    t.register(intern("apropos"), bi_apropos);
+
+    // Knowledge base builtins (loaded via --kb flag)
+    t.register(intern("kb-get"), crate::kb::bi_kb_get);
+    t.register(intern("kb-properties"), crate::kb::bi_kb_properties);
+    t.register(intern("kb-search"), crate::kb::bi_kb_search);
+    t.register(intern("kb-is-property"), crate::kb::bi_kb_is_property);
+    t.register(intern("kb-count"), crate::kb::bi_kb_count);
+    t.register(intern("kb-filter"), crate::kb::bi_kb_filter);
+    t.register(intern("kb-path"), crate::kb::bi_kb_path);
+    t.register(intern("kb-path-count"), crate::kb::bi_kb_path_count);
 
     // §9.48 P2: grid builtins
     t.register(intern("grid?"), bi_is_grid);
@@ -908,7 +919,9 @@ fn build_default_scope() -> Scope {
         "parse-source", "parse-file",
         // §9.45 P1 — env/function introspection (M7 prerequisites)
         "env-functions", "env-function-names", "env-lookup",
-        "function-arity", "function-param-types",
+        "function-arity", "function-param-types", "apropos",
+        "kb-get", "kb-properties", "kb-search", "kb-is-property", "kb-count",
+        "kb-filter", "kb-path", "kb-path-count",
         // §9.48 P2: grid builtins
         "grid?", "grid-height", "grid-width",
         "grid-rotate-cw", "grid-rotate-ccw", "grid-rotate-180",
@@ -2518,6 +2531,104 @@ fn bi_function_param_types(args: &[Value], env: &Env) -> Result<Value, String> {
         }
         None => Ok(Value::Nil),
     }
+}
+
+/// `(apropos pattern)` — search the environment for bindings whose names
+/// contain `pattern` as a case-insensitive substring. Returns a list of
+/// matching name strings, sorted alphabetically.
+///
+/// `(apropos pattern namespace)` — search within a namespace's keys instead
+/// of the environment. Useful for exploring KB namespaces, type registries,
+/// decomposer registries, etc.
+///
+/// `(apropos pattern namespace :type type-name)` — additionally filter by
+/// value type. `type-name` is one of: "function", "int", "num", "str",
+/// "bool", "list", "ns", "node", "nil".
+///
+/// Examples:
+///   (apropos "grid")              ; → ("grid-compact" "grid-crop" ...)
+///   (apropos "capital" my-kb)     ; → ("capital" "capital_population")
+///   (apropos "" my-kb :type "ns") ; → all namespace-valued keys in my-kb
+fn bi_apropos(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("apropos: expected at least 1 arg (pattern string)".into());
+    }
+    let pattern = args[0].as_str()?.to_lowercase();
+
+    // Optional type filter: look for ":type" "typename" in remaining args
+    // Optional namespace: first Ns-typed arg (not a string keyword)
+    let mut type_filter: Option<&str> = None;
+    let mut ns_arg: Option<&Value> = None;
+    let mut i = 1;
+    while i < args.len() {
+        if let Value::Str(s) = &args[i] {
+            if s.as_ref() == ":type" && i + 1 < args.len() {
+                type_filter = Some(args[i + 1].as_str()?);
+                i += 2;
+                continue;
+            }
+        }
+        // Only accept Ns values as the namespace arg (not strings)
+        if ns_arg.is_none() {
+            if matches!(&args[i], Value::Ns(_)) {
+                ns_arg = Some(&args[i]);
+            }
+        }
+        i += 1;
+    }
+
+    let matches_type = |val: &Value, filter: &str| -> bool {
+        match filter {
+            "function" => matches!(val, Value::Function(_) | Value::Builtin(_)),
+            "int" => matches!(val, Value::Int(_)),
+            "num" => matches!(val, Value::Num(_)),
+            "str" => matches!(val, Value::Str(_)),
+            "bool" => matches!(val, Value::Bool(_)),
+            "list" => matches!(val, Value::List(_)),
+            "ns" => matches!(val, Value::Ns(_)),
+            "node" => matches!(val, Value::Node(_)),
+            "nil" => matches!(val, Value::Nil),
+            _ => true,
+        }
+    };
+
+    let mut results: Vec<String> = Vec::new();
+
+    if let Some(ns_val) = ns_arg {
+        // Search within a namespace
+        let map = match ns_val {
+            Value::Ns(m) => m,
+            _ => return Err("apropos: second arg must be a namespace".into()),
+        };
+        for (sym, val) in map.iter() {
+            let name = resolve(*sym);
+            if name.to_lowercase().contains(&pattern) {
+                if let Some(tf) = type_filter {
+                    if !matches_type(val, tf) {
+                        continue;
+                    }
+                }
+                results.push(name);
+            }
+        }
+    } else {
+        // Search the environment
+        let bindings = env.collect_bindings();
+        for (sym, val) in bindings.iter() {
+            let name = resolve(*sym);
+            if name.to_lowercase().contains(&pattern) {
+                if let Some(tf) = type_filter {
+                    if !matches_type(val, tf) {
+                        continue;
+                    }
+                }
+                results.push(name);
+            }
+        }
+    }
+
+    results.sort();
+    Ok(Value::list(results.into_iter().map(Value::str).collect()))
 }
 
 // ── Bucket 6 stubs ──────────────────────────────────────────────────────────

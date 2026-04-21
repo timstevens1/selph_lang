@@ -1,0 +1,68 @@
+; Demo curriculum that loads the string POS tasks (via include) and
+; then prints the solution journal at the end. Use this to see what
+; structural patterns the chain has discovered after a full run.
+;
+; Usage: ./run_probe.sh examples/journal_demo.selph
+
+; Re-include the string POS curriculum tasks. (Cat-style include —
+; the SELPH file format doesn't have a real `include`, so we just
+; inline the tasks here. Keeping in sync with string_pos_curriculum.selph
+; is manual; for a real workflow, the user would symlink or generate.)
+
+; ── String POS curriculum (28 tasks + 2 Tier 3) ──────────────────────
+; Stage 0
+(task-args "always_noun" 2
+  (("the" "cat") "noun") (("a" "dog") "noun") (("the" "house") "noun")
+  (("an" "apple") "noun") (("the" "tree") "noun") (("a" "book") "noun"))
+(task-args "echo_target" 2
+  (("the" "cat") "cat") (("a" "dog") "dog") (("the" "house") "house")
+  (("an" "apple") "apple") (("the" "tree") "tree") (("a" "book") "book"))
+(task-args "echo_prev" 2
+  (("the" "cat") "the") (("a" "dog") "a") (("the" "house") "the")
+  (("an" "apple") "an") (("the" "tree") "the") (("a" "book") "a"))
+
+; Stage 1
+(task-args "definite_check" 2
+  (("the" "cat") "definite") (("the" "dog") "definite") (("the" "house") "definite")
+  (("a" "cat") "indefinite") (("a" "dog") "indefinite") (("an" "apple") "indefinite"))
+(task-args "has_article" 2
+  (("the" "cat") "yes") (("a" "dog") "yes") (("an" "apple") "yes")
+  (("my" "cat") "no") (("his" "dog") "no") (("their" "apple") "no"))
+(task-args "pronoun_or_article" 2
+  (("i" "see") "pronoun") (("we" "go") "pronoun") (("they" "run") "pronoun")
+  (("the" "cat") "article") (("a" "dog") "article") (("an" "apple") "article"))
+
+; Stage 2
+(task-args "run_pos" 2
+  (("i" "run") "verb") (("they" "run") "verb") (("we" "run") "verb")
+  (("you" "run") "verb")
+  (("a" "run") "noun") (("the" "run") "noun")
+  (("morning" "run") "noun") (("long" "run") "noun"))
+
+; Stage 6 (uses recursive classifier)
+(task-args "verb_form" 1
+  (("running") "gerund") (("playing") "gerund") (("eating") "gerund")
+  (("walked") "past") (("played") "past") (("opened") "past")
+  (("run") "base") (("walk") "base") (("eat") "base")
+  (test ("dancing") "gerund") (test ("closed") "past") (test ("dance") "base"))
+
+(task-args "gerund_context" 2
+  (("the" "running") "gerund-noun") (("a" "swimming") "gerund-noun")
+  (("the" "playing") "gerund-noun")
+  (("i" "running") "verb-progressive") (("we" "swimming") "verb-progressive")
+  (("they" "playing") "verb-progressive")
+  (("the" "cat") "common-noun") (("a" "dog") "common-noun")
+  (("the" "house") "common-noun")
+  (("i" "cat") "other") (("we" "dog") "other") (("they" "house") "other")
+  (test ("the" "dancing") "gerund-noun") (test ("she" "dancing") "verb-progressive")
+  (test ("a" "bird") "common-noun") (test ("he" "bird") "other"))
+
+; Tier 3 (3-feature)
+(task-args "word_class_3feat" 1
+  (("Running") "proper-gerund") (("Playing") "proper-gerund")
+  (("Walked") "proper-past") (("Opened") "proper-past")
+  (("Run") "proper-base") (("Walk") "proper-base")
+  (("running") "common-gerund") (("playing") "common-gerund")
+  (("walked") "common-past") (("opened") "common-past")
+  (("run") "common-base") (("walk") "common-base")
+  (test ("Dancing") "proper-gerund") (test ("dancing") "common-gerund"))

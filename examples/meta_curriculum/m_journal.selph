@@ -205,21 +205,38 @@
           " "
           (journal-skeleton-list (tail nodes)))))))
 
+; ── Trivial skeleton filter ─────────────────────────────────────────
+;
+; Constant-fit sub-synthesis results (from m_partition etc.) produce
+; skeletons like "(lambda ?BOOL?)" / "(lambda ?STR?)" / "(lambda ?NUM?)".
+; These are noise — the decomposer did the real work, the "solution"
+; is just a literal. Filter them out so the journal captures only
+; structurally interesting patterns.
+
+(define journal-trivial-skeletons
+  (list "(lambda ?BOOL?)" "(lambda ?NUM?)" "(lambda ?STR?)"
+        "(lambda ?INT?)"  "(lambda ?ERR?)"))
+
+(define journal-trivial?
+  (lambda (skeleton)
+    (contains journal-trivial-skeletons skeleton)))
+
 ; ── Recording ────────────────────────────────────────────────────────
 ;
-; Just prints. The log line IS the journal entry. External tools can
-; grep '[JOURNAL]' to extract, then sort/uniq the skeleton column to
-; find recurring patterns. Future iteration: stash entries in
-; __solution_journal__ for SELPH-side analysis.
+; Prints non-trivial entries as log lines. External tools can grep
+; '[JOURNAL]' to extract, then sort/uniq the skeleton column to find
+; recurring patterns.
 
 (define journal-record!
   (lambda (signature source-node strategy)
     (let ((skeleton (try (journal-skeleton source-node) "?ERR?"))
           (source-str (try (to-string source-node) "?ERR?")))
-      (print (concat "[JOURNAL] " strategy
-        " | " signature
-        " | " skeleton
-        " | " source-str)))))
+      (if (journal-trivial? skeleton)
+        nil
+        (print (concat "[JOURNAL] " strategy
+          " | " signature
+          " | " skeleton
+          " | " source-str))))))
 
 ; ── Smoke test ───────────────────────────────────────────────────────
 

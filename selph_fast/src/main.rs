@@ -17,6 +17,7 @@ mod eval_v2;
 mod synth_v2;
 mod meta_v2;
 mod ast_tools;
+mod kb;
 
 use std::env;
 use std::fs;
@@ -188,6 +189,38 @@ fn print_usage() {
 }
 
 fn cmd_eval(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: selph eval <file.selph> | -e \"expr\" [--kb <file.jsonl>] [--labels <file.json>]");
+        return;
+    }
+
+    // Parse --kb and --labels flags
+    let mut kb_path: Option<String> = None;
+    let mut labels_path: Option<String> = None;
+    let mut remaining = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--kb" && i + 1 < args.len() {
+            kb_path = Some(args[i + 1].clone());
+            i += 2;
+        } else if args[i] == "--labels" && i + 1 < args.len() {
+            labels_path = Some(args[i + 1].clone());
+            i += 2;
+        } else {
+            remaining.push(args[i].clone());
+            i += 1;
+        }
+    }
+    let args = &remaining;
+
+    // Load KB if requested
+    if let Some(ref kbp) = kb_path {
+        if let Err(e) = kb::load_kb(kbp, labels_path.as_deref()) {
+            eprintln!("Failed to load KB: {}", e);
+            return;
+        }
+    }
+
     if args.is_empty() {
         eprintln!("Usage: selph eval <file.selph> | -e \"expr\"");
         return;
