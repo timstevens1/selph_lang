@@ -740,6 +740,13 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("freeze"), bi_freeze);
     t.register(intern("thaw"), bi_thaw);
 
+    // Loss functions and datasets
+    t.register(intern("dataset"), bi_dataset);
+    t.register(intern("dataset?"), bi_is_dataset);
+    t.register(intern("mse"), bi_mse);
+    t.register(intern("mae"), bi_mae);
+    t.register(intern("model-loss"), bi_model_loss);
+
     // Errors / control
     t.register(intern("error"), bi_error);
 
@@ -918,6 +925,8 @@ fn build_default_scope() -> Scope {
         "function?", "nil?", "type-of",
         // Optimization parameters
         "param", "param?", "param-value", "param-bounds", "freeze", "thaw",
+        // Loss functions and datasets
+        "dataset", "dataset?", "mse", "mae", "model-loss",
         // Errors / control
         "error",
         // Bucket 6 stubs
@@ -1950,6 +1959,150 @@ fn bi_thaw(args: &[Value], _env: &Env) -> Result<Value, String> {
     } else {
         Err("thaw: expected 1 or 3 arguments (value) or (value min max)".into())
     }
+}
+
+// ── loss functions and dataset operations ────────────────────────────────────
+//
+// Phase 1 of the SELPH optimization extension. Datasets are plain lists of
+// (input, output) pairs — no special Value variant. Loss functions operate
+// on lists of numbers. `model-loss` bridges the two: apply a function to
+// dataset inputs, compute loss against outputs.
+
+/// Extract f64 from any numeric Value (Int, Num, Param).
+fn as_f64(v: &Value) -> Result<f64, String> {
+    match v {
+        Value::Int(n) => Ok(*n as f64),
+        Value::Num(n) => Ok(*n),
+        Value::Param(n, _, _) => Ok(*n),
+        _ => Err(format!("expected number, got {:?}", v)),
+    }
+}
+
+/// `(dataset ((x1 y1) (x2 y2) ...))` — validate and return a list of pairs.
+/// Each pair must be a list of length 2. Inputs and outputs can be any type.
+fn bi_dataset(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("dataset: expected 1 argument (list of pairs)".into());
+    }
+    let rows = args[0].as_list()?;
+    if rows.is_empty() {
+        return Err("dataset: empty dataset".into());
+    }
+    for (i, row) in rows.iter().enumerate() {
+        let pair = row.as_list().map_err(|_| {
+            format!("dataset: row {} is not a list: {:?}", i, row)
+        })?;
+        if pair.len() != 2 {
+            return Err(format!(
+                "dataset: row {} has {} elements, expected 2",
+                i,
+                pair.len()
+            ));
+        }
+    }
+    Ok(args[0].clone())
+}
+
+/// `(dataset? x)` — true if x is a list of length-2 lists.
+fn bi_is_dataset(args: &[Value], _env: &Env) -> Result<Value, String> {
+    let ok = match &args[0] {
+        Value::List(rows) if !rows.is_empty() => {
+            rows.iter().all(|row| {
+                matches!(row, Value::List(pair) if pair.len() == 2)
+            })
+        }
+        _ => false,
+    };
+    Ok(Value::Bool(ok))
+}
+
+/// `(mse predictions targets)` — mean squared error over two lists of numbers.
+fn bi_mse(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("mse: expected (mse predictions targets)".into());
+    }
+    let preds = args[0].as_list()?;
+    let targets = args[1].as_list()?;
+    if preds.len() != targets.len() {
+        return Err(format!(
+            "mse: predictions length {} != targets length {}",
+            preds.len(),
+            targets.len()
+        ));
+    }
+    if preds.is_empty() {
+        return Err("mse: empty lists".into());
+    }
+    let mut sum = 0.0;
+    for (p, t) in preds.iter().zip(targets.iter()) {
+        let pv = as_f64(p)?;
+        let tv = as_f64(t)?;
+        let d = pv - tv;
+        sum += d * d;
+    }
+    Ok(Value::Num(sum / preds.len() as f64))
+}
+
+/// `(mae predictions targets)` — mean absolute error over two lists of numbers.
+fn bi_mae(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("mae: expected (mae predictions targets)".into());
+    }
+    let preds = args[0].as_list()?;
+    let targets = args[1].as_list()?;
+    if preds.len() != targets.len() {
+        return Err(format!(
+            "mae: predictions length {} != targets length {}",
+            preds.len(),
+            targets.len()
+        ));
+    }
+    if preds.is_empty() {
+        return Err("mae: empty lists".into());
+    }
+    let mut sum = 0.0;
+    for (p, t) in preds.iter().zip(targets.iter()) {
+        let pv = as_f64(p)?;
+        let tv = as_f64(t)?;
+        sum += (pv - tv).abs();
+    }
+    Ok(Value::Num(sum / preds.len() as f64))
+}
+
+/// `(model-loss fn data loss-fn)` — apply fn to each input in data,
+/// collect predictions, compute loss against outputs using loss-fn.
+/// `fn` is a SELPH function (input → prediction).
+/// `data` is a dataset (list of (input, output) pairs).
+/// `loss-fn` is a SELPH function (predictions targets → scalar).
+fn bi_model_loss(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err("model-loss: expected (model-loss model-fn data loss-fn)".into());
+    }
+    let model_fn = &args[0];
+    let data = args[1].as_list()?;
+    let loss_fn = &args[2];
+
+    let mut predictions = Vec::with_capacity(data.len());
+    let mut targets = Vec::with_capacity(data.len());
+
+    for (i, row) in data.iter().enumerate() {
+        let pair = row.as_list().map_err(|_| {
+            format!("model-loss: row {} is not a list", i)
+        })?;
+        if pair.len() != 2 {
+            return Err(format!("model-loss: row {} has {} elements, expected 2", i, pair.len()));
+        }
+        let input = &pair[0];
+        let target = &pair[1];
+
+        let pred = apply(model_fn, &[input.clone()], env)?;
+        predictions.push(pred);
+        targets.push(target.clone());
+    }
+
+    let pred_list = Value::list(predictions);
+    let target_list = Value::list(targets);
+    apply(loss_fn, &[pred_list, target_list], env)
 }
 
 /// Returns the canonical type name as a string. Mirrors today's `type-of`
@@ -8876,5 +9029,162 @@ mod tests {
             run_file("(= (param 1.0 0.0 2.0) (param 1.0))").unwrap(),
             Value::Bool(false)
         ));
+    }
+
+    // ── Dataset and loss function tests ─────────────────────────────────────
+
+    #[test]
+    fn dataset_validates_pairs() {
+        let r = run_file("(dataset (list (list 1 2) (list 3 4)))").unwrap();
+        let rows = r.as_list().unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn dataset_rejects_empty() {
+        assert!(run_file("(dataset (list))").is_err());
+    }
+
+    #[test]
+    fn dataset_rejects_non_pairs() {
+        assert!(run_file("(dataset (list (list 1 2 3)))").is_err());
+    }
+
+    #[test]
+    fn dataset_rejects_non_list_rows() {
+        assert!(run_file("(dataset (list 1 2 3))").is_err());
+    }
+
+    #[test]
+    fn dataset_predicate() {
+        assert!(matches!(
+            run_file("(dataset? (list (list 1 2) (list 3 4)))").unwrap(),
+            Value::Bool(true)
+        ));
+        assert!(matches!(
+            run_file("(dataset? (list 1 2 3))").unwrap(),
+            Value::Bool(false)
+        ));
+        assert!(matches!(
+            run_file("(dataset? (list))").unwrap(),
+            Value::Bool(false)
+        ));
+        assert!(matches!(
+            run_file("(dataset? 42)").unwrap(),
+            Value::Bool(false)
+        ));
+    }
+
+    #[test]
+    fn mse_computes_correctly() {
+        // MSE of (1,2,3) vs (1,2,3) = 0
+        let r = run_file("(mse (list 1 2 3) (list 1 2 3))").unwrap();
+        match r {
+            Value::Num(v) => assert!(v.abs() < 1e-10),
+            other => panic!("expected Num 0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mse_nonzero() {
+        // MSE of (1,2,3) vs (2,3,4) = ((1+1+1)/3) = 1.0
+        let r = run_file("(mse (list 1 2 3) (list 2 3 4))").unwrap();
+        match r {
+            Value::Num(v) => assert!((v - 1.0).abs() < 1e-10),
+            other => panic!("expected Num 1.0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mse_with_params() {
+        // Params participate in MSE computation
+        let r = run_file("(mse (list (param 1.0) (param 2.0)) (list 1.0 2.0))").unwrap();
+        match r {
+            Value::Num(v) => assert!(v.abs() < 1e-10),
+            other => panic!("expected Num 0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mse_rejects_length_mismatch() {
+        assert!(run_file("(mse (list 1 2) (list 1 2 3))").is_err());
+    }
+
+    #[test]
+    fn mae_computes_correctly() {
+        // MAE of (1,2,3) vs (2,4,6) = (1+2+3)/3 = 2.0
+        let r = run_file("(mae (list 1 2 3) (list 2 4 6))").unwrap();
+        match r {
+            Value::Num(v) => assert!((v - 2.0).abs() < 1e-10),
+            other => panic!("expected Num 2.0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn model_loss_linear_regression() {
+        // y = 2x + 1, data: (1,3) (2,5) (3,7)
+        // With w=2, b=1 the model is perfect → MSE = 0
+        let src = r#"
+            (let ((data (dataset (list (list 1 3) (list 2 5) (list 3 7))))
+                  (model (lambda (x) (add (multiply 2 x) 1))))
+              (model-loss model data mse))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Num(v) => assert!(v.abs() < 1e-10, "expected ~0, got {}", v),
+            other => panic!("expected Num ~0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn model_loss_with_params() {
+        // y = wx + b with w=2, b=1 (as params), data: (1,3) (2,5)
+        // Perfect fit → MSE = 0
+        let src = r#"
+            (let ((w (param 2.0))
+                  (b (param 1.0))
+                  (data (dataset (list (list 1 3) (list 2 5))))
+                  (model (lambda (x) (add (multiply w x) b))))
+              (model-loss model data mse))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Num(v) => assert!(v.abs() < 1e-10, "expected ~0, got {}", v),
+            other => panic!("expected Num ~0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn model_loss_imperfect_fit() {
+        // y = wx with w=1 (param), data: (1,2) (2,4) (3,6)
+        // Predictions: 1, 2, 3. Targets: 2, 4, 6.
+        // MSE = ((1+4+9)/3) = 14/3 ≈ 4.667
+        let src = r#"
+            (let ((w (param 1.0))
+                  (data (dataset (list (list 1 2) (list 2 4) (list 3 6))))
+                  (model (lambda (x) (multiply w x))))
+              (model-loss model data mse))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Num(v) => assert!((v - 14.0 / 3.0).abs() < 1e-10, "expected ~4.667, got {}", v),
+            other => panic!("expected Num, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn model_loss_with_mae() {
+        // y = x, data: (1,2) (2,4). Preds: 1, 2. Targets: 2, 4.
+        // MAE = (1+2)/2 = 1.5
+        let src = r#"
+            (let ((data (dataset (list (list 1 2) (list 2 4))))
+                  (model (lambda (x) x)))
+              (model-loss model data mae))
+        "#;
+        let r = run_file(src).unwrap();
+        match r {
+            Value::Num(v) => assert!((v - 1.5).abs() < 1e-10, "expected 1.5, got {}", v),
+            other => panic!("expected Num, got {:?}", other),
+        }
     }
 }
