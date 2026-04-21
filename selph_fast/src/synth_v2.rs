@@ -6215,6 +6215,12 @@ pub fn val_hash(v: &Value) -> u64 {
         Value::Nil => {
             5u8.hash(&mut h);
         }
+        Value::Param(n, lo, hi) => {
+            7u8.hash(&mut h);
+            n.to_bits().hash(&mut h);
+            lo.map(|v| v.to_bits()).hash(&mut h);
+            hi.map(|v| v.to_bits()).hash(&mut h);
+        }
         Value::Function(_) | Value::Builtin(_) | Value::Ns(_) | Value::Node(_) => {
             // Opaque values — hash to a constant. Synthesis dedup is
             // structural over primitives + lists; functions, namespaces,

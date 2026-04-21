@@ -100,6 +100,14 @@ pub fn value_to_string(v: &Value) -> String {
             format!("<lambda ({})>", params.join(" "))
         }
         Value::Builtin(sym) => format!("<builtin {}>", resolve(*sym)),
+        Value::Param(val, lo, hi) => {
+            match (lo, hi) {
+                (Some(l), Some(h)) => format!("<param {} [{}, {}]>", val, l, h),
+                (Some(l), None) => format!("<param {} [{}, ∞)>", val, l),
+                (None, Some(h)) => format!("<param {} (-∞, {}]>", val, h),
+                (None, None) => format!("<param {}>", val),
+            }
+        }
         Value::Ns(map) => {
             let mut keys: Vec<String> = map.keys().map(|k| resolve(*k)).collect();
             keys.sort();
@@ -724,6 +732,14 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("nil?"), bi_is_nil);
     t.register(intern("type-of"), bi_type_of);
 
+    // Optimization parameters
+    t.register(intern("param"), bi_param);
+    t.register(intern("param?"), bi_is_param);
+    t.register(intern("param-value"), bi_param_value);
+    t.register(intern("param-bounds"), bi_param_bounds);
+    t.register(intern("freeze"), bi_freeze);
+    t.register(intern("thaw"), bi_thaw);
+
     // Errors / control
     t.register(intern("error"), bi_error);
 
@@ -900,6 +916,8 @@ fn build_default_scope() -> Scope {
         // Type predicates
         "int?", "num?", "number?", "string?", "list?", "bool?",
         "function?", "nil?", "type-of",
+        // Optimization parameters
+        "param", "param?", "param-value", "param-bounds", "freeze", "thaw",
         // Errors / control
         "error",
         // Bucket 6 stubs
@@ -969,11 +987,13 @@ fn as_nums(a: &Value, b: &Value) -> Result<(f64, f64), String> {
     let af = match a {
         Value::Int(n) => *n as f64,
         Value::Num(n) => *n,
+        Value::Param(n, _, _) => *n,
         _ => return Err(format!("expected number, got {:?}", a)),
     };
     let bf = match b {
         Value::Int(n) => *n as f64,
         Value::Num(n) => *n,
+        Value::Param(n, _, _) => *n,
         _ => return Err(format!("expected number, got {:?}", b)),
     };
     Ok((af, bf))
@@ -1203,6 +1223,10 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         // equality is wanted.
         (Value::Node(x), Value::Node(y)) => {
             std::rc::Rc::ptr_eq(&x.nodes, &y.nodes) && x.idx == y.idx
+        }
+        // Param equality: same value and same bounds.
+        (Value::Param(v1, lo1, hi1), Value::Param(v2, lo2, hi2)) => {
+            v1 == v2 && lo1 == lo2 && hi1 == hi2
         }
         _ => false,
     }
@@ -1817,6 +1841,117 @@ fn bi_is_nil(args: &[Value], _env: &Env) -> Result<Value, String> {
     Ok(Value::Bool(matches!(&args[0], Value::Nil)))
 }
 
+// ── optimization parameters ─────────────────────────────────────────────────
+//
+// Phase 0 of the SELPH optimization extension. Param is a continuous value
+// tagged for optimization, with optional bounds. Builtins:
+//   (param value)                    → unbounded param
+//   (param value min max)            → bounded param
+//   (param? x)                       → true if x is a Param
+//   (param-value p)                  → extract current f64 value
+//   (param-bounds p)                 → (list min max) or nil if unbounded
+//   (freeze p)                       → Param → Num (strip param tag)
+//   (thaw x)                         → Num/Int → Param (make optimizable)
+//   (thaw x min max)                 → Num/Int → bounded Param
+
+fn bi_param(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 3 {
+        return Err("param: expected 1-3 arguments (value [min max])".into());
+    }
+    let val = match &args[0] {
+        Value::Int(n) => *n as f64,
+        Value::Num(n) => *n,
+        Value::Param(n, _, _) => *n,
+        _ => return Err(format!("param: expected number, got {:?}", args[0])),
+    };
+    if args.len() == 1 {
+        Ok(Value::Param(val, None, None))
+    } else if args.len() == 3 {
+        let lo = match &args[1] {
+            Value::Int(n) => *n as f64,
+            Value::Num(n) => *n,
+            _ => return Err(format!("param: min must be a number, got {:?}", args[1])),
+        };
+        let hi = match &args[2] {
+            Value::Int(n) => *n as f64,
+            Value::Num(n) => *n,
+            _ => return Err(format!("param: max must be a number, got {:?}", args[2])),
+        };
+        if lo > hi {
+            return Err(format!("param: min ({}) > max ({})", lo, hi));
+        }
+        if val < lo || val > hi {
+            return Err(format!("param: value {} outside bounds [{}, {}]", val, lo, hi));
+        }
+        Ok(Value::Param(val, Some(lo), Some(hi)))
+    } else {
+        Err("param: expected 1 or 3 arguments (value) or (value min max)".into())
+    }
+}
+
+fn bi_is_param(args: &[Value], _env: &Env) -> Result<Value, String> {
+    Ok(Value::Bool(matches!(&args[0], Value::Param(..))))
+}
+
+fn bi_param_value(args: &[Value], _env: &Env) -> Result<Value, String> {
+    match &args[0] {
+        Value::Param(v, _, _) => Ok(Value::Num(*v)),
+        _ => Err(format!("param-value: expected param, got {:?}", args[0])),
+    }
+}
+
+fn bi_param_bounds(args: &[Value], _env: &Env) -> Result<Value, String> {
+    match &args[0] {
+        Value::Param(_, lo, hi) => {
+            match (lo, hi) {
+                (Some(l), Some(h)) => Ok(Value::List(Rc::from(
+                    vec![Value::Num(*l), Value::Num(*h)].into_boxed_slice(),
+                ))),
+                _ => Ok(Value::Nil),
+            }
+        }
+        _ => Err(format!("param-bounds: expected param, got {:?}", args[0])),
+    }
+}
+
+fn bi_freeze(args: &[Value], _env: &Env) -> Result<Value, String> {
+    match &args[0] {
+        Value::Param(v, _, _) => Ok(Value::Num(*v)),
+        Value::Num(n) => Ok(Value::Num(*n)),
+        Value::Int(n) => Ok(Value::Int(*n)),
+        _ => Err(format!("freeze: expected param or number, got {:?}", args[0])),
+    }
+}
+
+fn bi_thaw(args: &[Value], _env: &Env) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 3 {
+        return Err("thaw: expected 1-3 arguments (value [min max])".into());
+    }
+    let val = match &args[0] {
+        Value::Int(n) => *n as f64,
+        Value::Num(n) => *n,
+        Value::Param(n, _, _) => *n,
+        _ => return Err(format!("thaw: expected number, got {:?}", args[0])),
+    };
+    if args.len() == 1 {
+        Ok(Value::Param(val, None, None))
+    } else if args.len() == 3 {
+        let lo = match &args[1] {
+            Value::Int(n) => *n as f64,
+            Value::Num(n) => *n,
+            _ => return Err(format!("thaw: min must be a number, got {:?}", args[1])),
+        };
+        let hi = match &args[2] {
+            Value::Int(n) => *n as f64,
+            Value::Num(n) => *n,
+            _ => return Err(format!("thaw: max must be a number, got {:?}", args[2])),
+        };
+        Ok(Value::Param(val, Some(lo), Some(hi)))
+    } else {
+        Err("thaw: expected 1 or 3 arguments (value) or (value min max)".into())
+    }
+}
+
 /// Returns the canonical type name as a string. Mirrors today's `type-of`
 /// but reports `int` and `num` separately to match the new Value enum.
 fn bi_type_of(args: &[Value], _env: &Env) -> Result<Value, String> {
@@ -1829,6 +1964,7 @@ fn bi_type_of(args: &[Value], _env: &Env) -> Result<Value, String> {
         Value::Ns(_) => "namespace",
         Value::Function(_) | Value::Builtin(_) => "function",
         Value::Node(_) => "node",
+        Value::Param(..) => "param",
         Value::Nil => "nil",
     };
     Ok(Value::str(name))
@@ -2587,6 +2723,7 @@ fn bi_apropos(args: &[Value], env: &Env) -> Result<Value, String> {
             "list" => matches!(val, Value::List(_)),
             "ns" => matches!(val, Value::Ns(_)),
             "node" => matches!(val, Value::Node(_)),
+            "param" => matches!(val, Value::Param(..)),
             "nil" => matches!(val, Value::Nil),
             _ => true,
         }
@@ -8577,5 +8714,167 @@ mod tests {
         let r = run_file(src).unwrap();
         // Should return a list (grid)
         assert!(matches!(r, Value::List(_)), "expected List, got {:?}", r);
+    }
+
+    // ── Optimization parameter (Param) tests ────────────────────────────────
+
+    #[test]
+    fn param_creates_unbounded() {
+        let r = run_file("(param 3.14)").unwrap();
+        match r {
+            Value::Param(v, None, None) => assert!((v - 3.14).abs() < 1e-10),
+            other => panic!("expected Param, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn param_creates_bounded() {
+        let r = run_file("(param 0.5 0.0 1.0)").unwrap();
+        match r {
+            Value::Param(v, Some(lo), Some(hi)) => {
+                assert!((v - 0.5).abs() < 1e-10);
+                assert!((lo - 0.0).abs() < 1e-10);
+                assert!((hi - 1.0).abs() < 1e-10);
+            }
+            other => panic!("expected bounded Param, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn param_rejects_out_of_bounds() {
+        assert!(run_file("(param 2.0 0.0 1.0)").is_err());
+    }
+
+    #[test]
+    fn param_rejects_inverted_bounds() {
+        assert!(run_file("(param 0.5 1.0 0.0)").is_err());
+    }
+
+    #[test]
+    fn param_from_int() {
+        let r = run_file("(param 5)").unwrap();
+        match r {
+            Value::Param(v, None, None) => assert!((v - 5.0).abs() < 1e-10),
+            other => panic!("expected Param, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn param_predicate() {
+        assert!(matches!(run_file("(param? (param 1.0))").unwrap(), Value::Bool(true)));
+        assert!(matches!(run_file("(param? 1.0)").unwrap(), Value::Bool(false)));
+        assert!(matches!(run_file("(param? 42)").unwrap(), Value::Bool(false)));
+    }
+
+    #[test]
+    fn param_value_extracts() {
+        let r = run_file("(param-value (param 2.5 0.0 5.0))").unwrap();
+        match r {
+            Value::Num(v) => assert!((v - 2.5).abs() < 1e-10),
+            other => panic!("expected Num, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn param_bounds_returns_list() {
+        let r = run_file("(param-bounds (param 0.5 0.0 1.0))").unwrap();
+        match r {
+            Value::List(l) => {
+                assert_eq!(l.len(), 2);
+                match (&l[0], &l[1]) {
+                    (Value::Num(lo), Value::Num(hi)) => {
+                        assert!((lo - 0.0).abs() < 1e-10);
+                        assert!((hi - 1.0).abs() < 1e-10);
+                    }
+                    other => panic!("expected (Num, Num), got {:?}", other),
+                }
+            }
+            other => panic!("expected List, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn param_bounds_returns_nil_for_unbounded() {
+        let r = run_file("(param-bounds (param 1.0))").unwrap();
+        assert!(matches!(r, Value::Nil));
+    }
+
+    #[test]
+    fn freeze_param_to_num() {
+        let r = run_file("(freeze (param 3.14))").unwrap();
+        match r {
+            Value::Num(v) => assert!((v - 3.14).abs() < 1e-10),
+            other => panic!("expected Num, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn freeze_num_is_identity() {
+        let r = run_file("(freeze 3.14)").unwrap();
+        match r {
+            Value::Num(v) => assert!((v - 3.14).abs() < 1e-10),
+            other => panic!("expected Num, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn thaw_num_to_param() {
+        let r = run_file("(thaw 3.14)").unwrap();
+        match r {
+            Value::Param(v, None, None) => assert!((v - 3.14).abs() < 1e-10),
+            other => panic!("expected Param, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn thaw_with_bounds() {
+        let r = run_file("(thaw 0.5 0.0 1.0)").unwrap();
+        match r {
+            Value::Param(v, Some(lo), Some(hi)) => {
+                assert!((v - 0.5).abs() < 1e-10);
+                assert!((lo - 0.0).abs() < 1e-10);
+                assert!((hi - 1.0).abs() < 1e-10);
+            }
+            other => panic!("expected bounded Param, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn param_participates_in_arithmetic() {
+        // Param + Num → Num (arithmetic extracts current value)
+        let r = run_file("(add (param 2.0) 3.0)").unwrap();
+        match r {
+            Value::Num(v) => assert!((v - 5.0).abs() < 1e-10),
+            other => panic!("expected Num 5.0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn param_in_comparison() {
+        assert!(matches!(
+            run_file("(> (param 5.0) (param 3.0))").unwrap(),
+            Value::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn type_of_param() {
+        assert_str(&run_file("(type-of (param 1.0))").unwrap(), "param");
+    }
+
+    #[test]
+    fn param_equality() {
+        assert!(matches!(
+            run_file("(= (param 1.0) (param 1.0))").unwrap(),
+            Value::Bool(true)
+        ));
+        assert!(matches!(
+            run_file("(= (param 1.0) (param 2.0))").unwrap(),
+            Value::Bool(false)
+        ));
+        assert!(matches!(
+            run_file("(= (param 1.0 0.0 2.0) (param 1.0))").unwrap(),
+            Value::Bool(false)
+        ));
     }
 }

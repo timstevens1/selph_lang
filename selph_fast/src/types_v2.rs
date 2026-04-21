@@ -134,6 +134,13 @@ pub enum Value {
     /// decomposers (item 3) and type predicates (item 4).
     Node(NodeRef),
 
+    /// Optimizable parameter — a continuous value tagged for optimization.
+    /// Carries current value, optional lower bound, and optional upper bound.
+    /// Participates in arithmetic like Num but preserves its identity as a
+    /// parameter so that an external optimizer can extract the param graph.
+    /// Added for the SELPH optimization extension (Phase 0).
+    Param(f64, Option<f64>, Option<f64>),
+
     /// nil.
     Nil,
 }
@@ -451,6 +458,7 @@ struct PrimitiveTypeSyms {
     function: Sym,
     namespace: Sym,
     node: Sym,
+    param: Sym,
 }
 
 impl PrimitiveTypeSyms {
@@ -466,6 +474,7 @@ impl PrimitiveTypeSyms {
             function: intern("Function"),
             namespace: intern("Namespace"),
             node: intern("Node"),
+            param: intern("Param"),
         }
     }
 }
@@ -498,6 +507,7 @@ impl Value {
             Value::Function(_) | Value::Builtin(_) => Some(s.function),
             Value::Ns(_) => Some(s.namespace),
             Value::Node(_) => Some(s.node),
+            Value::Param(..) => Some(s.param),
             Value::Nil => None,
         })
     }
