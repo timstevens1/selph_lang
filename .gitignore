@@ -7,3 +7,7 @@ trace.json
 trace_optimized.json
 grown_library.selph
 selph_fast/grown_library.selph
+selph_fast/selph_fast/*.dylib*
+selph_fast/selph_fast/__pycache__/
+selph_fast/.venv/
+selph_fast/target/
