@@ -87,18 +87,20 @@ def detokenize(ids: list[int]) -> str:
         if i in (PAD_ID, BOS_ID, EOS_ID):
             continue
         tokens.append(ID2TOK.get(i, "?"))
-    # Reconstruct with proper spacing
-    result = []
+    # Reconstruct with proper spacing — SELPH requires spaces after ( and before )
+    parts = []
     for t in tokens:
         if t == "(":
-            result.append("(")
-        elif t == ")" and result and not result[-1].endswith("("):
-            result.append(")")
+            if parts and parts[-1] != "(":
+                parts.append(" ")
+            parts.append("(")
+        elif t == ")":
+            parts.append(")")
         else:
-            if result and not result[-1].endswith("("):
-                result.append(" ")
-            result.append(t)
-    return "".join(result)
+            if parts and parts[-1] != "(":
+                parts.append(" ")
+            parts.append(t)
+    return "".join(parts)
 
 
 # ── Prompt encoding ──────────────────────────────────────────────────────────
@@ -262,18 +264,141 @@ def compute_reward(sexpr: str, task: Task, optimize_steps: int = 300) -> float:
 
 # ── SFT data from curriculum results ─────────────────────────────────────────
 
-# Known good structures from the hand-coded curriculum templates
-SFT_EXAMPLES = [
-    # (task_pattern, structure)
-    ("const",    "(param 0)"),
-    ("linear",   "(add (multiply (param 0) x) (param 0))"),
-    ("quad",     "(add (multiply (param 0) (multiply x x)) (add (multiply (param 0) x) (param 0)))"),
-    ("piecewise", "(if (> x (param 0)) (add (multiply (param 0) x) (param 0)) (add (multiply (param 0) x) (param 0)))"),
-    ("identity", "(multiply (param 0) x)"),
-    ("double",   "(multiply (param 0) x)"),
-    ("square",   "(multiply (param 0) (multiply x x))"),
-    ("abs",      "(if (> x (param 0)) (multiply (param 0) x) (multiply (param 0) x))"),
-]
+# Known good (task, structure) pairs for SFT warmstart.
+# Multiple structures per task provide diversity — the model learns that
+# different structures can solve the same problem.
+SFT_PAIRS: list[tuple[Task, str]] = []
+
+def _build_sft_pairs():
+    """Build SFT training data from curriculum tasks + known-good structures."""
+    structures = {
+        "const_5":             ["(param 0)", "(add (param 0) 0)"],
+        "const_neg":           ["(param 0)"],
+        "identity":            ["(multiply (param 0) x)", "(add (multiply (param 0) x) (param 0))"],
+        "double":              ["(multiply (param 0) x)", "(add (multiply (param 0) x) (param 0))"],
+        "linear_2x+1":        ["(add (multiply (param 0) x) (param 0))"],
+        "linear_neg":          ["(add (multiply (param 0) x) (param 0))"],
+        "square":              ["(multiply (param 0) (multiply x x))",
+                                "(add (multiply (param 0) (multiply x x)) (param 0))"],
+        "quadratic_x2-2x+1":  ["(add (multiply (param 0) (multiply x x)) (add (multiply (param 0) x) (param 0)))"],
+        "abs_value":           ["(if (> x (param 0)) (multiply (param 0) x) (multiply (param 0) x))"],
+        "mystery_linear":      ["(add (multiply (param 0) x) (param 0))"],
+        "mystery_quad":        ["(add (multiply (param 0) (multiply x x)) (add (multiply (param 0) x) (param 0)))"],
+    }
+    task_map = {t.name: t for t in CURRICULUM}
+    pairs = []
+    for name, structs in structures.items():
+        if name in task_map:
+            for s in structs:
+                pairs.append((task_map[name], s))
+    return pairs
+
+SFT_PAIRS = _build_sft_pairs()
+
+
+# ── SFT Warmstart ────────────────────────────────────────────────────────────
+
+def sft_warmstart(
+    model: StructureGenerator,
+    pairs: list[tuple[Task, str]] | None = None,
+    epochs: int = 100,
+    lr: float = 3e-3,
+    verbose: bool = True,
+) -> float:
+    """Supervised fine-tuning on known-good (task, structure) pairs.
+
+    Teacher-forcing: given task data as prompt, train the model to output
+    the known structure token-by-token. Returns final average loss.
+    """
+    if pairs is None:
+        pairs = SFT_PAIRS
+
+    if not pairs:
+        if verbose:
+            print("SFT: no training pairs, skipping")
+        return 0.0
+
+    optimizer = optim.Adam(learning_rate=lr)
+
+    if verbose:
+        print(f"SFT warmstart: {len(pairs)} pairs, {epochs} epochs, lr={lr}")
+
+    # Pre-tokenize all pairs
+    tokenized = []
+    for task, structure in pairs:
+        prompt_ids = encode_task(task)
+        target_ids = tokenize(structure)  # includes BOS/EOS
+        # Full sequence: prompt + target (without BOS, since prompt provides context)
+        full_ids = prompt_ids + target_ids[1:]  # skip target's BOS
+        tokenized.append((full_ids, len(prompt_ids)))
+
+    best_loss = float("inf")
+    for epoch in range(epochs):
+        random.shuffle(tokenized)
+        epoch_loss = 0.0
+        n_batches = 0
+
+        for full_ids, prompt_len in tokenized:
+            def loss_fn(m):
+                x = mx.array([full_ids[:-1]])  # input: everything except last
+                logits = m(x)[0]               # (seq_len, vocab)
+
+                # Only compute loss on target tokens (after prompt)
+                target_logits = logits[prompt_len - 1:]  # predict target tokens
+                target_ids_arr = mx.array(full_ids[prompt_len:])  # ground truth
+
+                # Truncate to same length
+                L = min(target_logits.shape[0], target_ids_arr.shape[0])
+                if L == 0:
+                    return mx.array(0.0)
+                target_logits = target_logits[:L]
+                target_ids_arr = target_ids_arr[:L]
+
+                # Cross-entropy loss
+                return nn.losses.cross_entropy(target_logits, target_ids_arr, reduction="mean")
+
+            loss, grads = nn.value_and_grad(model, loss_fn)(model)
+            grads, _ = optim.clip_grad_norm(grads, max_norm=1.0)
+            optimizer.update(model, grads)
+            mx.eval(model.parameters(), optimizer.state, loss)
+
+            loss_val = float(loss.item())
+            if not math.isnan(loss_val):
+                epoch_loss += loss_val
+                n_batches += 1
+
+        avg_loss = epoch_loss / max(n_batches, 1)
+        best_loss = min(best_loss, avg_loss)
+
+        if verbose and ((epoch + 1) % 20 == 0 or epoch == 0):
+            # Show a sample generation
+            task, expected = pairs[0]
+            prompt = encode_task(task)
+            gen_ids, _ = generate(model, prompt, temperature=0.3)
+            generated = detokenize(gen_ids)
+            reward = compute_reward(generated, task)
+            print(f"  SFT epoch {epoch + 1}/{epochs}: loss={avg_loss:.4f}")
+            print(f"    {task.name}: {generated}")
+            print(f"    expected:   {expected}")
+            print(f"    reward:     {reward:.3f}")
+
+    if verbose:
+        print(f"  SFT complete: best_loss={best_loss:.4f}")
+        # Test on all training tasks
+        n_ok = 0
+        for task, expected in pairs:
+            prompt = encode_task(task)
+            gen_ids, _ = generate(model, prompt, temperature=0.3)
+            generated = detokenize(gen_ids)
+            r = compute_reward(generated, task)
+            status = "OK" if r >= 1.0 else f"r={r:.2f}"
+            if r >= 1.0:
+                n_ok += 1
+            print(f"    {task.name:25s}: {generated:50s} [{status}]")
+        print(f"  SFT accuracy: {n_ok}/{len(pairs)}")
+        print()
+
+    return best_loss
 
 
 # ── GRPO Training Loop ──────────────────────────────────────────────────────
@@ -288,40 +413,57 @@ class TrajectoryData:
 
 
 def train_structure_generator(
-    epochs: int = 20,
+    sft_epochs: int = 100,
+    grpo_epochs: int = 20,
     group_size: int = 4,
     temperature: float = 0.8,
     clip_eps: float = 0.2,
     kl_coef: float = 0.05,
-    lr: float = 1e-3,
+    sft_lr: float = 3e-3,
+    grpo_lr: float = 1e-4,
     tasks: list[Task] | None = None,
     verbose: bool = True,
 ) -> StructureGenerator:
-    """Train a neural model to generate model structures via GRPO."""
+    """Train a neural model to generate model structures.
+
+    Phase 1: SFT warmstart on known-good (task, structure) pairs.
+    Phase 2: GRPO refinement with minimize()-based rewards.
+    """
 
     if tasks is None:
-        # Use a subset of curriculum tasks for training
         tasks = [t for t in CURRICULUM if t.name in [
             "const_5", "identity", "double", "linear_2x+1", "linear_neg",
             "square", "quadratic_x2-2x+1", "abs_value",
         ]]
 
     model = StructureGenerator()
+
+    if verbose:
+        print(f"Structure generator: {sum(p.size for _, p in tree_flatten(model.parameters())):,} params")
+        print(f"  vocab_size={VOCAB_SIZE}, tasks={len(tasks)}")
+        print()
+
+    # Phase 1: SFT warmstart
+    if sft_epochs > 0:
+        sft_warmstart(model, epochs=sft_epochs, lr=sft_lr, verbose=verbose)
+
+    # Phase 2: GRPO
+    if grpo_epochs == 0:
+        return model
+
+    # Snapshot the SFT model as reference for KL
     ref_model = StructureGenerator()
-    # Copy initial weights to ref
     ref_params = [(k, v) for k, v in tree_flatten(model.parameters())]
     ref_model.load_weights(ref_params)
     ref_model.freeze()
 
-    optimizer = optim.Adam(learning_rate=lr)
+    optimizer = optim.Adam(learning_rate=grpo_lr)
 
     if verbose:
-        print(f"Training structure generator: {sum(p.size for _, p in tree_flatten(model.parameters())):,} params")
-        print(f"  vocab_size={VOCAB_SIZE}, tasks={len(tasks)}, group_size={group_size}")
-        print(f"  epochs={epochs}, lr={lr}, temperature={temperature}")
+        print(f"GRPO phase: {grpo_epochs} epochs, group_size={group_size}, lr={grpo_lr}")
         print()
 
-    for epoch in range(epochs):
+    for epoch in range(grpo_epochs):
         random.shuffle(tasks)
         epoch_reward = 0.0
         epoch_success = 0
@@ -377,12 +519,12 @@ def train_structure_generator(
                         pos = gen_start + i
                         if pos >= logits.shape[0]:
                             break
-                        new_lp = mx.log_softmax(logits[pos])[token_id]
+                        new_lp = mx.log(mx.softmax(logits[pos]) + 1e-10)[token_id]
 
                         # Ref model log-prob
                         ref_x = mx.array([full_ids[:pos + 1]])
                         ref_logits = ref_model(ref_x)[0]
-                        ref_lp = mx.log_softmax(ref_logits[-1])[token_id]
+                        ref_lp = mx.log(mx.softmax(ref_logits[-1]) + 1e-10)[token_id]
 
                         # PPO-clip objective
                         ratio = mx.exp(new_lp - old_lp)
@@ -406,7 +548,7 @@ def train_structure_generator(
         success_rate = epoch_success / max(epoch_total, 1)
 
         if verbose:
-            print(f"Epoch {epoch + 1}/{epochs}: reward={avg_reward:.3f} success={success_rate:.1%} ({epoch_success}/{epoch_total})")
+            print(f"GRPO {epoch + 1}/{grpo_epochs}: reward={avg_reward:.3f} success={success_rate:.1%} ({epoch_success}/{epoch_total})")
 
             # Show a few generated structures
             if (epoch + 1) % 5 == 0 or epoch == 0:
