@@ -97,8 +97,11 @@ pub fn load_kb(jsonl_path: &str, labels_path: Option<&str>) -> Result<(), String
         for (prop_name, prop_value) in &entity.properties {
             let prop_sym = intern(prop_name);
 
-            // Resolve Q-id references
-            let resolved = if prop_value.starts_with('Q')
+            // Values are pre-resolved by resolve_wikidata.py.
+            // Only fall back to label lookup if --labels is provided
+            // and value still looks like a Q-id.
+            let resolved = if !labels.is_empty()
+                && prop_value.starts_with('Q')
                 && prop_value[1..].chars().all(|c| c.is_ascii_digit())
             {
                 labels.get(prop_value).cloned().unwrap_or_else(|| prop_value.clone())
@@ -119,7 +122,14 @@ pub fn load_kb(jsonl_path: &str, labels_path: Option<&str>) -> Result<(), String
             by_property.entry(prop_sym).or_default().push(label_sym);
         }
 
-        forward.insert(label_sym, props);
+        // On duplicate labels, keep the entity with more properties
+        let dominated = match forward.get(&label_sym) {
+            Some(existing) => existing.len() < props.len(),
+            None => true,
+        };
+        if dominated {
+            forward.insert(label_sym, props);
+        }
         count += 1;
 
         if count % 500_000 == 0 {
@@ -496,6 +506,52 @@ pub fn bi_kb_count(args: &[Value], _env: &Env) -> Result<Value, String> {
     }
     let kb = get_kb().ok_or("kb-count: no KB loaded")?;
     Ok(Value::Int(kb.forward.len() as i64))
+}
+
+/// `(kb-apply entity arg1 arg2 ...)` → evaluate the entity's defining_function with args.
+/// Looks up "defining_function" property (a SELPH lambda string), parses it,
+/// evaluates it in the current env, and applies it to the remaining arguments.
+///
+/// Example: (kb-apply "frequency" 0.5) → 2.0
+///   because frequency's defining_function is (lambda (T) (divide 1 T))
+pub fn bi_kb_apply(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("kb-apply: expected at least 1 arg (entity name)".into());
+    }
+    let kb = get_kb().ok_or("kb-apply: no KB loaded")?;
+    let entity = intern(args[0].as_str()?);
+
+    let fn_str = match kb.forward.get(&entity) {
+        Some(props) => {
+            let fn_prop = intern("defining_function");
+            match props.get(&fn_prop) {
+                Some(s) => s.clone(),
+                None => return Err(format!(
+                    "kb-apply: entity '{}' has no defining_function", resolve(entity)
+                )),
+            }
+        }
+        None => return Err(format!("kb-apply: entity '{}' not found", resolve(entity))),
+    };
+
+    // Parse the lambda string into SELPH nodes
+    let (old_nodes, roots) = crate::parser::parse_file(&fn_str)
+        .map_err(|e| format!("kb-apply: parse error in defining_function: {}", e))?;
+    if roots.is_empty() {
+        return Err("kb-apply: defining_function produced no expressions".into());
+    }
+    let new_nodes_vec = crate::eval_v2::convert_tree(&old_nodes);
+    let new_nodes: std::rc::Rc<[crate::types_v2::Node]> = new_nodes_vec.into();
+
+    // Evaluate to get the function value
+    let func = crate::eval_v2::eval(&new_nodes, roots[0], env)?;
+
+    // Apply with remaining args
+    if args.len() == 1 {
+        return Ok(func); // just return the function if no args
+    }
+    let fn_args: Vec<Value> = args[1..].to_vec();
+    crate::eval_v2::apply(&func, &fn_args, env)
 }
 
 /// `(kb-filter property value)` → list of entity labels where property exactly equals value

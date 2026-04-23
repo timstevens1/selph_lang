@@ -143,6 +143,7 @@ fn real_main() {
     match args[1].as_str() {
         "eval" | "eval-v2" => cmd_eval(&args[2..]),
         "repl" => cmd_repl(),
+        "serve" => cmd_serve(&args[2..]),
         "parse" => cmd_parse(&args[2..]),
         "grow" | "grow-v2" => cmd_grow_v2(&args[2..]),
         "arc" => cmd_arc(&args[2..]),
@@ -471,6 +472,99 @@ fn cmd_fmt(args: &[String]) {
         }
     } else {
         print!("{}", output);
+    }
+}
+
+/// Persistent eval server: load KB once, read expressions from stdin, write results to stdout.
+/// Protocol: one expression per line in, one result per line out.
+/// Errors return "ERROR: <message>". Empty input lines are echoed as empty output.
+/// Send ":quit" to exit.
+///
+/// Usage: selph serve --kb <file.jsonl> [--labels <file.json>]
+fn cmd_serve(args: &[String]) {
+    use std::io::{self, Write, BufRead};
+
+    // Parse --kb and --labels
+    let mut kb_path: Option<String> = None;
+    let mut labels_path: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--kb" && i + 1 < args.len() {
+            kb_path = Some(args[i + 1].clone());
+            i += 2;
+        } else if args[i] == "--labels" && i + 1 < args.len() {
+            labels_path = Some(args[i + 1].clone());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Load KB
+    if let Some(ref kbp) = kb_path {
+        if let Err(e) = kb::load_kb(kbp, labels_path.as_deref()) {
+            eprintln!("Failed to load KB: {}", e);
+            return;
+        }
+    }
+
+    let env = eval_v2::make_default_env();
+
+    // Signal ready
+    println!("READY");
+    io::stdout().flush().unwrap();
+
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let line = line.trim().to_string();
+
+        if line.is_empty() {
+            println!();
+            io::stdout().flush().unwrap();
+            continue;
+        }
+        if line == ":quit" || line == ":q" {
+            break;
+        }
+
+        // Parse and eval
+        match parse_file(&line) {
+            Ok((old_nodes, roots)) => {
+                let new_nodes_vec = eval_v2::convert_tree(&old_nodes);
+                let new_nodes: Rc<[types_v2::Node]> = new_nodes_vec.into();
+
+                let mut results = Vec::new();
+                let mut had_error = false;
+                for root in &roots {
+                    match eval_v2::eval(&new_nodes, *root, &env) {
+                        Ok(val) => {
+                            let s = eval_v2::value_to_string(&val);
+                            results.push(s);
+                        }
+                        Err(e) => {
+                            println!("ERROR: {}", e);
+                            io::stdout().flush().unwrap();
+                            had_error = true;
+                            break;
+                        }
+                    }
+                }
+                if !had_error {
+                    // Print the last result (like eval)
+                    let last = results.last().cloned().unwrap_or_default();
+                    println!("{}", last);
+                    io::stdout().flush().unwrap();
+                }
+            }
+            Err(e) => {
+                println!("ERROR: {}", e);
+                io::stdout().flush().unwrap();
+            }
+        }
     }
 }
 

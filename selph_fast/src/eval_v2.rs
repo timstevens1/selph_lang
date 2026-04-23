@@ -807,6 +807,7 @@ fn build_builtin_table() -> BuiltinTable {
     t.register(intern("kb-search"), crate::kb::bi_kb_search);
     t.register(intern("kb-is-property"), crate::kb::bi_kb_is_property);
     t.register(intern("kb-count"), crate::kb::bi_kb_count);
+    t.register(intern("kb-apply"), crate::kb::bi_kb_apply);
     t.register(intern("kb-filter"), crate::kb::bi_kb_filter);
     t.register(intern("kb-path"), crate::kb::bi_kb_path);
     t.register(intern("kb-path-count"), crate::kb::bi_kb_path_count);
@@ -950,7 +951,7 @@ fn build_default_scope() -> Scope {
         "function-arity", "function-param-types",
         "apropos", "apropos-by-type",
         "kb-get", "kb-properties", "kb-search", "kb-is-property", "kb-count",
-        "kb-filter", "kb-path", "kb-path-count",
+        "kb-apply", "kb-filter", "kb-path", "kb-path-count",
         // §9.48 P2: grid builtins
         "grid?", "grid-height", "grid-width",
         "grid-rotate-cw", "grid-rotate-ccw", "grid-rotate-180",
